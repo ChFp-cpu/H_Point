@@ -132,7 +132,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 @router.message(Registration.name, F.text)
 async def reg_name(message: Message, state: FSMContext) -> None:
     name = message.text.strip()
-    if name.startswith("/") or name in (BTN_NEED_HELP, BTN_WANT_HELP, BTN_PROFILE, BTN_HISTORY, BTN_SETTINGS, BTN_CANCEL):
+    if name.startswith("/") or name in (BTN_NEED_HELP, BTN_WANT_HELP, BTN_FIND_CANDIDATES, BTN_MY_CANDIDATES, BTN_PROFILE, BTN_HISTORY, BTN_SETTINGS, BTN_CANCEL):
         await message.answer("Пожалуйста, напишите своё имя обычным текстом.")
         return
     if not name or len(name) > MAX_NAME_LEN:
@@ -255,6 +255,186 @@ async def cb_set_category(callback: CallbackQuery) -> None:
     set_helper_categories(callback.from_user.id, list(selected))
     await callback.answer("Изменено")
     await callback.message.edit_reply_markup(reply_markup=settings_categories_kb(selected))
+
+
+async def _candidate_card(candidate: dict) -> str:
+    verified = " ✓" if candidate.get("verified") else ""
+    rating = candidate.get("rating") or 0
+    reviews = int(candidate.get("reviews") or 0)
+    distance = candidate.get("distance_km")
+    distance_text = f"{distance} км" if distance is not None else "расстояние неизвестно"
+    score = min(100, round(float(candidate.get("score") or 0)))
+    username = f" (@{escape(candidate['username'])})" if candidate.get("username") else ""
+    return (
+        f"👤 <b>{escape(candidate.get('name') or 'Пользователь')}</b>{verified}{username}\n"
+        f"⭐ {rating:.1f}/5 · {reviews} отзывов\n"
+        f"📍 {distance_text}\n"
+        f"🎯 Совпадение: <b>{score}%</b>"
+    )
+
+
+async def _show_candidates(message: Message, request_id: int, *, edit: bool = False) -> None:
+    req = get_request(request_id)
+    if not req:
+        await message.answer("Заявка не найдена.")
+        return
+    if req["requester_id"] != message.from_user.id:
+        await message.answer("Эта заявка принадлежит другому пользователю.")
+        return
+    if req["status"] != STATUS_OPEN:
+        text = "Кандидатов можно подбирать только для открытой заявки.\n\n" + request_text(req)
+        if edit:
+            await message.edit_text(text, reply_markup=main_menu_kb())
+        else:
+            await message.answer(text, reply_markup=main_menu_kb())
+        return
+
+    matches = get_candidates_for_request(request_id, limit=20)
+    if not matches:
+        text = (
+            "⚡ <b>Подбор кандидатов</b>\n\n"
+            "Пока нет доступных кандидатов. Попробуйте обновить подбор позже.\n\n"
+            f"{request_text(req)}"
+        )
+        markup = candidates_navigation_kb(request_id)
+        if edit:
+            await message.edit_text(text, reply_markup=markup)
+        else:
+            await message.answer(text, reply_markup=markup)
+        return
+
+    header = (
+        f"⚡ <b>Кандидаты для заявки №{request_id}</b>\n\n"
+        f"{escape(req['what'])}\n\n"
+        f"Найдено: <b>{len(matches)}</b>. Выберите подходящего помощника."
+    )
+    if edit:
+        await message.edit_text(header)
+    else:
+        await message.answer(header)
+
+    for candidate in matches:
+        await message.answer(
+            await _candidate_card(candidate),
+            reply_markup=candidate_kb(request_id, candidate["user_id"]),
+        )
+    await message.answer("Подбор можно обновить после изменения профилей или доступности.", reply_markup=candidates_navigation_kb(request_id))
+
+
+async def _choose_candidate_request(message: Message, state: FSMContext) -> bool:
+    if not await ensure_registered(message, state) or not await check_not_busy(message):
+        return False
+    active = get_active_own_request(message.from_user.id)
+    if not active:
+        await message.answer(
+            "У вас нет активной заявки. Сначала создайте её через «🆘 Мне нужна помощь».\n\n"
+            "После создания здесь появится Smart Match с кандидатами."
+        )
+        return False
+    if active["status"] != STATUS_OPEN:
+        await message.answer("По вашей заявке уже назначен помощник. Новых кандидатов подбирать не нужно.", reply_markup=main_menu_kb())
+        return False
+    return True
+
+
+@router.message(StateFilter(None), F.text == BTN_FIND_CANDIDATES)
+async def find_candidates(message: Message, state: FSMContext) -> None:
+    if not await _choose_candidate_request(message, state):
+        return
+    active = get_active_own_request(message.from_user.id)
+    await _show_candidates(message, active["id"])
+
+
+@router.message(StateFilter(None), F.text == BTN_MY_CANDIDATES)
+async def my_candidates(message: Message, state: FSMContext) -> None:
+    if not await _choose_candidate_request(message, state):
+        return
+    active = get_active_own_request(message.from_user.id)
+    await _show_candidates(message, active["id"])
+
+
+@router.callback_query(F.data.startswith("candidate:assign:"))
+async def cb_candidate_assign(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        _, _, request_id_s, candidate_id_s = callback.data.split(":")
+        request_id, candidate_id = int(request_id_s), int(candidate_id_s)
+    except (ValueError, TypeError):
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+
+    req = get_request(request_id)
+    if not req or req["requester_id"] != callback.from_user.id:
+        await callback.answer("Заявка недоступна.", show_alert=True)
+        return
+    if req["status"] != STATUS_OPEN:
+        await callback.answer("Эта заявка уже получила помощника или закрыта.", show_alert=True)
+        return
+    if candidate_id == callback.from_user.id:
+        await callback.answer("Нельзя выбрать себя.", show_alert=True)
+        return
+
+    candidate = get_user(candidate_id)
+    if not candidate:
+        await callback.answer("Кандидат больше недоступен.", show_alert=True)
+        return
+
+    if not try_assign_helper(request_id, candidate_id):
+        await callback.answer("Кандидат уже занят. Обновляю список.", show_alert=True)
+        await _show_candidates(callback.message, request_id)
+        return
+
+    db.execute(
+        "UPDATE request_candidates SET status='accepted', updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND candidate_id=?",
+        (request_id, candidate_id),
+    )
+    db.execute(
+        "UPDATE request_candidates SET status='rejected', updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND candidate_id!=? AND status='pending'",
+        (request_id, candidate_id),
+    )
+
+    await callback.answer("Помощник назначен!")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(
+        "🎉 <b>Помощник назначен</b>\n\n"
+        f"{request_text(req)}\n\n"
+        f"<b>Ваш помощник:</b> {user_link(candidate)}\n\n"
+        "Чат создаётся автоматически. После выполнения помощи вы получите запрос на оценку.",
+        reply_markup=main_menu_kb(),
+    )
+    await safe_notify_match(bot, request_id)
+
+
+@router.callback_query(F.data.startswith("candidate:refresh:"))
+async def cb_candidate_refresh(callback: CallbackQuery) -> None:
+    try:
+        request_id = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer("Некорректная заявка.", show_alert=True)
+        return
+    req = get_request(request_id)
+    if not req or req["requester_id"] != callback.from_user.id:
+        await callback.answer("Заявка недоступна.", show_alert=True)
+        return
+    await callback.answer("Подбор обновлён")
+    await _show_candidates(callback.message, request_id, edit=True)
+
+
+@router.callback_query(F.data.startswith("candidate:back:"))
+async def cb_candidate_back(callback: CallbackQuery) -> None:
+    try:
+        request_id = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer("Некорректная заявка.", show_alert=True)
+        return
+    req = get_request(request_id)
+    if not req or req["requester_id"] != callback.from_user.id:
+        await callback.answer("Заявка недоступна.", show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.edit_text(request_text(req), reply_markup=cancel_request_kb(request_id) if req["status"] == STATUS_OPEN else main_menu_kb())
 
 
 @router.message(StateFilter(None), F.text == BTN_NEED_HELP)

@@ -1,0 +1,137 @@
+"""SQLite persistence and migrations for H-Point."""
+import sqlite3
+from .config import DB_PATH, START_BALANCE, STATUS_OPEN, STATUS_IN_PROGRESS, STATUS_DONE
+
+def db_connect():
+    conn=sqlite3.connect(DB_PATH, isolation_level=None, timeout=15, check_same_thread=False)
+    conn.row_factory=sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=15000")
+    return conn
+db=db_connect()
+
+def _columns(table):
+    return {r["name"] for r in db.execute(f"PRAGMA table_info({table})").fetchall()}
+def _add_column(table,name,definition):
+    if name not in _columns(table):
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+def init_db():
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS users(
+      user_id INTEGER PRIMARY KEY, name TEXT NOT NULL, username TEXT, email TEXT UNIQUE,
+      password_hash TEXT, balance INTEGER NOT NULL DEFAULT 0, helper_categories TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, pro_until TEXT, verified_until TEXT,
+      business_until TEXT, favorite_slots INTEGER NOT NULL DEFAULT 3,
+      tg_user_id INTEGER UNIQUE, verification_code TEXT, web_verified INTEGER NOT NULL DEFAULT 0,
+      lat REAL, lon REAL, city TEXT DEFAULT '', bio TEXT DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS sessions(
+      token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      expires_at TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS requests(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, requester_id INTEGER NOT NULL REFERENCES users(user_id),
+      helper_id INTEGER REFERENCES users(user_id), category TEXT NOT NULL DEFAULT 'other',
+      what TEXT NOT NULL, place TEXT NOT NULL, time_needed TEXT NOT NULL, urgency TEXT NOT NULL,
+      details TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', rating INTEGER,
+      requester_rating INTEGER, requester_review TEXT, helper_rating INTEGER, helper_review TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT,
+      priority_boost INTEGER NOT NULL DEFAULT 0, lat REAL, lon REAL
+    );
+    CREATE TABLE IF NOT EXISTS helper_queue(user_id INTEGER PRIMARY KEY REFERENCES users(user_id), joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS billing_invoices(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(user_id),
+      item_type TEXT NOT NULL, amount_rub INTEGER NOT NULL DEFAULT 0, currency TEXT NOT NULL DEFAULT 'RUB',
+      payload TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending', metadata TEXT NOT NULL DEFAULT '{}',
+      provider_payment_id TEXT UNIQUE, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, paid_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS billing_events(id INTEGER PRIMARY KEY AUTOINCREMENT, invoice_id INTEGER REFERENCES billing_invoices(id),
+      event_type TEXT NOT NULL, provider_event_id TEXT UNIQUE, payload TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS favorites(user_id INTEGER NOT NULL REFERENCES users(user_id), favorite_user_id INTEGER NOT NULL REFERENCES users(user_id),
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(user_id,favorite_user_id));
+    CREATE TABLE IF NOT EXISTS ads(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL REFERENCES users(user_id),
+      text TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',expires_at TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS commercial_orders(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL REFERENCES users(user_id),
+      title TEXT NOT NULL,gross_amount INTEGER NOT NULL,commission_percent INTEGER NOT NULL DEFAULT 10,commission_amount INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'draft',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS chats(id INTEGER PRIMARY KEY AUTOINCREMENT,request_id INTEGER NOT NULL UNIQUE REFERENCES requests(id) ON DELETE CASCADE,user_a_id INTEGER NOT NULL REFERENCES users(user_id),user_b_id INTEGER NOT NULL REFERENCES users(user_id),created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS chat_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,user_id INTEGER NOT NULL REFERENCES users(user_id),text TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+    CREATE INDEX IF NOT EXISTS idx_chat_messages_chat ON chat_messages(chat_id,id);
+    CREATE INDEX IF NOT EXISTS idx_requests_open ON requests(status,created_at);
+    CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+    """)
+    # Safe migration of the old project.
+    for t,n,d in [
+      ("users","email","TEXT"),("users","password_hash","TEXT"),("users","tg_user_id","INTEGER"),
+      ("users","verification_code","TEXT"),("users","web_verified","INTEGER NOT NULL DEFAULT 0"),
+      ("users","lat","REAL"),("users","lon","REAL"),("users","city","TEXT DEFAULT ''"),("users","bio","TEXT DEFAULT ''"),
+      ("requests","lat","REAL"),("requests","lon","REAL"),("billing_invoices","amount_rub","INTEGER NOT NULL DEFAULT 0"),
+      ("billing_invoices","currency","TEXT NOT NULL DEFAULT 'RUB'"),("billing_invoices","provider_payment_id","TEXT")
+    ]: _add_column(t,n,d)
+    # Old Stars columns can remain for backwards-compatible data, but new code never uses them.
+    db.execute("CREATE INDEX IF NOT EXISTS idx_requests_geo ON requests(status,lat,lon)")
+    try: db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tg ON users(tg_user_id) WHERE tg_user_id IS NOT NULL")
+    except sqlite3.IntegrityError: pass
+
+def get_user(user_id):
+    return db.execute("SELECT * FROM users WHERE user_id=?",(user_id,)).fetchone()
+def get_user_by_email(email):
+    return db.execute("SELECT * FROM users WHERE lower(email)=lower(?)",(email,)).fetchone()
+def get_user_by_tg(tg_user_id):
+    return db.execute("SELECT * FROM users WHERE tg_user_id=?",(tg_user_id,)).fetchone()
+def create_user(user_id,name,username=None,email=None,password_hash=None,tg_user_id=None,web_verified=False):
+    db.execute("""INSERT OR IGNORE INTO users(user_id,name,username,email,password_hash,balance,helper_categories,tg_user_id,web_verified)
+                 VALUES(?,?,?,?,?,?,?, ?,?)""",(user_id,name,username,email,password_hash,START_BALANCE,"",tg_user_id,int(web_verified)))
+    return get_user(user_id)
+def create_web_user(name,email,password_hash):
+    row=db.execute("SELECT COALESCE(MIN(user_id),0) m FROM users").fetchone()
+    uid=min(-1, int(row["m"])-1)
+    db.execute("""INSERT INTO users(user_id,name,email,password_hash,balance,helper_categories,web_verified)
+                  VALUES(?,?,?,?,?,?,0)""",(uid,name,email,password_hash,START_BALANCE,""))
+    return uid
+def link_telegram(user_id,tg_user_id,username=None):
+    db.execute("UPDATE users SET tg_user_id=?, username=COALESCE(?,username), web_verified=1, verification_code=NULL WHERE user_id=?",(tg_user_id,username,user_id))
+def get_request(request_id): return db.execute("SELECT * FROM requests WHERE id=?",(request_id,)).fetchone()
+def get_active_own_request(uid): return db.execute("SELECT * FROM requests WHERE requester_id=? AND status IN (?,?) ORDER BY id DESC LIMIT 1",(uid,STATUS_OPEN,STATUS_IN_PROGRESS)).fetchone()
+def get_active_help(uid): return db.execute("SELECT * FROM requests WHERE helper_id=? AND status=? ORDER BY id DESC LIMIT 1",(uid,STATUS_IN_PROGRESS)).fetchone()
+def get_unrated_request(uid): return db.execute("SELECT * FROM requests WHERE requester_id=? AND status=? AND requester_rating IS NULL ORDER BY id DESC LIMIT 1",(uid,STATUS_DONE)).fetchone()
+def get_unrated_help(uid): return db.execute("SELECT * FROM requests WHERE helper_id=? AND status=? AND helper_rating IS NULL ORDER BY id DESC LIMIT 1",(uid,STATUS_DONE)).fetchone()
+def get_history(uid,limit=20): return db.execute("SELECT * FROM requests WHERE requester_id=? OR helper_id=? ORDER BY id DESC LIMIT ?",(uid,uid,limit)).fetchall()
+def get_user_stats(uid):
+    a=db.execute("SELECT COUNT(*) n,AVG(helper_rating) avg FROM requests WHERE helper_id=? AND status=?",(uid,STATUS_DONE)).fetchone()
+    b=db.execute("SELECT COUNT(*) n,AVG(requester_rating) avg FROM requests WHERE requester_id=? AND status=?",(uid,STATUS_DONE)).fetchone()
+    return {"helped":a["n"] or 0,"helped_avg":float(a["avg"]) if a["avg"] is not None else None,
+            "received":b["n"] or 0,"received_avg":float(b["avg"]) if b["avg"] is not None else None}
+def get_invoice(invoice_id): return db.execute("SELECT * FROM billing_invoices WHERE id=?",(invoice_id,)).fetchone()
+def get_invoice_by_payload(payload): return db.execute("SELECT * FROM billing_invoices WHERE payload=?",(payload,)).fetchone()
+def record_billing_event(invoice_id,event_type,provider_event_id=None,payload="{}"):
+    db.execute("INSERT OR IGNORE INTO billing_events(invoice_id,event_type,provider_event_id,payload) VALUES(?,?,?,?)",(invoice_id,event_type,provider_event_id,payload))
+def get_billing_history(uid,limit=20): return db.execute("SELECT * FROM billing_invoices WHERE user_id=? ORDER BY id DESC LIMIT ?",(uid,limit)).fetchall()
+
+def link_by_code(code,tg_user_id,username=None):
+    row=db.execute("SELECT * FROM users WHERE verification_code=?",(code,)).fetchone()
+    if not row: return False,"Код не найден или уже использован."
+    if row["tg_user_id"] and row["tg_user_id"] != tg_user_id: return False,"Этот аккаунт уже привязан."
+    existing=get_user_by_tg(tg_user_id)
+    if existing and existing["user_id"] != row["user_id"]:
+        return False,"Этот Telegram уже связан с другим H-Point аккаунтом."
+    uid=row["user_id"]
+    if uid == tg_user_id:
+        db.execute("UPDATE users SET username=?,web_verified=1,verification_code=NULL WHERE user_id=?",(username,uid))
+        return True,"linked"
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        for table,col in [("requests","requester_id"),("requests","helper_id"),("helper_queue","user_id"),
+                           ("billing_invoices","user_id"),("ads","user_id"),("commercial_orders","user_id")]:
+            db.execute(f"UPDATE {table} SET {col}=? WHERE {col}=?",(tg_user_id,uid))
+        db.execute("UPDATE favorites SET user_id=? WHERE user_id=?",(tg_user_id,uid))
+        db.execute("UPDATE favorites SET favorite_user_id=? WHERE favorite_user_id=?",(tg_user_id,uid))
+        db.execute("UPDATE sessions SET user_id=? WHERE user_id=?",(tg_user_id,uid))
+        db.execute("UPDATE users SET user_id=?,tg_user_id=?,username=?,web_verified=1,verification_code=NULL WHERE user_id=?",
+                   (tg_user_id,tg_user_id,username,uid))
+        db.execute("COMMIT"); return True,"linked"
+    except Exception:
+        db.execute("ROLLBACK"); raise

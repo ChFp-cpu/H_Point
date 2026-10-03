@@ -4,6 +4,7 @@ from .config import *
 def main_menu_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text=BTN_NEED_HELP), KeyboardButton(text=BTN_WANT_HELP)],
+        [KeyboardButton(text=BTN_FIND_CANDIDATES), KeyboardButton(text=BTN_MY_CANDIDATES)],
         [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_HISTORY)],
         [KeyboardButton(text=BTN_SETTINGS)],
         [KeyboardButton(text="💳 H-Point+" )],
@@ -66,3 +67,21 @@ def billing_kb():
 
 def choose_request_kb(requests):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"№{r['id']} — {r['what'][:28]}", callback_data=f"buyreq:{r['id']}")] for r in requests])
+
+
+def choose_match_request_kb(requests, prefix="matchreq"):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"№{r['id']} — {r['what'][:32]}", callback_data=f"{prefix}:{r['id']}")]
+        for r in requests
+    ])
+
+def candidate_kb(request_id, candidate_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤝 Предложить помощь", callback_data=f"candidate:assign:{request_id}:{candidate_id}")]
+    ])
+
+def candidates_navigation_kb(request_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить кандидатов", callback_data=f"candidate:refresh:{request_id}")],
+        [InlineKeyboardButton(text="⬅️ К заявке", callback_data=f"candidate:back:{request_id}")]
+    ])

@@ -5,6 +5,7 @@ DB_PATH = os.getenv("DB_PATH", "hpoint.db")
 WEB_HOST = os.getenv("WEB_HOST", "127.0.0.1")
 WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
 WEB_PUBLIC_URL = os.getenv("WEB_PUBLIC_URL", f"http://{WEB_HOST}:{WEB_PORT}")
+YANDEX_MAPS_API_KEY = os.getenv("YANDEX_MAPS_API_KEY", "")
 SESSION_TTL = int(os.getenv("SESSION_TTL", str(60 * 60 * 24 * 14)))
 START_BALANCE = 100
 REQUEST_COST = 10
@@ -15,6 +16,8 @@ HISTORY_LIMIT = 20
 
 BTN_NEED_HELP = "🆘 Мне нужна помощь"
 BTN_WANT_HELP = "🤝 Хочу помочь"
+BTN_FIND_CANDIDATES = "⚡ Подобрать кандидатов"
+BTN_MY_CANDIDATES = "👥 Мои кандидаты"
 BTN_PROFILE = "👤 Мой профиль"
 BTN_HISTORY = "📜 История"
 BTN_SETTINGS = "⚙️ Настройки помощи"

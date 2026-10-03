@@ -1,7 +1,7 @@
 """Бизнес-логика H-Point без Telegram UI."""
 import json
 from .config import *
-from .database import db, get_request, get_user, get_active_help
+from .database import db, get_request, get_user, get_active_help, save_request_candidates, get_request_candidates
 
 
 def infer_category(what: str) -> str:
@@ -273,7 +273,21 @@ def smart_match(request_id, limit=20):
                     "reviews":int(stats["n"] or 0),"verified":is_verified(u["user_id"]),"distance_km":round(distance,2) if distance<999 else None,
                     "score":round(score,1),"lat":u["lat"],"lon":u["lon"]})
     out.sort(key=lambda x:(x["score"],x["rating"],-(x["distance_km"] or 999)),reverse=True)
-    return out[:limit]
+    out = out[:limit]
+    save_request_candidates(request_id, out)
+    return out
+
+def get_candidates_for_request(request_id, limit=20):
+    """Return the same candidate pool used by the website and Telegram."""
+    req = get_request(request_id)
+    if not req:
+        return []
+    # Recalculate so Telegram never shows stale candidates after profiles,
+    # ratings, queue state or location have changed.
+    matches = smart_match(request_id, limit=limit)
+    if matches:
+        return matches
+    return [dict(row) for row in get_request_candidates(request_id, limit)]
 
 def smart_requests_for_helper(helper_id, limit=20):
     rows=db.execute("SELECT * FROM requests WHERE status=? AND requester_id!=? ORDER BY created_at DESC LIMIT 100",(STATUS_OPEN,helper_id)).fetchall()

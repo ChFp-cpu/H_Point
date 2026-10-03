@@ -14,8 +14,17 @@ db=db_connect()
 def _columns(table):
     return {r["name"] for r in db.execute(f"PRAGMA table_info({table})").fetchall()}
 def _add_column(table,name,definition):
-    if name not in _columns(table):
+    # Migrations must be safe to run against every older H-Point database.
+    # Some SQLite/legacy databases may already contain the column even when
+    # the migration snapshot is stale, so treat SQLite's duplicate-column
+    # error as an already-applied migration rather than crashing startup.
+    if name in _columns(table):
+        return
+    try:
         db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
 
 def init_db():
     db.executescript("""
@@ -59,6 +68,17 @@ def init_db():
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS chats(id INTEGER PRIMARY KEY AUTOINCREMENT,request_id INTEGER NOT NULL UNIQUE REFERENCES requests(id) ON DELETE CASCADE,user_a_id INTEGER NOT NULL REFERENCES users(user_id),user_b_id INTEGER NOT NULL REFERENCES users(user_id),created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS chat_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,user_id INTEGER NOT NULL REFERENCES users(user_id),text TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS request_candidates(
+      request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+      candidate_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      score REAL NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'pending',
+      seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(request_id,candidate_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_request_candidates_request ON request_candidates(request_id,status,score);
+    CREATE INDEX IF NOT EXISTS idx_request_candidates_candidate ON request_candidates(candidate_id,status);
     CREATE INDEX IF NOT EXISTS idx_chat_messages_chat ON chat_messages(chat_id,id);
     CREATE INDEX IF NOT EXISTS idx_requests_open ON requests(status,created_at);
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
@@ -83,8 +103,12 @@ def get_user_by_email(email):
 def get_user_by_tg(tg_user_id):
     return db.execute("SELECT * FROM users WHERE tg_user_id=?",(tg_user_id,)).fetchone()
 def create_user(user_id,name,username=None,email=None,password_hash=None,tg_user_id=None,web_verified=False):
+    # Telegram registrations use the Telegram id as both the primary user id
+    # and the linked Telegram identity. Web accounts are created separately
+    # by create_web_user().
+    actual_tg_id = user_id if tg_user_id is None else tg_user_id
     db.execute("""INSERT OR IGNORE INTO users(user_id,name,username,email,password_hash,balance,helper_categories,tg_user_id,web_verified)
-                 VALUES(?,?,?,?,?,?,?, ?,?)""",(user_id,name,username,email,password_hash,START_BALANCE,"",tg_user_id,int(web_verified)))
+                 VALUES(?,?,?,?,?,?,?, ?,?)""",(user_id,name,username,email,password_hash,START_BALANCE,"",actual_tg_id,int(web_verified)))
     return get_user(user_id)
 def create_web_user(name,email,password_hash):
     row=db.execute("SELECT COALESCE(MIN(user_id),0) m FROM users").fetchone()
@@ -105,42 +129,139 @@ def get_user_stats(uid):
     b=db.execute("SELECT COUNT(*) n,AVG(requester_rating) avg FROM requests WHERE requester_id=? AND status=?",(uid,STATUS_DONE)).fetchone()
     return {"helped":a["n"] or 0,"helped_avg":float(a["avg"]) if a["avg"] is not None else None,
             "received":b["n"] or 0,"received_avg":float(b["avg"]) if b["avg"] is not None else None}
+def save_request_candidates(request_id, candidates):
+    for candidate in candidates:
+        db.execute(
+            """INSERT INTO request_candidates(request_id,candidate_id,score,status,seen_at,updated_at)
+               VALUES(?,?,?,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+               ON CONFLICT(request_id,candidate_id) DO UPDATE SET
+                 score=excluded.score, updated_at=CURRENT_TIMESTAMP""",
+            (request_id, candidate["user_id"], candidate["score"]),
+        )
+
+def get_request_candidates(request_id, limit=20):
+    return db.execute(
+        """SELECT rc.*, u.name, u.username, u.lat, u.lon, u.bio, u.tg_user_id
+           FROM request_candidates rc
+           JOIN users u ON u.user_id=rc.candidate_id
+           WHERE rc.request_id=? AND rc.status='pending'
+           ORDER BY rc.score DESC, rc.updated_at DESC LIMIT ?""",
+        (request_id, limit),
+    ).fetchall()
+
 def get_invoice(invoice_id): return db.execute("SELECT * FROM billing_invoices WHERE id=?",(invoice_id,)).fetchone()
 def get_invoice_by_payload(payload): return db.execute("SELECT * FROM billing_invoices WHERE payload=?",(payload,)).fetchone()
 def record_billing_event(invoice_id,event_type,provider_event_id=None,payload="{}"):
     db.execute("INSERT OR IGNORE INTO billing_events(invoice_id,event_type,provider_event_id,payload) VALUES(?,?,?,?)",(invoice_id,event_type,provider_event_id,payload))
 def get_billing_history(uid,limit=20): return db.execute("SELECT * FROM billing_invoices WHERE user_id=? ORDER BY id DESC LIMIT ?",(uid,limit)).fetchall()
 
-def link_by_code(code, tg_user_id, username=None):
-    row = db.execute(
-        "SELECT user_id FROM users WHERE verification_code=?",
-        (code,)
-    ).fetchone()
+def link_by_code(code,tg_user_id,username=None):
+    """Link a Telegram identity to the existing web account and merge prior activity.
 
+    Both clients use the same users/requests tables. If Telegram was used before
+    linking, that Telegram-only account is merged into the web account instead of
+    being rejected or leaving two separate histories. The Telegram user id is kept
+    as the canonical user_id because Telegram handlers address users by that id.
+    """
+    row=db.execute("SELECT * FROM users WHERE verification_code=?",(code,)).fetchone()
     if not row:
-        return False, "Неверный или просроченный код."
+        return False,"Код не найден или уже использован."
 
-    web_user_id = row["user_id"]
+    web_uid=row["user_id"]
+    if row["tg_user_id"] and row["tg_user_id"] != tg_user_id:
+        return False,"Этот аккаунт уже привязан к другому Telegram."
 
-    # Проверяем, не привязан ли этот Telegram к другому аккаунту
-    existing = db.execute(
-        "SELECT user_id FROM users WHERE tg_user_id=? AND user_id!=?",
-        (tg_user_id, web_user_id)
-    ).fetchone()
+    # Older bot registrations may have user_id=tg_user_id but a NULL
+    # tg_user_id column. Treat that row as the same Telegram identity too.
+    tg_row=get_user_by_tg(tg_user_id) or get_user(tg_user_id)
+    if tg_row and tg_row["user_id"] == web_uid:
+        db.execute("UPDATE users SET username=COALESCE(?,username),web_verified=1,verification_code=NULL WHERE user_id=?",
+                   (username,web_uid))
+        return True,"linked"
 
-    if existing:
-        return False, "Этот Telegram-аккаунт уже привязан к другому профилю."
+    try:
+        db.execute("BEGIN IMMEDIATE")
 
-    db.execute(
-        """
-        UPDATE users
-        SET tg_user_id=?,
-            username=?,
-            web_verified=1,
-            verification_code=NULL
-        WHERE user_id=?
-        """,
-        (tg_user_id, username, web_user_id)
-    )
+        # No Telegram profile yet: keep the old behaviour, but migrate every FK
+        # first so the primary-key change remains safe with foreign_keys=ON.
+        if tg_row is None:
+            canonical=tg_user_id
+            for table,col in [
+                ("requests","requester_id"),("requests","helper_id"),
+                ("helper_queue","user_id"),("billing_invoices","user_id"),
+                ("ads","user_id"),("commercial_orders","user_id"),
+                ("chats","user_a_id"),("chats","user_b_id"),("chat_messages","user_id"),("request_candidates","candidate_id")
+            ]:
+                db.execute(f"UPDATE {table} SET {col}=? WHERE {col}=?",(canonical,web_uid))
+            db.execute("UPDATE favorites SET user_id=? WHERE user_id=?",(canonical,web_uid))
+            db.execute("UPDATE favorites SET favorite_user_id=? WHERE favorite_user_id=?",(canonical,web_uid))
+            db.execute("UPDATE sessions SET user_id=? WHERE user_id=?",(canonical,web_uid))
+            db.execute("UPDATE users SET user_id=?,tg_user_id=?,username=COALESCE(?,username),web_verified=1,verification_code=NULL WHERE user_id=?",
+                       (canonical,tg_user_id,username,web_uid))
+            db.execute("COMMIT")
+            return True,"linked"
 
-    return True, "Telegram успешно привязан к вашему аккаунту."
+        # Telegram was already used before the site account was linked. Merge
+        # both identities into the Telegram id and preserve all activity.
+        tg_uid=tg_row["user_id"]
+        canonical=tg_uid
+
+        # Prefer explicitly entered web profile data where it exists.
+        merged_name=row["name"] or tg_row["name"]
+        merged_email=tg_row["email"] or row["email"]
+        merged_password=tg_row["password_hash"] or row["password_hash"]
+        merged_username=username or tg_row["username"] or row["username"]
+        merged_categories=tg_row["helper_categories"] or row["helper_categories"]
+        merged_city=tg_row["city"] or row["city"]
+        merged_bio=tg_row["bio"] or row["bio"]
+        merged_lat=tg_row["lat"] if tg_row["lat"] is not None else row["lat"]
+        merged_lon=tg_row["lon"] if tg_row["lon"] is not None else row["lon"]
+        merged_balance=max(int(tg_row["balance"] or 0),int(row["balance"] or 0))
+        merged_favorite_slots=max(int(tg_row["favorite_slots"] or 0),int(row["favorite_slots"] or 0))
+        merged_pro=max(x for x in (tg_row["pro_until"],row["pro_until"]) if x is not None) if (tg_row["pro_until"] or row["pro_until"]) else None
+        merged_verified=max(x for x in (tg_row["verified_until"],row["verified_until"]) if x is not None) if (tg_row["verified_until"] or row["verified_until"]) else None
+        merged_business=max(x for x in (tg_row["business_until"],row["business_until"]) if x is not None) if (tg_row["business_until"] or row["business_until"]) else None
+
+        # Merge FK-backed activity. Tables with composite primary keys need
+        # INSERT OR IGNORE first to avoid collisions, then the old rows are removed.
+        for table,col in [
+            ("requests","requester_id"),("requests","helper_id"),
+            ("billing_invoices","user_id"),("ads","user_id"),
+            ("commercial_orders","user_id"),("chat_messages","user_id"),("request_candidates","candidate_id")
+        ]:
+            db.execute(f"UPDATE {table} SET {col}=? WHERE {col}=?",(canonical,web_uid))
+
+        db.execute("UPDATE chats SET user_a_id=? WHERE user_a_id=?",(canonical,web_uid))
+        db.execute("UPDATE chats SET user_b_id=? WHERE user_b_id=?",(canonical,web_uid))
+
+        db.execute("INSERT OR IGNORE INTO helper_queue(user_id,joined_at) SELECT ?,joined_at FROM helper_queue WHERE user_id=?",(canonical,web_uid))
+        db.execute("DELETE FROM helper_queue WHERE user_id=?",(web_uid,))
+
+        db.execute("INSERT OR IGNORE INTO favorites(user_id,favorite_user_id,created_at) SELECT ?,favorite_user_id,created_at FROM favorites WHERE user_id=?",(canonical,web_uid))
+        db.execute("INSERT OR IGNORE INTO favorites(user_id,favorite_user_id,created_at) SELECT user_id,?,created_at FROM favorites WHERE favorite_user_id=?",(canonical,web_uid))
+        db.execute("DELETE FROM favorites WHERE user_id=? OR favorite_user_id=?",(web_uid,web_uid))
+
+        # Website sessions now follow the canonical Telegram-backed account, so
+        # the already-open browser remains logged in after linking.
+        db.execute("UPDATE sessions SET user_id=? WHERE user_id=?",(canonical,web_uid))
+
+        # Remove the old web shadow before copying its unique email/password
+        # onto the canonical Telegram row. All dependent rows were migrated above.
+        db.execute("DELETE FROM users WHERE user_id=?",(web_uid,))
+
+        # Merge billing / profile state into the canonical Telegram row.
+        db.execute("""UPDATE users SET
+            name=?,username=?,email=?,password_hash=?,balance=?,helper_categories=?,
+            pro_until=?,verified_until=?,business_until=?,favorite_slots=?,
+            tg_user_id=?,web_verified=1,verification_code=NULL,lat=?,lon=?,city=?,bio=?
+            WHERE user_id=?""",
+            (merged_name,merged_username,merged_email,merged_password,merged_balance,merged_categories,
+             merged_pro,merged_verified,merged_business,merged_favorite_slots,tg_user_id,
+             merged_lat,merged_lon,merged_city,merged_bio,canonical))
+
+        db.execute("COMMIT")
+        return True,"linked"
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
