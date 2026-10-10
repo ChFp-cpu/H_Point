@@ -129,6 +129,19 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await show_main_menu(message, f"С возвращением, {escape(user['name'])}! Выберите действие:")
 
 
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await message.answer(
+        "<b>H-Point — помощь рядом</b>\n\n"
+        "Создайте заявку, чтобы попросить о помощи, или встаньте в очередь, "
+        "чтобы помочь кому-то. После подбора вы получите уведомление; "
+        "завершение заявки и оценки доступны в боте.\n\n"
+        "Основные действия находятся в меню. Команды: /start, /profile, "
+        "/history, /settings, /billing, /cancel. Для привязки аккаунта: /link КОД.\n\n"
+        "Подбор использует правила и данные профиля; AI-функций в текущей версии нет."
+    )
+
+
 @router.message(Registration.name, F.text)
 async def reg_name(message: Message, state: FSMContext) -> None:
     name = message.text.strip()

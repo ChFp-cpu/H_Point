@@ -1,15 +1,43 @@
 """H-Point web-first application: dashboard, requests, Smart Match, chat, profile and RUB billing."""
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-import json, os, secrets, hashlib, hmac, datetime as dt, re
+import asyncio, json, logging, os, secrets, hashlib, hmac, datetime as dt, re
+from html import escape
 from . import database
 from .database import db, get_user, get_user_by_email, create_web_user, get_request, get_user_stats, get_active_own_request, get_history, get_billing_history
 from .config import *
 from .services import *
-from .billing import create_pending_invoice, create_payment, fulfill_invoice
+from .billing import create_pending_invoice, create_payment, fulfill_invoice, verify_robokassa_result
 
 database.init_db()
 YANDEX_MAPS_API_KEY = os.getenv("YANDEX_MAPS_API_KEY", "")
+_telegram_bot = None
+_telegram_loop = None
+
+def configure_telegram_notifications(bot):
+    """Enable best-effort Telegram notifications for requests created on the web."""
+    global _telegram_bot, _telegram_loop
+    _telegram_bot = bot
+    _telegram_loop = asyncio.get_running_loop()
+
+def notify_telegram_user(user_id, text):
+    if _telegram_bot is None or _telegram_loop is None:
+        return
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            _telegram_bot.send_message(user_id, text), _telegram_loop
+        )
+    except RuntimeError:
+        logging.warning("Telegram notification could not be scheduled")
+        return
+
+    def report_failure(result):
+        try:
+            result.result()
+        except Exception:
+            logging.warning("Telegram notification failed")
+
+    future.add_done_callback(report_failure)
 
 def now(): return dt.datetime.now(dt.timezone.utc)
 def ph(p,s=None):
@@ -33,6 +61,10 @@ def new_sess(uid):
     e=(now()+dt.timedelta(seconds=SESSION_TTL)).isoformat()
     db.execute("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)",(t,uid,e))
     return t
+
+def session_cookie(value, max_age):
+    secure = "; Secure" if SESSION_COOKIE_SECURE else ""
+    return f"hpoint_session={value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}{secure}"
 
 def read(h):
     return json.loads(h.rfile.read(int(h.headers.get("Content-Length","0"))) or b"{}")
@@ -68,6 +100,7 @@ PAGE=r'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet"><script src="https://api-maps.yandex.ru/2.1/?apikey=__YANDEX_MAPS_API_KEY__&lang=ru_RU" type="text/javascript"></script>
 <style>
 :root{--bg:#f5f7fb;--surface:#fff;--ink:#101828;--muted:#667085;--line:#e6eaf0;--brand:#5b5cf0;--brand2:#7c3aed;--ok:#12b76a;--warn:#f79009;--shadow:0 16px 50px rgba(16,24,40,.08)}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 80% -10%,#e9e8ff 0,transparent 35%),var(--bg);color:var(--ink);font-family:Manrope,system-ui,-apple-system,sans-serif}.nav{position:sticky;top:0;z-index:40;background:rgba(245,247,251,.86);backdrop-filter:blur(18px);border-bottom:1px solid rgba(230,234,240,.8)}.in,.wrap{width:min(1240px,100%);margin:auto;padding:0 24px}.in{height:74px;display:flex;align-items:center;gap:12px}.logo{font-size:25px;font-weight:800;letter-spacing:-1px}.logo b{color:var(--brand)}.sp{flex:1}.btn{border:0;border-radius:14px;padding:12px 17px;font:inherit;font-weight:800;cursor:pointer;transition:.2s;display:inline-flex;align-items:center;justify-content:center;gap:7px}.btn:hover{transform:translateY(-1px)}.dark{background:var(--ink);color:white}.light{background:var(--surface);color:var(--ink);border:1px solid var(--line)}.grad{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff}.danger{color:#b42318;background:#fff;border:1px solid #fecdca}.ey{display:inline-flex;padding:7px 10px;border-radius:999px;background:#eeefff;color:#4c4fd0;font-size:11px;font-weight:800}.landingHero{padding:76px 0 55px;display:grid;grid-template-columns:1.1fr .9fr;gap:44px;align-items:center}.hero h1{font-size:clamp(46px,6vw,82px);line-height:.95;letter-spacing:-5px;margin:18px 0}.hero p{font-size:18px;line-height:1.7;color:var(--muted);max-width:650px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:25px}.cover{min-height:430px;border-radius:34px;background:linear-gradient(145deg,#111326,#2f3270);box-shadow:0 30px 80px rgba(31,35,90,.28);padding:22px;color:white;position:relative;overflow:hidden}.cover:before{content:"";position:absolute;width:270px;height:270px;border-radius:50%;background:#7778ff55;filter:blur(8px);right:-70px;top:-70px}.coverCard{position:relative;background:#ffffff12;border:1px solid #ffffff1f;border-radius:22px;padding:19px;margin-bottom:12px;backdrop-filter:blur(8px)}.coverCard strong{display:block;font-size:18px}.coverCard small{display:block;color:#cfd2e7;margin-top:7px;line-height:1.5}.coverMap{position:absolute;left:22px;right:22px;bottom:22px;height:110px;border-radius:18px;background:linear-gradient(135deg,#34386e,#171a35);border:1px solid #ffffff1f;display:flex;align-items:center;justify-content:center;color:#cfd2e7}.section{padding:54px 0}.section h2{font-size:34px;letter-spacing:-1.5px}.featureGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.card{background:rgba(255,255,255,.88);border:1px solid var(--line);border-radius:22px;padding:21px;box-shadow:0 8px 30px rgba(16,24,40,.04)}.muted{color:var(--muted)}.price{font-size:28px;font-weight:800}.app{display:none}.appHead{padding:35px 0 0}.welcome{display:flex;align-items:flex-end;gap:15px;justify-content:space-between}.welcome h1{font-size:42px;letter-spacing:-2px;margin:9px 0}.tabs{display:flex;gap:7px;overflow:auto;padding:22px 0 10px;position:sticky;top:74px;z-index:15;background:linear-gradient(var(--bg) 80%,transparent)}.tab{padding:10px 14px;border-radius:12px;border:1px solid transparent;background:transparent;white-space:nowrap;font:inherit;font-weight:700;color:var(--muted);cursor:pointer}.tab.active{background:white;border-color:var(--line);color:var(--ink);box-shadow:0 5px 20px #1018280b}.panel{display:none;padding:18px 0 60px}.panel.active{display:block}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{padding:20px}.stat .big{font-size:28px;font-weight:800;margin-top:5px}.layout{display:grid;grid-template-columns:1.25fr .75fr;gap:16px}.form{display:grid;gap:11px}.input{width:100%;padding:13px 14px;border:1px solid var(--line);border-radius:13px;background:#fff;font:inherit;outline:none}.input:focus{border-color:#8d8ff7;box-shadow:0 0 0 4px #5b5cf012}.textarea{min-height:110px;resize:vertical}.request{display:flex;gap:14px;align-items:center;padding:16px;border:1px solid var(--line);border-radius:17px;background:#fff;margin:9px 0}.requestmain{flex:1;min-width:0}.badge{padding:6px 9px;border-radius:999px;background:#f2f4f7;font-size:11px;font-weight:800;white-space:nowrap}.badge.ok{background:#ecfdf3;color:#027a48}.badge.warn{background:#fffaeb;color:#b54708}.map{height:460px;border-radius:22px;overflow:hidden;border:1px solid var(--line);background:#eef0f5}.match{padding:16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}.avatar{width:42px;height:42px;border-radius:14px;background:linear-gradient(135deg,#ececff,#ddd8ff);display:flex;align-items:center;justify-content:center;font-weight:800}.grow{flex:1;min-width:0}.modal{position:fixed;inset:0;background:#10182899;display:none;align-items:center;justify-content:center;z-index:100;padding:20px}.box{background:#fff;border-radius:26px;padding:26px;width:min(600px,100%);max-height:90vh;overflow:auto;box-shadow:0 30px 100px #10182833}.close{float:right;border:0;background:none;font-size:25px;cursor:pointer}.chat{height:480px;display:flex;flex-direction:column}.messages{flex:1;overflow:auto;padding:12px;background:#f7f8fb;border-radius:17px}.msg{max-width:78%;padding:10px 13px;border-radius:16px;background:#fff;margin:7px 0;border:1px solid var(--line)}.msg.mine{margin-left:auto;background:#eef0ff;border-color:#d9dbff}.msg small{display:block;color:var(--muted);font-size:10px;margin-top:4px}.chatbar{display:flex;gap:8px;margin-top:10px}.empty{padding:32px;text-align:center;color:var(--muted)}.toast{position:fixed;right:20px;bottom:20px;z-index:200;background:#101828;color:#fff;border-radius:14px;padding:13px 16px;box-shadow:var(--shadow);display:none}.verify{background:linear-gradient(135deg,#f0f0ff,#fff);border:1px solid #dfe1ff}.profileGrid{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:900px){.landingHero,.layout,.profileGrid{grid-template-columns:1fr}.featureGrid{grid-template-columns:1fr 1fr}.stats{grid-template-columns:1fr 1fr}}@media(max-width:600px){.in,.wrap{padding:0 15px}.featureGrid,.stats{grid-template-columns:1fr}.hero h1{letter-spacing:-3px}.welcome h1{font-size:32px}.cover{min-height:390px}.request{align-items:flex-start;flex-wrap:wrap}}
+#p-billing .layout{grid-template-columns:minmax(0,1.7fr) minmax(280px,.8fr);align-items:start}#appprices{grid-template-columns:repeat(2,minmax(0,1fr))}#appprices>.card{min-width:0;display:flex;flex-direction:column;align-items:flex-start}#appprices>.card h3{min-height:2.8em;margin-bottom:8px}#appprices>.card .muted{min-height:3em}#appprices>.card .price{margin-top:auto;padding:12px 0 16px;white-space:nowrap}#appprices>.card .btn{width:100%}@media(max-width:900px){#p-billing .layout{grid-template-columns:minmax(0,1fr)}#appprices{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){#appprices{grid-template-columns:minmax(0,1fr)}}
 </style></head><body>
 <header class="nav"><div class="in"><div class="logo">H·Point<b>.</b></div><div class="sp"></div><div id="nav"></div></div></header>
 <main id="landing" class="wrap"><section class="landingHero"><div class="hero"><span class="ey">ПОМОЩЬ РЯДОМ · SMART MATCH</span><h1>Найди помощь.<br>Помоги другим.</h1><p>H·Point объединяет заявки, людей рядом, умный подбор, карту, рейтинг и Telegram. Сайт — главное пространство, бот — быстрый второй вход.</p><div class="actions"><button class="btn dark" onclick="authForm(true)">Создать аккаунт</button><button class="btn light" onclick="authForm(false)">Войти</button></div></div><div class="cover"><div class="coverCard"><strong>⚡ Smart Match</strong><small>Подбираем помощников по категории, рейтингу, верификации и расстоянию.</small></div><div class="coverCard"><strong>⭐ Живой рейтинг</strong><small>Отзывы появляются после реального взаимодействия.</small></div><div class="coverCard"><strong>💬 Сайт + Telegram</strong><small>Один аккаунт, единая история и заявки.</small></div><div class="coverMap">● 12 помощников рядом · 4 подходят сейчас</div></div></section>
@@ -99,8 +132,8 @@ async function login(){try{await api('/api/auth/login',{method:'POST',body:JSON.
 async function logout(){await fetch('/api/auth/logout',{method:'POST'});location.reload()}
 function landing(){ $('landing').style.display='block';$('app').style.display='none';$('nav').innerHTML='<button class="btn light" onclick="authForm(false)">Войти</button><button class="btn dark" onclick="authForm(true)">Регистрация</button>';prices('prices',false)}
 async function load(){try{let d=await api('/api/dashboard');$('landing').style.display='none';$('app').style.display='block';$('nav').innerHTML='<button class="btn light" onclick="go(\'profile\')">Профиль</button><button class="btn dark" onclick="requestForm()">+ Заявка</button>';$('welcome').textContent='Добро пожаловать, '+d.user.name;$('bal').textContent=d.user.balance+' HP';$('rate').textContent=d.user.stats.helped_avg?'⭐ '+d.user.stats.helped_avg.toFixed(1):'—';$('helped').textContent=d.user.stats.helped;$('received').textContent=d.user.stats.received;$('verifyText').textContent=d.user.verified?'Профиль подтверждён. Можно пользоваться всеми основными функциями.':'Привяжите Telegram в профиле, чтобы подтвердить аккаунт и получить полный доступ к связке сайта и бота.';$('verifyNotice').innerHTML=d.user.verified?'<span class="badge ok">✓ Профиль подтверждён</span>':'<span class="badge warn">Нужно привязать Telegram</span>';await requests();await profile();prices('appprices',true);await billing();startSync()}catch(e){landing()}}
-async function syncTick(){try{let d=await api('/api/dashboard');$('welcome').textContent='Добро пожаловать, '+d.user.name;$('bal').textContent=d.user.balance+' HP';$('rate').textContent=d.user.stats.helped_avg?'⭐ '+d.user.stats.helped_avg.toFixed(1):'—';$('helped').textContent=d.user.stats.helped;$('received').textContent=d.user.stats.received;await requests();let tab=document.querySelector('.tab.active')?.dataset.t;if(tab==='history')await history();if(tab==='billing')await billing()}catch(e){if(e.message==='auth_required')stopSync()}}
-function startSync(){if(syncTimer)return;syncTimer=setInterval(()=>{if(document.visibilityState==='visible')syncTick()},1500)}
+async function syncTick(){try{let d=await api('/api/dashboard');$('welcome').textContent='Добро пожаловать, '+d.user.name;$('bal').textContent=d.user.balance+' HP';$('rate').textContent=d.user.stats.helped_avg?'⭐ '+d.user.stats.helped_avg.toFixed(1):'—';$('helped').textContent=d.user.stats.helped;$('received').textContent=d.user.stats.received;$('verifyText').textContent=d.user.tg_linked?'Telegram привязан: заявки и история доступны в обоих интерфейсах.':'До привязки заявки сайта и Telegram относятся к разным профилям. В профиле получите код и отправьте /link КОД в боте.';$('verifyNotice').innerHTML=d.user.tg_linked?'<span class="badge ok">✓ Telegram привязан</span>':'<span class="badge warn">Нужно привязать Telegram</span>';await requests();let tab=document.querySelector('.tab.active')?.dataset.t;if(tab==='history')await history();if(tab==='profile')await profile();if(tab==='billing')await billing()}catch(e){if(e.message==='auth_required')stopSync()}}
+function startSync(){if(syncTimer)return;syncTick();syncTimer=setInterval(()=>{if(document.visibilityState==='visible')syncTick()},1000);document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')syncTick()})}
 function stopSync(){if(syncTimer){clearInterval(syncTimer);syncTimer=null}}
 async function requests(){let d=await api('/api/requests/mine');$('mine').innerHTML=d.requests.length?d.requests.map(r=>`<div class="request"><div class="avatar">${esc((r.what||'?')[0].toUpperCase())}</div><div class="requestmain"><b>#${r.id} · ${esc(r.what)}</b><div class="muted">${esc(r.category_name)} · ${esc(r.place)} · ${esc(r.status_title)}</div></div><span class="badge ${r.status==='done'?'ok':r.status==='in_progress'?'warn':''}">${esc(r.urgency)}</span>${r.status==='in_progress'&&r.helper_id===d.current_user_id?`<button class="btn grad" onclick="finish(${r.id})">Завершить</button>`:''}${r.status==='in_progress'?`<button class="btn light" onclick="openChat(${r.id})">Чат</button>`:''}${r.status==='done'&&r.requester_id===d.current_user_id&&!r.requester_rating?`<button class="btn light" onclick="review(${r.id},'requester')">Оценить</button>`:''}${r.status==='done'&&r.helper_id===d.current_user_id&&!r.helper_rating?`<button class="btn light" onclick="review(${r.id},'helper')">Оценить</button>`:''}</div>`).join(''):'<div class="empty">Здесь появятся ваши заявки.</div>'; $('rid').innerHTML=d.requests.filter(r=>r.status==='open').map(r=>`<option value="${r.id}">#${r.id} — ${esc(r.what)}</option>`).join('')||'<option value="">Нет открытых заявок</option>'}
 function requestForm(){ $('modal').style.display='flex';$('modalbody').innerHTML=`<h2>Новая заявка</h2><p class="muted">Опишите задачу понятно. Геопозиция используется только для подбора.</p><div class="form"><input id="qw" class="input" placeholder="Что нужно сделать?"><input id="qp" class="input" placeholder="Район / ориентир"><input id="qt" class="input" placeholder="Когда нужна помощь?"><select id="qc" class="input"><option value="other">Другое</option><option value="carry">Перенос / переезд</option><option value="shopping">Покупки</option><option value="snow">Снег / уборка</option><option value="tools">Инструменты</option><option value="transport">Транспорт</option><option value="tech">Техника</option><option value="study">Учёба</option></select><select id="qu" class="input"><option>🔥 Очень срочно</option><option>⏳ В течение дня</option><option>🕊 Не срочно</option></select><textarea id="qd" class="input textarea" placeholder="Детали"></textarea><button class="btn grad" onclick="createReq()">Создать заявку</button><div id="rqerr" class="muted"></div></div>`}
@@ -131,13 +164,15 @@ load();
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
     def log_message(self,f,*a): print("[WEB]",f%a)
+    def _text(self,text,status=200):
+        b=text.encode("utf-8");self.send_response(status);self.send_header("Content-Type","text/plain;charset=utf-8");self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
     def html(self):
         b=PAGE.replace("__YANDEX_MAPS_API_KEY__", YANDEX_MAPS_API_KEY).encode();self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
     def do_GET(self):
         database.init_db(); p=urlparse(self.path)
         try:
             if p.path in ("/","/index.html","/payment/result"): return self.html()
-            if p.path=="/api/health": return reply(self,{"ok":True,"database":True,"bot_configured":bool(os.getenv("BOT_TOKEN")),"acquiring_configured":bool(YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY)})
+            if p.path=="/api/health": return reply(self,{"ok":True,"database":True})
             if p.path=="/api/me":
                 u=auth(self)
                 if not u:return
@@ -207,6 +242,17 @@ class Handler(BaseHTTPRequestHandler):
             print("[WEB][ERROR]",repr(e));reply(self,{"ok":False,"error":"Внутренняя ошибка сервера"},500)
     def do_POST(self):
         database.init_db(); p=urlparse(self.path)
+        if p.path=="/api/payments/robokassa/result":
+            try:
+                raw=self.rfile.read(int(self.headers.get("Content-Length","0"))).decode("utf-8")
+                fields={k:v[0] for k,v in parse_qs(raw,keep_blank_values=True).items()}
+                inv=verify_robokassa_result(fields)
+                if not inv: return self._text("bad signature or invoice",400)
+                ok,result=fulfill_invoice(inv["id"],str(inv["id"]))
+                if not ok: return self._text("invoice not processed",409)
+                return self._text("OK"+str(inv["id"]))
+            except Exception as e:
+                print("[PAYMENT][ERROR]",repr(e));return self._text("payment callback failed",500)
         try:d=read(self)
         except:return reply(self,{"ok":False,"error":"Некорректный JSON"},400)
         try:
@@ -217,15 +263,15 @@ class Handler(BaseHTTPRequestHandler):
                 if len(pw)<8:return reply(self,{"ok":False,"error":"Пароль должен быть не короче 8 символов."},400)
                 if get_user_by_email(e):return reply(self,{"ok":False,"error":"Этот email уже зарегистрирован."},409)
                 uid=create_web_user(n,e,ph(pw));t=new_sess(uid);c=secrets.token_hex(4).upper();db.execute("UPDATE users SET verification_code=? WHERE user_id=?",(c,uid))
-                return reply(self,{"ok":True,"link_code":c},headers={"Set-Cookie":f"hpoint_session={t}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL}"})
+                return reply(self,{"ok":True,"link_code":c},headers={"Set-Cookie":session_cookie(t, SESSION_TTL)})
             if p.path=="/api/auth/login":
                 u=get_user_by_email(str(d.get("email","")).strip().lower())
                 if not u or not u["password_hash"] or not pv(str(d.get("password","")),u["password_hash"]):return reply(self,{"ok":False,"error":"Неверный email или пароль."},401)
-                t=new_sess(u["user_id"]);return reply(self,{"ok":True},headers={"Set-Cookie":f"hpoint_session={t}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL}"})
+                t=new_sess(u["user_id"]);return reply(self,{"ok":True},headers={"Set-Cookie":session_cookie(t, SESSION_TTL)})
             if p.path=="/api/auth/logout":
                 c=self.headers.get("Cookie","");t=next((x.strip().split("=",1)[1] for x in c.split(";") if x.strip().startswith("hpoint_session=")),None)
                 if t:db.execute("DELETE FROM sessions WHERE token=?",(t,))
-                return reply(self,{"ok":True},headers={"Set-Cookie":"hpoint_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"})
+                return reply(self,{"ok":True},headers={"Set-Cookie":session_cookie("", 0)})
             if p.path=="/api/auth/link-code":
                 u=auth(self)
                 if not u:return
@@ -254,6 +300,13 @@ class Handler(BaseHTTPRequestHandler):
                     matched=try_assign_helper(rid,helper_id)
                     if matched:
                         chat_for_request(rid)
+                if u["tg_user_id"]:
+                    status = "Помощник уже найден." if matched else "Заявка ожидает помощника."
+                    notify_telegram_user(
+                        u["tg_user_id"],
+                        f"🆕 На сайте создана заявка №{rid}: {escape(req['what'])}\n{status}\n"
+                        "Она доступна в общей истории. Откройте /history в H-Point.",
+                    )
                 return reply(self,{"ok":True,"request_id":rid,"matched":matched})
             if p.path=="/api/helper/queue":
                 u=auth(self)
@@ -305,18 +358,16 @@ class Handler(BaseHTTPRequestHandler):
                 try:i,_,_=create_pending_invoice(u["user_id"],item,meta);url,pid=create_payment(i)
                 except Exception as x:return reply(self,{"ok":False,"error":str(x)},503)
                 return reply(self,{"ok":True,"invoice_id":i,"confirmation_url":url,"payment_id":pid})
-            if p.path=="/api/payments/webhook":
-                obj=d.get("object") or {};m=obj.get("metadata") or {};iid=m.get("hpoint_invoice_id")
-                if d.get("event")=="payment.succeeded" and iid:
-                    try:ok,r=fulfill_invoice(int(iid),obj.get("id"));return reply(self,{"ok":ok,"result":r})
-                    except Exception as x:return reply(self,{"ok":False,"error":str(x)},500)
-                return reply(self,{"ok":True,"ignored":True})
             self.send_error(404)
         except Exception as e:
             print("[WEB][ERROR]",repr(e));reply(self,{"ok":False,"error":"Внутренняя ошибка сервера"},500)
 
+def create_server():
+    database.init_db()
+    return ThreadingHTTPServer((WEB_HOST, WEB_PORT), Handler)
+
 def run():
-    database.init_db();s=ThreadingHTTPServer((WEB_HOST,WEB_PORT),Handler);print(f"H-Point website: http://{WEB_HOST}:{WEB_PORT}")
+    s=create_server();print(f"H-Point website: http://{WEB_HOST}:{WEB_PORT}")
     try:s.serve_forever()
     finally:s.server_close()
 if __name__=="__main__":run()

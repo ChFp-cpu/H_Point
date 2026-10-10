@@ -1,7 +1,6 @@
-"""RUB acquiring via YooKassa. Telegram Stars are not used."""
-import json, uuid, base64
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+"""Website RUB checkout via Robokassa; no in-Telegram digital sales."""
+import json, uuid, hashlib, hmac
+from urllib.parse import urlencode
 from .config import *
 from .database import db, get_invoice
 from .services import grant_entitlement
@@ -14,31 +13,38 @@ def create_pending_invoice(user_id,item_type,metadata=None):
                       VALUES(?,?,?,?,?,?)""",(user_id,item_type,item["rub"],PAYMENT_CURRENCY,payload,json.dumps(metadata or {},ensure_ascii=False)))
     return cur.lastrowid,payload,item["rub"]
 
-def _auth():
-    if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
-        raise RuntimeError("YooKassa is not configured: set YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY")
-    token=base64.b64encode(f"{YOOKASSA_SHOP_ID}:{YOOKASSA_SECRET_KEY}".encode()).decode()
-    return "Basic "+token
+def _signature(value, password):
+    try: digest=getattr(hashlib, ROBOKASSA_HASH_ALGORITHM.lower())
+    except AttributeError: raise RuntimeError("Unsupported ROBOKASSA_HASH_ALGORITHM")
+    return digest(f"{value}:{password}".encode()).hexdigest().upper()
 
 def create_payment(invoice_id):
     inv=get_invoice(invoice_id)
     if not inv: raise ValueError("invoice not found")
     if inv["status"]!="pending": raise ValueError("invoice already processed")
-    meta=json.loads(inv["metadata"] or "{}")
-    body={"amount":{"value":f'{inv["amount_rub"]:.2f}',"currency":"RUB"},"capture":True,
-          "confirmation":{"type":"redirect","return_url":PAYMENT_RETURN_URL},
-          "description":MONETIZATION_ITEMS[inv["item_type"]]["title"][:128],
-          "metadata":{"hpoint_invoice_id":str(invoice_id),"item_type":inv["item_type"],**{k:str(v) for k,v in meta.items()}}}
-    req=Request("https://api.yookassa.ru/v3/payments",data=json.dumps(body).encode(),
-                headers={"Authorization":_auth(),"Idempotence-Key":str(uuid.uuid4()),"Content-Type":"application/json"},method="POST")
+    if not ROBOKASSA_MERCHANT_LOGIN or not ROBOKASSA_PASSWORD_1 or not ROBOKASSA_PASSWORD_2:
+        raise RuntimeError("Robokassa is not configured: set ROBOKASSA_MERCHANT_LOGIN, ROBOKASSA_PASSWORD_1 and ROBOKASSA_PASSWORD_2")
+    amount=f'{inv["amount_rub"]:.2f}'
+    description=MONETIZATION_ITEMS[inv["item_type"]]["title"][:100]
+    params={"MerchantLogin":ROBOKASSA_MERCHANT_LOGIN,"OutSum":amount,"InvId":str(invoice_id),
+            "Description":description,"Culture":"ru","Encoding":"utf-8",
+            "SignatureValue":_signature(f"{amount}:{invoice_id}",ROBOKASSA_PASSWORD_1),
+            "SuccessURL":PAYMENT_SUCCESS_URL,"FailURL":PAYMENT_FAIL_URL}
+    db.execute("UPDATE billing_invoices SET provider_payment_id=? WHERE id=?",(str(invoice_id),invoice_id))
+    return "https://auth.robokassa.ru/Merchant/Index.aspx?"+urlencode(params),str(invoice_id)
+
+def verify_robokassa_result(fields):
+    """Validate ResultURL fields and return the matching invoice, if valid."""
+    if not ROBOKASSA_PASSWORD_2: return None
     try:
-        with urlopen(req,timeout=20) as r: data=json.loads(r.read())
-    except (HTTPError,URLError) as e:
-        raise RuntimeError(f"YooKassa request failed: {e}")
-    payment_id=data.get("id"); url=(data.get("confirmation") or {}).get("confirmation_url")
-    if not payment_id or not url: raise RuntimeError("YooKassa did not return payment URL")
-    db.execute("UPDATE billing_invoices SET provider_payment_id=? WHERE id=?",(payment_id,invoice_id))
-    return url,payment_id
+        invoice_id=int(fields.get("InvId", "")); amount=f'{float(fields.get("OutSum", "")):.2f}'
+    except (TypeError, ValueError): return None
+    signature=fields.get("SignatureValue", "").upper()
+    expected=_signature(f"{amount}:{invoice_id}",ROBOKASSA_PASSWORD_2)
+    if not hmac.compare_digest(signature,expected): return None
+    inv=get_invoice(invoice_id)
+    if not inv or inv["currency"]!="RUB" or f'{inv["amount_rub"]:.2f}'!=amount: return None
+    return inv
 
 def fulfill_invoice(invoice_id,payment_id=None):
     inv=get_invoice(invoice_id)
@@ -62,8 +68,3 @@ def fulfill_invoice(invoice_id,payment_id=None):
     except Exception:
         db.execute("ROLLBACK"); raise
     return True,inv["item_type"]
-
-def check_payment(payment_id):
-    if not payment_id: return None
-    req=Request(f"https://api.yookassa.ru/v3/payments/{payment_id}",headers={"Authorization":_auth()},method="GET")
-    with urlopen(req,timeout=20) as r: return json.loads(r.read())

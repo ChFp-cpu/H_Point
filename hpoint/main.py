@@ -16,6 +16,8 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     init_db()
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    from . import web
+    web.configure_telegram_notifications(bot)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     logging.info("H-Point бот запущен")
