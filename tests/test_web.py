@@ -16,8 +16,21 @@ class Web(unittest.TestCase):
   self.assertIn("Smart Match",web.PAGE);self.assertIn("Telegram",web.PAGE);self.assertIn("руб",web.PAGE)
   self.assertIn("timeout:2500",web.PAGE)
   self.assertIn("&csp=true",web.PAGE)
+  self.assertIn("Создать профиль",web.PAGE)
+  self.assertIn("resumeTelegramLogin",web.PAGE)
+  self.assertIn("/api/requests/accept",web.PAGE)
   self.assertIn("https://*.maps.yandex.net",web.CSP)
   self.assertIn("https://api-maps.yandex.ru",web.CSP)
+ def test_head_for_public_page_and_health(self):
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   base=f"http://127.0.0.1:{server.server_address[1]}"
+   for path,content_type in (("/","text/html"),("/api/health","application/json")):
+    req=urllib.request.Request(base+path,method="HEAD")
+    with urllib.request.urlopen(req,timeout=3) as response:
+     self.assertEqual(response.status,200);self.assertEqual(response.headers.get_content_type(),content_type);self.assertEqual(response.read(),b"")
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
  def test_registration_login_and_api_access_control(self):
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler)
   thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
@@ -74,9 +87,20 @@ class Web(unittest.TestCase):
   try:
    base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Cookie":f"hpoint_session={token}"}
    with urllib.request.urlopen(urllib.request.Request(base+"/api/requests?open=1",headers=headers),timeout=3) as response: row=json.load(response)["requests"][0]
-   self.assertEqual(row["id"],rid);self.assertEqual(row["lat"],55.75);self.assertNotIn("details",row)
+   self.assertEqual(row["id"],rid);self.assertIsNone(row["lat"]);self.assertIsNone(row["lon"]);self.assertNotIn("details",row);self.assertNotEqual(row["place"],"район")
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_production_requires_same_origin_for_state_changes(self):
+  class Request:
+   def __init__(self, origin=None): self.headers={} if origin is None else {"Origin":origin}
+  old_env,old_url=web.APP_ENV,web.WEB_PUBLIC_URL
+  try:
+   web.APP_ENV="production";web.WEB_PUBLIC_URL="https://gethpoint.ru"
+   self.assertFalse(web.valid_origin(Request()))
+   self.assertFalse(web.valid_origin(Request("https://attacker.example")))
+   self.assertTrue(web.valid_origin(Request("https://gethpoint.ru")))
+  finally:
+   web.APP_ENV,web.WEB_PUBLIC_URL=old_env,old_url
  def test_telegram_ticket_logs_into_same_web_profile_once(self):
   database.create_user(42,"Telegram",None)
   ticket="one-time-test-ticket"
@@ -195,6 +219,39 @@ class Web(unittest.TestCase):
    for asset in ("hpoint-brand-hero.png", "hpoint-route-network.png", "hpoint-match-field.png", "hpoint-logo-dark.png"):
     with urllib.request.urlopen(base+"/assets/"+asset,timeout=3) as response:
      self.assertEqual(response.headers.get_content_type(),"image/png");self.assertGreater(len(response.read()),1000)
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_helper_claims_existing_request_and_open_feed_hides_own_request(self):
+  database.create_user(1,"Requester");database.create_user(2,"Helper")
+  rid=services.create_request(1,{"what":"Нужна помощь с техникой","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
+  token=web.new_sess(2)
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Cookie":f"hpoint_session={token}","Content-Type":"application/json"}
+   with urllib.request.urlopen(urllib.request.Request(base+"/api/requests?open=1",headers=headers),timeout=3) as response:feed=json.load(response)["requests"]
+   self.assertEqual([row["id"] for row in feed],[rid]);self.assertNotIn("details",feed[0])
+   with urllib.request.urlopen(urllib.request.Request(base+"/api/helper/queue",data=b"{}",headers=headers,method="POST"),timeout=3) as response:claimed=json.load(response)
+   self.assertTrue(claimed["matched"]);self.assertEqual(claimed["request_id"],rid)
+   request=database.get_request(rid);self.assertEqual(request["helper_id"],2);self.assertEqual(request["status"],"in_progress")
+   self.assertIsNotNone(web.chat_for_request(rid))
+   with self.assertRaises(urllib.error.HTTPError) as busy:
+    urllib.request.urlopen(urllib.request.Request(base+"/api/helper/queue",data=b"{}",headers=headers,method="POST"),timeout=3)
+   self.assertEqual(busy.exception.code,409);busy.exception.close()
+   with urllib.request.urlopen(urllib.request.Request(base+"/api/requests?open=1",headers=headers),timeout=3) as response:self.assertEqual(json.load(response)["requests"],[])
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_helper_with_active_request_cannot_accept_another_request(self):
+  database.create_user(1,"Requester");database.create_user(2,"Busy helper")
+  target=services.create_request(1,{"what":"Нужна помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
+  services.create_request(2,{"what":"Моя активная заявка","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
+  token=web.new_sess(2)
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Cookie":f"hpoint_session={token}","Content-Type":"application/json"}
+   req=urllib.request.Request(base+"/api/requests/accept",data=json.dumps({"request_id":target}).encode(),headers=headers,method="POST")
+   with self.assertRaises(urllib.error.HTTPError) as denied:urllib.request.urlopen(req,timeout=3)
+   self.assertEqual(denied.exception.code,409);denied.exception.close()
+   self.assertEqual(database.get_request(target)["status"],"open")
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_points_purchase_and_device_profile_switching(self):

@@ -1,7 +1,7 @@
 """Telegram UI и пользовательские сценарии H-Point."""
 import logging
 import secrets
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from html import escape
 from aiogram import Bot, F, Router
 from aiogram.filters import CommandStart, Command, StateFilter
@@ -349,6 +349,12 @@ async def cmd_request_identity_verification(message: Message, state: FSMContext)
 @router.message(StateFilter(None), F.text == BTN_WEBSITE)
 async def website(message: Message, state: FSMContext) -> None:
     if not await ensure_registered(message, state):
+        return
+    public_url = urlparse(WEB_PUBLIC_URL)
+    if public_url.scheme not in {"http", "https"} or public_url.hostname in {None, "0.0.0.0", "::"}:
+        await message.answer(
+            "Ссылка на сайт ещё не настроена. Укажите публичный адрес в WEB_PUBLIC_URL и перезапустите бота."
+        )
         return
     token = secrets.token_urlsafe(32)
     create_web_login_ticket(message.from_user.id, token)

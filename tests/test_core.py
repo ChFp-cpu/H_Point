@@ -21,12 +21,12 @@ class Core(unittest.TestCase):
         rid=services.create_request(1,{"what":"Помочь с компьютером","place":"центр","time_needed":"сегодня","urgency":"🕊 Не срочно","details":"test"})
         match=services.smart_match(rid,query="опытный мастер")[0]
         self.assertIn("соответствует уточнению",match["reasons"])
-    def test_smart_match_rounds_candidate_coordinates(self):
+    def test_smart_match_does_not_disclose_candidate_coordinates(self):
         self.add(1);self.add(2)
         self.db.execute("UPDATE users SET lat=55.75123,lon=37.61987 WHERE user_id=2")
         rid=services.create_request(1,{"what":"Помочь","place":"центр","time_needed":"сегодня","urgency":"🕊 Не срочно","details":"test","lat":55.75,"lon":37.62})
         match=services.smart_match(rid)[0]
-        self.assertEqual((match["lat"],match["lon"]),(55.75,37.62))
+        self.assertEqual((match["lat"],match["lon"]),(None,None))
     def test_auth_attempts_are_rate_limited_and_clear_on_success(self):
         self.assertFalse(database.auth_is_rate_limited("login","person@example.com",3))
         for _ in range(3): database.record_auth_failure("login","person@example.com")

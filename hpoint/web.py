@@ -147,7 +147,11 @@ def admin_auth(h):
 def valid_origin(h):
     origin = h.headers.get("Origin")
     if not origin:
-        return True
+        # Browser fetch/XHR sends Origin for unsafe requests.  Requiring it in
+        # production prevents a request with an ambient session cookie from
+        # being accepted when a proxy or browser misbehaves around SameSite.
+        # Keep direct, local development clients convenient.
+        return APP_ENV not in {"production", "prod"}
     public = urlparse(WEB_PUBLIC_URL)
     expected = f"{public.scheme}://{public.netloc}"
     return hmac.compare_digest(origin.rstrip("/"), expected.rstrip("/"))
@@ -172,8 +176,9 @@ def public_request_payload(r):
     """Discovery and map records never disclose address details or exact coordinates."""
     return {"id": r["id"], "what": r["what"], "category": r["category"],
             "category_name": CATEGORIES.get(r["category"], "Другое"), "urgency": r["urgency"],
-            "place": r["place"], "lat": round(r["lat"], 2) if r["lat"] is not None else None,
-            "lon": round(r["lon"], 2) if r["lon"] is not None else None}
+            # The free-text place field can contain a home address.  It is
+            # shared only with the assigned helper through the private flow.
+            "place": "Район уточняется после назначения", "lat": None, "lon": None}
 
 def chat_for_request(rid):
     return database.get_or_create_chat_for_request(rid)
@@ -306,6 +311,22 @@ async function load(){try{let d=await api('/api/sync');$('landing').style.displa
 async function billing(){let d=await api('/api/billing');$('subs').innerHTML=`<p>Баланс: <b>${d.user.balance} HP</b></p><p>PRO: <b>${d.user.pro_until?new Date(d.user.pro_until).toLocaleDateString('ru-RU'):'нет'}</b></p><p>Проверка личности: <b>${d.user.identity_verified?'подтверждена':d.user.identity_verification?.status==='pending'?'на проверке':'нет'}</b></p><p>Business: <b>${d.user.business_until?new Date(d.user.business_until).toLocaleDateString('ru-RU'):'нет'}</b></p>`;$('payments').innerHTML=d.history.length?d.history.map(x=>`<div class="request"><div class="requestmain"><b>${esc(x.item_type)}</b><div class="muted">${x.amount_rub} ${x.currency==='HP'?'HP':'₽'} · ${x.status}</div></div></div>`).join(''):'<div class="muted">Покупок пока нет.</div>'}
 '''
 
+FUNCTIONAL_FIXES=r'''
+let telegramLoginTimer=null;
+function stopTelegramLoginPolling(){if(telegramLoginTimer){clearInterval(telegramLoginTimer);telegramLoginTimer=null}}
+function showTelegramLoginWait(){ $('modal').style.display='flex';$('modalbody').innerHTML=`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Подтвердите вход в Telegram</h2><p class="muted">Нажмите Start в открывшемся боте. Сайт завершит вход сам, в том числе после возврата из Telegram.</p><div id="tgLoginStatus" class="ey">Ожидаем подтверждение…</div>`}
+async function completeTelegramLogin(ticket){stopTelegramLoginPolling();let tries=0,finished=false;let poll=async()=>{if(finished)return;tries++;try{let r=await fetch('/api/auth/telegram/complete?ticket='+encodeURIComponent(ticket),{credentials:'same-origin'});if(r.status===202){if(tries>150){finished=true;stopTelegramLoginPolling();sessionStorage.removeItem('hpointTelegramLoginTicket');let status=$('tgLoginStatus');if(status)status.textContent='Ссылка истекла. Начните вход заново.'}return}let done=await r.json();if(done.ok){finished=true;stopTelegramLoginPolling();sessionStorage.removeItem('hpointTelegramLoginTicket');closeModal();await load();toast('Вход через Telegram выполнен')}}catch(e){finished=true;stopTelegramLoginPolling();let status=$('tgLoginStatus');if(status)status.textContent='Не удалось подтвердить вход. Попробуйте ещё раз.'}};await poll();if(!finished)telegramLoginTimer=setInterval(poll,2000)}
+async function telegramLogin(){let popup=window.open('', 'hpointTelegramLogin', 'popup,width=480,height=720');if(popup)popup.opener=null;try{let d=await api('/api/auth/telegram/start',{method:'POST',body:'{}'});sessionStorage.setItem('hpointTelegramLoginTicket',d.ticket);showTelegramLoginWait();if(popup){popup.location.replace(d.bot_url);await completeTelegramLogin(d.ticket)}else window.location.assign(d.bot_url)}catch(e){if(popup)popup.close();let target=$('err');if(target)target.textContent=e.message==='telegram_login_unavailable'?'Вход через Telegram пока не настроен.':e.message||'Не удалось начать вход через Telegram.'}}
+function resumeTelegramLogin(){let ticket=sessionStorage.getItem('hpointTelegramLoginTicket');if(ticket){showTelegramLoginWait();completeTelegramLogin(ticket)}}
+function openRequestHost(){let host=$('openRequests');if(host)return host;host=document.createElement('div');host.id='openRequests';host.style.marginTop='18px';let anchor=$('searchResults');if(anchor&&anchor.parentElement)anchor.parentElement.appendChild(host);return host}
+async function loadOpenRequests(){try{let d=await api('/api/requests?open=1');let host=openRequestHost();host.innerHTML=`<h3>Открытые заявки</h3>${d.requests.length?d.requests.map(r=>`<div class="request"><div class="requestmain"><b>#${r.id} · ${esc(r.what)}</b><div class="muted">${esc(r.category_name)} · ${esc(r.place)} · ${esc(r.urgency)}</div></div><button class="btn grad" onclick="acceptOpenRequest(${r.id})">Помочь</button></div>`).join(''):'<div class="empty">Сейчас нет открытых заявок от других пользователей.</div>'}`}catch(e){let host=openRequestHost();host.innerHTML='<div class="empty">Не удалось загрузить открытые заявки.</div>'}}
+async function acceptOpenRequest(id){try{let d=await api('/api/requests/accept',{method:'POST',body:JSON.stringify({request_id:id})});toast('Заявка принята, чат создан');await requests();openChat(d.request_id)}catch(e){toast(e.message);await loadOpenRequests()}}
+async function helper(){try{let d=await api('/api/helper/queue',{method:'POST',body:'{}'});toast(d.message);await requests();if(d.matched)openChat(d.request_id);else {go('requests');await loadOpenRequests()}}catch(e){toast(e.message)}}
+async function requests(data){renderRequests(data||await api('/api/requests/mine'));if(document.querySelector('.tab.active')?.dataset.t==='requests')await loadOpenRequests()}
+function go(t){document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.t===t));document.querySelectorAll('.panel').forEach(x=>x.classList.toggle('active',x.id==='p-'+t));if(t!=='chat')stopChatPolling();if(t==='requests')requests();if(t==='match'){requests();setTimeout(initMatchMap,50)}if(t==='chat'){loadChats();if(currentChat)startChatPolling()}if(t==='map')setTimeout(loadBigMap,50);if(t==='history')history();if(t==='profile')profile();if(t==='billing'){prices('appprices',true);billing()}}
+async function openProfiles(){try{let d=await api('/api/profiles');$('modal').style.display='flex';$('modalbody').innerHTML=`<div class="authBrand"><img src="/assets/hpoint-logo-dark.png" alt="H-Point"></div><h2>Профили на этом устройстве</h2><p class="muted">Каждый профиль хранит свои заявки, баланс и подписки.</p><div class="profileSwitch">${d.profiles.map(p=>`<button class="request" onclick="switchProfile(${p.id})"><div class="avatar">${esc((p.name||'?')[0])}</div><div class="requestmain"><b>${esc(p.name)}</b><div class="muted">${esc(p.email||'Telegram')}</div></div><span class="badge ${p.active?'ok':''}">${p.active?'Активен':'Перейти'}</span></button>`).join('')}</div><div class="profileActions"><button class="btn grad" onclick="closeModal();authForm(true)">+ Создать профиль</button><button class="btn light" onclick="closeModal();authForm(false)">Войти в существующий</button></div>`}catch(e){toast(e.message)}}
+'''
+
 UI_OVERRIDES=r'''
 products[3]=['verification','Проверка личности','Рассмотрение заявки после привязки Telegram',99];
 function authForm(reg){$('modal').style.display='flex';$('modalbody').innerHTML=reg?`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Создайте общий профиль</h2><p class="muted">Telegram создаёт профиль бесплатно и сразу объединяет сайт с ботом. Email можно добавить для отдельного входа.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Продолжить бесплатно с Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="an" class="input" placeholder="Имя"><input id="ae" class="input" placeholder="Email"><input id="ap" class="input" type="password" autocomplete="new-password" placeholder="Пароль от 12 символов"><button class="btn light" onclick="register()">Создать аккаунт</button><div id="err" class="muted"></div></div>`:`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Войти в H·Point</h2><p class="muted">Через Telegram вы попадёте в тот же профиль и историю заявок.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Войти через Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="ae" class="input" placeholder="Email" autocomplete="email"><input id="ap" class="input" type="password" autocomplete="current-password" placeholder="Пароль"><button class="btn light" onclick="login()">Войти по email</button><div id="err" class="muted"></div></div>`}
@@ -343,7 +364,7 @@ _page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+"</style></hea
 _page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
 _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandLogo" href="/" aria-label="H-Point"><img src="/assets/hpoint-logo-dark.png" alt="H-Point"></a>')
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+"\nload();\n</script></body></html>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
@@ -364,6 +385,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200);self.send_header("Content-Type",item[1]);self.send_header("X-Content-Type-Options","nosniff");self.send_header("Cache-Control","public, max-age=604800, immutable");self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
     def html(self):
         b=PAGE.replace("__YANDEX_MAPS_API_KEY__", YANDEX_MAPS_API_KEY).encode();self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
+    def do_HEAD(self):
+        """Serve metadata for public resources without a response body."""
+        p = urlparse(self.path)
+        if p.path.startswith("/assets/"):
+            item = ASSETS.get(p.path.rsplit("/", 1)[-1])
+            if not item or not item[0].is_file():
+                self.send_error(404)
+                return
+            self.send_response(200);self.send_header("Content-Type",item[1]);self.send_header("X-Content-Type-Options","nosniff");self.send_header("Cache-Control","public, max-age=604800, immutable");self.send_header("Content-Length",str(item[0].stat().st_size));self.end_headers()
+            return
+        if p.path in ("/", "/index.html", "/payment/result"):
+            size = len(PAGE.replace("__YANDEX_MAPS_API_KEY__", YANDEX_MAPS_API_KEY).encode())
+            self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(size));self.end_headers()
+            return
+        if p.path == "/api/health":
+            b = json.dumps({"ok":True,"database":True}).encode()
+            self.send_response(200);self.send_header("Content-Type","application/json;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("Content-Length",str(len(b)));self.end_headers()
+            return
+        self.send_response(405);self.send_header("Allow","GET, POST, HEAD");self.send_header("Content-Length","0");self.end_headers()
     def do_GET(self):
         p=urlparse(self.path)
         try:
@@ -430,7 +470,7 @@ class Handler(BaseHTTPRequestHandler):
                 u=auth(self)
                 if not u:return
                 if parse_qs(p.query).get("open",[""])[0]:
-                    rs=db.execute("SELECT * FROM requests WHERE status=? ORDER BY priority_boost DESC,created_at DESC LIMIT 100",(STATUS_OPEN,)).fetchall()
+                    rs=db.execute("SELECT * FROM requests WHERE status=? AND requester_id!=? ORDER BY priority_boost DESC,created_at DESC LIMIT 100",(STATUS_OPEN,u["user_id"])).fetchall()
                     return reply(self,{"ok":True,"requests":[public_request_payload(r) for r in rs]})
                 return reply(self,{"ok":True,"requests":[request_payload(r) for r in get_history(u["user_id"],HISTORY_LIMIT)]})
             if p.path=="/api/smart-match":
@@ -601,7 +641,42 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/helper/queue":
                 u=auth(self)
                 if not u:return
-                add_to_queue(u["user_id"]);return reply(self,{"ok":True,"message":"Вы добавлены в очередь помощников."})
+                if get_active_own_request(u["user_id"]):
+                    return reply(self,{"ok":False,"error":"Сначала завершите или отмените свою активную заявку."},409)
+                if get_active_help(u["user_id"]):
+                    return reply(self,{"ok":False,"error":"Сначала завершите текущую помощь."},409)
+                while True:
+                    request=find_best_open_request_for(u["user_id"])
+                    if request is None:
+                        add_to_queue(u["user_id"])
+                        return reply(self,{"ok":True,"matched":False,"message":"Подходящих заявок пока нет. Вы добавлены в очередь помощников."})
+                    if try_assign_helper(request["id"],u["user_id"]):
+                        chat_for_request(request["id"])
+                        requester=get_user(request["requester_id"])
+                        if requester and requester["tg_user_id"]:
+                            notify_telegram_user(requester["tg_user_id"],f"🤝 По заявке №{request['id']} найден помощник. Откройте сайт H-Point или бот, чтобы продолжить общение.")
+                        if u["tg_user_id"]:
+                            notify_telegram_user(u["tg_user_id"],f"🤝 Вы приняли заявку №{request['id']}: {escape(request['what'])}. Чат уже создан.")
+                        return reply(self,{"ok":True,"matched":True,"request_id":request["id"],"message":"Вы приняли подходящую заявку. Чат создан."})
+            if p.path=="/api/requests/accept":
+                u=auth(self)
+                if not u:return
+                try: rid=int(d.get("request_id"))
+                except (TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
+                request=get_request(rid)
+                if not request or request["status"]!=STATUS_OPEN or request["requester_id"]==u["user_id"]:
+                    return reply(self,{"ok":False,"error":"Эта заявка недоступна."},409)
+                if get_active_own_request(u["user_id"]):
+                    return reply(self,{"ok":False,"error":"Сначала завершите или отмените свою активную заявку."},409)
+                if not try_assign_helper(rid,u["user_id"]):
+                    return reply(self,{"ok":False,"error":"Заявку уже принял другой помощник или у вас есть активная помощь."},409)
+                chat_for_request(rid)
+                requester=get_user(request["requester_id"])
+                if requester and requester["tg_user_id"]:
+                    notify_telegram_user(requester["tg_user_id"],f"🤝 По заявке №{rid} найден помощник. Откройте сайт H-Point или бот, чтобы продолжить общение.")
+                if u["tg_user_id"]:
+                    notify_telegram_user(u["tg_user_id"],f"🤝 Вы приняли заявку №{rid}: {escape(request['what'])}. Чат уже создан.")
+                return reply(self,{"ok":True,"request_id":rid})
             if p.path=="/api/assistant/candidates":
                 u=auth(self)
                 if not u:return
@@ -615,20 +690,25 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/smart-match/assign":
                 u=auth(self)
                 if not u:return
-                rid=int(d["request_id"]);hid=int(d["helper_id"]);r=get_request(rid)
-                if not r or r["requester_id"]!=u["user_id"]:return reply(self,{"ok":False,"error":"Недоступно."},403)
+                try:rid=int(d["request_id"]);hid=int(d["helper_id"])
+                except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректные данные."},400)
+                r=get_request(rid)
+                if not r or r["requester_id"]!=u["user_id"] or r["status"]!=STATUS_OPEN:return reply(self,{"ok":False,"error":"Недоступно."},403)
                 if not try_assign_helper(rid,hid):return reply(self,{"ok":False,"error":"Кандидат уже занят или заявка изменилась."},409)
                 chat_for_request(rid);return reply(self,{"ok":True})
             if p.path=="/api/requests/finish":
                 u=auth(self)
                 if not u:return
-                rid=int(d["request_id"])
+                try:rid=int(d["request_id"])
+                except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
                 if not complete_request(rid,u["user_id"]):return reply(self,{"ok":False,"error":"Завершить может только назначенный помощник."},409)
                 return reply(self,{"ok":True})
             if p.path=="/api/reviews":
                 u=auth(self)
                 if not u:return
-                rid=int(d["request_id"]);rating=int(d["rating"]);side=str(d["side"])
+                try:rid=int(d["request_id"]);rating=int(d["rating"])
+                except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная оценка."},400)
+                side=str(d.get("side", ""))
                 ok=set_rating(rid,u["user_id"],rating) if side=="requester" else set_helper_rating(rid,u["user_id"],rating) if side=="helper" else False
                 if not ok:return reply(self,{"ok":False,"error":"Оценка уже поставлена или недоступна."},409)
                 review=str(d.get("review","")).strip()[:MAX_TEXT_LEN]

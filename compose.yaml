@@ -68,6 +68,9 @@ services:
 
   caddy:
     image: caddy:2-alpine
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     depends_on:
       app:
         condition: service_healthy
