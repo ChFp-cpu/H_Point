@@ -301,8 +301,11 @@ def smart_match(request_id, limit=20, query=""):
         if query_bonus: reasons.append("соответствует уточнению")
         out.append({"user_id":u["user_id"],"name":u["name"],"username":u["username"],"rating":round(rating,1),
                     "reviews":int(stats["n"] or 0),"verified":is_verified(u["user_id"]),"distance_km":round(distance,2) if distance<999 else None,
-                    "score":round(score,1),"lat":round(u["lat"],2) if u["lat"] is not None else None,
-                    "lon":round(u["lon"],2) if u["lon"] is not None else None,"reasons":reasons})
+                    "score":round(score,1),
+                    # A requester only needs the distance to compare helpers.
+                    # Publishing even rounded coordinates would expose a
+                    # helper's neighbourhood before they accept the task.
+                    "lat":None,"lon":None,"reasons":reasons})
     out.sort(key=lambda x:(x["score"],x["rating"],-(x["distance_km"] or 999)),reverse=True)
     out = out[:limit]
     save_request_candidates(request_id, out)
