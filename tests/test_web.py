@@ -80,6 +80,17 @@ class Web(unittest.TestCase):
    self.assertEqual(row["id"],rid);self.assertIsNone(row["lat"]);self.assertIsNone(row["lon"]);self.assertNotIn("details",row);self.assertNotEqual(row["place"],"район")
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_production_requires_same_origin_for_state_changes(self):
+  class Request:
+   def __init__(self, origin=None): self.headers={} if origin is None else {"Origin":origin}
+  old_env,old_url=web.APP_ENV,web.WEB_PUBLIC_URL
+  try:
+   web.APP_ENV="production";web.WEB_PUBLIC_URL="https://gethpoint.ru"
+   self.assertFalse(web.valid_origin(Request()))
+   self.assertFalse(web.valid_origin(Request("https://attacker.example")))
+   self.assertTrue(web.valid_origin(Request("https://gethpoint.ru")))
+  finally:
+   web.APP_ENV,web.WEB_PUBLIC_URL=old_env,old_url
  def test_telegram_ticket_logs_into_same_web_profile_once(self):
   database.create_user(42,"Telegram",None)
   ticket="one-time-test-ticket"
@@ -217,6 +228,20 @@ class Web(unittest.TestCase):
     urllib.request.urlopen(urllib.request.Request(base+"/api/helper/queue",data=b"{}",headers=headers,method="POST"),timeout=3)
    self.assertEqual(busy.exception.code,409);busy.exception.close()
    with urllib.request.urlopen(urllib.request.Request(base+"/api/requests?open=1",headers=headers),timeout=3) as response:self.assertEqual(json.load(response)["requests"],[])
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_helper_with_active_request_cannot_accept_another_request(self):
+  database.create_user(1,"Requester");database.create_user(2,"Busy helper")
+  target=services.create_request(1,{"what":"Нужна помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
+  services.create_request(2,{"what":"Моя активная заявка","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
+  token=web.new_sess(2)
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Cookie":f"hpoint_session={token}","Content-Type":"application/json"}
+   req=urllib.request.Request(base+"/api/requests/accept",data=json.dumps({"request_id":target}).encode(),headers=headers,method="POST")
+   with self.assertRaises(urllib.error.HTTPError) as denied:urllib.request.urlopen(req,timeout=3)
+   self.assertEqual(denied.exception.code,409);denied.exception.close()
+   self.assertEqual(database.get_request(target)["status"],"open")
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_points_purchase_and_device_profile_switching(self):
