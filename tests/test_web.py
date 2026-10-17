@@ -18,7 +18,8 @@ class Web(unittest.TestCase):
   self.assertIn("&csp=true",web.PAGE)
   self.assertIn("Создать профиль",web.PAGE)
   self.assertIn("resumeTelegramLogin",web.PAGE)
-  self.assertIn("/api/requests/accept",web.PAGE)
+  self.assertIn("/api/helper/offers",web.PAGE)
+  self.assertIn("Предложения помощи",web.PAGE)
   self.assertIn("https://*.maps.yandex.net",web.CSP)
   self.assertIn("https://api-maps.yandex.ru",web.CSP)
  def test_head_for_public_page_and_health(self):
@@ -221,23 +222,27 @@ class Web(unittest.TestCase):
      self.assertEqual(response.headers.get_content_type(),"image/png");self.assertGreater(len(response.read()),1000)
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
- def test_helper_claims_existing_request_and_open_feed_hides_own_request(self):
+ def test_helper_is_offered_request_and_must_confirm(self):
   database.create_user(1,"Requester");database.create_user(2,"Helper")
   rid=services.create_request(1,{"what":"Нужна помощь с техникой","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
-  token=web.new_sess(2)
+  requester_token=web.new_sess(1);token=web.new_sess(2)
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
   try:
    base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Cookie":f"hpoint_session={token}","Content-Type":"application/json"}
    with urllib.request.urlopen(urllib.request.Request(base+"/api/requests?open=1",headers=headers),timeout=3) as response:feed=json.load(response)["requests"]
    self.assertEqual([row["id"] for row in feed],[rid]);self.assertNotIn("details",feed[0])
    with urllib.request.urlopen(urllib.request.Request(base+"/api/helper/queue",data=b"{}",headers=headers,method="POST"),timeout=3) as response:claimed=json.load(response)
-   self.assertTrue(claimed["matched"]);self.assertEqual(claimed["request_id"],rid)
+   self.assertFalse(claimed["matched"])
+   request=database.get_request(rid);self.assertIsNone(request["helper_id"]);self.assertEqual(request["status"],"open")
+   requester_headers={"Cookie":f"hpoint_session={requester_token}","Content-Type":"application/json"}
+   offer=urllib.request.Request(base+"/api/smart-match/assign",data=json.dumps({"request_id":rid,"helper_id":2}).encode(),headers=requester_headers,method="POST")
+   with urllib.request.urlopen(offer,timeout=3) as response:self.assertTrue(json.load(response)["offered"])
+   self.assertEqual(database.get_request(rid)["status"],"open")
+   with urllib.request.urlopen(urllib.request.Request(base+"/api/helper/offers",headers=headers),timeout=3) as response:self.assertEqual(json.load(response)["offers"][0]["request_id"],rid)
+   response_request=urllib.request.Request(base+"/api/helper/offers/respond",data=json.dumps({"request_id":rid,"accept":True}).encode(),headers=headers,method="POST")
+   with urllib.request.urlopen(response_request,timeout=3) as response:self.assertTrue(json.load(response)["accepted"])
    request=database.get_request(rid);self.assertEqual(request["helper_id"],2);self.assertEqual(request["status"],"in_progress")
    self.assertIsNotNone(web.chat_for_request(rid))
-   with self.assertRaises(urllib.error.HTTPError) as busy:
-    urllib.request.urlopen(urllib.request.Request(base+"/api/helper/queue",data=b"{}",headers=headers,method="POST"),timeout=3)
-   self.assertEqual(busy.exception.code,409);busy.exception.close()
-   with urllib.request.urlopen(urllib.request.Request(base+"/api/requests?open=1",headers=headers),timeout=3) as response:self.assertEqual(json.load(response)["requests"],[])
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_helper_with_active_request_cannot_accept_another_request(self):

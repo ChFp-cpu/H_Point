@@ -11,11 +11,13 @@ class Core(unittest.TestCase):
     def add(self,uid,b=100):database.create_user(uid,f"User {uid}",None);self.db.execute("UPDATE users SET balance=? WHERE user_id=?",(b,uid))
     def test_request_and_match(self):
         self.add(1);self.add(2);self.add(3)
+        services.add_to_queue(2);services.add_to_queue(3)
         services.set_helper_categories(2,["snow"]);services.set_helper_categories(3,["tech"])
         rid=services.create_request(1,{"what":"Помочь с компьютером","place":"центр","time_needed":"сегодня","urgency":"🕊 Не срочно","details":"test","lat":55.75,"lon":37.62})
         m=services.smart_match(rid);self.assertTrue(m);self.assertEqual(m[0]["user_id"],3)
     def test_smart_match_explains_query_match(self):
         self.add(1);self.add(2)
+        services.add_to_queue(2)
         services.set_helper_categories(2,["tech"])
         self.db.execute("UPDATE users SET bio='Опытный компьютерный мастер' WHERE user_id=2")
         rid=services.create_request(1,{"what":"Помочь с компьютером","place":"центр","time_needed":"сегодня","urgency":"🕊 Не срочно","details":"test"})
@@ -23,10 +25,29 @@ class Core(unittest.TestCase):
         self.assertIn("соответствует уточнению",match["reasons"])
     def test_smart_match_does_not_disclose_candidate_coordinates(self):
         self.add(1);self.add(2)
+        services.add_to_queue(2)
         self.db.execute("UPDATE users SET lat=55.75123,lon=37.61987 WHERE user_id=2")
         rid=services.create_request(1,{"what":"Помочь","place":"центр","time_needed":"сегодня","urgency":"🕊 Не срочно","details":"test","lat":55.75,"lon":37.62})
         match=services.smart_match(rid)[0]
         self.assertEqual((match["lat"],match["lon"]),(None,None))
+    def test_helper_offer_requires_queue_and_consent(self):
+        self.add(1);self.add(2);self.add(3)
+        rid=services.create_request(1,{"what":"Нужна помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
+        self.assertFalse(services.offer_helper(rid,2))
+        services.add_to_queue(2)
+        self.assertTrue(services.offer_helper(rid,2))
+        self.assertEqual(database.get_request(rid)["status"],"open")
+        self.assertIsNone(database.get_request(rid)["helper_id"])
+        self.assertEqual(services.get_current_helper_offer(rid)["candidate_id"],2)
+        self.assertTrue(services.respond_to_helper_offer(rid,2,False))
+        self.assertTrue(services.is_in_queue(2))
+        self.assertEqual(services.smart_match(rid),[])
+        services.add_to_queue(3)
+        self.assertTrue(services.offer_helper(rid,3))
+        self.assertTrue(services.respond_to_helper_offer(rid,3,True))
+        self.assertEqual(database.get_request(rid)["status"],"in_progress")
+        self.assertEqual(database.get_request(rid)["helper_id"],3)
+        self.assertFalse(services.is_in_queue(3))
     def test_auth_attempts_are_rate_limited_and_clear_on_success(self):
         self.assertFalse(database.auth_is_rate_limited("login","person@example.com",3))
         for _ in range(3): database.record_auth_failure("login","person@example.com")

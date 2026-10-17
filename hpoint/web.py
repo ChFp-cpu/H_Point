@@ -46,12 +46,12 @@ def configure_telegram_notifications(bot, username=None):
     _telegram_loop = asyncio.get_running_loop()
     _telegram_username = username
 
-def notify_telegram_user(user_id, text):
+def notify_telegram_user(user_id, text, reply_markup=None):
     if _telegram_bot is None or _telegram_loop is None:
         return
     try:
         future = asyncio.run_coroutine_threadsafe(
-            _telegram_bot.send_message(user_id, text), _telegram_loop
+            _telegram_bot.send_message(user_id, text, reply_markup=reply_markup), _telegram_loop
         )
     except RuntimeError:
         logging.warning("Telegram notification could not be scheduled")
@@ -354,6 +354,19 @@ async function sendChat(){let input=$('chatInput'),button=$('sendChatButton'),te
 async function billing(){let d=await api('/api/billing');$('subs').innerHTML=`<p>PRO: <b>${d.user.pro_until?new Date(d.user.pro_until).toLocaleDateString('ru-RU'):'нет'}</b></p><p>Проверка личности: <b>${d.user.identity_verified?'подтверждена':d.user.identity_verification?.status==='pending'?'на проверке':'нет'}</b></p><p>Business: <b>${d.user.business_until?new Date(d.user.business_until).toLocaleDateString('ru-RU'):'нет'}</b></p>`;$('payments').innerHTML=d.history.length?d.history.map(x=>`<div class="request"><div class="requestmain"><b>${esc(x.item_type)}</b><div class="muted">${x.amount_rub} ₽ · ${x.status}</div></div></div>`).join(''):'<div class="muted">Платежей пока нет.</div>'}
 '''
 
+CONSENT_MATCH_UI=r'''
+async function match(){if(!rid.value)return;try{let d=await api('/api/assistant/candidates',{method:'POST',body:JSON.stringify({request_id:Number(rid.value),question:$('matchQuestion').value})});if(d.offer){$('matches').innerHTML=`<div class="empty">⏳ Ожидаем ответ от <b>${esc(d.offer.name)}</b>. После отказа можно выбрать другого кандидата.</div>`;return}$('matches').innerHTML=d.matches.length?d.matches.map(x=>`<div class="match"><div class="avatar">${esc((x.name||'?')[0])}</div><div class="grow"><b>${esc(x.name)} ${x.verified?'✓':''}</b><div class="muted">⭐ ${x.rating||'—'} · ${x.distance_km??'—'} км · ${x.reviews} отзывов · match ${Math.round(x.score)}%</div><div class="muted">${esc((x.reasons||[]).join(' · '))}</div></div><button class="btn grad" onclick="assign(${rid.value},${x.user_id})">Выбрать</button></div>`).join(''):'<div class="empty">Сейчас в очереди нет подходящих добровольцев.</div>';initMatchMap();d.matches.filter(x=>x.lat&&x.lon).forEach(x=>{const pm=new ymaps.Placemark([x.lat,x.lon],{balloonContent:esc(x.name)});matchMap.geoObjects.add(pm)});}catch(e){toast(e.message)}}
+async function assign(requestId,helperId){try{let d=await api('/api/smart-match/assign',{method:'POST',body:JSON.stringify({request_id:requestId,helper_id:helperId})});toast(d.offered?'Предложение отправлено. Ждём ответ помощника.':'Не удалось отправить предложение');await requests();await match()}catch(e){toast(e.message)}}
+async function loadOpenRequests(){try{let d=await api('/api/requests?open=1');let host=openRequestHost();host.innerHTML=`<h3>Открытые заявки</h3>${d.requests.length?d.requests.map(r=>`<div class="request"><div class="requestmain"><b>#${r.id} · ${esc(r.what)}</b><div class="muted">${esc(r.category_name)} · ${esc(r.place)} · ${esc(r.urgency)}</div></div><button class="btn grad" onclick="helper()">Готов помочь</button></div>`).join(''):'<div class="empty">Сейчас нет открытых заявок от других пользователей.</div>'}`}catch(e){let host=openRequestHost();host.innerHTML='<div class="empty">Не удалось загрузить открытые заявки.</div>'}}
+async function acceptOpenRequest(id){try{let d=await api('/api/requests/accept',{method:'POST',body:JSON.stringify({request_id:id})});toast(d.message);await requests()}catch(e){toast(e.message);await loadOpenRequests()}}
+async function helper(){try{let d=await api('/api/helper/queue',{method:'POST',body:'{}'});toast(d.message);go('requests')}catch(e){toast(e.message)}}
+function helperOffersHost(){let host=$('helperOffers');if(host)return host;host=document.createElement('div');host.id='helperOffers';host.style.marginTop='18px';let anchor=openRequestHost();if(anchor&&anchor.parentElement)anchor.parentElement.appendChild(host);return host}
+async function loadHelperOffers(){try{let d=await api('/api/helper/offers');let host=helperOffersHost();host.innerHTML=`<h3>Предложения помощи</h3>${d.offers.length?d.offers.map(o=>`<div class="request"><div class="requestmain"><b>Заявка #${o.request_id} · ${esc(o.what)}</b><div class="muted">${esc(o.requester_name)} · ${esc(o.place)} · ${esc(o.time_needed)}</div></div><button class="btn grad" onclick="respondToOffer(${o.request_id},true)">Помогу</button><button class="btn light" onclick="respondToOffer(${o.request_id},false)">Не смогу</button></div>`).join(''):'<div class="empty">Новых предложений нет. Готовность к помощи синхронизирована с ботом.</div>'}catch(e){let host=helperOffersHost();host.innerHTML='<div class="empty">Не удалось загрузить предложения.</div>'}}
+async function respondToOffer(id,accept){try{let d=await api('/api/helper/offers/respond',{method:'POST',body:JSON.stringify({request_id:id,accept})});toast(accept?'Помощь подтверждена, чат создан':'Предложение отклонено');await requests();if(d.accepted)openChat(id)}catch(e){toast(e.message);await loadHelperOffers()}}
+async function requests(data){renderRequests(data||await api('/api/requests/mine'));if(document.querySelector('.tab.active')?.dataset.t==='requests'){await loadOpenRequests();await loadHelperOffers()}}
+async function syncTick(){try{let d=await api('/api/sync');applySync(d);let tab=document.querySelector('.tab.active')?.dataset.t;if(tab==='requests'){await loadOpenRequests();await loadHelperOffers()}if(tab==='history')await history();if(tab==='profile')await profile(d.user);if(tab==='billing')await billing();if(tab==='chat')loadChats()}catch(e){if(e.message==='auth_required'){stopSync();stopChatPolling()}}}
+'''
+
 def _page_replace(needle, replacement):
     global PAGE
     if needle not in PAGE:
@@ -364,7 +377,7 @@ _page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+"</style></hea
 _page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
 _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandLogo" href="/" aria-label="H-Point"><img src="/assets/hpoint-logo-dark.png" alt="H-Point"></a>')
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
@@ -446,6 +459,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not u:return
                 rs=get_history(u["user_id"],HISTORY_LIMIT)
                 return reply(self,{"ok":True,"current_user_id":u["user_id"],"requests":[request_payload(r) for r in rs]})
+            if p.path=="/api/helper/offers":
+                u=auth(self)
+                if not u:return
+                return reply(self,{"ok":True,"offers":[dict(row) for row in get_helper_offers(u["user_id"])]})
             if p.path=="/api/history":
                 u=auth(self)
                 if not u:return
@@ -624,20 +641,13 @@ class Handler(BaseHTTPRequestHandler):
                 if (lat is None) != (lon is None) or (lat is not None and not (-90<=lat<=90 and -180<=lon<=180)):return reply(self,{"ok":False,"error":"Некорректные координаты."},400)
                 rid=create_request(u["user_id"],{**f,"lat":lat,"lon":lon})
                 req=get_request(rid)
-                helper_id=find_best_queued_helper(req)
-                matched=False
-                if helper_id is not None:
-                    matched=try_assign_helper(rid,helper_id)
-                    if matched:
-                        chat_for_request(rid)
                 if u["tg_user_id"]:
-                    status = "Помощник уже найден." if matched else "Заявка ожидает помощника."
                     notify_telegram_user(
                         u["tg_user_id"],
-                        f"🆕 На сайте создана заявка №{rid}: {escape(req['what'])}\n{status}\n"
-                        "Она доступна в общей истории. Откройте /history в H-Point.",
+                        f"🆕 На сайте создана заявка №{rid}: {escape(req['what'])}\n"
+                        "Откройте в H-Point «⚡ Подобрать кандидатов», выберите человека из очереди — он сам подтвердит согласие.",
                     )
-                return reply(self,{"ok":True,"request_id":rid,"matched":matched})
+                return reply(self,{"ok":True,"request_id":rid,"matched":False})
             if p.path=="/api/helper/queue":
                 u=auth(self)
                 if not u:return
@@ -645,19 +655,8 @@ class Handler(BaseHTTPRequestHandler):
                     return reply(self,{"ok":False,"error":"Сначала завершите или отмените свою активную заявку."},409)
                 if get_active_help(u["user_id"]):
                     return reply(self,{"ok":False,"error":"Сначала завершите текущую помощь."},409)
-                while True:
-                    request=find_best_open_request_for(u["user_id"])
-                    if request is None:
-                        add_to_queue(u["user_id"])
-                        return reply(self,{"ok":True,"matched":False,"message":"Подходящих заявок пока нет. Вы добавлены в очередь помощников."})
-                    if try_assign_helper(request["id"],u["user_id"]):
-                        chat_for_request(request["id"])
-                        requester=get_user(request["requester_id"])
-                        if requester and requester["tg_user_id"]:
-                            notify_telegram_user(requester["tg_user_id"],f"🤝 По заявке №{request['id']} найден помощник. Откройте сайт H-Point или бот, чтобы продолжить общение.")
-                        if u["tg_user_id"]:
-                            notify_telegram_user(u["tg_user_id"],f"🤝 Вы приняли заявку №{request['id']}: {escape(request['what'])}. Чат уже создан.")
-                        return reply(self,{"ok":True,"matched":True,"request_id":request["id"],"message":"Вы приняли подходящую заявку. Чат создан."})
+                add_to_queue(u["user_id"])
+                return reply(self,{"ok":True,"matched":False,"message":"Вы в общей очереди помощников. Когда вас выберут, вы сами подтвердите или отклоните предложение."})
             if p.path=="/api/requests/accept":
                 u=auth(self)
                 if not u:return
@@ -668,15 +667,10 @@ class Handler(BaseHTTPRequestHandler):
                     return reply(self,{"ok":False,"error":"Эта заявка недоступна."},409)
                 if get_active_own_request(u["user_id"]):
                     return reply(self,{"ok":False,"error":"Сначала завершите или отмените свою активную заявку."},409)
-                if not try_assign_helper(rid,u["user_id"]):
-                    return reply(self,{"ok":False,"error":"Заявку уже принял другой помощник или у вас есть активная помощь."},409)
-                chat_for_request(rid)
-                requester=get_user(request["requester_id"])
-                if requester and requester["tg_user_id"]:
-                    notify_telegram_user(requester["tg_user_id"],f"🤝 По заявке №{rid} найден помощник. Откройте сайт H-Point или бот, чтобы продолжить общение.")
-                if u["tg_user_id"]:
-                    notify_telegram_user(u["tg_user_id"],f"🤝 Вы приняли заявку №{rid}: {escape(request['what'])}. Чат уже создан.")
-                return reply(self,{"ok":True,"request_id":rid})
+                if get_active_help(u["user_id"]):
+                    return reply(self,{"ok":False,"error":"Сначала завершите текущую помощь."},409)
+                add_to_queue(u["user_id"])
+                return reply(self,{"ok":True,"request_id":rid,"queued":True,"message":"Вы в очереди помощников. Автор заявки сам выберет кандидата."})
             if p.path=="/api/assistant/candidates":
                 u=auth(self)
                 if not u:return
@@ -686,7 +680,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not request or request["requester_id"]!=u["user_id"] or request["status"]!=STATUS_OPEN:
                     return reply(self,{"ok":False,"error":"Подбор доступен только для вашей открытой заявки."},403)
                 question=str(d.get("question", "")).strip()[:MAX_TEXT_LEN]
-                return reply(self,{"ok":True,"matches":smart_match(rid,query=question)})
+                offer=get_current_helper_offer(rid)
+                return reply(self,{"ok":True,"matches":smart_match(rid,query=question),"offer":dict(offer) if offer else None})
             if p.path=="/api/smart-match/assign":
                 u=auth(self)
                 if not u:return
@@ -694,8 +689,39 @@ class Handler(BaseHTTPRequestHandler):
                 except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректные данные."},400)
                 r=get_request(rid)
                 if not r or r["requester_id"]!=u["user_id"] or r["status"]!=STATUS_OPEN:return reply(self,{"ok":False,"error":"Недоступно."},403)
-                if not try_assign_helper(rid,hid):return reply(self,{"ok":False,"error":"Кандидат уже занят или заявка изменилась."},409)
-                chat_for_request(rid);return reply(self,{"ok":True})
+                if not offer_helper(rid,hid):return reply(self,{"ok":False,"error":"Кандидат уже занят, вышел из очереди или заявка изменилась."},409)
+                candidate=get_user(hid)
+                if candidate and candidate["tg_user_id"]:
+                    from .keyboards import helper_offer_kb
+                    notify_telegram_user(
+                        candidate["tg_user_id"],
+                        f"🤝 <b>Вас выбрали как помощника</b>\n\n"
+                        f"Заявка №{rid}: {escape(r['what'])}\n"
+                        f"Где: {escape(r['place'])}\nКогда: {escape(r['time_needed'])}\n\n"
+                        "Подтвердите, что готовы помочь. До вашего согласия заявка никому не назначена.",
+                        reply_markup=helper_offer_kb(rid),
+                    )
+                return reply(self,{"ok":True,"offered":True})
+            if p.path=="/api/helper/offers/respond":
+                u=auth(self)
+                if not u:return
+                try:rid=int(d["request_id"])
+                except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
+                accept=d.get("accept")
+                if not isinstance(accept,bool):return reply(self,{"ok":False,"error":"Некорректный ответ."},400)
+                if not respond_to_helper_offer(rid,u["user_id"],accept):
+                    return reply(self,{"ok":False,"error":"Предложение уже неактуально."},409)
+                request=get_request(rid)
+                if accept:
+                    chat_for_request(rid)
+                    requester=get_user(request["requester_id"])
+                    if requester and requester["tg_user_id"]:
+                        notify_telegram_user(requester["tg_user_id"],f"🎉 Помощник подтвердил заявку №{rid}. Чат уже создан.")
+                else:
+                    requester=get_user(request["requester_id"])
+                    if requester and requester["tg_user_id"]:
+                        notify_telegram_user(requester["tg_user_id"],f"ℹ️ Помощник отклонил предложение по заявке №{rid}. Выберите другого кандидата.")
+                return reply(self,{"ok":True,"accepted":accept,"request_id":rid})
             if p.path=="/api/requests/finish":
                 u=auth(self)
                 if not u:return

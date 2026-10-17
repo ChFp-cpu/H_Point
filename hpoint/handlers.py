@@ -88,6 +88,26 @@ async def safe_notify_match(bot: Bot, request_id: int) -> None:
         logging.exception("Не удалось отправить уведомление о паре для заявки %s", request_id)
 
 
+async def notify_helper_offer(bot: Bot, request_id: int, helper_id: int) -> None:
+    """Ask a selected volunteer for consent before creating a chat or assignment."""
+    request = get_request(request_id)
+    helper = get_user(helper_id)
+    requester = get_user(request["requester_id"]) if request else None
+    if not request or not helper or not requester or not helper["tg_user_id"]:
+        return
+    try:
+        await bot.send_message(
+            helper["tg_user_id"],
+            "🤝 <b>Вас выбрали как помощника</b>\n\n"
+            f"{request_text(request)}\n\n"
+            f"<b>Кому нужна помощь:</b> {user_link(requester)}\n\n"
+            "Подтвердите, что готовы помочь. До вашего согласия заявка никому не назначена.",
+            reply_markup=helper_offer_kb(request_id),
+        )
+    except Exception:
+        logging.exception("Не удалось отправить предложение помощнику %s по заявке %s", helper_id, request_id)
+
+
 async def show_main_menu(message: Message, text: str = "Главное меню. Выберите действие:") -> None:
     await message.answer(text, reply_markup=main_menu_kb())
 
@@ -561,7 +581,7 @@ async def _show_candidates(message: Message, request_id: int, *, edit: bool = Fa
     header = (
         f"⚡ <b>Кандидаты для заявки №{request_id}</b>\n\n"
         f"{escape(req['what'])}\n\n"
-        f"Найдено: <b>{len(matches)}</b>. Выберите подходящего помощника."
+        f"Найдено: <b>{len(matches)}</b>. Это люди, которые сейчас готовы помочь. Выберите одного — он подтвердит согласие сам."
     )
     if edit:
         await message.edit_text(header)
@@ -633,33 +653,62 @@ async def cb_candidate_assign(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Кандидат больше недоступен.", show_alert=True)
         return
 
-    if not try_assign_helper(request_id, candidate_id):
-        await callback.answer("Кандидат уже занят. Обновляю список.", show_alert=True)
+    if not offer_helper(request_id, candidate_id):
+        await callback.answer("Кандидат уже занят, вышел из очереди или заявка изменилась. Обновляю список.", show_alert=True)
         await _show_candidates(callback.message, request_id)
         return
 
-    db.execute(
-        "UPDATE request_candidates SET status='accepted', updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND candidate_id=?",
-        (request_id, candidate_id),
-    )
-    db.execute(
-        "UPDATE request_candidates SET status='rejected', updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND candidate_id!=? AND status='pending'",
-        (request_id, candidate_id),
-    )
-
-    await callback.answer("Помощник назначен!")
+    await callback.answer("Предложение отправлено")
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
     await callback.message.answer(
-        "🎉 <b>Помощник назначен</b>\n\n"
+        "⏳ <b>Ждём подтверждение помощника</b>\n\n"
         f"{request_text(req)}\n\n"
-        f"<b>Ваш помощник:</b> {user_link(candidate)}\n\n"
-        "Чат создаётся автоматически. После выполнения помощи вы получите запрос на оценку.",
+        f"<b>Вы выбрали:</b> {user_link(candidate)}\n\n"
+        "Помощник сам подтвердит или отклонит предложение. Чат появится только после его согласия.",
         reply_markup=main_menu_kb(),
     )
-    await safe_notify_match(bot, request_id)
+    await notify_helper_offer(bot, request_id, candidate_id)
+
+
+@router.callback_query(F.data.startswith("offer:"))
+async def cb_helper_offer_response(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        _, action, request_id_s = callback.data.split(":")
+        request_id = int(request_id_s)
+    except (ValueError, TypeError):
+        await callback.answer("Некорректное предложение.", show_alert=True)
+        return
+    if action not in ("accept", "decline"):
+        await callback.answer("Некорректное действие.", show_alert=True)
+        return
+    accepted = action == "accept"
+    if not respond_to_helper_offer(request_id, callback.from_user.id, accepted):
+        await callback.answer("Предложение уже неактуально.", show_alert=True)
+        return
+    request = get_request(request_id)
+    if accepted:
+        await callback.answer("Помощь подтверждена")
+        await callback.message.edit_text(
+            "✅ <b>Вы подтвердили помощь.</b> Чат создан — можно связаться с человеком на сайте или командой /chat ТЕКСТ.",
+            reply_markup=finish_kb(request_id),
+        )
+        await safe_notify_match(bot, request_id)
+        return
+    await callback.answer("Предложение отклонено")
+    await callback.message.edit_text("↩️ <b>Вы отказались от помощи.</b> Вы остались в очереди и можете получить другое предложение.")
+    requester = get_user(request["requester_id"]) if request else None
+    if requester and requester["tg_user_id"]:
+        try:
+            await bot.send_message(
+                requester["tg_user_id"],
+                f"ℹ️ Помощник отклонил предложение по заявке №{request_id}. Откройте «⚡ Подобрать кандидатов» и выберите другого.",
+                reply_markup=main_menu_kb(),
+            )
+        except Exception:
+            logging.exception("Не удалось уведомить автора заявки %s об отказе", request_id)
 
 
 @router.callback_query(F.data.startswith("candidate:refresh:"))
@@ -777,14 +826,9 @@ async def q_details(message: Message, state: FSMContext, bot: Bot) -> None:
         return
     request_id = create_request(user_id, data)
     req = get_request(request_id)
-    helper_id = find_best_queued_helper(req)
-    if helper_id is not None and try_assign_helper(request_id, helper_id):
-        await message.answer("✅ Заявка создана и помощник найден!", reply_markup=main_menu_kb())
-        await safe_notify_match(bot, request_id)
-        return
     await message.answer(
         f"✅ Заявка создана!\n\n{request_text(req)}\n\n"
-        "Свободного помощника пока нет. Как только кто-то откликнется, мы вас соединим.",
+        "Теперь откройте «⚡ Подобрать кандидатов» и выберите человека из тех, кто готов помочь. Он сам подтвердит согласие.",
         reply_markup=main_menu_kb(),
     )
     await message.answer("Если помощь больше не нужна:", reply_markup=cancel_request_kb(request_id))
@@ -799,18 +843,14 @@ async def want_help(message: Message, state: FSMContext, bot: Bot) -> None:
     if own:
         await message.answer(f"У вас есть активная заявка №{own['id']}. Нельзя одновременно просить помощь и помогать.")
         return
-    while True:
-        req = find_best_open_request_for(user_id)
-        if req is None:
-            break
-        if try_assign_helper(req["id"], user_id):
-            await safe_notify_match(bot, req["id"])
-            return
     if is_in_queue(user_id):
         await message.answer("Вы уже в очереди помощников.", reply_markup=leave_queue_kb())
         return
     add_to_queue(user_id)
-    await message.answer("Вы добавлены в очередь помощников. Мы сообщим, когда появится подходящая заявка.", reply_markup=leave_queue_kb())
+    await message.answer(
+        "Вы добавлены в общую очередь помощников сайта и бота. Когда вас выберут, вы сами подтвердите или отклоните предложение.",
+        reply_markup=leave_queue_kb(),
+    )
 
 
 @router.callback_query(F.data == "leave_queue")

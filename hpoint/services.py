@@ -51,6 +51,127 @@ def remove_from_queue(user_id: int) -> None:
     db.execute("DELETE FROM helper_queue WHERE user_id = ?", (user_id,))
 
 
+def get_current_helper_offer(request_id: int):
+    """Return the one helper currently deciding on a request, if any."""
+    return db.execute(
+        """SELECT rc.request_id, rc.candidate_id, rc.status, rc.updated_at,
+                  u.name, u.username, u.tg_user_id
+           FROM request_candidates rc
+           JOIN users u ON u.user_id = rc.candidate_id
+           WHERE rc.request_id = ? AND rc.status = 'offered'
+           ORDER BY rc.updated_at DESC LIMIT 1""",
+        (request_id,),
+    ).fetchone()
+
+
+def get_helper_offers(helper_id: int, limit: int = 20):
+    """Offers awaiting a helper's answer; used by both the site and the bot."""
+    return db.execute(
+        """SELECT rc.request_id, rc.updated_at, r.category, r.what, r.place,
+                  r.time_needed, r.urgency, r.details, r.requester_id,
+                  requester.name requester_name, requester.username requester_username
+           FROM request_candidates rc
+           JOIN requests r ON r.id = rc.request_id
+           JOIN users requester ON requester.user_id = r.requester_id
+           WHERE rc.candidate_id = ? AND rc.status = 'offered' AND r.status = ?
+           ORDER BY rc.updated_at DESC LIMIT ?""",
+        (helper_id, STATUS_OPEN, limit),
+    ).fetchall()
+
+
+def offer_helper(request_id: int, helper_id: int) -> bool:
+    """Let a requester invite one available volunteer without assigning them yet."""
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
+        request = db.execute("SELECT * FROM requests WHERE id = ?" + lock, (request_id,)).fetchone()
+        available = db.execute("SELECT 1 FROM helper_queue WHERE user_id = ?" + lock, (helper_id,)).fetchone()
+        busy = db.execute(
+            "SELECT 1 FROM requests WHERE helper_id = ? AND status = ?" + lock,
+            (helper_id, STATUS_IN_PROGRESS),
+        ).fetchone()
+        if not request or request["status"] != STATUS_OPEN or request["requester_id"] == helper_id or not available or busy:
+            db.execute("ROLLBACK")
+            return False
+
+        # A new choice withdraws the previous offer, so a requester never has
+        # several volunteers waiting for a reply at the same time.
+        db.execute(
+            "UPDATE request_candidates SET status='withdrawn', updated_at=CURRENT_TIMESTAMP "
+            "WHERE request_id=? AND status='offered' AND candidate_id!=?",
+            (request_id, helper_id),
+        )
+        db.execute(
+            """INSERT INTO request_candidates(request_id,candidate_id,score,status,seen_at,updated_at)
+               VALUES(?,?,?,'offered',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+               ON CONFLICT(request_id,candidate_id) DO UPDATE SET
+                 score=excluded.score,status='offered',updated_at=CURRENT_TIMESTAMP""",
+            (request_id, helper_id, match_score(request, helper_id)),
+        )
+        db.execute("COMMIT")
+        return True
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool) -> bool:
+    """Accept or decline an invitation atomically, keeping the queue shared."""
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
+        offer = db.execute(
+            "SELECT * FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='offered'" + lock,
+            (request_id, helper_id),
+        ).fetchone()
+        request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
+        if not offer or not request or request["status"] != STATUS_OPEN:
+            db.execute("ROLLBACK")
+            return False
+        if not accept:
+            db.execute(
+                "UPDATE request_candidates SET status='declined', updated_at=CURRENT_TIMESTAMP "
+                "WHERE request_id=? AND candidate_id=? AND status='offered'",
+                (request_id, helper_id),
+            )
+            db.execute("COMMIT")
+            return True
+
+        current = db.execute(
+            """UPDATE requests SET helper_id=?, status=?
+               WHERE id=? AND status=? AND helper_id IS NULL AND requester_id!=?
+               AND NOT EXISTS (
+                 SELECT 1 FROM requests active
+                 WHERE active.helper_id=? AND active.status=?
+               )""",
+            (helper_id, STATUS_IN_PROGRESS, request_id, STATUS_OPEN, helper_id, helper_id, STATUS_IN_PROGRESS),
+        )
+        if current.rowcount != 1:
+            db.execute("ROLLBACK")
+            return False
+        remove_from_queue(helper_id)
+        db.execute(
+            "UPDATE request_candidates SET status='accepted', updated_at=CURRENT_TIMESTAMP "
+            "WHERE request_id=? AND candidate_id=?",
+            (request_id, helper_id),
+        )
+        db.execute(
+            "UPDATE request_candidates SET status='withdrawn', updated_at=CURRENT_TIMESTAMP "
+            "WHERE request_id=? AND candidate_id!=? AND status IN ('pending','offered')",
+            (request_id, helper_id),
+        )
+        db.execute(
+            "UPDATE request_candidates SET status='withdrawn', updated_at=CURRENT_TIMESTAMP "
+            "WHERE candidate_id=? AND request_id!=? AND status='offered'",
+            (helper_id, request_id),
+        )
+        db.execute("COMMIT")
+        return True
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
 def find_best_open_request_for(helper_id: int):
     rows = db.execute(
         "SELECT * FROM requests WHERE status = ? AND requester_id != ? ORDER BY id ASC LIMIT 50",
@@ -274,12 +395,29 @@ def smart_match(request_id, limit=20, query=""):
     req=get_request(request_id)
     if not req: return []
     rows=db.execute("""SELECT u.*, r.id request_id, r.category request_category, r.what, r.lat request_lat, r.lon request_lon
-                       FROM users u CROSS JOIN (SELECT id,category,what,lat,lon FROM requests WHERE id=?) r
-                       WHERE u.user_id != ? AND u.user_id IS NOT NULL""",(request_id,req["requester_id"])).fetchall()
+                       FROM users u
+                       JOIN helper_queue q ON q.user_id=u.user_id
+                       CROSS JOIN (SELECT id,category,what,lat,lon FROM requests WHERE id=?) r
+                       WHERE u.user_id != ? AND u.user_id IS NOT NULL
+                       AND NOT EXISTS (
+                         SELECT 1 FROM requests own
+                         WHERE own.requester_id=u.user_id AND own.status IN (?,?)
+                       )""",(request_id,req["requester_id"],STATUS_OPEN,STATUS_IN_PROGRESS)).fetchall()
+    offered_elsewhere = {
+        row["candidate_id"] for row in db.execute(
+            "SELECT candidate_id FROM request_candidates WHERE status='offered'"
+        ).fetchall()
+    }
+    declined_for_request = {
+        row["candidate_id"] for row in db.execute(
+            "SELECT candidate_id FROM request_candidates WHERE request_id=? AND status='declined'",
+            (request_id,),
+        ).fetchall()
+    }
     out=[]
     terms = _query_terms(query)
     for u in rows:
-        if get_active_help(u["user_id"]) is not None: continue
+        if u["user_id"] in offered_elsewhere or u["user_id"] in declined_for_request or get_active_help(u["user_id"]) is not None: continue
         cats=get_helper_categories(u["user_id"])
         category_bonus=100 if (not cats or req["category"] in cats) else 0
         distance=haversine_km(req["lat"],req["lon"],u["lat"],u["lon"])
@@ -316,12 +454,9 @@ def get_candidates_for_request(request_id, limit=20):
     req = get_request(request_id)
     if not req:
         return []
-    # Recalculate so Telegram never shows stale candidates after profiles,
-    # ratings, queue state or location have changed.
-    matches = smart_match(request_id, limit=limit)
-    if matches:
-        return matches
-    return [dict(row) for row in get_request_candidates(request_id, limit)]
+    # Recalculate from helper_queue every time. The bot and the site use one
+    # database, so a person entering or leaving either queue is visible at once.
+    return smart_match(request_id, limit=limit)
 
 def smart_requests_for_helper(helper_id, limit=20):
     rows=db.execute("SELECT * FROM requests WHERE status=? AND requester_id!=? ORDER BY created_at DESC LIMIT 100",(STATUS_OPEN,helper_id)).fetchall()

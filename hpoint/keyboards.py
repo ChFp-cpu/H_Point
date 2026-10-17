@@ -78,7 +78,13 @@ def choose_match_request_kb(requests, prefix="matchreq"):
 
 def candidate_kb(request_id, candidate_id):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🤝 Предложить помощь", callback_data=f"candidate:assign:{request_id}:{candidate_id}")]
+        [InlineKeyboardButton(text="🤝 Выбрать помощника", callback_data=f"candidate:assign:{request_id}:{candidate_id}")]
+    ])
+
+def helper_offer_kb(request_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Помогу", callback_data=f"offer:accept:{request_id}"),
+         InlineKeyboardButton(text="↩️ Не смогу", callback_data=f"offer:decline:{request_id}")]
     ])
 
 def candidates_navigation_kb(request_id):
