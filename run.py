@@ -5,7 +5,9 @@ import threading
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# The local .env is the project's source of runtime settings.  In particular,
+# it must win over stale Windows user variables such as WEB_PUBLIC_URL=0.0.0.0.
+load_dotenv(override=True)
 
 class SingleInstance:
     """Keep exactly one Telegram polling process per project directory."""
