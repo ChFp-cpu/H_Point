@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import os
+import tempfile
 import threading
 from pathlib import Path
 from dotenv import load_dotenv
@@ -19,6 +20,12 @@ class SingleInstance:
         self._name = f"{identity}-{hashlib.sha256(project).hexdigest()[:16]}"
         self._handle = None
         self._file = None
+
+    def _lock_path(self) -> Path:
+        """Store runtime locks outside the read-only application directory."""
+        runtime_dir = Path(os.getenv("HPOINT_LOCK_DIR", tempfile.gettempdir()))
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        return runtime_dir / f".{self._name}.lock"
 
     def acquire(self):
         if os.name == "nt":
@@ -46,8 +53,7 @@ class SingleInstance:
             # script with a different working directory or mutex handling is
             # altered by an embedding environment.
             import msvcrt
-            lock_path = Path(__file__).resolve().parent / f".{self._name}.lock"
-            self._file = lock_path.open("a+b")
+            self._file = self._lock_path().open("a+b")
             if self._file.tell() == 0:
                 self._file.write(b"0")
                 self._file.flush()
@@ -64,8 +70,7 @@ class SingleInstance:
 
         import fcntl
 
-        lock_path = Path(__file__).resolve().parent / f".{self._name}.lock"
-        self._file = lock_path.open("a+")
+        self._file = self._lock_path().open("a+")
         try:
             fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:

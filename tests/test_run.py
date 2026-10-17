@@ -1,5 +1,6 @@
 import importlib
 import os
+import tempfile
 import unittest
 import uuid
 from pathlib import Path
@@ -10,6 +11,17 @@ from run import SingleInstance
 
 
 class RunTests(unittest.TestCase):
+    def test_lock_uses_the_writable_runtime_directory(self):
+        identity = f"hpoint-test-{uuid.uuid4().hex}"
+        with tempfile.TemporaryDirectory() as lock_dir:
+            with patch.dict(os.environ, {"HPOINT_LOCK_DIR": lock_dir}, clear=False):
+                instance = SingleInstance(identity)
+                self.assertTrue(instance.acquire())
+                try:
+                    self.assertTrue(instance._lock_path().is_file())
+                finally:
+                    instance.release()
+
     def test_only_one_instance_can_hold_the_project_lock(self):
         identity = f"hpoint-test-{uuid.uuid4().hex}"
         first = SingleInstance(identity)
