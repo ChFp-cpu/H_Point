@@ -385,6 +385,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200);self.send_header("Content-Type",item[1]);self.send_header("X-Content-Type-Options","nosniff");self.send_header("Cache-Control","public, max-age=604800, immutable");self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
     def html(self):
         b=PAGE.replace("__YANDEX_MAPS_API_KEY__", YANDEX_MAPS_API_KEY).encode();self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
+    def do_HEAD(self):
+        """Serve metadata for public resources without a response body."""
+        p = urlparse(self.path)
+        if p.path.startswith("/assets/"):
+            item = ASSETS.get(p.path.rsplit("/", 1)[-1])
+            if not item or not item[0].is_file():
+                self.send_error(404)
+                return
+            self.send_response(200);self.send_header("Content-Type",item[1]);self.send_header("X-Content-Type-Options","nosniff");self.send_header("Cache-Control","public, max-age=604800, immutable");self.send_header("Content-Length",str(item[0].stat().st_size));self.end_headers()
+            return
+        if p.path in ("/", "/index.html", "/payment/result"):
+            size = len(PAGE.replace("__YANDEX_MAPS_API_KEY__", YANDEX_MAPS_API_KEY).encode())
+            self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(size));self.end_headers()
+            return
+        if p.path == "/api/health":
+            b = json.dumps({"ok":True,"database":True}).encode()
+            self.send_response(200);self.send_header("Content-Type","application/json;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("Content-Length",str(len(b)));self.end_headers()
+            return
+        self.send_response(405);self.send_header("Allow","GET, POST, HEAD");self.send_header("Content-Length","0");self.end_headers()
     def do_GET(self):
         p=urlparse(self.path)
         try:

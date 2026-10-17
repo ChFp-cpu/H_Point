@@ -21,6 +21,16 @@ class Web(unittest.TestCase):
   self.assertIn("/api/requests/accept",web.PAGE)
   self.assertIn("https://*.maps.yandex.net",web.CSP)
   self.assertIn("https://api-maps.yandex.ru",web.CSP)
+ def test_head_for_public_page_and_health(self):
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   base=f"http://127.0.0.1:{server.server_address[1]}"
+   for path,content_type in (("/","text/html"),("/api/health","application/json")):
+    req=urllib.request.Request(base+path,method="HEAD")
+    with urllib.request.urlopen(req,timeout=3) as response:
+     self.assertEqual(response.status,200);self.assertEqual(response.headers.get_content_type(),content_type);self.assertEqual(response.read(),b"")
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
  def test_registration_login_and_api_access_control(self):
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler)
   thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
