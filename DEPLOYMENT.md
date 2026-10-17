@@ -1,53 +1,49 @@
-# Production deployment
+# Запуск H-Point на VPS
 
-The production configuration uses PostgreSQL, Caddy with automatic TLS, and separate website and Telegram bot containers. They share the same database, but only the `bot` container polls Telegram.
+Проект уже настроен для Docker Compose: сайт, PostgreSQL, Telegram-бот и Caddy с автоматическим HTTPS. Отдельно устанавливать Nginx и Python-зависимости на VPS не нужно.
 
-## Before first launch
+## 1. Подготовьте сервер и DNS
 
-1. Copy `.env.example` to `.env`; keep `.env` only on the server and set its mode to `600`.
-2. Set `APP_ENV=production`, `CADDY_DOMAIN`, `WEB_PUBLIC_URL=https://YOUR-DOMAIN`, `BOT_TOKEN`, and `BOT_USERNAME` without `@`.
-3. Generate a long database password. Set `POSTGRES_PASSWORD` and set `DATABASE_URL=postgresql://hpoint:URL_ENCODED_PASSWORD@db:5432/hpoint`.
-4. Set `SESSION_COOKIE_SECURE=1`. Production startup refuses insecure cookies, HTTP public URLs, SQLite, an untrusted proxy configuration, or a missing Telegram bot name.
-5. Point the domain's A record to the VPS public IPv4 address. Open only TCP ports 80 and 443 in the VPS firewall; do not expose PostgreSQL or port 8080.
-6. Start the stack with `docker compose up -d --build`, then check `docker compose ps` and `docker compose logs --tail=100 app bot caddy`.
+На Ubuntu установите Docker Engine с Compose plugin по официальной инструкции Docker. В DNS создайте A-запись `gethpoint.ru` на публичный IPv4 VPS. Разрешите входящие TCP-порты **22, 80 и 443** в firewall VPS и провайдера. PostgreSQL и порт 8080 наружу не открывайте.
 
-## Telegram and payments
+## 2. Загрузите проект и настройте `.env`
 
-- In BotFather set the bot's name and username. The website sign-in flow opens `https://t.me/BOT_USERNAME?start=login_TOKEN`; no Telegram Login Widget domain configuration is required for this flow.
-- The existing profile flow remains available: users can generate a code on the site and send `/link CODE` to the bot.
-- In Robokassa configure ResultURL as `https://YOUR-DOMAIN/api/payments/robokassa/result`. Set merchant credentials only in `.env`; never place them in the repository.
+На VPS перейдите в папку `HPoint` (там лежит `compose.yaml`) и выполните:
 
-## Start and stop Telegram independently
-
-The website keeps working when the bot is stopped:
-
-```sh
-docker compose stop bot
-docker compose start bot
-docker compose logs -f bot
+```bash
+cp .env.example .env
+nano .env
 ```
 
-Run exactly one Telegram poller for one bot token. Do not also start `python run.py` or `python run_bot.py` on a computer while the production `bot` container is running with the same token.
+Заполните в `.env`:
 
-## Backups and recovery
-
-Create an encrypted or access-restricted backup location outside the checkout and run the backup script daily:
-
-```sh
-export BACKUP_DIR=/srv/hpoint-backups
-sh scripts/backup-postgres.sh
+```dotenv
+APP_ENV=production
+CADDY_DOMAIN=gethpoint.ru
+WEB_PUBLIC_URL=https://gethpoint.ru
+SESSION_COOKIE_SECURE=1
+TRUST_PROXY_HEADERS=1
+BOT_TOKEN=токен_от_BotFather
+BOT_USERNAME=имя_бота_без_собаки
+POSTGRES_PASSWORD=длинный_случайный_пароль_из_букв_и_цифр
+DATABASE_URL=postgresql://hpoint:ТОТ_ЖЕ_ПАРОЛЬ@db:5432/hpoint
 ```
 
-Copy the resulting `.dump` and `.sha256` files to separate storage. Test restoration on a separate PostgreSQL instance before relying on a backup. To restore: `pg_restore --clean --if-exists --no-owner -d TARGET_DATABASE hpoint-TIMESTAMP.dump`.
+В `DATABASE_URL` подставьте тот же пароль, что в `POSTGRES_PASSWORD`. Используйте пароль только из латинских букв и цифр, чтобы не кодировать специальные символы. Не публикуйте `.env` и не отправляйте токен бота в чат.
 
-## Operational checks
+`BOT_TOKEN` и `BOT_USERNAME` нужны для запуска контейнера бота и входа через Telegram. Остальные необязательные интеграции (карта и Robokassa) можно оставить пустыми.
 
-```sh
+## 3. Запустите сайт
+
+Из папки `HPoint`:
+
+```bash
+chmod 600 .env
+docker compose up -d --build
 docker compose ps
-curl -fsS https://YOUR-DOMAIN/api/health
-docker compose exec db pg_isready -U hpoint -d hpoint
+docker compose logs --tail=100 app bot caddy
 ```
 
-Do not put exact home addresses into public request text. The website map intentionally rounds coordinates and does not send request details in its discovery API.
+Откройте **https://gethpoint.ru**. Первый выпуск HTTPS-сертификата Caddy может занять минуту. Если сайт не открылся, проверьте DNS, доступность портов 80/443 и вывод команды `docker compose logs`.
 
-The build intentionally does not contain payment credentials or a bot token.
+После обновления файлов проекта повторите `docker compose up -d --build`. Для остановки: `docker compose down` (данные PostgreSQL сохраняются в Docker volume). Не используйте `docker compose down -v`: это удалит базу.
