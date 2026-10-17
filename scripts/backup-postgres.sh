@@ -3,6 +3,8 @@
 set -eu
 
 : "${BACKUP_DIR:?Set BACKUP_DIR to an existing backup directory}"
+BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS:-14}
+case "$BACKUP_RETENTION_DAYS" in *[!0-9]*|'') echo "BACKUP_RETENTION_DAYS must be a positive integer" >&2; exit 2;; esac
 mkdir -p "$BACKUP_DIR"
 umask 077
 
@@ -15,5 +17,6 @@ docker compose exec -T db sh -c 'pg_dump -U "$POSTGRES_USER" -Fc "$POSTGRES_DB"'
 test -s "$temporary"
 mv "$temporary" "$target"
 sha256sum "$target" > "$target.sha256"
+find "$BACKUP_DIR" -type f \( -name 'hpoint-*.dump' -o -name 'hpoint-*.dump.sha256' \) -mtime +"$BACKUP_RETENTION_DAYS" -delete
 trap - EXIT HUP INT TERM
 printf 'Created %s\n' "$target"
