@@ -2,16 +2,16 @@
 import json, uuid, hashlib, hmac
 from urllib.parse import urlencode
 from .config import *
-from .database import db, get_invoice
+from .database import db, get_invoice, get_request, get_user, insert_id
 from .services import grant_entitlement
 
 def create_pending_invoice(user_id,item_type,metadata=None):
     item=MONETIZATION_ITEMS.get(item_type)
     if not item: raise ValueError("unknown billing item")
     payload=f"hpoint:v2:{uuid.uuid4().hex}"
-    cur=db.execute("""INSERT INTO billing_invoices(user_id,item_type,amount_rub,currency,payload,metadata)
-                      VALUES(?,?,?,?,?,?)""",(user_id,item_type,item["rub"],PAYMENT_CURRENCY,payload,json.dumps(metadata or {},ensure_ascii=False)))
-    return cur.lastrowid,payload,item["rub"]
+    invoice_id=insert_id("""INSERT INTO billing_invoices(user_id,item_type,amount_rub,currency,payload,metadata)
+                          VALUES(?,?,?,?,?,?)""",(user_id,item_type,item["rub"],PAYMENT_CURRENCY,payload,json.dumps(metadata or {},ensure_ascii=False)))
+    return invoice_id,payload,item["rub"]
 
 def _signature(value, password):
     try: digest=getattr(hashlib, ROBOKASSA_HASH_ALGORITHM.lower())
@@ -58,8 +58,8 @@ def fulfill_invoice(invoice_id,payment_id=None):
         inv=get_invoice(invoice_id)
         if inv["status"]=="paid":
             db.execute("ROLLBACK"); return True,"already_paid"
-        db.execute("UPDATE billing_invoices SET status='paid',paid_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'",(invoice_id,))
-        if db.execute("SELECT changes() n").fetchone()["n"]!=1:
+        changed = db.execute("UPDATE billing_invoices SET status='paid',paid_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'",(invoice_id,)).rowcount
+        if changed != 1:
             db.execute("ROLLBACK"); return False,"already_processed"
         db.execute("INSERT OR IGNORE INTO billing_events(invoice_id,event_type,provider_event_id,payload) VALUES(?,?,?,?)",
                    (invoice_id,"successful_payment",payment_id or inv["provider_payment_id"],json.dumps(meta,ensure_ascii=False)))
@@ -68,3 +68,68 @@ def fulfill_invoice(invoice_id,payment_id=None):
     except Exception:
         db.execute("ROLLBACK"); raise
     return True,inv["item_type"]
+
+def purchase_with_points(user_id, item_type, metadata=None, idempotency_key=None):
+    """Atomically exchange earned H-Points for a real entitlement.
+
+    A client retry uses the same idempotency key and returns the original
+    invoice without charging the balance a second time.
+    """
+    item = MONETIZATION_ITEMS.get(item_type)
+    if not item or "hp" not in item:
+        raise ValueError("unknown billing item")
+    metadata = dict(metadata or {})
+    key = str(idempotency_key or "").strip()
+    if not key or len(key) > 100:
+        raise ValueError("invalid purchase key")
+    payload = f"hpoint:hp:{key}"
+    price = int(item["hp"])
+
+    # Validate inputs before taking a balance lock.  The entitlement function
+    # then applies the same mutation inside the transaction below.
+    if item_type in ("boost", "more_responses"):
+        request_id = metadata.get("request_id")
+        if not isinstance(request_id, int):
+            raise ValueError("request_id required")
+        request = get_request(request_id)
+        if not request or request["requester_id"] != user_id or request["status"] != "open":
+            raise ValueError("request is unavailable")
+    if item_type == "verification" and not get_user(user_id)["tg_user_id"]:
+        raise ValueError("telegram link required")
+    if item_type == "ad" and not str(metadata.get("ad_text", "")).strip():
+        raise ValueError("ad_text required")
+
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        existing = db.execute("SELECT * FROM billing_invoices WHERE payload=?", (payload,)).fetchone()
+        if existing:
+            if existing["user_id"] != user_id or existing["currency"] != "HP":
+                db.execute("ROLLBACK")
+                raise ValueError("purchase key already used")
+            db.execute("COMMIT")
+            return existing["id"], False
+        changed = db.execute(
+            "UPDATE users SET balance=balance-? WHERE user_id=? AND balance>=?",
+            (price, user_id, price),
+        ).rowcount
+        if changed != 1:
+            db.execute("ROLLBACK")
+            raise ValueError("insufficient_points")
+        invoice_id = insert_id(
+            """INSERT INTO billing_invoices(user_id,item_type,amount_rub,currency,payload,metadata,status,paid_at)
+               VALUES(?,?,?,?,?,?, 'paid', CURRENT_TIMESTAMP)""",
+            (user_id, item_type, price, "HP", payload, json.dumps(metadata, ensure_ascii=False)),
+        )
+        grant_entitlement(user_id, item_type, request_id=metadata.get("request_id"), ad_text=metadata.get("ad_text"))
+        db.execute(
+            "INSERT OR IGNORE INTO billing_events(invoice_id,event_type,provider_event_id,payload) VALUES(?,?,?,?)",
+            (invoice_id, "points_purchase", payload, json.dumps(metadata, ensure_ascii=False)),
+        )
+        db.execute("COMMIT")
+        return invoice_id, True
+    except Exception:
+        try:
+            db.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise

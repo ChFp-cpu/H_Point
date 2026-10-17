@@ -1,14 +1,53 @@
-# Production checklist
+# Production deployment
 
-1. Set `BOT_TOKEN`, `WEB_PUBLIC_URL=https://YOUR-DOMAIN`, and `SESSION_COOKIE_SECURE=1`.
-2. Keep `WEB_HOST=127.0.0.1`; do not expose port `8080` publicly.
-3. Put an HTTPS reverse proxy in front of the application. It must proxy to `http://127.0.0.1:8080` and pass `Host`, `X-Forwarded-For`, and `X-Forwarded-Proto` headers.
-4. Restrict `/api/health` to the proxy or internal monitoring. It contains no integration details, but does confirm that the application responds.
-5. Configure `ROBOKASSA_MERCHANT_LOGIN`, `ROBOKASSA_PASSWORD_1`, and `ROBOKASSA_PASSWORD_2`.
-6. In Robokassa set ResultURL to `https://YOUR-DOMAIN/api/payments/robokassa/result` and use the configured hash algorithm.
-7. Set `PAYMENT_SUCCESS_URL` and `PAYMENT_FAIL_URL` to the corresponding pages on your HTTPS domain.
-8. Create backups using SQLite's online backup command, for example: `sqlite3 hpoint.db ".backup '/absolute/path/backups/hpoint-backup.db'"`. Do not copy only `hpoint.db` while the application runs: WAL data may be missing. Store the resulting backup outside the application host and regularly test restoration.
-9. For Telegram linking, the user gets a code in the site's Profile and sends `/link CODE` to the bot.
-10. Do not publish exact home addresses in request text.
+The production configuration uses PostgreSQL, Caddy with automatic TLS, and separate website and Telegram bot containers. They share the same database, but only the `bot` container polls Telegram.
+
+## Before first launch
+
+1. Copy `.env.example` to `.env`; keep `.env` only on the server and set its mode to `600`.
+2. Set `APP_ENV=production`, `CADDY_DOMAIN`, `WEB_PUBLIC_URL=https://YOUR-DOMAIN`, `BOT_TOKEN`, and `BOT_USERNAME` without `@`.
+3. Generate a long database password. Set `POSTGRES_PASSWORD` and set `DATABASE_URL=postgresql://hpoint:URL_ENCODED_PASSWORD@db:5432/hpoint`.
+4. Set `SESSION_COOKIE_SECURE=1`. Production startup refuses insecure cookies, HTTP public URLs, SQLite, an untrusted proxy configuration, or a missing Telegram bot name.
+5. Point the domain's A record to the VPS public IPv4 address. Open only TCP ports 80 and 443 in the VPS firewall; do not expose PostgreSQL or port 8080.
+6. Start the stack with `docker compose up -d --build`, then check `docker compose ps` and `docker compose logs --tail=100 app bot caddy`.
+
+## Telegram and payments
+
+- In BotFather set the bot's name and username. The website sign-in flow opens `https://t.me/BOT_USERNAME?start=login_TOKEN`; no Telegram Login Widget domain configuration is required for this flow.
+- The existing profile flow remains available: users can generate a code on the site and send `/link CODE` to the bot.
+- In Robokassa configure ResultURL as `https://YOUR-DOMAIN/api/payments/robokassa/result`. Set merchant credentials only in `.env`; never place them in the repository.
+
+## Start and stop Telegram independently
+
+The website keeps working when the bot is stopped:
+
+```sh
+docker compose stop bot
+docker compose start bot
+docker compose logs -f bot
+```
+
+Run exactly one Telegram poller for one bot token. Do not also start `python run.py` or `python run_bot.py` on a computer while the production `bot` container is running with the same token.
+
+## Backups and recovery
+
+Create an encrypted or access-restricted backup location outside the checkout and run the backup script daily:
+
+```sh
+export BACKUP_DIR=/srv/hpoint-backups
+sh scripts/backup-postgres.sh
+```
+
+Copy the resulting `.dump` and `.sha256` files to separate storage. Test restoration on a separate PostgreSQL instance before relying on a backup. To restore: `pg_restore --clean --if-exists --no-owner -d TARGET_DATABASE hpoint-TIMESTAMP.dump`.
+
+## Operational checks
+
+```sh
+docker compose ps
+curl -fsS https://YOUR-DOMAIN/api/health
+docker compose exec db pg_isready -U hpoint -d hpoint
+```
+
+Do not put exact home addresses into public request text. The website map intentionally rounds coordinates and does not send request details in its discovery API.
 
 The build intentionally does not contain payment credentials or a bot token.

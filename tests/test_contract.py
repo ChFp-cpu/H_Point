@@ -9,7 +9,7 @@ def test_external_rub_billing_contract():
  assert "ROBOKASSA_MERCHANT_LOGIN" in bill
  assert "auth.robokassa.ru" in bill
  assert "YOOKASSA" not in bill
- assert "Stars" not in h or "Stars не используются" in h
+ assert "Stars" not in h
  assert "/link" in h
 
 def test_public_web_contract():
