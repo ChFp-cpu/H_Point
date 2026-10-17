@@ -14,8 +14,12 @@ async def main() -> None:
         print("PowerShell: $env:BOT_TOKEN='...' ")
         return
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    validate_production_config()
     init_db()
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    from . import web
+    bot_profile = await bot.me()
+    web.configure_telegram_notifications(bot, bot_profile.username)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     logging.info("H-Point бот запущен")

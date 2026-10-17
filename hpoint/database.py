@@ -1,17 +1,97 @@
-"""SQLite persistence and migrations for H-Point."""
-import sqlite3
-from .config import DB_PATH, START_BALANCE, STATUS_OPEN, STATUS_IN_PROGRESS, STATUS_DONE
+"""Database persistence with SQLite development and PostgreSQL production support."""
+import sqlite3, hashlib, re, threading, json, secrets
+from datetime import datetime, timedelta, timezone
+from .config import DATABASE_URL, DB_PATH, START_BALANCE, STATUS_OPEN, STATUS_IN_PROGRESS, STATUS_DONE, ADMIN_TELEGRAM_IDS, TELEGRAM_AUTH_TTL_SECONDS, TELEGRAM_LINK_TTL_SECONDS, AUTH_ATTEMPT_WINDOW_SECONDS
+
+
+class PostgresConnection:
+    """Small compatibility layer so existing parameterized SQL works on PostgreSQL."""
+    is_postgres = True
+
+    def __init__(self, url):
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError("DATABASE_URL requires the psycopg package. Install requirements.txt.") from exc
+        self._psycopg = psycopg
+        self._dict_row = dict_row
+        self._url = url
+        self._local = threading.local()
+
+    def _connection(self):
+        conn = getattr(self._local, "connection", None)
+        if conn is None or conn.closed:
+            conn = self._psycopg.connect(self._url, autocommit=True, row_factory=self._dict_row, connect_timeout=10)
+            self._local.connection = conn
+        return conn
+
+    @staticmethod
+    def _sql(sql):
+        sql = sql.strip()
+        if sql.upper() == "BEGIN IMMEDIATE":
+            return "BEGIN"
+        ignored_insert = bool(re.search(r"INSERT\s+OR\s+IGNORE\s+INTO", sql, flags=re.I))
+        sql = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", sql, flags=re.I)
+        if ignored_insert and "ON CONFLICT" not in sql.upper():
+            sql += " ON CONFLICT DO NOTHING"
+        sql = re.sub(r"\bCURRENT_TIMESTAMP\b", "CURRENT_TIMESTAMP::text", sql, flags=re.I)
+        return sql.replace("?", "%s")
+
+    def execute(self, sql, params=None):
+        return self._connection().execute(self._sql(sql), params or ())
+
+    def executescript(self, script):
+        for statement in script.split(";"):
+            if statement.strip():
+                self.execute(statement)
+
+    def close(self):
+        connection = getattr(self._local, "connection", None)
+        if connection is not None and not connection.closed:
+            connection.close()
+
+class SQLiteConnection:
+    """One SQLite connection per thread, avoiding cross-request transaction sharing."""
+    is_postgres = False
+
+    def __init__(self, path):
+        self._path = path
+        self._local = threading.local()
+
+    def _connection(self):
+        conn = getattr(self._local, "connection", None)
+        if conn is None:
+            conn = sqlite3.connect(self._path, isolation_level=None, timeout=15)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=15000")
+            self._local.connection = conn
+        return conn
+
+    def execute(self, sql, params=None):
+        return self._connection().execute(sql, params or ())
+
+    def executescript(self, script):
+        return self._connection().executescript(script)
+
+    def close(self):
+        connection = getattr(self._local, "connection", None)
+        if connection is not None:
+            connection.close()
+            self._local.connection = None
 
 def db_connect():
-    conn=sqlite3.connect(DB_PATH, isolation_level=None, timeout=15, check_same_thread=False)
-    conn.row_factory=sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=15000")
-    return conn
+    if DATABASE_URL:
+        return PostgresConnection(DATABASE_URL)
+    return SQLiteConnection(DB_PATH)
 db=db_connect()
 
 def _columns(table):
+    if getattr(db, "is_postgres", False):
+        rows = db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=?", (table,)).fetchall()
+        return {r["column_name"] for r in rows}
     return {r["name"] for r in db.execute(f"PRAGMA table_info({table})").fetchall()}
 def _add_column(table,name,definition):
     # Migrations must be safe to run against every older H-Point database.
@@ -20,6 +100,9 @@ def _add_column(table,name,definition):
     # error as an already-applied migration rather than crashing startup.
     if name in _columns(table):
         return
+    if getattr(db, "is_postgres", False):
+        db.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {definition}")
+        return
     try:
         db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
     except sqlite3.OperationalError as exc:
@@ -27,18 +110,36 @@ def _add_column(table,name,definition):
             raise
 
 def init_db():
-    db.executescript("""
+    schema = """
     CREATE TABLE IF NOT EXISTS users(
       user_id INTEGER PRIMARY KEY, name TEXT NOT NULL, username TEXT, email TEXT UNIQUE,
       password_hash TEXT, balance INTEGER NOT NULL DEFAULT 0, helper_categories TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, pro_until TEXT, verified_until TEXT,
       business_until TEXT, favorite_slots INTEGER NOT NULL DEFAULT 3,
-      tg_user_id INTEGER UNIQUE, verification_code TEXT, web_verified INTEGER NOT NULL DEFAULT 0,
-      lat REAL, lon REAL, city TEXT DEFAULT '', bio TEXT DEFAULT ''
+      tg_user_id INTEGER UNIQUE, verification_code TEXT, verification_code_expires_at TEXT, web_verified INTEGER NOT NULL DEFAULT 0,
+      lat REAL, lon REAL, city TEXT DEFAULT '', bio TEXT DEFAULT '',
+      role TEXT NOT NULL DEFAULT 'user', is_blocked INTEGER NOT NULL DEFAULT 0, blocked_reason TEXT
     );
     CREATE TABLE IF NOT EXISTS sessions(
       token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-      expires_at TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      expires_at TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, device_id TEXT
+    );
+    CREATE TABLE IF NOT EXISTS identity_verification_requests(
+      user_id INTEGER PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'pending', submitted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      reviewed_at TEXT, reviewer_id INTEGER REFERENCES users(user_id), note TEXT NOT NULL DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS web_login_tickets(
+      token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      expires_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS telegram_auth_tickets(
+      token_hash TEXT PRIMARY KEY, user_id INTEGER REFERENCES users(user_id) ON DELETE CASCADE,
+      expires_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS auth_attempts(
+      action TEXT NOT NULL, subject_hash TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+      expires_at TEXT NOT NULL, PRIMARY KEY(action,subject_hash)
     );
     CREATE TABLE IF NOT EXISTS requests(
       id INTEGER PRIMARY KEY AUTOINCREMENT, requester_id INTEGER NOT NULL REFERENCES users(user_id),
@@ -59,6 +160,12 @@ def init_db():
     CREATE TABLE IF NOT EXISTS billing_events(id INTEGER PRIMARY KEY AUTOINCREMENT, invoice_id INTEGER REFERENCES billing_invoices(id),
       event_type TEXT NOT NULL, provider_event_id TEXT UNIQUE, payload TEXT NOT NULL DEFAULT '{}',
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS subscriptions(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      invoice_id INTEGER UNIQUE REFERENCES billing_invoices(id), plan TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+      starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'manual',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE TABLE IF NOT EXISTS favorites(user_id INTEGER NOT NULL REFERENCES users(user_id), favorite_user_id INTEGER NOT NULL REFERENCES users(user_id),
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(user_id,favorite_user_id));
     CREATE TABLE IF NOT EXISTS ads(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL REFERENCES users(user_id),
@@ -77,24 +184,62 @@ def init_db():
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY(request_id,candidate_id)
     );
+    CREATE TABLE IF NOT EXISTS ai_usage(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      request_count INTEGER NOT NULL DEFAULT 0, token_count INTEGER NOT NULL DEFAULT 0,
+      period_start TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id,period_start)
+    );
+    CREATE TABLE IF NOT EXISTS admin_audit_log(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, admin_user_id INTEGER NOT NULL REFERENCES users(user_id),
+      action TEXT NOT NULL, target_user_id INTEGER REFERENCES users(user_id), details TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE INDEX IF NOT EXISTS idx_request_candidates_request ON request_candidates(request_id,status,score);
     CREATE INDEX IF NOT EXISTS idx_request_candidates_candidate ON request_candidates(candidate_id,status);
     CREATE INDEX IF NOT EXISTS idx_chat_messages_chat ON chat_messages(chat_id,id);
+    CREATE INDEX IF NOT EXISTS idx_identity_verification_status ON identity_verification_requests(status,submitted_at);
     CREATE INDEX IF NOT EXISTS idx_requests_open ON requests(status,created_at);
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
-    """)
+    CREATE INDEX IF NOT EXISTS idx_telegram_auth_tickets_expires ON telegram_auth_tickets(expires_at);
+    """
+    if getattr(db, "is_postgres", False):
+        schema = schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY").replace("INTEGER", "BIGINT")
+    db.executescript(schema)
+    db.execute("CREATE TABLE IF NOT EXISTS schema_migrations(version TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+    db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", ("001_initial",))
     # Safe migration of the old project.
     for t,n,d in [
       ("users","email","TEXT"),("users","password_hash","TEXT"),("users","tg_user_id","INTEGER"),
-      ("users","verification_code","TEXT"),("users","web_verified","INTEGER NOT NULL DEFAULT 0"),
+      ("users","verification_code","TEXT"),("users","verification_code_expires_at","TEXT"),("users","web_verified","INTEGER NOT NULL DEFAULT 0"),
       ("users","lat","REAL"),("users","lon","REAL"),("users","city","TEXT DEFAULT ''"),("users","bio","TEXT DEFAULT ''"),
+      ("users","role","TEXT NOT NULL DEFAULT 'user'"),("users","is_blocked","INTEGER NOT NULL DEFAULT 0"),("users","blocked_reason","TEXT"),
       ("requests","lat","REAL"),("requests","lon","REAL"),("billing_invoices","amount_rub","INTEGER NOT NULL DEFAULT 0"),
       ("billing_invoices","currency","TEXT NOT NULL DEFAULT 'RUB'"),("billing_invoices","provider_payment_id","TEXT")
+      ,("sessions","device_id","TEXT")
     ]: _add_column(t,n,d)
-    # Old Stars columns can remain for backwards-compatible data, but new code never uses them.
+    # Legacy payment columns remain for backwards-compatible data, but new code never uses them.
     db.execute("CREATE INDEX IF NOT EXISTS idx_requests_geo ON requests(status,lat,lon)")
-    try: db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tg ON users(tg_user_id) WHERE tg_user_id IS NOT NULL")
-    except sqlite3.IntegrityError: pass
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_device ON sessions(device_id,expires_at)")
+    if not getattr(db, "is_postgres", False):
+        try: db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tg ON users(tg_user_id) WHERE tg_user_id IS NOT NULL")
+        except sqlite3.IntegrityError:
+            pass
+    if ADMIN_TELEGRAM_IDS:
+        for telegram_id in ADMIN_TELEGRAM_IDS:
+            db.execute("UPDATE users SET role='admin' WHERE tg_user_id=?", (telegram_id,))
+    sync_legacy_subscriptions()
+
+def sync_legacy_subscriptions():
+    """Mirror legacy entitlement dates into the subscription ledger once."""
+    now = datetime.now(timezone.utc).isoformat()
+    for field, plan in (("pro_until", "pro"), ("business_until", "business")):
+        rows = db.execute(f"SELECT user_id,created_at,{field} ends_at FROM users WHERE {field} IS NOT NULL").fetchall()
+        for row in rows:
+            exists = db.execute("SELECT 1 FROM subscriptions WHERE user_id=? AND plan=? AND ends_at=? LIMIT 1", (row["user_id"], plan, row["ends_at"])).fetchone()
+            if not exists:
+                state = "active" if row["ends_at"] > now else "expired"
+                db.execute("INSERT INTO subscriptions(user_id,plan,status,starts_at,ends_at,provider) VALUES(?,?,?,?,?,?)", (row["user_id"], plan, state, row["created_at"], row["ends_at"], "legacy"))
 
 def get_user(user_id):
     return db.execute("SELECT * FROM users WHERE user_id=?",(user_id,)).fetchone()
@@ -102,13 +247,115 @@ def get_user_by_email(email):
     return db.execute("SELECT * FROM users WHERE lower(email)=lower(?)",(email,)).fetchone()
 def get_user_by_tg(tg_user_id):
     return db.execute("SELECT * FROM users WHERE tg_user_id=?",(tg_user_id,)).fetchone()
+
+def insert_id(sql, params=()):
+    """Insert a row and return its generated numeric id on both supported engines."""
+    if getattr(db, "is_postgres", False):
+        row = db.execute(sql.rstrip() + " RETURNING id", params).fetchone()
+        return row["id"]
+    return db.execute(sql, params).lastrowid
+
+def create_web_login_ticket(user_id, token):
+    token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest()
+    expires=(datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat()
+    now=datetime.now(timezone.utc).isoformat()
+    db.execute("DELETE FROM web_login_tickets WHERE expires_at<=?",(now,))
+    db.execute("INSERT INTO web_login_tickets(token_hash,user_id,expires_at) VALUES(?,?,?)",(token_hash,user_id,expires))
+
+def consume_web_login_ticket(token):
+    if not token: return None
+    token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now=datetime.now(timezone.utc).isoformat()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        row=db.execute("SELECT user_id FROM web_login_tickets WHERE token_hash=? AND expires_at>?",(token_hash,now)).fetchone()
+        if not row:
+            db.execute("ROLLBACK"); return None
+        db.execute("DELETE FROM web_login_tickets WHERE token_hash=?",(token_hash,))
+        db.execute("COMMIT")
+        return row["user_id"]
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+def _ticket_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def create_telegram_auth_ticket(token):
+    token_hash = _ticket_hash(token)
+    now = datetime.now(timezone.utc)
+    expires = (now + timedelta(seconds=TELEGRAM_AUTH_TTL_SECONDS)).isoformat()
+    db.execute("DELETE FROM telegram_auth_tickets WHERE expires_at<=?", (now.isoformat(),))
+    db.execute("INSERT INTO telegram_auth_tickets(token_hash,expires_at) VALUES(?,?)", (token_hash, expires))
+
+def complete_telegram_auth_ticket(token, tg_user_id, name, username=None):
+    """Bind a one-time browser ticket to the Telegram identity that opened it."""
+    if not token:
+        return False
+    token_hash = _ticket_hash(token)
+    now = datetime.now(timezone.utc).isoformat()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        ticket = db.execute("SELECT user_id FROM telegram_auth_tickets WHERE token_hash=? AND expires_at>?", (token_hash, now)).fetchone()
+        if not ticket or ticket["user_id"] is not None:
+            db.execute("ROLLBACK")
+            return False
+        user = get_user_by_tg(tg_user_id) or get_user(tg_user_id)
+        if user is None:
+            create_user(tg_user_id, name[:50] or "Пользователь", username, tg_user_id=tg_user_id, web_verified=True)
+        else:
+            db.execute("UPDATE users SET tg_user_id=?,username=COALESCE(?,username),web_verified=1 WHERE user_id=?", (tg_user_id, username, user["user_id"]))
+        db.execute("UPDATE telegram_auth_tickets SET user_id=? WHERE token_hash=? AND user_id IS NULL", (tg_user_id, token_hash))
+        db.execute("COMMIT")
+        return True
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+def consume_telegram_auth_ticket(token):
+    if not token:
+        return None
+    token_hash = _ticket_hash(token)
+    now = datetime.now(timezone.utc).isoformat()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        row = db.execute("SELECT user_id FROM telegram_auth_tickets WHERE token_hash=? AND expires_at>?", (token_hash, now)).fetchone()
+        if not row or row["user_id"] is None:
+            db.execute("ROLLBACK")
+            return None
+        db.execute("DELETE FROM telegram_auth_tickets WHERE token_hash=?", (token_hash,))
+        db.execute("COMMIT")
+        return row["user_id"]
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+def _auth_subject(value):
+    return hashlib.sha256(value.strip().lower().encode("utf-8")).hexdigest()
+
+def auth_is_rate_limited(action, subject, limit):
+    now = datetime.now(timezone.utc).isoformat()
+    key = _auth_subject(subject)
+    db.execute("DELETE FROM auth_attempts WHERE expires_at<=?", (now,))
+    row = db.execute("SELECT attempts FROM auth_attempts WHERE action=? AND subject_hash=?", (action, key)).fetchone()
+    return bool(row and row["attempts"] >= limit)
+
+def record_auth_failure(action, subject):
+    key = _auth_subject(subject)
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=AUTH_ATTEMPT_WINDOW_SECONDS)).isoformat()
+    db.execute("""INSERT INTO auth_attempts(action,subject_hash,attempts,expires_at) VALUES(?,?,1,?)
+        ON CONFLICT(action,subject_hash) DO UPDATE SET attempts=auth_attempts.attempts+1,expires_at=excluded.expires_at""", (action, key, expires))
+
+def clear_auth_failures(action, subject):
+    db.execute("DELETE FROM auth_attempts WHERE action=? AND subject_hash=?", (action, _auth_subject(subject)))
 def create_user(user_id,name,username=None,email=None,password_hash=None,tg_user_id=None,web_verified=False):
     # Telegram registrations use the Telegram id as both the primary user id
     # and the linked Telegram identity. Web accounts are created separately
     # by create_web_user().
     actual_tg_id = user_id if tg_user_id is None else tg_user_id
-    db.execute("""INSERT OR IGNORE INTO users(user_id,name,username,email,password_hash,balance,helper_categories,tg_user_id,web_verified)
-                 VALUES(?,?,?,?,?,?,?, ?,?)""",(user_id,name,username,email,password_hash,START_BALANCE,"",actual_tg_id,int(web_verified)))
+    role = "admin" if actual_tg_id in ADMIN_TELEGRAM_IDS else "user"
+    db.execute("""INSERT OR IGNORE INTO users(user_id,name,username,email,password_hash,balance,helper_categories,tg_user_id,web_verified,role)
+                 VALUES(?,?,?,?,?,?,?,?,?,?)""",(user_id,name,username,email,password_hash,START_BALANCE,"",actual_tg_id,int(web_verified),role))
     return get_user(user_id)
 def create_web_user(name,email,password_hash):
     row=db.execute("SELECT COALESCE(MIN(user_id),0) m FROM users").fetchone()
@@ -116,9 +363,156 @@ def create_web_user(name,email,password_hash):
     db.execute("""INSERT INTO users(user_id,name,email,password_hash,balance,helper_categories,web_verified)
                   VALUES(?,?,?,?,?,?,0)""",(uid,name,email,password_hash,START_BALANCE,""))
     return uid
+
+def detach_telegram_to_web_profile(user_id):
+    """Split a linked Telegram account into an independent website profile.
+
+    Website data and active sessions move to a new negative id; the former
+    Telegram id stays as a clean bot profile.  This is reversible by linking
+    the profiles again with a new code.
+    """
+    source = get_user(user_id)
+    if not source or not source["tg_user_id"]:
+        return None
+    telegram_id = source["tg_user_id"]
+    row = db.execute("SELECT COALESCE(MIN(user_id),0) m FROM users").fetchone()
+    web_id = min(-1, int(row["m"]) - 1)
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        # Email is unique and must move from the Telegram row before the
+        # independent website record can be inserted.
+        db.execute("UPDATE users SET email=NULL WHERE user_id=?", (user_id,))
+        db.execute("""INSERT INTO users(user_id,name,username,email,password_hash,balance,helper_categories,created_at,
+                   pro_until,verified_until,business_until,favorite_slots,web_verified,lat,lon,city,bio,role,is_blocked,blocked_reason)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (web_id,source["name"],None,source["email"],source["password_hash"],source["balance"],source["helper_categories"],source["created_at"],
+                    source["pro_until"],source["verified_until"],source["business_until"],source["favorite_slots"],0,source["lat"],source["lon"],source["city"],source["bio"],source["role"],source["is_blocked"],source["blocked_reason"]))
+        for table, column in [
+            ("requests","requester_id"),("requests","helper_id"),("helper_queue","user_id"),
+            ("billing_invoices","user_id"),("subscriptions","user_id"),("web_login_tickets","user_id"),
+            ("ai_usage","user_id"),("ads","user_id"),("commercial_orders","user_id"),
+            ("chats","user_a_id"),("chats","user_b_id"),("chat_messages","user_id"),
+            ("request_candidates","candidate_id"),("sessions","user_id"),
+            ("admin_audit_log","admin_user_id"),("admin_audit_log","target_user_id")]:
+            db.execute(f"UPDATE {table} SET {column}=? WHERE {column}=?", (web_id, user_id))
+        db.execute("UPDATE favorites SET user_id=? WHERE user_id=?", (web_id, user_id))
+        db.execute("UPDATE favorites SET favorite_user_id=? WHERE favorite_user_id=?", (web_id, user_id))
+        db.execute("UPDATE identity_verification_requests SET user_id=? WHERE user_id=?", (web_id, user_id))
+        db.execute("UPDATE identity_verification_requests SET reviewer_id=? WHERE reviewer_id=?", (web_id, user_id))
+        # Keep the Telegram primary id available for a fresh, isolated bot profile.
+        db.execute("""UPDATE users SET email=NULL,password_hash=NULL,balance=?,helper_categories='',pro_until=NULL,
+                   verified_until=NULL,business_until=NULL,favorite_slots=3,web_verified=1,verification_code=NULL,
+                   verification_code_expires_at=NULL,lat=NULL,lon=NULL,city='',bio='',tg_user_id=? WHERE user_id=?""",
+                   (START_BALANCE, telegram_id, user_id))
+        db.execute("COMMIT")
+        return web_id
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+def create_link_code(user_id):
+    code=secrets.token_hex(4).upper()
+    expires=(datetime.now(timezone.utc)+timedelta(seconds=TELEGRAM_LINK_TTL_SECONDS)).isoformat()
+    db.execute("UPDATE users SET verification_code=?,verification_code_expires_at=? WHERE user_id=?",(code,expires,user_id))
+    return code
+
+def is_user_blocked(user_id):
+    user = get_user(user_id)
+    return bool(user and user["is_blocked"])
+
+def set_user_blocked(admin_user_id, target_user_id, blocked, reason=""):
+    admin = get_user(admin_user_id)
+    if not admin or admin["role"] != "admin":
+        return False
+    changed = db.execute("UPDATE users SET is_blocked=?, blocked_reason=? WHERE user_id=?", (int(blocked), reason[:300] if blocked else None, target_user_id)).rowcount
+    if changed:
+        db.execute("INSERT INTO admin_audit_log(admin_user_id,action,target_user_id,details) VALUES(?,?,?,?)", (admin_user_id, "block" if blocked else "unblock", target_user_id, json.dumps({"reason": reason[:300]} if blocked and reason else {}, ensure_ascii=False)))
+    return changed == 1
+
+def get_identity_verification(user_id):
+    return db.execute("SELECT * FROM identity_verification_requests WHERE user_id=?", (user_id,)).fetchone()
+
+def request_identity_verification(user_id):
+    """Queue a manual identity review after the owner has linked Telegram.
+
+    Linking Telegram proves control of the Telegram account; it does not by
+    itself prove a person's identity.  Keeping the two states separate avoids
+    issuing a misleading verification badge.
+    """
+    user = get_user(user_id)
+    if not user:
+        return False, "user_not_found"
+    if not user["tg_user_id"]:
+        return False, "telegram_required"
+    current = get_identity_verification(user_id)
+    if current and current["status"] == "approved":
+        return True, "approved"
+    db.execute("""INSERT INTO identity_verification_requests(user_id,status,submitted_at,reviewed_at,reviewer_id,note)
+                  VALUES(?,'pending',CURRENT_TIMESTAMP,NULL,NULL,'')
+                  ON CONFLICT(user_id) DO UPDATE SET
+                    status='pending', submitted_at=CURRENT_TIMESTAMP,
+                    reviewed_at=NULL, reviewer_id=NULL, note=''""", (user_id,))
+    return True, "pending"
+
+def pending_identity_verifications(limit=20):
+    return db.execute("""SELECT v.*,u.name,u.username,u.tg_user_id
+                         FROM identity_verification_requests v
+                         JOIN users u ON u.user_id=v.user_id
+                         WHERE v.status='pending'
+                         ORDER BY v.submitted_at ASC LIMIT ?""", (limit,)).fetchall()
+
+def review_identity_verification(admin_user_id, target_user_id, approved, note=""):
+    admin = get_user(admin_user_id)
+    if not admin or admin["role"] != "admin":
+        return False, "forbidden"
+    request = get_identity_verification(target_user_id)
+    if not request or request["status"] != "pending":
+        return False, "not_pending"
+    status = "approved" if approved else "rejected"
+    clean_note = str(note or "").strip()[:500]
+    db.execute("""UPDATE identity_verification_requests
+                  SET status=?, reviewed_at=CURRENT_TIMESTAMP, reviewer_id=?, note=?
+                  WHERE user_id=?""", (status, admin_user_id, clean_note, target_user_id))
+    if approved:
+        until = (datetime.now(timezone.utc) + timedelta(days=365)).isoformat()
+        db.execute("UPDATE users SET verified_until=? WHERE user_id=?", (until, target_user_id))
+    db.execute("INSERT INTO admin_audit_log(admin_user_id,action,target_user_id,details) VALUES(?,?,?,?)",
+               (admin_user_id, "identity_approved" if approved else "identity_rejected", target_user_id,
+                json.dumps({"note": clean_note}, ensure_ascii=False)))
+    return True, status
+
+def admin_summary():
+    users = db.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+    blocked = db.execute("SELECT COUNT(*) n FROM users WHERE is_blocked=1").fetchone()["n"]
+    requests = db.execute("SELECT status,COUNT(*) n FROM requests GROUP BY status").fetchall()
+    invoices = db.execute("SELECT status,COUNT(*) n FROM billing_invoices GROUP BY status").fetchall()
+    return {"users": users, "blocked_users": blocked, "requests": {r["status"]: r["n"] for r in requests}, "invoices": {r["status"]: r["n"] for r in invoices}}
+
+def consume_ai_quota(user_id, token_count, max_requests, max_tokens):
+    """Reserve AI quota atomically before a future AI provider call."""
+    if token_count < 0:
+        return False
+    period = datetime.now(timezone.utc).date().isoformat()
+    cur = db.execute("""INSERT INTO ai_usage(user_id,request_count,token_count,period_start)
+        VALUES(?,1,?,?)
+        ON CONFLICT(user_id,period_start) DO UPDATE SET
+        request_count=ai_usage.request_count+1, token_count=ai_usage.token_count+excluded.token_count,
+        updated_at=CURRENT_TIMESTAMP
+        WHERE ai_usage.request_count < ? AND ai_usage.token_count + excluded.token_count <= ?""",
+        (user_id, token_count, period, max_requests, max_tokens))
+    return cur.rowcount == 1
 def link_telegram(user_id,tg_user_id,username=None):
-    db.execute("UPDATE users SET tg_user_id=?, username=COALESCE(?,username), web_verified=1, verification_code=NULL WHERE user_id=?",(tg_user_id,username,user_id))
+    db.execute("UPDATE users SET tg_user_id=?, username=COALESCE(?,username), web_verified=1, verification_code=NULL, verification_code_expires_at=NULL WHERE user_id=?",(tg_user_id,username,user_id))
 def get_request(request_id): return db.execute("SELECT * FROM requests WHERE id=?",(request_id,)).fetchone()
+def get_or_create_chat_for_request(request_id):
+    """Return the one chat for an assigned request, safely under races."""
+    request=get_request(request_id)
+    if not request or not request["helper_id"]:
+        return None
+    db.execute("INSERT OR IGNORE INTO chats(request_id,user_a_id,user_b_id) VALUES(?,?,?)",
+               (request_id,request["requester_id"],request["helper_id"]))
+    row=db.execute("SELECT id FROM chats WHERE request_id=?",(request_id,)).fetchone()
+    return row["id"] if row else None
 def get_active_own_request(uid): return db.execute("SELECT * FROM requests WHERE requester_id=? AND status IN (?,?) ORDER BY id DESC LIMIT 1",(uid,STATUS_OPEN,STATUS_IN_PROGRESS)).fetchone()
 def get_active_help(uid): return db.execute("SELECT * FROM requests WHERE helper_id=? AND status=? ORDER BY id DESC LIMIT 1",(uid,STATUS_IN_PROGRESS)).fetchone()
 def get_unrated_request(uid): return db.execute("SELECT * FROM requests WHERE requester_id=? AND status=? AND requester_rating IS NULL ORDER BY id DESC LIMIT 1",(uid,STATUS_DONE)).fetchone()
@@ -163,7 +557,8 @@ def link_by_code(code,tg_user_id,username=None):
     being rejected or leaving two separate histories. The Telegram user id is kept
     as the canonical user_id because Telegram handlers address users by that id.
     """
-    row=db.execute("SELECT * FROM users WHERE verification_code=?",(code,)).fetchone()
+    now=datetime.now(timezone.utc).isoformat()
+    row=db.execute("SELECT * FROM users WHERE verification_code=? AND verification_code_expires_at>?",(code,now)).fetchone()
     if not row:
         return False,"Код не найден или уже использован."
 
@@ -175,7 +570,7 @@ def link_by_code(code,tg_user_id,username=None):
     # tg_user_id column. Treat that row as the same Telegram identity too.
     tg_row=get_user_by_tg(tg_user_id) or get_user(tg_user_id)
     if tg_row and tg_row["user_id"] == web_uid:
-        db.execute("UPDATE users SET username=COALESCE(?,username),web_verified=1,verification_code=NULL WHERE user_id=?",
+        db.execute("UPDATE users SET username=COALESCE(?,username),web_verified=1,verification_code=NULL,verification_code_expires_at=NULL WHERE user_id=?",
                    (username,web_uid))
         return True,"linked"
 
@@ -186,9 +581,16 @@ def link_by_code(code,tg_user_id,username=None):
         # first so the primary-key change remains safe with foreign_keys=ON.
         if tg_row is None:
             canonical=tg_user_id
+            admin_role = "admin" if tg_user_id in ADMIN_TELEGRAM_IDS else "user"
+            db.execute("""INSERT INTO users(user_id,name,username,balance,helper_categories,tg_user_id,web_verified,role)
+                VALUES(?,?,?,?,?,?,1,?)""", (canonical,row["name"],username,row["balance"],row["helper_categories"],tg_user_id,admin_role))
             for table,col in [
                 ("requests","requester_id"),("requests","helper_id"),
                 ("helper_queue","user_id"),("billing_invoices","user_id"),
+                ("subscriptions","user_id"),
+                ("web_login_tickets","user_id"),("ai_usage","user_id"),
+                ("admin_audit_log","admin_user_id"),("admin_audit_log","target_user_id"),
+                ("identity_verification_requests","reviewer_id"),
                 ("ads","user_id"),("commercial_orders","user_id"),
                 ("chats","user_a_id"),("chats","user_b_id"),("chat_messages","user_id"),("request_candidates","candidate_id")
             ]:
@@ -196,8 +598,10 @@ def link_by_code(code,tg_user_id,username=None):
             db.execute("UPDATE favorites SET user_id=? WHERE user_id=?",(canonical,web_uid))
             db.execute("UPDATE favorites SET favorite_user_id=? WHERE favorite_user_id=?",(canonical,web_uid))
             db.execute("UPDATE sessions SET user_id=? WHERE user_id=?",(canonical,web_uid))
-            db.execute("UPDATE users SET user_id=?,tg_user_id=?,username=COALESCE(?,username),web_verified=1,verification_code=NULL WHERE user_id=?",
-                       (canonical,tg_user_id,username,web_uid))
+            db.execute("UPDATE identity_verification_requests SET user_id=? WHERE user_id=?", (canonical, web_uid))
+            db.execute("DELETE FROM users WHERE user_id=?",(web_uid,))
+            db.execute("UPDATE users SET name=?,username=COALESCE(?,username),email=?,password_hash=?,balance=?,helper_categories=?,created_at=?,pro_until=?,verified_until=?,business_until=?,favorite_slots=?,verification_code=NULL,verification_code_expires_at=NULL,web_verified=1,lat=?,lon=?,city=?,bio=? WHERE user_id=?",
+                       (row["name"],username or row["username"],row["email"],row["password_hash"],row["balance"],row["helper_categories"],row["created_at"],row["pro_until"],row["verified_until"],row["business_until"],row["favorite_slots"],row["lat"],row["lon"],row["city"],row["bio"],canonical))
             db.execute("COMMIT")
             return True,"linked"
 
@@ -226,10 +630,33 @@ def link_by_code(code,tg_user_id,username=None):
         # INSERT OR IGNORE first to avoid collisions, then the old rows are removed.
         for table,col in [
             ("requests","requester_id"),("requests","helper_id"),
-            ("billing_invoices","user_id"),("ads","user_id"),
-            ("commercial_orders","user_id"),("chat_messages","user_id"),("request_candidates","candidate_id")
+            ("billing_invoices","user_id"),("subscriptions","user_id"),
+            ("web_login_tickets","user_id"),("ads","user_id"),
+            ("commercial_orders","user_id"),("chat_messages","user_id")
         ]:
             db.execute(f"UPDATE {table} SET {col}=? WHERE {col}=?",(canonical,web_uid))
+
+        db.execute("INSERT OR IGNORE INTO request_candidates(request_id,candidate_id,score,status,seen_at,updated_at) SELECT request_id,?,score,status,seen_at,updated_at FROM request_candidates WHERE candidate_id=?",(canonical,web_uid))
+        db.execute("DELETE FROM request_candidates WHERE candidate_id=?",(web_uid,))
+        db.execute("INSERT INTO ai_usage(user_id,request_count,token_count,period_start,updated_at) SELECT ?,request_count,token_count,period_start,updated_at FROM ai_usage WHERE user_id=? ON CONFLICT(user_id,period_start) DO UPDATE SET request_count=ai_usage.request_count+excluded.request_count,token_count=ai_usage.token_count+excluded.token_count",(canonical,web_uid))
+        db.execute("DELETE FROM ai_usage WHERE user_id=?",(web_uid,))
+        db.execute("UPDATE admin_audit_log SET admin_user_id=? WHERE admin_user_id=?",(canonical,web_uid))
+        db.execute("UPDATE admin_audit_log SET target_user_id=? WHERE target_user_id=?",(canonical,web_uid))
+
+        source_identity = get_identity_verification(web_uid)
+        target_identity = get_identity_verification(canonical)
+        if source_identity:
+            if target_identity is None:
+                db.execute("UPDATE identity_verification_requests SET user_id=? WHERE user_id=?", (canonical, web_uid))
+            elif source_identity["status"] == "approved" and target_identity["status"] != "approved":
+                db.execute("""UPDATE identity_verification_requests
+                              SET status=?,submitted_at=?,reviewed_at=?,reviewer_id=?,note=? WHERE user_id=?""",
+                           (source_identity["status"], source_identity["submitted_at"], source_identity["reviewed_at"],
+                            source_identity["reviewer_id"], source_identity["note"], canonical))
+                db.execute("DELETE FROM identity_verification_requests WHERE user_id=?", (web_uid,))
+            else:
+                db.execute("DELETE FROM identity_verification_requests WHERE user_id=?", (web_uid,))
+        db.execute("UPDATE identity_verification_requests SET reviewer_id=? WHERE reviewer_id=?", (canonical, web_uid))
 
         db.execute("UPDATE chats SET user_a_id=? WHERE user_a_id=?",(canonical,web_uid))
         db.execute("UPDATE chats SET user_b_id=? WHERE user_b_id=?",(canonical,web_uid))
@@ -253,7 +680,7 @@ def link_by_code(code,tg_user_id,username=None):
         db.execute("""UPDATE users SET
             name=?,username=?,email=?,password_hash=?,balance=?,helper_categories=?,
             pro_until=?,verified_until=?,business_until=?,favorite_slots=?,
-            tg_user_id=?,web_verified=1,verification_code=NULL,lat=?,lon=?,city=?,bio=?
+            tg_user_id=?,web_verified=1,verification_code=NULL,verification_code_expires_at=NULL,lat=?,lon=?,city=?,bio=?
             WHERE user_id=?""",
             (merged_name,merged_username,merged_email,merged_password,merged_balance,merged_categories,
              merged_pro,merged_verified,merged_business,merged_favorite_slots,tg_user_id,

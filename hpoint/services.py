@@ -1,7 +1,7 @@
 """Бизнес-логика H-Point без Telegram UI."""
-import json
+import json, re
 from .config import *
-from .database import db, get_request, get_user, get_active_help, save_request_candidates, get_request_candidates
+from .database import db, get_request, get_user, get_active_help, save_request_candidates, get_request_candidates, insert_id, request_identity_verification
 
 
 def infer_category(what: str) -> str:
@@ -30,14 +30,13 @@ def get_helper_categories(user_id: int) -> list[str]:
 
 def create_request(user_id: int, data: dict) -> int:
     category = data.get("category") or infer_category(data["what"])
-    cur = db.execute(
+    return insert_id(
         """INSERT INTO requests
         (requester_id, category, what, place, time_needed, urgency, details, status, priority_boost, lat, lon)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)""",
         (user_id, category, data["what"], data["place"], data["time_needed"], data["urgency"], data["details"], STATUS_OPEN,
          data.get("lat"), data.get("lon")),
     )
-    return cur.lastrowid
 
 
 def is_in_queue(user_id: int) -> bool:
@@ -64,7 +63,7 @@ def find_best_open_request_for(helper_id: int):
 
 def find_best_queued_helper(request):
     rows = db.execute(
-        "SELECT user_id FROM helper_queue WHERE user_id != ? ORDER BY joined_at, rowid",
+        "SELECT user_id FROM helper_queue WHERE user_id != ? ORDER BY joined_at, user_id",
         (request["requester_id"],),
     ).fetchall()
     candidates = []
@@ -79,30 +78,48 @@ def find_best_queued_helper(request):
 
 def try_assign_helper(request_id: int, helper_id: int) -> bool:
     """Атомарно назначает свободного помощника только на одну активную заявку."""
-    cur = db.execute(
-        """UPDATE requests SET helper_id = ?, status = ?
-        WHERE id = ? AND status = ? AND helper_id IS NULL AND requester_id != ?
-        AND NOT EXISTS (
-            SELECT 1 FROM requests active
-            WHERE active.helper_id = ? AND active.status = ?
-        )""",
-        (helper_id, STATUS_IN_PROGRESS, request_id, STATUS_OPEN, helper_id, helper_id, STATUS_IN_PROGRESS),
-    )
-    if cur.rowcount == 1:
-        remove_from_queue(helper_id)
-        return True
-    return False
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        if getattr(db, "is_postgres", False):
+            # Serialize assignments for one helper across distinct requests.
+            if not db.execute("SELECT user_id FROM users WHERE user_id=? FOR UPDATE", (helper_id,)).fetchone():
+                db.execute("ROLLBACK")
+                return False
+        cur = db.execute(
+            """UPDATE requests SET helper_id = ?, status = ?
+            WHERE id = ? AND status = ? AND helper_id IS NULL AND requester_id != ?
+            AND NOT EXISTS (
+                SELECT 1 FROM requests active
+                WHERE active.helper_id = ? AND active.status = ?
+            )""",
+            (helper_id, STATUS_IN_PROGRESS, request_id, STATUS_OPEN, helper_id, helper_id, STATUS_IN_PROGRESS),
+        )
+        if cur.rowcount == 1:
+            remove_from_queue(helper_id)
+            db.execute("COMMIT")
+            return True
+        db.execute("ROLLBACK")
+        return False
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
 
 
 def complete_request(request_id: int, helper_id: int) -> bool:
     try:
         db.execute("BEGIN IMMEDIATE")
-        req = db.execute("SELECT * FROM requests WHERE id = ?", (request_id,)).fetchone()
+        lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
+        req = db.execute("SELECT * FROM requests WHERE id = ?" + lock, (request_id,)).fetchone()
         if req is None or req["status"] != STATUS_IN_PROGRESS or req["helper_id"] != helper_id:
             db.execute("ROLLBACK")
             return False
-        requester = db.execute("SELECT balance FROM users WHERE user_id = ?", (req["requester_id"],)).fetchone()
-        if requester is None or requester["balance"] < REQUEST_COST:
+        user_rows = db.execute(
+            "SELECT user_id,balance FROM users WHERE user_id IN (?,?) ORDER BY user_id" + lock,
+            (req["requester_id"], helper_id),
+        ).fetchall()
+        balances = {row["user_id"]: row["balance"] for row in user_rows}
+        requester_balance = balances.get(req["requester_id"])
+        if requester_balance is None or helper_id not in balances or requester_balance < REQUEST_COST:
             db.execute("ROLLBACK")
             return False
         db.execute("UPDATE requests SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?", (STATUS_DONE, request_id))
@@ -186,7 +203,9 @@ def grant_entitlement(user_id: int, item_type: str, request_id: int | None = Non
             until = (base + timedelta(days=30)).isoformat()
         db.execute("UPDATE users SET pro_until=? WHERE user_id=?", (until, user_id))
     elif item_type == "verification":
-        db.execute("UPDATE users SET verified_until=? WHERE user_id=?", (_future_iso(365), user_id))
+        # A completed payment may cover a manual review, but it must never
+        # itself assert that a real person's identity was checked.
+        request_identity_verification(user_id)
     elif item_type in ("business", "business_pro"):
         if subscription_until:
             until = datetime.fromtimestamp(subscription_until, tz=timezone.utc).isoformat()
@@ -214,8 +233,7 @@ def create_commercial_order(user_id: int, title: str, gross_amount: int) -> int:
     if gross_amount <= 0:
         raise ValueError("gross_amount must be positive")
     commission = round(gross_amount * 10 / 100)
-    cur = db.execute("INSERT INTO commercial_orders (user_id,title,gross_amount,commission_amount) VALUES (?,?,?,?)", (user_id,title,gross_amount,commission))
-    return cur.lastrowid
+    return insert_id("INSERT INTO commercial_orders (user_id,title,gross_amount,commission_amount) VALUES (?,?,?,?)", (user_id,title,gross_amount,commission))
 
 def get_commercial_order(order_id: int):
     return db.execute("SELECT * FROM commercial_orders WHERE id=?", (order_id,)).fetchone()
@@ -249,13 +267,17 @@ def haversine_km(lat1, lon1, lat2, lon2):
     a=sin(dlat/2)**2+cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
     return 6371*2*asin(sqrt(a))
 
-def smart_match(request_id, limit=20):
+def _query_terms(query):
+    return {word for word in re.findall(r"[\wа-яё-]{3,}", (query or "").lower())}
+
+def smart_match(request_id, limit=20, query=""):
     req=get_request(request_id)
     if not req: return []
     rows=db.execute("""SELECT u.*, r.id request_id, r.category request_category, r.what, r.lat request_lat, r.lon request_lon
                        FROM users u CROSS JOIN (SELECT id,category,what,lat,lon FROM requests WHERE id=?) r
                        WHERE u.user_id != ? AND u.user_id IS NOT NULL""",(request_id,req["requester_id"])).fetchall()
     out=[]
+    terms = _query_terms(query)
     for u in rows:
         if get_active_help(u["user_id"]) is not None: continue
         cats=get_helper_categories(u["user_id"])
@@ -268,10 +290,19 @@ def smart_match(request_id, limit=20):
         verified_bonus=12 if is_verified(u["user_id"]) else 0
         pro_bonus=8 if is_pro(u["user_id"]) else 0
         distance_bonus=max(0,30-distance*3) if distance < 10 else 0
-        score=category_bonus+rating_bonus+verified_bonus+pro_bonus+distance_bonus+int(req["priority_boost"] or 0)
+        profile_text=" ".join(str(u.get(field) or "") if isinstance(u, dict) else str(u[field] or "") for field in ("name","username","city","bio","helper_categories")).lower()
+        query_bonus=min(25, 8 * sum(term in profile_text for term in terms))
+        score=category_bonus+rating_bonus+verified_bonus+pro_bonus+distance_bonus+query_bonus+int(req["priority_boost"] or 0)
+        reasons=[]
+        if category_bonus: reasons.append("подходит по категории")
+        if distance_bonus: reasons.append("рядом")
+        if rating_bonus: reasons.append("есть рейтинг")
+        if verified_bonus: reasons.append("Telegram подтверждён")
+        if query_bonus: reasons.append("соответствует уточнению")
         out.append({"user_id":u["user_id"],"name":u["name"],"username":u["username"],"rating":round(rating,1),
                     "reviews":int(stats["n"] or 0),"verified":is_verified(u["user_id"]),"distance_km":round(distance,2) if distance<999 else None,
-                    "score":round(score,1),"lat":u["lat"],"lon":u["lon"]})
+                    "score":round(score,1),"lat":round(u["lat"],2) if u["lat"] is not None else None,
+                    "lon":round(u["lon"],2) if u["lon"] is not None else None,"reasons":reasons})
     out.sort(key=lambda x:(x["score"],x["rating"],-(x["distance_km"] or 999)),reverse=True)
     out = out[:limit]
     save_request_candidates(request_id, out)

@@ -1,0 +1,15 @@
+{$CADDY_DOMAIN} {
+    encode zstd gzip
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "same-origin"
+        Permissions-Policy "geolocation=(self), camera=(), microphone=()"
+    }
+    request_body {
+        max_size 32KB
+    }
+    reverse_proxy app:8080
+}

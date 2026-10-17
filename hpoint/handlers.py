@@ -1,5 +1,7 @@
 """Telegram UI и пользовательские сценарии H-Point."""
 import logging
+import secrets
+from urllib.parse import urlencode
 from html import escape
 from aiogram import Bot, F, Router
 from aiogram.filters import CommandStart, Command, StateFilter
@@ -46,6 +48,7 @@ async def notify_match(bot: Bot, request_id: int) -> None:
     if req is None or req["helper_id"] is None:
         logging.error("Нельзя отправить уведомление: заявка %s не найдена или без помощника", request_id)
         return
+    get_or_create_chat_for_request(request_id)
     requester = get_user(req["requester_id"])
     helper = get_user(req["helper_id"])
     if requester is None or helper is None:
@@ -58,7 +61,7 @@ async def notify_match(bot: Bot, request_id: int) -> None:
             "🤝 <b>Вы нашли, кому помочь!</b>\n\n"
             f"{request_text(req)}\n\n"
             f"<b>Кому помогаете:</b> {user_link(requester)}\n\n"
-            "Свяжитесь с человеком. Когда помощь будет оказана — нажмите «Завершить помощь».",
+            "Свяжитесь с человеком на сайте или отправьте /chat ТЕКСТ. Когда помощь будет оказана — нажмите «Завершить помощь».",
             reply_markup=finish_kb(request_id),
         )
     except Exception:
@@ -70,7 +73,7 @@ async def notify_match(bot: Bot, request_id: int) -> None:
             "🎉 <b>Для вашей заявки нашёлся помощник!</b>\n\n"
             f"{request_text(req)}\n\n"
             f"<b>Ваш помощник:</b> {user_link(helper)}\n\n"
-            "Помощник свяжется с вами. После выполнения он нажмёт «Завершить помощь», "
+            "Помощник свяжется с вами. Можно ответить на сайте или командой /chat ТЕКСТ. После выполнения он нажмёт «Завершить помощь», "
             "а вас попросят оценить взаимодействие.",
             reply_markup=main_menu_kb(),
         )
@@ -118,21 +121,252 @@ async def check_not_busy(message: Message) -> bool:
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
+    payload = (message.text or "").partition(" ")[2].strip()
+    if payload.startswith("login_"):
+        ticket = payload.removeprefix("login_")
+        if complete_telegram_auth_ticket(ticket, message.from_user.id, message.from_user.full_name, message.from_user.username):
+            await message.answer(
+                "✅ <b>Telegram подтверждён.</b> Вернитесь в браузер: сайт автоматически откроет ваш общий профиль.",
+                reply_markup=main_menu_kb(),
+            )
+        else:
+            await message.answer("Эта ссылка уже использована или истекла. Вернитесь на сайт и начните вход заново.")
+        return
     user = get_user(message.from_user.id)
     if user is None:
         await state.set_state(Registration.name)
         await message.answer(
-            "👋 Добро пожаловать в <b>H-Point</b> — сервис взаимопомощи!\n\n"
-            "Как вас зовут? Напишите своё имя."
+            "👋 <b>H-Point — помощь рядом.</b>\n\n"
+            "1. Напишите имя — создадим профиль.\n"
+            "2. В меню можно попросить о помощи или предложить её.\n"
+            "3. Для сайта нажмите «🌐 Перейти на сайт».\n\n"
+            "Уже есть профиль на сайте? Откройте там «Профиль», получите код и отправьте сюда <b>/link КОД</b>.\n\n"
+            "Как вас зовут?"
         )
         return
     await show_main_menu(message, f"С возвращением, {escape(user['name'])}! Выберите действие:")
+    if payload == "profile":
+        await profile(message, state)
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await message.answer(
+        "<b>H-Point — помощь рядом</b>\n\n"
+        "Создайте заявку, чтобы попросить о помощи, или встаньте в очередь, "
+        "чтобы помочь кому-то. После подбора вы получите уведомление; "
+        "завершение заявки и оценки доступны в боте.\n\n"
+        "<b>Как подключить сайт:</b> на сайте откройте «Профиль» → «Получить код привязки», "
+        "затем отправьте боту <b>/link КОД</b>. После этого заявки и история будут общими.\n\n"
+        "Основные действия находятся в меню. Команды: /start, /profile, /website, "
+        "/history, /settings, /billing, /verifyme, /chat, /cancel, /ask.\n\n"
+        "Команда /ask уточняет подбор для вашей активной заявки. В группах бот отвечает только на команды и не публикует заявки или профили."
+    )
+
+
+@router.message(Command("ask"))
+async def cmd_ask(message: Message, state: FSMContext) -> None:
+    """Explainable local assistant: it ranks candidates without exporting user data."""
+    question = (message.text or "").partition(" ")[2].strip()
+    if message.chat.type != "private":
+        await message.answer(
+            "Я работаю в группе по командам. Для подбора людей и просмотра заявок откройте личный чат со мной — там данные доступны только участнику заявки."
+        )
+        return
+    if not await ensure_registered(message, state):
+        return
+    request = get_active_own_request(message.from_user.id)
+    if not request or request["status"] != STATUS_OPEN:
+        await message.answer("Сначала создайте открытую заявку через «🆘 Мне нужна помощь». Затем напишите, например: /ask нужен человек с опытом техники.")
+        return
+    matches = smart_match(request["id"], limit=3, query=question)
+    if not matches:
+        await message.answer("Пока подходящих свободных помощников нет. Попробуйте позже или расширьте описание заявки.")
+        return
+    text = "⚡ <b>Подбор кандидатов</b>\n\n"
+    for index, candidate in enumerate(matches, start=1):
+        reasons = ", ".join(candidate.get("reasons") or ["по параметрам заявки"])
+        distance = f" · {candidate['distance_km']} км" if candidate.get("distance_km") is not None else ""
+        text += f"{index}. <b>{escape(candidate['name'])}</b> — {escape(reasons)}{distance}\n"
+    text += "\nОткройте «⚡ Подобрать кандидатов», чтобы назначить помощника."
+    await message.answer(text, reply_markup=main_menu_kb())
+
+
+@router.message(Command("chat"))
+async def cmd_chat(message: Message, state: FSMContext, bot: Bot) -> None:
+    """Relay a private Telegram reply into the shared website chat."""
+    if message.chat.type != "private":
+        await message.answer("Для чата по заявке откройте личный диалог с H-Point.")
+        return
+    if not await ensure_registered(message, state):
+        return
+    text = (message.text or "").partition(" ")[2].strip()[:1000]
+    if not text:
+        await message.answer("Отправьте сообщение так: <b>/chat ТЕКСТ</b>")
+        return
+    user_id = message.from_user.id
+    request = get_active_own_request(user_id)
+    if not request or request["status"] != STATUS_IN_PROGRESS:
+        request = get_active_help(user_id)
+    if not request or request["status"] != STATUS_IN_PROGRESS:
+        await message.answer("Чат доступен после назначения помощника по активной заявке.")
+        return
+    chat_id = get_or_create_chat_for_request(request["id"])
+    if not chat_id:
+        await message.answer("Не удалось открыть чат по этой заявке.")
+        return
+    db.execute("INSERT INTO chat_messages(chat_id,user_id,text) VALUES(?,?,?)", (chat_id, user_id, text))
+    other_id = request["helper_id"] if request["requester_id"] == user_id else request["requester_id"]
+    other = get_user(other_id)
+    if other and other["tg_user_id"]:
+        try:
+            await bot.send_message(
+                other["tg_user_id"],
+                f"💬 Новое сообщение по заявке №{request['id']} от {escape(get_user(user_id)['name'])}. "
+                "Откройте сайт H-Point или ответьте: /chat ТЕКСТ",
+            )
+        except Exception:
+            logging.exception("Не удалось отправить уведомление о сообщении в Telegram")
+    await message.answer(f"💬 Сообщение отправлено в общий чат заявки №{request['id']}.")
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message) -> None:
+    admin = get_user(message.from_user.id)
+    if not admin or admin["role"] != "admin":
+        await message.answer("Команда доступна только администратору.")
+        return
+    summary = admin_summary()
+    reqs = ", ".join(f"{status}: {count}" for status, count in summary["requests"].items()) or "нет"
+    await message.answer(
+        "<b>Администрирование H-Point</b>\n"
+        f"Пользователей: {summary['users']} · заблокировано: {summary['blocked_users']}\n"
+        f"Заявки: {escape(reqs)}\n\n"
+        "Блокировка: /block USER_ID причина\n"
+        "Разблокировка: /unblock USER_ID\n"
+        "Проверки личности: /verifications, /verify USER_ID, /rejectverify USER_ID причина"
+    )
+
+
+@router.message(Command("block"))
+@router.message(Command("unblock"))
+async def cmd_user_block(message: Message) -> None:
+    admin = get_user(message.from_user.id)
+    if not admin or admin["role"] != "admin":
+        await message.answer("Команда доступна только администратору.")
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2:
+        await message.answer("Укажите ID пользователя.")
+        return
+    try: target_id = int(parts[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+    blocked = parts[0].split("@", 1)[0] == "/block"
+    reason = parts[2] if len(parts) > 2 and blocked else ""
+    if target_id == message.from_user.id:
+        await message.answer("Нельзя изменить собственный доступ.")
+        return
+    if not set_user_blocked(message.from_user.id, target_id, blocked, reason):
+        await message.answer("Пользователь не найден.")
+        return
+    await message.answer("Пользователь заблокирован." if blocked else "Доступ пользователя восстановлен.")
+
+
+@router.message(Command("verifications"))
+async def cmd_verifications(message: Message) -> None:
+    admin = get_user(message.from_user.id)
+    if not admin or admin["role"] != "admin":
+        await message.answer("Команда доступна только администратору.")
+        return
+    rows = pending_identity_verifications()
+    if not rows:
+        await message.answer("Заявок на проверку личности нет.")
+        return
+    items = []
+    for row in rows:
+        username = f" @{escape(row['username'])}" if row["username"] else ""
+        items.append(f"• <b>{escape(row['name'])}</b>{username} · ID <code>{row['user_id']}</code>")
+    await message.answer(
+        "<b>Ожидают ручной проверки</b>\n\n" + "\n".join(items) +
+        "\n\nОдобрить: /verify USER_ID\nОтклонить: /rejectverify USER_ID причина"
+    )
+
+
+@router.message(Command("verify"))
+@router.message(Command("rejectverify"))
+async def cmd_review_identity(message: Message, bot: Bot) -> None:
+    admin = get_user(message.from_user.id)
+    if not admin or admin["role"] != "admin":
+        await message.answer("Команда доступна только администратору.")
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2:
+        await message.answer("Укажите ID пользователя.")
+        return
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+    approved = parts[0].split("@", 1)[0] == "/verify"
+    note = parts[2] if len(parts) > 2 and not approved else ""
+    ok, status = review_identity_verification(message.from_user.id, target_id, approved, note)
+    if not ok:
+        await message.answer("Заявка не найдена, уже обработана или доступ запрещён.")
+        return
+    target = get_user(target_id)
+    if target and target["tg_user_id"]:
+        try:
+            text = "✅ Ваша личность подтверждена на 365 дней." if approved else "ℹ️ Заявка на подтверждение личности отклонена."
+            if note:
+                text += f"\nПричина: {escape(note[:500])}"
+            await bot.send_message(target["tg_user_id"], text)
+        except Exception:
+            logging.exception("Не удалось сообщить пользователю результат проверки")
+    await message.answer("Личность подтверждена." if status == "approved" else "Заявка отклонена.")
+
+
+@router.message(Command("verifyme"))
+async def cmd_request_identity_verification(message: Message, state: FSMContext) -> None:
+    if not await ensure_registered(message, state):
+        return
+    ok, status = request_identity_verification(message.from_user.id)
+    if not ok:
+        await message.answer("Сначала откройте бот в личном чате и завершите привязку Telegram.")
+        return
+    if status == "approved":
+        await message.answer("Ваша личность уже подтверждена.")
+        return
+    await message.answer(
+        "🔐 Заявка на ручную проверку отправлена. Telegram подтверждает владение аккаунтом; "
+        "решение по личности принимает администратор. Не присылайте документы в обычный чат."
+    )
+
+
+@router.message(Command("website"))
+@router.message(StateFilter(None), F.text == BTN_WEBSITE)
+async def website(message: Message, state: FSMContext) -> None:
+    if not await ensure_registered(message, state):
+        return
+    token = secrets.token_urlsafe(32)
+    create_web_login_ticket(message.from_user.id, token)
+    url = WEB_PUBLIC_URL.rstrip("/") + "/auth/telegram?" + urlencode({"ticket": token})
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Открыть мой профиль на сайте", url=url)
+    ]])
+    await message.answer(
+        "Войти на сайт в ваш профиль H-Point можно по одноразовой ссылке. "
+        "Она действует 5 минут.",
+        reply_markup=keyboard,
+    )
 
 
 @router.message(Registration.name, F.text)
 async def reg_name(message: Message, state: FSMContext) -> None:
     name = message.text.strip()
-    if name.startswith("/") or name in (BTN_NEED_HELP, BTN_WANT_HELP, BTN_FIND_CANDIDATES, BTN_MY_CANDIDATES, BTN_PROFILE, BTN_HISTORY, BTN_SETTINGS, BTN_CANCEL):
+    if name.startswith("/") or name in (BTN_NEED_HELP, BTN_WANT_HELP, BTN_FIND_CANDIDATES, BTN_MY_CANDIDATES, BTN_PROFILE, BTN_HISTORY, BTN_SETTINGS, BTN_WEBSITE, BTN_CANCEL):
         await message.answer("Пожалуйста, напишите своё имя обычным текстом.")
         return
     if not name or len(name) > MAX_NAME_LEN:
@@ -140,7 +374,11 @@ async def reg_name(message: Message, state: FSMContext) -> None:
         return
     create_user(message.from_user.id, name, message.from_user.username)
     await state.clear()
-    await show_main_menu(message, f"✅ Регистрация завершена, {escape(name)}! Вам начислено <b>{START_BALANCE} HP</b>.")
+    await show_main_menu(
+        message,
+        f"✅ Регистрация завершена, {escape(name)}! Вам начислено <b>{START_BALANCE} HP</b>.\n\n"
+        "Нажмите «🌐 Перейти на сайт», чтобы открыть этот же профиль в браузере.",
+    )
 
 
 @router.message(Registration.name)
@@ -149,9 +387,13 @@ async def reg_name_invalid(message: Message) -> None:
 
 
 async def ensure_registered(message: Message, state: FSMContext) -> bool:
-    if get_user(message.from_user.id) is None:
+    user = get_user(message.from_user.id)
+    if user is None:
         await state.set_state(Registration.name)
         await message.answer("Сначала давайте познакомимся. Как вас зовут?")
+        return False
+    if user["is_blocked"]:
+        await message.answer("Доступ к аккаунту ограничен. Обратитесь в поддержку.")
         return False
     return True
 
@@ -171,6 +413,12 @@ async def profile(message: Message, state: FSMContext) -> None:
     user = get_user(message.from_user.id)
     stats = get_user_stats(user["user_id"])
     categories = get_helper_categories(user["user_id"])
+    identity = get_identity_verification(user["user_id"])
+    identity_text = "не запрошено — /verifyme" if not identity else {
+        "pending": "заявка на ручной проверке",
+        "approved": "подтверждена",
+        "rejected": "отклонена — /verifyme для новой заявки",
+    }.get(identity["status"], identity["status"])
     text = (
         f"👤 <b>{escape(user['name'])}</b>\n\n"
         f"💰 Баланс: <b>{user['balance']} HP</b>\n"
@@ -178,6 +426,7 @@ async def profile(message: Message, state: FSMContext) -> None:
         f"📥 Помощей получено: <b>{stats['received']}</b>\n"
         f"⭐ Оценка как помощника: <b>{stars(stats['helped_avg'])}</b>\n"
         f"⭐ Оценка как получателя: <b>{stars(stats['received_avg'])}</b>\n\n"
+        f"🔐 Личность: <b>{identity_text}</b>\n"
         f"🛠 Категории помощи: {', '.join(CATEGORIES[c] for c in categories) if categories else 'не настроены'}"
     )
     await message.answer(text, reply_markup=profile_kb())
@@ -702,8 +951,7 @@ async def show_billing(message: Message, state: FSMContext) -> None:
     if is_business(user["user_id"]): status.append("💼 Business активен")
     await message.answer(
         "💳 <b>H-Point+</b>\n\n"
-        "Платные возможности оплачиваются в рублях через внешний эквайринг.\n"
-        "Telegram Stars не используются.\n\n"
+        "Платные возможности оплачиваются в рублях через внешний эквайринг или H-Points.\n\n"
         + ("\n".join(status)+"\n\n" if status else "") +
         "Выберите функцию:",
         reply_markup=billing_kb(),

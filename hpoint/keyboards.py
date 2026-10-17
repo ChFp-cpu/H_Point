@@ -7,6 +7,7 @@ def main_menu_kb():
         [KeyboardButton(text=BTN_FIND_CANDIDATES), KeyboardButton(text=BTN_MY_CANDIDATES)],
         [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_HISTORY)],
         [KeyboardButton(text=BTN_SETTINGS)],
+        [KeyboardButton(text=BTN_WEBSITE)],
         [KeyboardButton(text="💳 H-Point+" )],
     ], resize_keyboard=True)
 
@@ -58,7 +59,7 @@ def billing_kb():
         [InlineKeyboardButton(text=f"🚀 Продвижение — {PRICE_BOOST_RUB} ₽", callback_data="buy:boost")],
         [InlineKeyboardButton(text=f"🔥 Больше откликов — {PRICE_MORE_RESPONSES_RUB} ₽", callback_data="buy:more_responses")],
         [InlineKeyboardButton(text=f"⭐ PRO — {PRICE_PRO_RUB} ₽/мес", callback_data="buy:pro")],
-        [InlineKeyboardButton(text=f"✓ Верификация — {PRICE_VERIFICATION_RUB} ₽", callback_data="buy:verification")],
+        [InlineKeyboardButton(text=f"🔐 Проверка личности — {PRICE_VERIFICATION_RUB} ₽", callback_data="buy:verification")],
         [InlineKeyboardButton(text=f"📌 Избранное+ — {PRICE_FAVORITES_RUB} ₽", callback_data="buy:favorites")],
         [InlineKeyboardButton(text=f"💼 Business — {PRICE_BUSINESS_RUB} ₽/мес", callback_data="buy:business")],
         [InlineKeyboardButton(text=f"🏢 Business Pro — {PRICE_BUSINESS_PRO_RUB} ₽/мес", callback_data="buy:business_pro")],
