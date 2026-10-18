@@ -92,6 +92,21 @@ def send_email_verification_code(address, code):
     """Send a short code through the configured transactional SMTP mailbox."""
     if not email_delivery_configured():
         return False
+
+def send_password_reset_code(address, code):
+    """Deliver a one-time password-reset code without exposing account data."""
+    if not email_delivery_configured(): return False
+    message = EmailMessage(); message["Subject"] = "Восстановление пароля H-Point"; message["From"] = SMTP_FROM; message["To"] = address
+    message.set_content(f"Код для восстановления пароля H-Point: {code}\n\nКод действует 10 минут. Никому его не сообщайте.")
+    try:
+        context=ssl.create_default_context()
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as client:
+            client.ehlo()
+            if SMTP_USE_TLS: client.starttls(context=context); client.ehlo()
+            client.login(SMTP_USERNAME, SMTP_PASSWORD); client.send_message(message)
+        return True
+    except Exception:
+        logging.exception("Password reset delivery failed"); return False
     message = EmailMessage()
     message["Subject"] = "Код подтверждения H-Point"
     message["From"] = SMTP_FROM
@@ -519,6 +534,14 @@ const originalLoadForProfileMenu=window.load;
 window.load=async function(){await originalLoadForProfileMenu();let nav=$('nav');if(nav)nav.innerHTML='<button class="btn light" onclick="openProfileMenu()">👤 Профиль</button><button class="btn dark" onclick="requestForm()">+ Заявка</button>'}
 '''
 
+PASSWORD_RESET_UI=r'''
+function openPasswordReset(){ $('modal').style.display='flex';$('modalbody').innerHTML='<button class="close" onclick="closeModal()">×</button><h2>Восстановить пароль</h2><p class="muted">Введите email. Если аккаунт существует, код придёт на эту почту.</p><div class="form"><input id="resetEmail" class="input" type="email" autocomplete="email" placeholder="Email"><button class="btn grad" onclick="requestPasswordReset()">Получить код</button><div id="err" class="muted"></div></div>' }
+async function requestPasswordReset(){try{await api('/api/auth/password/reset/request',{method:'POST',body:JSON.stringify({email:$('resetEmail').value})});$('modalbody').innerHTML='<button class="close" onclick="closeModal()">×</button><h2>Новый пароль</h2><p class="muted">Введите код из письма и новый пароль.</p><div class="form"><input id="resetCode" class="input" inputmode="numeric" maxlength="6" placeholder="Код из письма"><input id="resetPassword" class="input" type="password" placeholder="Новый пароль"><input id="resetConfirm" class="input" type="password" placeholder="Повторите пароль"><button class="btn grad" onclick="confirmPasswordReset()">Сохранить пароль</button><div id="err" class="muted"></div></div>'}catch(e){$('err').textContent=e.message}}
+async function confirmPasswordReset(){let password=$('resetPassword').value,problem=passwordClientProblem(password);if(problem){$('err').textContent=problem;return}try{await api('/api/auth/password/reset/confirm',{method:'POST',body:JSON.stringify({email:$('resetEmail')?.value||window.__resetEmail,code:$('resetCode').value,password:password,password_confirm:$('resetConfirm').value})});closeModal();toast('Пароль изменён. Войдите с новым паролем.');authForm(false)}catch(e){$('err').textContent=e.message}}
+const originalRequestPasswordReset=requestPasswordReset;requestPasswordReset=async function(){window.__resetEmail=$('resetEmail').value;return originalRequestPasswordReset()}
+const originalAuthFormWithReset=window.authForm;window.authForm=function(reg){originalAuthFormWithReset(reg);if(!reg){let error=$('err');if(error)error.insertAdjacentHTML('beforebegin','<button class="btn light" type="button" onclick="openPasswordReset()">Забыли пароль?</button>')}}
+'''
+
 YANDEX_MAP_UI=r'''
 /* Russian Yandex Maps implementation.  Exact address lookup is used only for
    the owner’s request; helpers receive distances until both sides agree. */
@@ -553,7 +576,7 @@ _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandL
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
 _page_replace('<p class="audiencePortrait">H·Point создан для Ильи: он недавно переехал в новый район, работает до вечера и хочет быстро найти надёжного человека рядом, чтобы настроить роутер, донести коробки или решить другую небольшую, но срочную задачу.</p>', '')
 _page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
@@ -787,6 +810,25 @@ class Handler(BaseHTTPRequestHandler):
                 database.clear_auth_failures("login",email);database.clear_auth_failures("login_ip",subject)
                 if password_needs_upgrade(u["password_hash"]):db.execute("UPDATE users SET password_hash=? WHERE user_id=?",(ph(str(d.get("password",""))),u["user_id"]))
                 return reply(self,{"ok":True},headers=session_headers(self,u["user_id"]))
+            if p.path=="/api/auth/password/reset/request":
+                email=str(d.get("email","")).strip().lower(); subject=client_key(self)
+                if database.auth_is_rate_limited("password_reset",email,3) or database.auth_is_rate_limited("password_reset_ip",subject,5): return reply(self,{"ok":True})
+                user=get_user_by_email(email)
+                if user and email_delivery_configured():
+                    code=database.create_email_verification_code(user["user_id"]); send_password_reset_code(email,code)
+                database.record_auth_failure("password_reset",email); database.record_auth_failure("password_reset_ip",subject)
+                return reply(self,{"ok":True})
+            if p.path=="/api/auth/password/reset/confirm":
+                email=str(d.get("email","")).strip().lower(); password=str(d.get("password", "")); confirmation=str(d.get("password_confirm", ""))
+                user=get_user_by_email(email)
+                if not user:return reply(self,{"ok":False,"error":"Код недействителен или истёк."},400)
+                if password!=confirmation:return reply(self,{"ok":False,"error":"Пароли не совпадают."},400)
+                problem=password_error(password)
+                if problem:return reply(self,{"ok":False,"error":problem},400)
+                ok,_=database.verify_email_code(user["user_id"],str(d.get("code","")).strip())
+                if not ok:return reply(self,{"ok":False,"error":"Код недействителен или истёк."},400)
+                db.execute("UPDATE users SET password_hash=? WHERE user_id=?",(ph(password),user["user_id"])); db.execute("DELETE FROM sessions WHERE user_id=?",(user["user_id"],))
+                return reply(self,{"ok":True})
             if p.path=="/api/auth/email/resend":
                 u=auth(self)
                 if not u:return
