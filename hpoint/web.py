@@ -919,9 +919,14 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/auth/password/reset/request":
                 email=str(d.get("email","")).strip().lower(); subject=client_key(self)
                 if database.auth_is_rate_limited("password_reset",email,3) or database.auth_is_rate_limited("password_reset_ip",subject,5): return reply(self,{"ok":True})
+                if not email_delivery_configured():
+                    return reply(self,{"ok":False,"error":"Отправка писем временно не настроена. Обратитесь в поддержку."},503)
                 user=get_user_by_email(email)
-                if user and email_delivery_configured():
-                    code=database.create_email_verification_code(user["user_id"]); send_password_reset_code(email,code)
+                if user:
+                    code=database.create_email_verification_code(user["user_id"])
+                    if not send_password_reset_code(email,code):
+                        db.execute("DELETE FROM email_verification_codes WHERE user_id=?",(user["user_id"],))
+                        return reply(self,{"ok":False,"error":"Не удалось отправить письмо. Повторите позже."},503)
                 database.record_auth_failure("password_reset",email); database.record_auth_failure("password_reset_ip",subject)
                 return reply(self,{"ok":True})
             if p.path=="/api/auth/password/reset/confirm":
