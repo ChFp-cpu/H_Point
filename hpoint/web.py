@@ -24,11 +24,11 @@ ASSETS = {
     "hpoint-route-network.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-route-network.png", "image/png"),
     "hpoint-match-field.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-match-field.png", "image/png"),
 }
-CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com; "
-       "style-src 'self' 'unsafe-inline' blob: https://unpkg.com https://fonts.googleapis.com; "
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://api-maps.yandex.ru; "
+       "style-src 'self' 'unsafe-inline' blob: https://fonts.googleapis.com; "
        "font-src 'self' data: https://fonts.gstatic.com; "
-       "img-src 'self' data: https://tile.openstreetmap.org https://*.tile.openstreetmap.org; "
-       "connect-src 'self' https://router.project-osrm.org; "
+       "img-src 'self' data: https://*.maps.yandex.net https://*.yandex.ru; "
+       "connect-src 'self' https://*.yandex.ru https://*.maps.yandex.net; "
        "worker-src 'self' data: blob:; child-src 'self'; frame-src 'none'; frame-ancestors 'none'; "
        "base-uri 'self'; form-action 'self'")
 
@@ -519,6 +519,22 @@ const originalLoadForProfileMenu=window.load;
 window.load=async function(){await originalLoadForProfileMenu();let nav=$('nav');if(nav)nav.innerHTML='<button class="btn light" onclick="openProfileMenu()">👤 Профиль</button><button class="btn dark" onclick="requestForm()">+ Заявка</button>'}
 '''
 
+YANDEX_MAP_UI=r'''
+/* Russian Yandex Maps implementation.  Exact address lookup is used only for
+   the owner’s request; helpers receive distances until both sides agree. */
+const hpointYMaps={};
+function yMap(id,key,done){if(!window.ymaps){toast('Яндекс Карты загружаются…');return}ymaps.ready(function(){let item=hpointYMaps[key];if(!item){let element=$(id);if(!element)return;item={map:new ymaps.Map(id,{center:[55.751244,37.618423],zoom:11,controls:['zoomControl']}, {suppressMapOpenBlock:true}),objects:[]};hpointYMaps[key]=item}done(item)})}
+function yClear(item){item.objects.forEach(function(object){item.map.geoObjects.remove(object)});item.objects=[]}
+function yAdd(item,coords,label,color){let mark=new ymaps.Placemark(coords,{balloonContent:esc(label)},{preset:'islands#'+color+'Icon'});item.map.geoObjects.add(mark);item.objects.push(mark);return mark}
+function yFit(item,points){if(!points.length)return;if(points.length===1){item.map.setCenter(points[0],14);return}item.map.setBounds(ymaps.util.bounds.fromPoints(points),{checkZoomRange:true,zoomMargin:35})}
+function initMatchMap(){yMap('mapMatch','match',function(){});return null}
+function hpointRenderCandidateMap(data){yMap('mapMatch','match',function(item){yClear(item);let location=hpointCoordinates(data.request_location);if(!location)return;let point=[location.lat,location.lon];yAdd(item,point,'Ваша заявка','violet');yFit(item,[point]);let distances=(data.matches||[]).map(function(c){return c.distance_km}).filter(function(x){return x!==null&&x!==undefined}).sort(function(a,b){return a-b});let note=$('candidateMapNote');if(!note){note=document.createElement('p');note.id='candidateMapNote';note.className='candidateMapNote';$('mapMatch').after(note)}note.textContent=distances.length?'Показана ваша заявка. Точные точки помощников скрыты до взаимного согласия.':'У кандидатов пока нет геолокации.'})}
+async function loadBigMap(){hpointSetupMapPanel();let data;try{data=await api('/api/map/active')}catch(error){hpointSetMapNotice('Не удалось загрузить карту: '+error.message);return}hpointMapTasks=data.tasks||[];if(data.user_location)hpointLastLocation=hpointCoordinates(data.user_location)||hpointLastLocation;yMap('bigMap','big',function(item){yClear(item);let points=[],me=hpointSavedLocation();if(me){let point=[me.lat,me.lon];yAdd(item,point,'Вы здесь','blue');points.push(point);hpointSetMapNotice('Показана ваша текущая или последняя сохранённая геопозиция.')}hpointMapTasks.forEach(function(task){let dst=hpointCoordinates(task.destination);if(dst){let point=[dst.lat,dst.lon];yAdd(item,point,'Активная заявка: '+task.what,'green');points.push(point)}});yFit(item,points);hpointRenderMapTasks(hpointMapTasks)})}
+async function buildRoute(id){let task=hpointMapTasks.find(function(row){return Number(row.id)===Number(id)}),destination=task&&hpointCoordinates(task.destination);if(!destination){toast('У этой заявки нет геопозиции.');return}let start;try{start=await hpointGetBrowserLocation()}catch(error){start=hpointSavedLocation();if(!start){toast(hpointGeoMessage(error));return}}yMap('bigMap','big',function(item){ymaps.route([[start.lat,start.lon],[destination.lat,destination.lon]],{mapStateAutoApply:true}).then(function(route){item.map.geoObjects.add(route);item.objects.push(route);hpointSetMapNotice('Маршрут построен Яндекс Картами.')},function(){toast('Не удалось построить маршрут')})})}
+function requestForm(){ $('modal').style.display='flex';$('modalbody').innerHTML=`<h2>Новая заявка</h2><p class="muted">Укажите город и адрес или ориентир: Яндекс Карты поставят точку по этому адресу. Точный адрес виден только после назначения помощника.</p><div class="form"><input id="qw" class="input" placeholder="Что нужно сделать?"><input id="qp" class="input" placeholder="Город, улица, дом или ориентир"><input id="qt" class="input" placeholder="Когда нужна помощь?"><select id="qc" class="input"><option value="other">Другое</option><option value="carry">Перенос / переезд</option><option value="shopping">Покупки</option><option value="snow">Снег / уборка</option><option value="tools">Инструменты</option><option value="transport">Транспорт</option><option value="tech">Техника</option><option value="study">Учёба</option></select><select id="qu" class="input"><option>🔥 Очень срочно</option><option>⏳ В течение дня</option><option>🕊 Не срочно</option></select><textarea id="qd" class="input textarea" placeholder="Детали"></textarea><button class="btn grad" onclick="createReq()">Создать заявку</button><div id="rqerr" class="muted"></div></div>`}
+function createReq(){let fallback=function(){navigator.geolocation?navigator.geolocation.getCurrentPosition(function(p){sendReq(p.coords.latitude,p.coords.longitude)},function(){sendReq(null,null)},{timeout:5000,maximumAge:60000}):sendReq(null,null)};let address=(qp&&qp.value||'').trim();if(!address||!window.ymaps){fallback();return}ymaps.ready(function(){ymaps.geocode(address,{results:1}).then(function(result){let first=result.geoObjects.get(0),coords=first&&first.geometry.getCoordinates();if(coords){sendReq(coords[0],coords[1])}else{fallback()}},fallback)})}
+'''
+
 def _page_replace(needle, replacement):
     global PAGE
     if needle not in PAGE:
@@ -527,11 +543,13 @@ def _page_replace(needle, replacement):
 
 _page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+PASSWORD_CSS+MAP_CSS+"</style></head>")
 _page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg"><link rel="apple-touch-icon" href="/assets/hpoint-logo.png"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
+if YANDEX_MAPS_API_KEY:
+    PAGE=PAGE.replace('<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>', f'<script src="https://api-maps.yandex.ru/2.1/?apikey={escape(YANDEX_MAPS_API_KEY, quote=True)}&lang=ru_RU"></script>')
 _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandLogo" href="/" aria-label="H-Point"><img src="/assets/hpoint-logo-dark.png" alt="H-Point"></a>')
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
 _page_replace('<p class="audiencePortrait">H·Point создан для Ильи: он недавно переехал в новый район, работает до вечера и хочет быстро найти надёжного человека рядом, чтобы настроить роутер, донести коробки или решить другую небольшую, но срочную задачу.</p>', '')
 _page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
