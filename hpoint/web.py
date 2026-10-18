@@ -875,7 +875,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/auth/telegram/start":
                 if not _telegram_username:return reply(self,{"ok":False,"error":"telegram_login_unavailable"},503)
                 subject=client_key(self)
-                if database.auth_is_rate_limited("telegram_start",subject,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"too_many_attempts"},429)
+                if database.auth_is_rate_limited("telegram_start",subject,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"Слишком много попыток. Повторите через 15 минут."},429)
                 ticket=secrets.token_urlsafe(32)
                 database.create_telegram_auth_ticket(ticket)
                 database.record_auth_failure("telegram_start",subject)
@@ -883,7 +883,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/auth/register":
                 n=str(d.get("name","")).strip();e=str(d.get("email","")).strip().lower();pw=str(d.get("password",""));confirm=str(d.get("password_confirm",""))
                 subject=client_key(self)
-                if database.auth_is_rate_limited("register",e,AUTH_ATTEMPT_LIMIT) or database.auth_is_rate_limited("register_ip",subject,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"too_many_attempts"},429)
+                if database.auth_is_rate_limited("register",e,AUTH_ATTEMPT_LIMIT) or database.auth_is_rate_limited("register_ip",subject,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"Слишком много попыток. Повторите через 15 минут."},429)
                 if not 2<=len(n)<=MAX_NAME_LEN:return reply(self,{"ok":False,"error":"Имя должно быть от 2 до 50 символов."},400)
                 if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",e):return reply(self,{"ok":False,"error":"Введите корректный email."},400)
                 if pw!=confirm:return reply(self,{"ok":False,"error":"Пароли не совпадают."},400)
@@ -907,7 +907,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/auth/login":
                 email=str(d.get("email","")).strip().lower()
                 subject=client_key(self)
-                if database.auth_is_rate_limited("login",email,AUTH_ATTEMPT_LIMIT) or database.auth_is_rate_limited("login_ip",subject,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"too_many_attempts"},429)
+                if database.auth_is_rate_limited("login",email,AUTH_ATTEMPT_LIMIT) or database.auth_is_rate_limited("login_ip",subject,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"Слишком много попыток. Повторите через 15 минут."},429)
                 u=get_user_by_email(email)
                 if not u or not u["password_hash"] or not pv(str(d.get("password","")),u["password_hash"]):
                     database.record_auth_failure("login",email);database.record_auth_failure("login_ip",subject)
