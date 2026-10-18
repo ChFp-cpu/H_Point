@@ -24,11 +24,11 @@ ASSETS = {
     "hpoint-route-network.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-route-network.png", "image/png"),
     "hpoint-match-field.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-match-field.png", "image/png"),
 }
-CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://api-maps.yandex.ru; "
-       "style-src 'self' 'unsafe-inline' blob: https://fonts.googleapis.com; "
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://*.yandex.ru https://yastatic.net; "
+       "style-src 'self' 'unsafe-inline' blob: https://fonts.googleapis.com https://yastatic.net; "
        "font-src 'self' data: https://fonts.gstatic.com; "
-       "img-src 'self' data: https://*.maps.yandex.net https://*.yandex.ru; "
-       "connect-src 'self' https://*.yandex.ru https://*.maps.yandex.net; "
+       "img-src 'self' data: https://*.yandex.net https://*.yandex.ru https://yastatic.net; "
+       "connect-src 'self' https://*.yandex.ru https://*.yandex.net https://yastatic.net; "
        "worker-src 'self' data: blob:; child-src 'self'; frame-src 'none'; frame-ancestors 'none'; "
        "base-uri 'self'; form-action 'self'")
 
