@@ -210,6 +210,18 @@ def init_db():
       admin_reply TEXT, replied_by INTEGER REFERENCES users(user_id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       replied_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS community_events(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, creator_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', place TEXT NOT NULL,
+      starts_at TEXT NOT NULL, ends_at TEXT, capacity INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'published', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS event_participants(
+      event_id INTEGER NOT NULL REFERENCES community_events(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(event_id,user_id)
+    );
     CREATE TABLE IF NOT EXISTS ai_usage(
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
       request_count INTEGER NOT NULL DEFAULT 0, token_count INTEGER NOT NULL DEFAULT 0,
@@ -224,6 +236,8 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_request_candidates_request ON request_candidates(request_id,status,score);
     CREATE INDEX IF NOT EXISTS idx_request_candidates_candidate ON request_candidates(candidate_id,status);
     CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status,created_at);
+    CREATE INDEX IF NOT EXISTS idx_community_events_upcoming ON community_events(status,starts_at);
+    CREATE INDEX IF NOT EXISTS idx_event_participants_user ON event_participants(user_id,joined_at);
     CREATE INDEX IF NOT EXISTS idx_chat_messages_chat ON chat_messages(chat_id,id);
     CREATE INDEX IF NOT EXISTS idx_identity_verification_status ON identity_verification_requests(status,submitted_at);
     CREATE INDEX IF NOT EXISTS idx_requests_open ON requests(status,created_at);
@@ -410,6 +424,113 @@ def record_auth_failure(action, subject):
 def clear_auth_failures(action, subject):
     db.execute("DELETE FROM auth_attempts WHERE action=? AND subject_hash=?", (action, _auth_subject(subject)))
 
+def _event_timestamp(value, required=True):
+    raw = str(value or "").strip()
+    if not raw:
+        if required:
+            raise ValueError("Укажите дату и время мероприятия.")
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Укажите корректную дату и время.") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+def create_community_event(creator_id, title, description, place, starts_at, ends_at=None, capacity=0):
+    title = " ".join(str(title or "").split())
+    description = str(description or "").strip()
+    place = " ".join(str(place or "").split())
+    if not 3 <= len(title) <= 120:
+        raise ValueError("Название мероприятия должно быть от 3 до 120 символов.")
+    if len(description) > 2000:
+        raise ValueError("Описание не должно быть длиннее 2000 символов.")
+    if not 2 <= len(place) <= 180:
+        raise ValueError("Укажите место проведения.")
+    start = _event_timestamp(starts_at)
+    end = _event_timestamp(ends_at, required=False)
+    current = datetime.now(timezone.utc)
+    start_time = datetime.fromisoformat(start)
+    if start_time <= current:
+        raise ValueError("Время мероприятия должно быть в будущем.")
+    if start_time > current + timedelta(days=366):
+        raise ValueError("Мероприятие можно запланировать не более чем на год вперёд.")
+    if end and datetime.fromisoformat(end) <= start_time:
+        raise ValueError("Время окончания должно быть позже начала.")
+    try:
+        capacity = int(capacity or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Некорректное количество мест.") from exc
+    if capacity and not 2 <= capacity <= 1000:
+        raise ValueError("Количество мест — от 2 до 1000, либо оставьте поле пустым.")
+    future_count = db.execute("SELECT COUNT(*) total FROM community_events WHERE creator_id=? AND status='published' AND starts_at>?", (creator_id, current.isoformat())).fetchone()["total"]
+    if int(future_count) >= 20:
+        raise ValueError("У вас уже слишком много запланированных мероприятий.")
+    return insert_id("""INSERT INTO community_events(creator_id,title,description,place,starts_at,ends_at,capacity)
+                      VALUES(?,?,?,?,?,?,?)""", (creator_id, title, description, place, start, end, capacity))
+
+def community_events_for_user(user_id, mine=False, limit=100):
+    current = datetime.now(timezone.utc).isoformat()
+    limit = max(1, min(int(limit), 100))
+    if mine:
+        where = "(e.creator_id=? OR EXISTS(SELECT 1 FROM event_participants mine WHERE mine.event_id=e.id AND mine.user_id=?))"
+        args = (user_id, user_id, user_id, limit)
+    else:
+        where = "e.status='published' AND e.starts_at>?"
+        args = (user_id, current, limit)
+    return db.execute(f"""SELECT e.*,u.name creator_name,
+        (SELECT COUNT(*) FROM event_participants p WHERE p.event_id=e.id) participant_count,
+        CASE WHEN EXISTS(SELECT 1 FROM event_participants mine WHERE mine.event_id=e.id AND mine.user_id=?) THEN 1 ELSE 0 END joined
+        FROM community_events e JOIN users u ON u.user_id=e.creator_id
+        WHERE {where} ORDER BY CASE e.status WHEN 'published' THEN 0 ELSE 1 END,e.starts_at ASC LIMIT ?""", args).fetchall()
+
+def join_community_event(event_id, user_id):
+    current = datetime.now(timezone.utc).isoformat()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        event = db.execute("SELECT * FROM community_events WHERE id=?", (event_id,)).fetchone()
+        if not event or event["status"] != "published" or event["starts_at"] <= current:
+            db.execute("ROLLBACK")
+            return False, "Мероприятие уже недоступно."
+        if event["creator_id"] == user_id:
+            db.execute("ROLLBACK")
+            return False, "Вы организатор этого мероприятия."
+        exists = db.execute("SELECT 1 FROM event_participants WHERE event_id=? AND user_id=?", (event_id, user_id)).fetchone()
+        if exists:
+            db.execute("ROLLBACK")
+            return True, "Вы уже участвуете."
+        count = db.execute("SELECT COUNT(*) total FROM event_participants WHERE event_id=?", (event_id,)).fetchone()["total"]
+        if event["capacity"] and int(count) >= int(event["capacity"]):
+            db.execute("ROLLBACK")
+            return False, "Свободных мест уже нет."
+        db.execute("INSERT INTO event_participants(event_id,user_id) VALUES(?,?)", (event_id, user_id))
+        db.execute("COMMIT")
+        return True, "Вы участвуете в мероприятии."
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+def leave_community_event(event_id, user_id):
+    event = db.execute("SELECT creator_id,status FROM community_events WHERE id=?", (event_id,)).fetchone()
+    if not event or event["status"] != "published":
+        return False, "Мероприятие уже недоступно."
+    if event["creator_id"] == user_id:
+        return False, "Организатор не может выйти из собственного мероприятия."
+    changed = db.execute("DELETE FROM event_participants WHERE event_id=? AND user_id=?", (event_id, user_id)).rowcount
+    return (True, "Участие отменено.") if changed else (False, "Вы не записаны на это мероприятие.")
+
+def cancel_community_event(event_id, user_id, allow_admin=False):
+    event = db.execute("SELECT creator_id,status FROM community_events WHERE id=?", (event_id,)).fetchone()
+    if not event:
+        return False, "Мероприятие не найдено."
+    if event["creator_id"] != user_id and not allow_admin:
+        return False, "Отменить мероприятие может только организатор."
+    if event["status"] != "published":
+        return False, "Мероприятие уже отменено."
+    db.execute("UPDATE community_events SET status='cancelled' WHERE id=?", (event_id,))
+    return True, "Мероприятие отменено."
+
 def _email_code_hash(code):
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
@@ -576,7 +697,7 @@ def detach_telegram_to_web_profile(user_id):
             ("requests","requester_id"),("requests","helper_id"),("helper_queue","user_id"),
             ("billing_invoices","user_id"),("subscriptions","user_id"),("web_login_tickets","user_id"),
             ("email_verification_codes","user_id"),("phone_verification_codes","user_id"),
-            ("ai_usage","user_id"),("ads","user_id"),("commercial_orders","user_id"),
+            ("ai_usage","user_id"),("ads","user_id"),("commercial_orders","user_id"),("community_events","creator_id"),("event_participants","user_id"),
             ("chats","user_a_id"),("chats","user_b_id"),("chat_messages","user_id"),
             ("request_candidates","candidate_id"),("sessions","user_id"),
             ("admin_audit_log","admin_user_id"),("admin_audit_log","target_user_id")]:
@@ -916,7 +1037,7 @@ def link_by_code(code,tg_user_id,username=None):
                 ("web_login_tickets","user_id"),("ai_usage","user_id"),
                 ("admin_audit_log","admin_user_id"),("admin_audit_log","target_user_id"),
                 ("identity_verification_requests","reviewer_id"),
-                ("ads","user_id"),("commercial_orders","user_id"),
+                ("ads","user_id"),("commercial_orders","user_id"),("community_events","creator_id"),("event_participants","user_id"),
                 ("chats","user_a_id"),("chats","user_b_id"),("chat_messages","user_id"),("request_candidates","candidate_id")
             ]:
                 db.execute(f"UPDATE {table} SET {col}=? WHERE {col}=?",(canonical,web_uid))
@@ -964,7 +1085,7 @@ def link_by_code(code,tg_user_id,username=None):
             ("requests","requester_id"),("requests","helper_id"),
             ("billing_invoices","user_id"),("subscriptions","user_id"),
             ("web_login_tickets","user_id"),("ads","user_id"),
-            ("commercial_orders","user_id"),("chat_messages","user_id")
+            ("commercial_orders","user_id"),("chat_messages","user_id"),("community_events","creator_id")
         ]:
             db.execute(f"UPDATE {table} SET {col}=? WHERE {col}=?",(canonical,web_uid))
 
@@ -995,6 +1116,9 @@ def link_by_code(code,tg_user_id,username=None):
 
         db.execute("INSERT OR IGNORE INTO helper_queue(user_id,joined_at) SELECT ?,joined_at FROM helper_queue WHERE user_id=?",(canonical,web_uid))
         db.execute("DELETE FROM helper_queue WHERE user_id=?",(web_uid,))
+
+        db.execute("INSERT OR IGNORE INTO event_participants(event_id,user_id,joined_at) SELECT event_id,?,joined_at FROM event_participants WHERE user_id=?", (canonical, web_uid))
+        db.execute("DELETE FROM event_participants WHERE user_id=?", (web_uid,))
 
         db.execute("INSERT OR IGNORE INTO favorites(user_id,favorite_user_id,created_at) SELECT ?,favorite_user_id,created_at FROM favorites WHERE user_id=?",(canonical,web_uid))
         db.execute("INSERT OR IGNORE INTO favorites(user_id,favorite_user_id,created_at) SELECT user_id,?,created_at FROM favorites WHERE favorite_user_id=?",(canonical,web_uid))

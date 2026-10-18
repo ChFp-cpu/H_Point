@@ -587,6 +587,10 @@ CONTACT_VERIFICATION_CSS=r'''
 .contactVerification{grid-column:1/-1}.contactVerification h2{margin:0}.contactLead{margin:8px 0 18px;max-width:760px;line-height:1.6}.contactChecks{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:16px 0}.contactCheck{padding:12px;border:1px solid #394035;background:#11140f;color:#a9afa1;font-size:12px}.contactCheck.ok{border-color:#53723c;background:#1d2918;color:#d5ff8a}.contactCheck b{display:block;margin-bottom:4px;color:#edf0e7}.contactForm{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:12px}.contactForm .contactWide{grid-column:1/-1}.contactActions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.contactHint{margin:10px 0 0;font-size:12px;line-height:1.55}.phoneVerify{display:flex;gap:8px;align-items:center;margin-top:10px}.phoneVerify .input{max-width:190px;letter-spacing:.16em}@media(max-width:700px){.contactChecks,.contactForm{grid-template-columns:1fr}.contactForm .contactWide{grid-column:auto}.phoneVerify{align-items:stretch;flex-direction:column}.phoneVerify .input{max-width:none}.contactVerification{grid-column:auto}}.modal.adminModal{align-items:flex-start;overflow:auto;padding:30px 20px}.modal.adminModal>.box.adminShell{position:relative;width:min(1280px,100%);max-width:1280px;max-height:none;overflow:visible;margin:auto;padding:0;background:#11140f}.modal.adminModal>.box.adminShell>.close{position:absolute;z-index:4;right:18px;top:14px;float:none;padding:4px 10px;color:#edf0e7}.adminWorkspace{padding:32px;min-width:0}.adminWorkspace .adminCharts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.adminWorkspace .adminChart{overflow:hidden}.adminWorkspace .adminActivity{max-height:360px}.adminWorkspace .adminTickets{max-height:560px}@media(max-width:900px){.modal.adminModal{padding:12px}.modal.adminModal>.box.adminShell{width:100%}.adminWorkspace{padding:24px 18px}.adminWorkspace .adminCharts{grid-template-columns:1fr}}@media(max-width:600px){.adminWorkspace{padding:20px 14px}.modal.adminModal>.box.adminShell>.close{right:7px;top:8px}.adminWorkspace .adminTop{padding-right:42px}.adminWorkspace .adminCharts{grid-template-columns:1fr}.adminWorkspace .adminMetrics{grid-template-columns:repeat(2,minmax(0,1fr)}}
 '''
 
+EVENTS_CSS=r'''
+.activitiesHead{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}.activitiesHead h2{margin:0}.activitiesHead p{margin:7px 0 0;max-width:680px}.eventsList{display:grid;gap:14px}.eventCard{position:relative;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:16px;align-items:start;padding:20px;border:1px solid #3a4035;background:#171a14}.eventDate{width:74px;padding:10px 7px;text-align:center;border:1px solid #566050;background:#1e2919;color:#d5ff8a}.eventDate b{display:block;font:700 21px 'Space Mono',monospace}.eventDate span{display:block;margin-top:4px;font-size:10px;text-transform:uppercase}.eventCopy{min-width:0}.eventCopy h3{margin:0;font-size:20px}.eventMeta{display:flex;gap:8px;flex-wrap:wrap;margin:9px 0;color:#c7cec1;font-size:12px}.eventDescription{margin:0;color:#aeb6a8;line-height:1.62;white-space:pre-wrap}.eventActions{display:grid;gap:8px;justify-items:stretch;min-width:132px}.eventActions .btn{padding:10px 12px;font-size:11px}.eventCapacity{font:700 10px 'Space Mono',monospace;color:#b8f36b;text-align:center}.eventEmpty{padding:46px 22px;border:1px dashed #4b5447;text-align:center;color:#a9afa1}.eventFormNote{margin:0;font-size:12px;line-height:1.5}@media(max-width:680px){.activitiesHead{align-items:stretch;flex-direction:column}.activitiesHead .btn{width:100%}.eventCard{grid-template-columns:58px minmax(0,1fr);gap:12px;padding:15px}.eventDate{width:58px;padding:8px 4px}.eventDate b{font-size:18px}.eventCopy h3{font-size:17px}.eventActions{grid-column:1/-1;grid-template-columns:1fr 1fr;width:100%}.eventActions .eventCapacity{grid-column:1/-1}.eventActions .btn:only-child{grid-column:1/-1}}
+'''
+
 ADMIN_DASHBOARD_UI=r'''
 function adminDate(value,withTime=true){if(!value)return 'нет данных';let date=new Date(value);if(Number.isNaN(date.getTime()))return String(value);return date.toLocaleString('ru-RU',withTime?{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}:{day:'2-digit',month:'short'})}
 function adminMetric(value,label){return '<div class="adminMetric"><b>'+Number(value||0).toLocaleString('ru-RU')+'</b><span>'+esc(label)+'</span></div>'}
@@ -619,6 +623,21 @@ async function verifyPhoneCode(){let note=$('contactNotice');try{await api('/api
 // Replaces the older manual-review card.  It is intentionally defined last so
 // every profile refresh uses the automatic contact check above.
 function renderIdentityCard(u){contactVerificationCard(u)}
+'''
+
+EVENTS_UI=r'''
+function ensureActivitiesPanel(){let tabs=document.querySelector('.tabs'),app=$('app');if(!tabs||!app)return;if(!document.querySelector('[data-t="activities"]')){let tab=document.createElement('button');tab.className='tab';tab.dataset.t='activities';tab.textContent='Активности';tab.onclick=function(){go('activities')};let profile=document.querySelector('[data-t="profile"]');tabs.insertBefore(tab,profile||null)}if(!$('p-activities')){let panel=document.createElement('section');panel.id='p-activities';panel.className='panel';panel.innerHTML='<div class="activitiesHead"><div><span class="ey">СООБЩЕСТВО</span><h2>Активности рядом</h2><p class="muted">Создавайте турниры, встречи, мастер-классы и любые полезные события для района.</p></div><button class="btn grad" onclick="activityForm()">+ Новое мероприятие</button></div><div id="eventsList" class="eventsList"></div>';app.appendChild(panel)}}
+function eventDateParts(value){let date=new Date(value);if(Number.isNaN(date.getTime()))return {day:'—',month:'',full:'Дата уточняется'};return {day:String(date.getDate()).padStart(2,'0'),month:date.toLocaleDateString('ru-RU',{month:'short'}).replace('.',''),full:date.toLocaleString('ru-RU',{weekday:'short',day:'numeric',month:'long',hour:'2-digit',minute:'2-digit'})}}
+function eventTimeRange(event){let start=eventDateParts(event.starts_at).full;if(!event.ends_at)return start;let end=new Date(event.ends_at);if(Number.isNaN(end.getTime()))return start;return start+' — '+end.toLocaleString('ru-RU',{day:'numeric',month:'long',hour:'2-digit',minute:'2-digit'})}
+function eventCard(event){let date=eventDateParts(event.starts_at),full=Number(event.capacity||0)>0&&Number(event.participant_count)>=Number(event.capacity),capacity=Number(event.capacity||0)>0?Number(event.participant_count)+' / '+Number(event.capacity)+' мест':Number(event.participant_count)+' участников';let action=event.status!=='published'?'<span class="muted">Архив</span>':event.is_creator?'<button class="btn danger" onclick="cancelEvent('+Number(event.id)+')">Отменить</button>':event.joined?'<button class="btn light" onclick="leaveEvent('+Number(event.id)+')">Не участвовать</button>':full?'<button class="btn light" disabled>Мест нет</button>':'<button class="btn grad" onclick="joinEvent('+Number(event.id)+')">Участвовать</button>';let status=event.status!=='published'?'<span class="badge warn">Отменено</span>':'';return '<article class="eventCard"><div class="eventDate"><b>'+esc(date.day)+'</b><span>'+esc(date.month)+'</span></div><div class="eventCopy"><h3>'+esc(event.title)+' '+status+'</h3><div class="eventMeta"><span>◷ '+esc(eventTimeRange(event))+'</span><span>⌖ '+esc(event.place)+'</span><span>Организатор: '+esc(event.creator_name)+'</span></div>'+(event.description?'<p class="eventDescription">'+esc(event.description)+'</p>':'')+'</div><div class="eventActions"><span class="eventCapacity">'+esc(capacity)+'</span>'+action+'</div></article>'}
+async function loadActivities(mine){ensureActivitiesPanel();let host=$('eventsList');if(!host)return;host.innerHTML='<div class="eventEmpty">Загружаем мероприятия…</div>';try{let data=await api('/api/events'+(mine?'?mine=1':''));host.innerHTML=data.events.length?data.events.map(eventCard).join(''):'<div class="eventEmpty"><b>Пока нет ближайших мероприятий.</b><br>Создайте первое событие для своего района.</div>'}catch(error){host.innerHTML='<div class="eventEmpty">Не удалось загрузить мероприятия: '+esc(error.message)+'</div>'}}
+function activityForm(){$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Новое мероприятие</h2><p class="muted eventFormNote">Место и описание видны пользователям раздела «Активности». Контакты организатора не публикуются.</p><div class="form" style="margin-top:16px"><input id="eventTitle" class="input" maxlength="120" placeholder="Например: Турнир по настольному теннису"><input id="eventPlace" class="input" maxlength="180" placeholder="Место: парк, клуб, адрес или ориентир"><label class="muted">Начало<input id="eventStart" class="input" type="datetime-local" style="margin-top:5px"></label><label class="muted">Окончание, если известно<input id="eventEnd" class="input" type="datetime-local" style="margin-top:5px"></label><input id="eventCapacity" class="input" type="number" min="2" max="1000" inputmode="numeric" placeholder="Количество мест, если ограничено"><textarea id="eventDescription" class="input textarea" maxlength="2000" placeholder="Расскажите, что будет на мероприятии и что взять с собой"></textarea><button class="btn grad" onclick="createEvent()">Опубликовать мероприятие</button><div id="eventError" class="muted"></div></div>'}
+function eventIso(id){let value=$(id).value;if(!value)return '';let date=new Date(value);return Number.isNaN(date.getTime())?'':date.toISOString()}
+async function createEvent(){let error=$('eventError'),starts=eventIso('eventStart');if(!starts){error.textContent='Укажите дату и время начала.';return}try{let data=await api('/api/events',{method:'POST',body:JSON.stringify({title:$('eventTitle').value,place:$('eventPlace').value,starts_at:starts,ends_at:eventIso('eventEnd'),capacity:$('eventCapacity').value,description:$('eventDescription').value})});closeModal();toast('Мероприятие опубликовано');go('activities');await loadActivities()}catch(exception){error.textContent=exception.message}}
+async function joinEvent(id){try{let data=await api('/api/events/join',{method:'POST',body:JSON.stringify({event_id:Number(id)})});toast(data.message);await loadActivities()}catch(error){toast(error.message)}}
+async function leaveEvent(id){if(!confirm('Отменить участие в мероприятии?'))return;try{let data=await api('/api/events/leave',{method:'POST',body:JSON.stringify({event_id:Number(id)})});toast(data.message);await loadActivities()}catch(error){toast(error.message)}}
+async function cancelEvent(id){if(!confirm('Отменить мероприятие? Участники больше не смогут записаться.'))return;try{let data=await api('/api/events/cancel',{method:'POST',body:JSON.stringify({event_id:Number(id)})});toast(data.message);await loadActivities()}catch(error){toast(error.message)}}
+const hpointBaseGoForActivities=window.go;window.go=function(tab){ensureActivitiesPanel();hpointBaseGoForActivities(tab);if(tab==='activities')loadActivities()};ensureActivitiesPanel();
 '''
 
 LOCATION_PICKER_UI=r'''
@@ -655,7 +674,7 @@ def _page_replace(needle, replacement):
         raise RuntimeError("H-Point page template changed; UI override target is missing")
     PAGE=PAGE.replace(needle, replacement, 1)
 
-_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+PASSWORD_CSS+MAP_CSS+ADMIN_DASHBOARD_CSS+CONTACT_VERIFICATION_CSS+"</style></head>")
+_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+PASSWORD_CSS+MAP_CSS+ADMIN_DASHBOARD_CSS+CONTACT_VERIFICATION_CSS+EVENTS_CSS+"</style></head>")
 _page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg"><link rel="apple-touch-icon" href="/assets/hpoint-logo.png"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
 if YANDEX_MAPS_API_KEY:
     PAGE=PAGE.replace('<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>', f'<script src="https://api-maps.yandex.ru/2.1/?apikey={escape(YANDEX_MAPS_API_KEY, quote=True)}&lang=ru_RU"></script>')
@@ -663,7 +682,7 @@ _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandL
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
 _page_replace('<p class="audiencePortrait">H·Point создан для Ильи: он недавно переехал в новый район, работает до вечера и хочет быстро найти надёжного человека рядом, чтобы настроить роутер, донести коробки или решить другую небольшую, но срочную задачу.</p>', '')
 _page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+SUPPORT_UI+ADMIN_DASHBOARD_UI+ADMIN_MODAL_FIXES+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+LOCATION_PICKER_UI+CONTACT_VERIFICATION_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+SUPPORT_UI+ADMIN_DASHBOARD_UI+ADMIN_MODAL_FIXES+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+LOCATION_PICKER_UI+CONTACT_VERIFICATION_UI+EVENTS_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
@@ -790,6 +809,18 @@ class Handler(BaseHTTPRequestHandler):
                     role="Вы просили помощь" if r["requester_id"]==u["user_id"] else "Вы помогали";rating=r["requester_rating"] if r["requester_id"]==u["user_id"] else r["helper_rating"]
                     x=request_payload(r);x["role"]=role;x["rating"]=rating;out.append(x)
                 return reply(self,{"ok":True,"requests":out})
+            if p.path=="/api/events":
+                u=auth(self)
+                if not u:return
+                mine=parse_qs(p.query).get("mine",["0"])[0] in {"1","true","yes"}
+                rows=database.community_events_for_user(u["user_id"],mine=mine)
+                events=[]
+                for row in rows:
+                    item=dict(row)
+                    item["joined"]=bool(item["joined"])
+                    item["is_creator"]=item["creator_id"]==u["user_id"]
+                    events.append(item)
+                return reply(self,{"ok":True,"events":events,"mine":mine})
             if p.path=="/api/search":
                 u=auth(self)
                 if not u:return
@@ -1035,6 +1066,45 @@ class Handler(BaseHTTPRequestHandler):
                 n=str(d.get("name",u["name"])).strip()[:MAX_NAME_LEN];city=str(d.get("city","")).strip()[:80];bio=str(d.get("bio","")).strip()[:500]
                 if len(n)<2:return reply(self,{"ok":False,"error":"Имя слишком короткое."},400)
                 db.execute("UPDATE users SET name=?,city=?,bio=? WHERE user_id=?",(n,city,bio,u["user_id"]));return reply(self,{"ok":True})
+            if p.path=="/api/events":
+                u=auth(self)
+                if not u:return
+                if not verified_community_account(self,u):return
+                try:
+                    event_id=database.create_community_event(u["user_id"],d.get("title"),d.get("description"),d.get("place"),d.get("starts_at"),d.get("ends_at"),d.get("capacity"))
+                except ValueError as exc:
+                    return reply(self,{"ok":False,"error":str(exc)},400)
+                if u["tg_user_id"]:
+                    notify_telegram_user(u["tg_user_id"],f"📅 На сайте создано мероприятие «{escape(str(d.get('title',''))[:120])}»." )
+                return reply(self,{"ok":True,"event_id":event_id})
+            if p.path=="/api/events/join":
+                u=auth(self)
+                if not u:return
+                if not verified_community_account(self,u):return
+                try:event_id=int(d.get("event_id"))
+                except (TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректное мероприятие."},400)
+                ok,message=database.join_community_event(event_id,u["user_id"])
+                if not ok:return reply(self,{"ok":False,"error":message},409)
+                event=db.execute("SELECT creator_id,title FROM community_events WHERE id=?",(event_id,)).fetchone()
+                creator=get_user(event["creator_id"]) if event else None
+                if creator and creator["tg_user_id"] and creator["user_id"]!=u["user_id"]:
+                    notify_telegram_user(creator["tg_user_id"],f"📅 Пользователь записался на ваше мероприятие «{escape(event['title'])}».")
+                return reply(self,{"ok":True,"message":message})
+            if p.path=="/api/events/leave":
+                u=auth(self)
+                if not u:return
+                try:event_id=int(d.get("event_id"))
+                except (TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректное мероприятие."},400)
+                ok,message=database.leave_community_event(event_id,u["user_id"])
+                return reply(self,{"ok":ok,"error":None if ok else message,"message":message},200 if ok else 409)
+            if p.path=="/api/events/cancel":
+                u=auth(self)
+                if not u:return
+                try:event_id=int(d.get("event_id"))
+                except (TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректное мероприятие."},400)
+                ok,message=database.cancel_community_event(event_id,u["user_id"],allow_admin=u["role"]=="admin")
+                if not ok:return reply(self,{"ok":False,"error":message},403)
+                return reply(self,{"ok":True,"message":message})
             if p.path=="/api/support":
                 u=auth(self)
                 if not u:return
