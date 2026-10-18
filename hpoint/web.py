@@ -509,6 +509,16 @@ async function loadBigMap(){hpointSetupMapPanel();let map=hpointMap('bigMap','bi
 async function buildRoute(id){let task=hpointMapTasks.find(function(row){return Number(row.id)===Number(id)});let destination=task&&hpointCoordinates(task.destination);if(!destination){toast('У этой заявки нет геопозиции.');return}let start=null;try{start=await hpointGetBrowserLocation()}catch(error){start=hpointSavedLocation();if(!start){toast(hpointGeoMessage(error));return}}try{let url='https://router.project-osrm.org/route/v1/driving/'+start.lon+','+start.lat+';'+destination.lon+','+destination.lat+'?overview=full&geometries=geojson&steps=false';let response=await fetch(url);let data=await response.json();if(!response.ok||data.code!=='Ok'||!data.routes||!data.routes[0])throw new Error('маршрут пока недоступен');let route=data.routes[0];let map=hpointMap('bigMap','big');if(hpointMapLayers.route)hpointMapLayers.route.clearLayers();else hpointMapLayers.route=L.layerGroup().addTo(map);let routeLayer=L.geoJSON(route.geometry,{style:{color:'#087bff',weight:6,opacity:.86}}).addTo(hpointMapLayers.route);map.fitBounds(routeLayer.getBounds(),{padding:[42,42]});let km=(route.distance/1000).toLocaleString('ru-RU',{maximumFractionDigits:1});let minutes=Math.max(1,Math.round(route.duration/60));hpointSetMapNotice('Маршрут: '+km+' км · около '+minutes+' мин.')}catch(error){toast('Не удалось построить маршрут: '+error.message)}}
 '''
 
+# One account menu keeps identity-changing actions in a single, explicit place.
+# A full reload after a switch clears all rendered data and in-memory polling
+# state that belonged to the previous account.
+PROFILE_MENU_UI=r'''
+function openProfileMenu(){api('/api/me').then(function(data){let u=data.user;$('modal').style.display='flex';$('modalbody').innerHTML='<button class="close" onclick="closeModal()">×</button><h2>'+esc(u.name)+'</h2><p class="muted">'+esc(u.email||'Профиль Telegram')+'</p><div class="profileActions"><button class="btn grad" onclick="closeModal();go(\'profile\')">Мой профиль</button><button class="btn light" onclick="openProfiles()">Сменить аккаунт</button><button class="btn light" onclick="closeModal();authForm(true)">Добавить аккаунт</button><button class="btn light" onclick="logout()">Выйти из аккаунта</button><button class="btn danger" onclick="deleteAccount()">Удалить аккаунт</button></div>'}).catch(function(e){toast(e.message)})}
+async function switchProfile(id){try{stopSync();await api('/api/profiles/switch',{method:'POST',body:JSON.stringify({user_id:id})});sessionStorage.removeItem('hpointLastLocation');sessionStorage.removeItem('hpointTelegramLoginTicket');location.replace('/')}catch(e){toast(e.message)}}
+const originalLoadForProfileMenu=window.load;
+window.load=async function(){await originalLoadForProfileMenu();let nav=$('nav');if(nav)nav.innerHTML='<button class="btn light" onclick="openProfileMenu()">👤 Профиль</button><button class="btn dark" onclick="requestForm()">+ Заявка</button>'}
+'''
+
 def _page_replace(needle, replacement):
     global PAGE
     if needle not in PAGE:
@@ -521,7 +531,7 @@ _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandL
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
 _page_replace('<p class="audiencePortrait">H·Point создан для Ильи: он недавно переехал в новый район, работает до вечера и хочет быстро найти надёжного человека рядом, чтобы настроить роутер, донести коробки или решить другую небольшую, но срочную задачу.</p>', '')
 _page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
@@ -793,6 +803,11 @@ class Handler(BaseHTTPRequestHandler):
                 device=cookie_value(self,"hpoint_device")
                 row=db.execute("SELECT 1 FROM sessions WHERE user_id=? AND device_id=? AND expires_at>? LIMIT 1",(target,device,now().isoformat())).fetchone() if device else None
                 if not row:return reply(self,{"ok":False,"error":"Этот профиль недоступен на устройстве."},403)
+                # Rotate the browser session on every switch.  This prevents a
+                # stale session token from being reused after the UI changes
+                # identity and makes all subsequent requests unambiguous.
+                current=cookie_value(self,"hpoint_session")
+                if current: db.execute("DELETE FROM sessions WHERE token=?",(current,))
                 return reply(self,{"ok":True},headers=session_headers(self,target))
             if p.path=="/api/profile/telegram/unlink":
                 u=auth(self)
