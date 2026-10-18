@@ -154,7 +154,8 @@ def init_db():
       details TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', rating INTEGER,
       requester_rating INTEGER, requester_review TEXT, helper_rating INTEGER, helper_review TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT,
-      priority_boost INTEGER NOT NULL DEFAULT 0, lat REAL, lon REAL
+      priority_boost INTEGER NOT NULL DEFAULT 0, lat REAL, lon REAL,
+      expires_at TEXT, views INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS helper_queue(user_id INTEGER PRIMARY KEY REFERENCES users(user_id), joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS billing_invoices(
@@ -221,12 +222,13 @@ def init_db():
       ("users","verification_code","TEXT"),("users","verification_code_expires_at","TEXT"),("users","web_verified","INTEGER NOT NULL DEFAULT 0"),("users","email_verified","INTEGER NOT NULL DEFAULT 0"),
       ("users","lat","REAL"),("users","lon","REAL"),("users","city","TEXT DEFAULT ''"),("users","bio","TEXT DEFAULT ''"),
       ("users","role","TEXT NOT NULL DEFAULT 'user'"),("users","is_blocked","INTEGER NOT NULL DEFAULT 0"),("users","blocked_reason","TEXT"),
-      ("requests","lat","REAL"),("requests","lon","REAL"),("billing_invoices","amount_rub","INTEGER NOT NULL DEFAULT 0"),
+      ("requests","lat","REAL"),("requests","lon","REAL"),("requests","expires_at","TEXT"),("requests","views","INTEGER NOT NULL DEFAULT 0"),("billing_invoices","amount_rub","INTEGER NOT NULL DEFAULT 0"),
       ("billing_invoices","currency","TEXT NOT NULL DEFAULT 'RUB'"),("billing_invoices","provider_payment_id","TEXT")
       ,("sessions","device_id","TEXT")
     ]: _add_column(t,n,d)
     # Legacy payment columns remain for backwards-compatible data, but new code never uses them.
     db.execute("CREATE INDEX IF NOT EXISTS idx_requests_geo ON requests(status,lat,lon)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_requests_expires ON requests(status,expires_at)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_device ON sessions(device_id,expires_at)")
     if not getattr(db, "is_postgres", False):
         try: db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tg ON users(tg_user_id) WHERE tg_user_id IS NOT NULL")
