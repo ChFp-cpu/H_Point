@@ -17,6 +17,7 @@ _telegram_bot = None
 _telegram_loop = None
 _telegram_username = BOT_USERNAME or None
 ASSETS = {
+    "favicon.svg": (Path(__file__).resolve().parent.parent / "assets" / "favicon.svg", "image/svg+xml"),
     "hpoint-logo.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-logo.png", "image/png"),
     "hpoint-logo-dark.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-logo-dark.png", "image/png"),
     "hpoint-brand-hero.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-brand-hero.png", "image/png"),
@@ -453,7 +454,7 @@ def _page_replace(needle, replacement):
     PAGE=PAGE.replace(needle, replacement, 1)
 
 _page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+"</style></head>")
-_page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
+_page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg"><link rel="apple-touch-icon" href="/assets/hpoint-logo.png"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
 _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandLogo" href="/" aria-label="H-Point"><img src="/assets/hpoint-logo-dark.png" alt="H-Point"></a>')
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
 _page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')

@@ -14,6 +14,7 @@ class Web(unittest.TestCase):
   self.assertEqual(database.get_request(rid)["category"],"tech")
  def test_page_contains_platform(self):
   self.assertIn("Smart Match",web.PAGE);self.assertIn("Telegram",web.PAGE);self.assertIn("руб",web.PAGE)
+  self.assertIn('rel="icon" type="image/svg+xml" href="/assets/favicon.svg"',web.PAGE)
   self.assertIn("timeout:2500",web.PAGE)
   self.assertIn("&csp=true",web.PAGE)
   self.assertIn("Создать профиль",web.PAGE)
@@ -26,7 +27,7 @@ class Web(unittest.TestCase):
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
   try:
    base=f"http://127.0.0.1:{server.server_address[1]}"
-   for path,content_type in (("/","text/html"),("/api/health","application/json")):
+   for path,content_type in (("/","text/html"),("/api/health","application/json"),("/assets/favicon.svg","image/svg+xml")):
     req=urllib.request.Request(base+path,method="HEAD")
     with urllib.request.urlopen(req,timeout=3) as response:
      self.assertEqual(response.status,200);self.assertEqual(response.headers.get_content_type(),content_type);self.assertEqual(response.read(),b"")
