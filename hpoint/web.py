@@ -152,6 +152,7 @@ def new_sess(uid, device_id=None):
     e=(now()+dt.timedelta(seconds=SESSION_TTL)).isoformat()
     db.execute("DELETE FROM sessions WHERE expires_at<=?", (now().isoformat(),))
     db.execute("INSERT INTO sessions(token,user_id,expires_at,device_id) VALUES(?,?,?,?)",(t,uid,e,device_id))
+    database.touch_user_activity(uid)
     return t
 
 def session_cookie(value, max_age):
@@ -554,6 +555,30 @@ const originalRequestPasswordReset=requestPasswordReset;requestPasswordReset=asy
 const originalAuthFormWithReset=window.authForm;window.authForm=function(reg){originalAuthFormWithReset(reg);if(!reg){let error=$('err');if(error)error.insertAdjacentHTML('beforebegin','<button class="btn light" type="button" onclick="openPasswordReset()">Забыли пароль?</button>')}}
 '''
 
+ADMIN_DASHBOARD_CSS=r'''
+/* Administrator workspace */
+.adminWorkspace{width:min(1180px,100%);max-width:1180px;padding:28px;background:#11140f;color:#edf0e7}
+.adminWorkspace .close{color:#edf0e7}.adminWorkspace h2{margin:0;font-size:30px}.adminTop{display:flex;gap:18px;align-items:flex-start;justify-content:space-between;padding-bottom:20px;border-bottom:1px solid #394035}.adminKicker{margin:0 0 6px;color:#b8f36b;font:700 10px 'Space Mono',monospace;letter-spacing:.14em}.adminSub{margin:8px 0 0;color:#a9afa1;font-size:13px}.adminRefresh{white-space:nowrap}.adminMetrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:19px 0}.adminMetric{padding:15px;border:1px solid #394035;background:#171a14}.adminMetric b{display:block;font-size:26px;letter-spacing:-.06em;color:#dfffb0}.adminMetric span{display:block;margin-top:6px;color:#a9afa1;font-size:11px}.adminGrid{display:grid;grid-template-columns:1.2fr .8fr;gap:12px}.adminCard{min-width:0;padding:18px;border:1px solid #394035;background:#171a14}.adminCard h3{margin:0 0 14px;font-size:16px}.adminChart{display:flex;align-items:flex-end;gap:5px;height:170px;padding-top:16px;border-bottom:1px solid #394035}.adminBar{flex:1;min-width:12px;position:relative;height:100%;display:flex;align-items:flex-end}.adminBar i{display:block;width:100%;min-height:4px;background:#b8f36b}.adminBar b{position:absolute;bottom:calc(100% + 5px);left:50%;transform:translateX(-50%);font-size:10px;color:#dfe5d9}.adminChartLabels{display:flex;justify-content:space-between;gap:5px;margin-top:8px;color:#899184;font:10px 'Space Mono',monospace}.adminTable{display:grid;gap:7px}.adminUser{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid #30362d}.adminUser:last-child{border-bottom:0}.adminUserCopy{min-width:0;flex:1}.adminUserCopy b,.adminUserCopy span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.adminUserCopy span{margin-top:3px;color:#a9afa1;font-size:11px}.adminState{display:flex;gap:5px;flex-wrap:wrap}.adminState .badge{font-size:9px}.adminUserActions{display:flex;gap:7px;flex-wrap:wrap}.adminUserActions .btn{padding:8px 11px;font-size:10px}.adminTickets{display:grid;gap:10px;max-height:470px;overflow:auto;padding-right:3px}.adminTicket{padding:14px;border:1px solid #394035;background:#11140f}.adminTicket h4{margin:0 0 5px;font-size:14px}.adminTicket p{margin:9px 0;color:#d6dcd1;font-size:12px;line-height:1.55;white-space:pre-wrap}.adminTicket small{color:#a9afa1}.adminTicket textarea{margin-top:8px;min-height:76px}.adminTicket .btn{margin-top:8px;padding:9px 13px;font-size:11px}.adminActivity{display:grid;gap:7px;max-height:430px;overflow:auto}.adminActivityItem{display:flex;gap:9px;align-items:flex-start;padding:9px 0;border-bottom:1px solid #30362d}.adminActivityItem:last-child{border-bottom:0}.adminActivityDot{width:8px;height:8px;flex:0 0 auto;margin-top:5px;background:#b8f36b}.adminActivityItem b{display:block;font-size:12px}.adminActivityItem span{display:block;margin-top:3px;color:#a9afa1;font-size:11px}.adminSearch{display:flex;gap:8px;margin:-1px 0 11px}.adminSearch .input{min-width:0}.adminEmpty{padding:20px 0;color:#a9afa1;font-size:12px}.adminWorkspace .danger{color:#ffc8bf;border-color:#8f4137}.adminWorkspace .input{background:#10120f;color:#edf0e7;border-color:#444b40}
+@media(max-width:900px){.adminMetrics{grid-template-columns:repeat(3,minmax(0,1fr))}.adminGrid{grid-template-columns:1fr}.adminWorkspace{max-height:94vh;padding:22px 16px}}
+@media(max-width:600px){.adminTop{align-items:flex-start;flex-direction:column;gap:12px}.adminMetrics{grid-template-columns:repeat(2,minmax(0,1fr))}.adminMetric b{font-size:23px}.adminWorkspace h2{font-size:25px}.adminUser{align-items:flex-start;flex-wrap:wrap}.adminUserActions{width:100%}.adminUserActions .btn{flex:1}.adminSearch{flex-direction:column}.adminSearch .btn{width:100%}.adminChart{height:135px}.adminCard{padding:14px}}
+'''
+
+ADMIN_DASHBOARD_UI=r'''
+function adminDate(value,withTime=true){if(!value)return 'нет данных';let date=new Date(value);if(Number.isNaN(date.getTime()))return String(value);return date.toLocaleString('ru-RU',withTime?{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}:{day:'2-digit',month:'short'})}
+function adminMetric(value,label){return '<div class="adminMetric"><b>'+Number(value||0).toLocaleString('ru-RU')+'</b><span>'+esc(label)+'</span></div>'}
+function adminChart(series,key,label){let values=series.map(function(point){return Number(point[key]||0)}),max=Math.max(1,...values);return '<div class="adminCard"><h3>'+esc(label)+'</h3><div class="adminChart">'+series.map(function(point){let value=Number(point[key]||0),height=Math.max(4,Math.round(value/max*100));return '<div class="adminBar" title="'+esc(point.date)+': '+value+'"><i style="height:'+height+'%"></i><b>'+value+'</b></div>'}).join('')+'</div><div class="adminChartLabels"><span>'+esc(series[0]?.date?.slice(5)||'')+'</span><span>'+esc(series.at(-1)?.date?.slice(5)||'')+'</span></div></div>'}
+function adminUserRow(user){let states=(user.telegram_linked?'<span class="badge ok">Telegram</span>':'')+(user.email_verified?'<span class="badge ok">email</span>':'')+(user.blocked?'<span class="badge warn">заблокирован</span>':'')+(user.role==='admin'?'<span class="badge">админ</span>':'');let safety=user.role==='admin'?'':user.blocked?'<button class="btn light" onclick="adminSetBlock('+Number(user.id)+',false)">Разблокировать</button>':'<button class="btn danger" onclick="adminSetBlock('+Number(user.id)+',true)">Ограничить</button>';return '<div class="adminUser"><div class="avatar">'+esc((user.name||'?')[0])+'</div><div class="adminUserCopy"><b>'+esc(user.name)+'</b><span>'+esc(user.email||'Email не указан')+' · '+esc(user.city||'Город не указан')+'</span><span>Последняя активность: '+esc(adminDate(user.last_seen_at))+' · заявок: '+Number(user.request_count||0)+' · активных: '+Number(user.active_request_count||0)+'</span><div class="adminState">'+states+'</div></div><div class="adminUserActions">'+safety+'</div></div>'}
+function adminTicketRow(ticket){return '<article class="adminTicket"><h4>#'+Number(ticket.id)+' · '+esc(ticket.subject)+'</h4><small>'+esc(ticket.user_name)+' · '+esc(ticket.user_email||'без email')+' · '+esc(adminDate(ticket.created_at))+'</small><p>'+esc(ticket.message)+'</p>'+(ticket.admin_reply?'<p><b>Ваш ответ:</b> '+esc(ticket.admin_reply)+'</p>':'')+'<textarea id="adminReply'+Number(ticket.id)+'" class="input textarea" maxlength="2000" placeholder="Ответ пользователю">'+esc(ticket.admin_reply||'')+'</textarea><button class="btn grad" onclick="replySupport('+Number(ticket.id)+',true)">Сохранить ответ</button></article>'}
+function adminActivityRow(item){let action=item.kind==='request'&&['open','in_progress'].includes(item.status)?'<button class="btn light" onclick="adminCancelRequest('+Number(item.target_id)+')">Закрыть</button>':'';return '<div class="adminActivityItem"><i class="adminActivityDot"></i><div class="grow"><b>'+esc(item.title)+'</b><span>'+esc(item.meta)+' · '+esc(adminDate(item.at))+'</span></div>'+action+'</div>'}
+function renderAdminDashboard(data){let summary=data.summary||{},series=data.series||[],users=data.users||[],tickets=data.tickets||[],activities=data.activities||[];$('modal').style.display='flex';$('modalbody').className='box adminWorkspace';$('modalbody').innerHTML='<button class="close" onclick="closeAdminPanel()">×</button><div class="adminTop"><div><p class="adminKicker">H·POINT · ADMIN</p><h2>Управление сообществом</h2><p class="adminSub">Статистика, обращения и доступ пользователей. Обновлено: '+esc(adminDate(new Date().toISOString()))+'</p></div><button class="btn light adminRefresh" onclick="openAdminSupport()">Обновить</button></div><div class="adminMetrics">'+adminMetric(summary.users,'Всего пользователей')+adminMetric(summary.active_24h,'Активны за 24 часа')+adminMetric(summary.active_7d,'Активны за 7 дней')+adminMetric((summary.requests||{}).open,'Открытые заявки')+adminMetric((summary.support||{}).open,'Ожидают ответа')+'</div><div class="adminGrid"><section class="adminCard"><h3>Динамика за 14 дней</h3><div class="adminGrid">'+adminChart(series,'users','Регистрации')+adminChart(series,'requests','Новые заявки')+'</div></section><section class="adminCard"><h3>Последняя активность</h3><div class="adminActivity">'+(activities.map(adminActivityRow).join('')||'<p class="adminEmpty">Событий пока нет.</p>')+'</div></section><section class="adminCard"><h3>Пользователи</h3><div class="adminSearch"><input id="adminUserSearch" class="input" maxlength="80" placeholder="Имя или email"><button class="btn light" onclick="adminSearchUsers()">Найти</button></div><div class="adminTable">'+(users.map(adminUserRow).join('')||'<p class="adminEmpty">Пользователи не найдены.</p>')+'</div></section><section class="adminCard"><h3>Обращения в поддержку</h3><div class="adminTickets">'+(tickets.map(adminTicketRow).join('')||'<p class="adminEmpty">Обращений пока нет.</p>')+'</div></section></div>';}
+function closeAdminPanel(){$('modalbody').className='box';closeModal()}
+async function openAdminSupport(query){try{let suffix=query?'?q='+encodeURIComponent(query):'';let data=await api('/api/admin/dashboard'+suffix);renderAdminDashboard(data)}catch(e){toast(e.message||'Не удалось открыть панель администратора')}}
+async function adminSearchUsers(){return openAdminSupport(($('adminUserSearch')?.value||'').trim())}
+async function replySupport(id,fromDashboard){try{let field=$('adminReply'+Number(id))||$('reply'+Number(id));await api('/api/admin/support/reply',{method:'POST',body:JSON.stringify({ticket_id:Number(id),message:field?.value||''})});toast('Ответ отправлен пользователю');if(fromDashboard)openAdminSupport();else openAdminSupport()}catch(e){toast(e.message)}}
+async function adminSetBlock(id,blocked){let reason='';if(blocked){reason=prompt('Укажите причину ограничения доступа:')||'';if(!reason.trim()){toast('Укажите причину ограничения.');return}}try{await api('/api/admin/users/block',{method:'POST',body:JSON.stringify({user_id:Number(id),blocked:Boolean(blocked),reason:reason})});toast(blocked?'Доступ ограничен':'Доступ восстановлен');openAdminSupport()}catch(e){toast(e.message)}}
+async function adminCancelRequest(id){let reason=prompt('Причина закрытия заявки:');if(reason===null)return;try{await api('/api/admin/requests/cancel',{method:'POST',body:JSON.stringify({request_id:Number(id),reason:reason})});toast('Заявка закрыта');openAdminSupport()}catch(e){toast(e.message)}}
+'''
+
 LOCATION_PICKER_UI=r'''
 function locationPicker(id,onPick){if(!window.ymaps){toast('Яндекс Карты ещё загружаются.');return}ymaps.ready(function(){let host=$(id);if(!host)return;let map=new ymaps.Map(id,{center:[55.751244,37.618423],zoom:11,controls:['zoomControl','searchControl']},{suppressMapOpenBlock:true});let mark=null;map.events.add('click',function(event){let point=event.get('coords');if(mark)map.geoObjects.remove(mark);mark=new ymaps.Placemark(point,{balloonContent:'Выбранная точка'},{preset:'islands#blueDotIcon'});map.geoObjects.add(mark);onPick({lat:point[0],lon:point[1]})});let hint=document.createElement('p');hint.className='muted';hint.textContent='Нажмите на карте в нужном месте, чтобы поставить точку.';host.after(hint)})}
 function requestForm(){hpointRequestPoint=null;$('modal').style.display='flex';$('modalbody').innerHTML=`<h2>Новая заявка</h2><p class="muted">Укажите адрес или вручную поставьте точку на карте. Точный адрес виден только после назначения помощника.</p><div class="form"><input id="qw" class="input" placeholder="Что нужно сделать?"><input id="qp" class="input" placeholder="Город, улица, дом или ориентир"><div id="requestPicker" class="map" style="height:230px"></div><input id="qt" class="input" placeholder="Когда нужна помощь?"><label class="muted">Срок публикации: <b id="requestDuration">2 дня</b></label><input id="requestHours" type="range" min="1" max="168" value="48" step="1" oninput="$('requestDuration').textContent=this.value==24?'1 день':this.value==48?'2 дня':this.value+' ч.'"><select id="qc" class="input"><option value="other">Другое</option><option value="carry">Перенос / переезд</option><option value="shopping">Покупки</option><option value="snow">Снег / уборка</option><option value="tools">Инструменты</option><option value="transport">Транспорт</option><option value="tech">Техника</option><option value="study">Учёба</option></select><select id="qu" class="input"><option>🔥 Очень срочно</option><option>⏳ В течение дня</option><option>🕊 Не срочно</option></select><textarea id="qd" class="input textarea" placeholder="Детали"></textarea><button class="btn grad" onclick="createReq()">Создать заявку</button><div id="rqerr" class="muted"></div></div>`;setTimeout(function(){locationPicker('requestPicker',function(point){hpointRequestPoint=point;$('rqerr').textContent='Точка выбрана на карте.'})},20)}
@@ -588,7 +613,7 @@ def _page_replace(needle, replacement):
         raise RuntimeError("H-Point page template changed; UI override target is missing")
     PAGE=PAGE.replace(needle, replacement, 1)
 
-_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+PASSWORD_CSS+MAP_CSS+"</style></head>")
+_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+PASSWORD_CSS+MAP_CSS+ADMIN_DASHBOARD_CSS+"</style></head>")
 _page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg"><link rel="apple-touch-icon" href="/assets/hpoint-logo.png"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
 if YANDEX_MAPS_API_KEY:
     PAGE=PAGE.replace('<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>', f'<script src="https://api-maps.yandex.ru/2.1/?apikey={escape(YANDEX_MAPS_API_KEY, quote=True)}&lang=ru_RU"></script>')
@@ -596,7 +621,7 @@ _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandL
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
 _page_replace('<p class="audiencePortrait">H·Point создан для Ильи: он недавно переехал в новый район, работает до вечера и хочет быстро найти надёжного человека рядом, чтобы настроить роутер, донести коробки или решить другую небольшую, но срочную задачу.</p>', '')
 _page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+SUPPORT_UI+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+LOCATION_PICKER_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+SUPPORT_UI+ADMIN_DASHBOARD_UI+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+LOCATION_PICKER_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
@@ -660,6 +685,14 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/admin/summary":
                 if not admin_auth(self): return
                 return reply(self,{"ok":True,"summary":admin_summary()})
+            if p.path=="/api/admin/dashboard":
+                if not admin_auth(self): return
+                query=parse_qs(p.query)
+                try: days=int(query.get("days",[14])[0])
+                except (TypeError,ValueError): days=14
+                try: limit=int(query.get("limit",[100])[0])
+                except (TypeError,ValueError): limit=100
+                return reply(self,{"ok":True,**database.admin_dashboard(days,limit,query.get("q",[""])[0])})
             if p.path=="/api/me":
                 u=auth(self)
                 if not u:return
@@ -939,6 +972,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not message:return reply(self,{"ok":False,"error":"Введите ответ."},400)
                 changed=db.execute("UPDATE support_tickets SET admin_reply=?,replied_by=?,replied_at=CURRENT_TIMESTAMP,status='answered' WHERE id=?",(message,admin["user_id"],ticket_id)).rowcount
                 if not changed:return reply(self,{"ok":False,"error":"Обращение не найдено."},404)
+                database.record_admin_action(admin["user_id"],"support_replied",None,{"ticket_id":ticket_id})
                 return reply(self,{"ok":True})
             if p.path=="/api/identity-verification":
                 u=auth(self)
@@ -955,6 +989,20 @@ class Handler(BaseHTTPRequestHandler):
                 blocked=bool(d.get("blocked",True))
                 if target_id==admin["user_id"]:return reply(self,{"ok":False,"error":"Нельзя изменить свой доступ."},400)
                 if not set_user_blocked(admin["user_id"],target_id,blocked,str(d.get("reason", ""))):return reply(self,{"ok":False,"error":"Пользователь не найден."},404)
+                return reply(self,{"ok":True})
+            if p.path=="/api/admin/requests/cancel":
+                admin=admin_auth(self)
+                if not admin:return
+                try: request_id=int(d["request_id"])
+                except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
+                reason=str(d.get("reason","")).strip()[:300]
+                cancelled,request=database.admin_cancel_request(admin["user_id"],request_id,reason)
+                if not cancelled:return reply(self,{"ok":False,"error":"Заявка не найдена или уже завершена."},409)
+                requester=get_user(request["requester_id"])
+                if requester and requester["tg_user_id"]:
+                    message=f"ℹ️ Заявка №{request_id} закрыта поддержкой."
+                    if reason: message+=f" Причина: {reason}"
+                    notify_telegram_user(requester["tg_user_id"],message)
                 return reply(self,{"ok":True})
             if p.path=="/api/requests":
                 u=auth(self)

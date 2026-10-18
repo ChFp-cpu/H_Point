@@ -119,7 +119,8 @@ def init_db():
       tg_user_id INTEGER UNIQUE, verification_code TEXT, verification_code_expires_at TEXT, web_verified INTEGER NOT NULL DEFAULT 0,
       email_verified INTEGER NOT NULL DEFAULT 0,
       lat REAL, lon REAL, city TEXT DEFAULT '', bio TEXT DEFAULT '',
-      role TEXT NOT NULL DEFAULT 'user', is_blocked INTEGER NOT NULL DEFAULT 0, blocked_reason TEXT
+      role TEXT NOT NULL DEFAULT 'user', is_blocked INTEGER NOT NULL DEFAULT 0, blocked_reason TEXT,
+      last_seen_at TEXT
     );
     CREATE TABLE IF NOT EXISTS sessions(
       token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
@@ -235,6 +236,7 @@ def init_db():
       ("users","verification_code","TEXT"),("users","verification_code_expires_at","TEXT"),("users","web_verified","INTEGER NOT NULL DEFAULT 0"),("users","email_verified","INTEGER NOT NULL DEFAULT 0"),
       ("users","lat","REAL"),("users","lon","REAL"),("users","city","TEXT DEFAULT ''"),("users","bio","TEXT DEFAULT ''"),
       ("users","role","TEXT NOT NULL DEFAULT 'user'"),("users","is_blocked","INTEGER NOT NULL DEFAULT 0"),("users","blocked_reason","TEXT"),
+      ("users","last_seen_at","TEXT"),
       ("requests","lat","REAL"),("requests","lon","REAL"),("requests","expires_at","TEXT"),("requests","views","INTEGER NOT NULL DEFAULT 0"),("billing_invoices","amount_rub","INTEGER NOT NULL DEFAULT 0"),
       ("billing_invoices","currency","TEXT NOT NULL DEFAULT 'RUB'"),("billing_invoices","provider_payment_id","TEXT")
       ,("sessions","device_id","TEXT")
@@ -516,6 +518,20 @@ def is_user_blocked(user_id):
     user = get_user(user_id)
     return bool(user and user["is_blocked"])
 
+def touch_user_activity(user_id, seen_at=None):
+    """Record recent web activity without writing on every sync request."""
+    user = get_user(user_id)
+    if not user:
+        return
+    current = user["last_seen_at"]
+    observed = seen_at or datetime.now(timezone.utc)
+    # A five minute granularity keeps the activity view useful while avoiding a
+    # write on each client-side sync tick.
+    cutoff = (observed - timedelta(minutes=5)).isoformat()
+    if current and str(current) >= cutoff:
+        return
+    db.execute("UPDATE users SET last_seen_at=? WHERE user_id=?", (observed.isoformat(), user_id))
+
 def set_user_blocked(admin_user_id, target_user_id, blocked, reason=""):
     admin = get_user(admin_user_id)
     if not admin or admin["role"] != "admin":
@@ -583,6 +599,131 @@ def admin_summary():
     requests = db.execute("SELECT status,COUNT(*) n FROM requests GROUP BY status").fetchall()
     invoices = db.execute("SELECT status,COUNT(*) n FROM billing_invoices GROUP BY status").fetchall()
     return {"users": users, "blocked_users": blocked, "requests": {r["status"]: r["n"] for r in requests}, "invoices": {r["status"]: r["n"] for r in invoices}}
+
+def _as_utc_datetime(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+def _date_key(value):
+    parsed = _as_utc_datetime(value)
+    return parsed.date().isoformat() if parsed else None
+
+def record_admin_action(admin_user_id, action, target_user_id=None, details=None):
+    db.execute(
+        "INSERT INTO admin_audit_log(admin_user_id,action,target_user_id,details) VALUES(?,?,?,?)",
+        (admin_user_id, action[:80], target_user_id, json.dumps(details or {}, ensure_ascii=False)),
+    )
+
+def admin_cancel_request(admin_user_id, request_id, reason=""):
+    """Cancel only unfinished requests and leave an auditable operator trail."""
+    admin = get_user(admin_user_id)
+    request = get_request(request_id)
+    if not admin or admin["role"] != "admin" or not request:
+        return False, None
+    if request["status"] not in (STATUS_OPEN, STATUS_IN_PROGRESS):
+        return False, request
+    changed = db.execute(
+        "UPDATE requests SET status='cancelled' WHERE id=? AND status IN (?,?)",
+        (request_id, STATUS_OPEN, STATUS_IN_PROGRESS),
+    ).rowcount
+    if not changed:
+        return False, get_request(request_id)
+    record_admin_action(admin_user_id, "request_cancelled", request["requester_id"], {"request_id": request_id, "reason": str(reason).strip()[:300]})
+    return True, request
+
+def admin_dashboard(days=14, user_limit=100, user_query=""):
+    """Return privacy conscious operational data for an authenticated admin."""
+    days = max(7, min(int(days), 30))
+    user_limit = max(1, min(int(user_limit), 200))
+    now_utc = datetime.now(timezone.utc)
+    labels = [(now_utc.date() - timedelta(days=offset)).isoformat() for offset in range(days - 1, -1, -1)]
+    series = {label: {"date": label, "users": 0, "requests": 0, "support": 0} for label in labels}
+
+    all_users = db.execute("SELECT user_id,created_at,last_seen_at,is_blocked FROM users").fetchall()
+    all_requests = db.execute("SELECT created_at,status,views FROM requests").fetchall()
+    all_tickets = db.execute("SELECT created_at,status FROM support_tickets").fetchall()
+    for row in all_users:
+        day = _date_key(row["created_at"])
+        if day in series:
+            series[day]["users"] += 1
+    for row in all_requests:
+        day = _date_key(row["created_at"])
+        if day in series:
+            series[day]["requests"] += 1
+    for row in all_tickets:
+        day = _date_key(row["created_at"])
+        if day in series:
+            series[day]["support"] += 1
+
+    active_24h = active_7d = 0
+    for row in all_users:
+        seen = _as_utc_datetime(row["last_seen_at"])
+        if seen and seen >= now_utc - timedelta(days=7):
+            active_7d += 1
+            if seen >= now_utc - timedelta(hours=24):
+                active_24h += 1
+    request_counts = {}
+    views_total = 0
+    for row in all_requests:
+        request_counts[row["status"]] = request_counts.get(row["status"], 0) + 1
+        views_total += int(row["views"] or 0)
+    support_counts = {}
+    for row in all_tickets:
+        support_counts[row["status"]] = support_counts.get(row["status"], 0) + 1
+
+    query = str(user_query or "").strip().lower()[:80]
+    params = []
+    where = ""
+    if query:
+        where = "WHERE lower(u.name) LIKE ? OR lower(COALESCE(u.email,'')) LIKE ?"
+        like = f"%{query}%"
+        params.extend((like, like))
+    params.append(user_limit)
+    users = db.execute(f"""SELECT u.user_id,u.name,u.email,u.city,u.created_at,u.last_seen_at,u.role,u.is_blocked,u.blocked_reason,
+               u.tg_user_id,u.email_verified,
+               (SELECT COUNT(*) FROM requests r WHERE r.requester_id=u.user_id OR r.helper_id=u.user_id) request_count,
+               (SELECT COUNT(*) FROM requests r WHERE (r.requester_id=u.user_id OR r.helper_id=u.user_id) AND r.status IN ('open','in_progress')) active_request_count,
+               (SELECT COUNT(*) FROM support_tickets t WHERE t.user_id=u.user_id AND t.status='open') open_support_count
+          FROM users u {where}
+         ORDER BY CASE WHEN u.last_seen_at IS NULL THEN 1 ELSE 0 END,u.last_seen_at DESC,u.created_at DESC LIMIT ?""", tuple(params)).fetchall()
+    user_payloads = [{
+        "id": row["user_id"], "name": row["name"], "email": row["email"] or "", "city": row["city"] or "",
+        "created_at": row["created_at"], "last_seen_at": row["last_seen_at"], "role": row["role"],
+        "blocked": bool(row["is_blocked"]), "blocked_reason": row["blocked_reason"] or "",
+        "telegram_linked": bool(row["tg_user_id"]), "email_verified": bool(row["email_verified"]),
+        "request_count": int(row["request_count"] or 0), "active_request_count": int(row["active_request_count"] or 0),
+        "open_support_count": int(row["open_support_count"] or 0),
+    } for row in users]
+
+    activities = []
+    for row in db.execute("""SELECT r.id,r.what,r.status,r.created_at,u.name
+                             FROM requests r JOIN users u ON u.user_id=r.requester_id
+                             ORDER BY r.created_at DESC LIMIT 20""").fetchall():
+        activities.append({"kind": "request", "target_id": row["id"], "status": row["status"], "at": row["created_at"], "title": f"Заявка #{row['id']}: {row['what'][:90]}", "meta": f"{row['name']} · {row['status']}"})
+    for row in db.execute("""SELECT t.id,t.subject,t.status,t.created_at,u.name
+                             FROM support_tickets t JOIN users u ON u.user_id=t.user_id
+                             ORDER BY t.created_at DESC LIMIT 20""").fetchall():
+        activities.append({"kind": "support", "target_id": row["id"], "status": row["status"], "at": row["created_at"], "title": f"Поддержка #{row['id']}: {row['subject'][:90]}", "meta": f"{row['name']} · {row['status']}"})
+    activities.sort(key=lambda item: str(item["at"]), reverse=True)
+
+    tickets = db.execute("""SELECT t.*,u.name user_name,u.email user_email
+                            FROM support_tickets t JOIN users u ON u.user_id=t.user_id
+                            ORDER BY CASE t.status WHEN 'open' THEN 0 ELSE 1 END,t.id DESC LIMIT 100""").fetchall()
+    return {
+        "summary": {
+            "users": len(all_users), "active_24h": active_24h, "active_7d": active_7d,
+            "new_7d": sum(point["users"] for point in list(series.values())[-7:]),
+            "blocked_users": sum(1 for row in all_users if row["is_blocked"]),
+            "requests": request_counts, "support": support_counts, "views_total": views_total,
+        },
+        "series": list(series.values()), "users": user_payloads,
+        "tickets": [dict(row) for row in tickets], "activities": activities[:30],
+    }
 
 def consume_ai_quota(user_id, token_count, max_requests, max_tokens):
     """Reserve AI quota atomically before a future AI provider call."""

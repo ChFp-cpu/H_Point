@@ -16,14 +16,14 @@ class Web(unittest.TestCase):
   self.assertIn("Smart Match",web.PAGE);self.assertIn("Telegram",web.PAGE);self.assertIn("руб",web.PAGE)
   self.assertIn('rel="icon" type="image/svg+xml" href="/assets/favicon.svg"',web.PAGE)
   self.assertIn("timeout:2500",web.PAGE)
-  self.assertIn("leaflet@1.9.4",web.PAGE)
+  if web.YANDEX_MAPS_API_KEY:self.assertIn("api-maps.yandex.ru",web.PAGE)
+  else:self.assertIn("leaflet@1.9.4",web.PAGE)
   self.assertIn("Создать профиль",web.PAGE)
   self.assertIn("resumeTelegramLogin",web.PAGE)
   self.assertIn("/api/helper/offers",web.PAGE)
   self.assertIn("Предложения помощи",web.PAGE)
-  self.assertIn("https://tile.openstreetmap.org",web.CSP)
-  self.assertIn("https://router.project-osrm.org",web.CSP)
-  self.assertNotIn("api-maps.yandex.ru",web.PAGE)
+  self.assertIn("https://*.yandex.ru",web.CSP)
+  self.assertIn("https://*.yandex.net",web.CSP)
  def test_head_for_public_page_and_health(self):
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
   try:
@@ -365,6 +365,25 @@ class Web(unittest.TestCase):
    with urllib.request.urlopen(urllib.request.Request(base+"/api/me",headers={"Cookie":new_cookie+"; hpoint_device=unlink-device"}),timeout=3) as response:site_user=json.load(response)["user"]
    self.assertLess(site_user["id"],0);self.assertEqual(site_user["balance"],333);self.assertFalse(site_user["tg_linked"])
    self.assertEqual(database.get_user(77)["tg_user_id"],77);self.assertEqual(database.get_user(77)["balance"],100)
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_admin_dashboard_is_private_and_can_close_active_request(self):
+  database.create_user(1,"Member");database.create_user(99,"Admin")
+  self.db.execute("UPDATE users SET role='admin' WHERE user_id=99")
+  rid=services.create_request(1,{"what":"Need help","place":"centre","time_needed":"today","urgency":"normal","details":"test"})
+  member_token,admin_token=web.new_sess(1),web.new_sess(99)
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   base=f"http://127.0.0.1:{server.server_address[1]}"
+   denied=urllib.request.Request(base+"/api/admin/dashboard",headers={"Cookie":f"hpoint_session={member_token}"})
+   with self.assertRaises(urllib.error.HTTPError) as error:urllib.request.urlopen(denied,timeout=3)
+   self.assertEqual(error.exception.code,403);error.exception.close()
+   allowed=urllib.request.Request(base+"/api/admin/dashboard",headers={"Cookie":f"hpoint_session={admin_token}"})
+   with urllib.request.urlopen(allowed,timeout=3) as response:dashboard=json.load(response)
+   self.assertEqual(dashboard["summary"]["requests"]["open"],1)
+   close=urllib.request.Request(base+"/api/admin/requests/cancel",data=json.dumps({"request_id":rid,"reason":"duplicate"}).encode(),headers={"Cookie":f"hpoint_session={admin_token}","Content-Type":"application/json"},method="POST")
+   with urllib.request.urlopen(close,timeout=3) as response:self.assertTrue(json.load(response)["ok"])
+   self.assertEqual(database.get_request(rid)["status"],"cancelled")
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
 if __name__=="__main__":unittest.main()
