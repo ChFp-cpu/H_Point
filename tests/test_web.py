@@ -43,7 +43,7 @@ class Web(unittest.TestCase):
    req=urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers=headers,method="POST")
    return urllib.request.urlopen(req,timeout=3)
   try:
-   password="SecurePass123A"
+   password="Aa1234"
    with post("/api/auth/register",{"name":"New User","email":"new@example.com","password":password,"password_confirm":password}) as response:
     created=json.load(response);cookie=response.headers["Set-Cookie"].split(";",1)[0]
    self.assertTrue(created["ok"])

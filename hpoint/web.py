@@ -88,8 +88,8 @@ def pv(password, stored):
 def password_needs_upgrade(stored): return not stored.startswith("scrypt$")
 
 def password_error(password):
-    if not 12 <= len(password) <= 256:
-        return "Пароль должен быть от 12 до 256 символов."
+    if not 6 <= len(password) <= 256:
+        return "Пароль должен быть от 6 до 256 символов."
     if not re.search(r"[a-z]", password) or not re.search(r"[A-Z]", password) or not re.search(r"\d", password):
         return "В пароле нужны строчная и заглавная латинские буквы, а также цифра."
     return None
@@ -447,18 +447,33 @@ function emailVerificationCard(u){let card=$('emailState');if(!card){card=docume
 async function profile(providedUser){let u=providedUser||(await api('/api/me')).user,linked=Boolean(u.tg_linked);$('pn').value=u.name||'';$('pc').value=u.city||'';$('pb').value=u.bio||'';$('profInfo').innerHTML=`<p><b>${esc(u.name)}</b></p><p class="muted">${esc(u.email||'')}<br>Рейтинг: ${u.stats.helped_avg?u.stats.helped_avg.toFixed(1):'—'} · ${u.stats.helped} помощей</p>`;emailVerificationCard(u);$('tgState').innerHTML=(linked?'<span class="badge ok">✓ Telegram привязан</span>':'<span class="badge warn">Telegram не привязан</span>')+(u.telegram_url?` <a class="btn light" href="${esc(u.telegram_url)}" target="_blank" rel="noopener">Перейти в Telegram</a>`:'');$('tgLinkButton').style.display=linked?'none':'';$('code').textContent=linked?'Подключено':u.link_code||'Код не создан';$('tgGuide').innerHTML=linked?'Сайт и бот используют один профиль. Входить можно одновременно с нескольких устройств; выход завершает только текущий сеанс.':'Получите код и отправьте в боте: <b>/link КОД</b>.';renderIdentityCard(u)}
 '''
 
+PASSWORD_CSS=r'''
+.passwordRules li.bad{color:#ff6b6b;text-decoration:underline;text-decoration-color:#ff6b6b;text-decoration-thickness:2px;text-underline-offset:3px}.passwordRules li.bad:before{color:#ff6b6b}.passwordRules li.ok{color:#b8f36b}.passwordHint.bad{color:#ff6b6b!important}.passwordHint.good{color:#b8f36b!important}.passwordField{position:relative}.passwordField .input{padding-right:48px}.passwordToggle{position:absolute;right:8px;top:50%;transform:translateY(-50%);border:0;background:transparent;color:#a9afa1;cursor:pointer;font-size:18px;line-height:1;padding:7px}.passwordToggle:hover{color:#b8f36b}
+'''
+
+PASSWORD_UI_ENHANCEMENTS=r'''
+function passwordChecks(password){return {length:password.length>=6&&password.length<=256,lower:/[a-z]/.test(password),upper:/[A-Z]/.test(password),digit:/\d/.test(password)}}
+function passwordClientProblem(password){let c=passwordChecks(password);if(!c.length)return 'Пароль должен быть от 6 до 256 символов.';if(!c.lower||!c.upper||!c.digit)return 'Нужны строчная и заглавная латинские буквы, а также цифра.';return ''}
+function updatePasswordHint(){let password=$('ap')?.value||'',checks=passwordChecks(password),items=document.querySelectorAll('#passwordRules li');items.forEach(item=>{let key=item.dataset.rule;item.classList.toggle('ok',Boolean(checks[key]));item.classList.toggle('bad',Boolean(password)&&!checks[key])});let hint=$('passwordHint');if(hint){let problem=passwordClientProblem(password);hint.textContent=password?(problem||'Пароль соответствует требованиям.'):'Введите пароль по требованиям ниже.';hint.className='passwordHint '+(password&&!problem?'good':password?'bad':'')}}
+function togglePassword(id,button){let input=$(id),visible=input.type==='text';input.type=visible?'password':'text';button.textContent=visible?'👁️':'🙈';button.setAttribute('aria-label',visible?'Показать пароль':'Скрыть пароль')}
+function decoratePasswordInput(id,autocomplete){let input=$(id);if(!input)return;let wrap=document.createElement('div');wrap.className='passwordField';input.parentNode.insertBefore(wrap,input);wrap.appendChild(input);let button=document.createElement('button');button.type='button';button.className='passwordToggle';button.textContent='👁️';button.setAttribute('aria-label','Показать пароль');button.onclick=()=>togglePassword(id,button);wrap.appendChild(button);input.autocomplete=autocomplete}
+function passwordRulesMarkup(){return '<ul id="passwordRules" class="passwordRules"><li data-rule="length">от 6 до 256 символов</li><li data-rule="lower">строчная латинская буква</li><li data-rule="upper">заглавная латинская буква</li><li data-rule="digit">хотя бы одна цифра</li></ul>'}
+const originalAuthForm=authForm;
+function authForm(reg){originalAuthForm(reg);let body=$('modalbody'),rules=body.querySelector('.passwordRules');if(rules){rules.id='passwordRules';rules.innerHTML='<li data-rule="length">от 6 до 256 символов</li><li data-rule="lower">строчная латинская буква</li><li data-rule="upper">заглавная латинская буква</li><li data-rule="digit">хотя бы одна цифра</li>'}else{let input=$('ap');if(input){input.insertAdjacentHTML('afterend',passwordRulesMarkup());input.insertAdjacentHTML('afterend','<p id="passwordHint" class="muted passwordHint" aria-live="polite">Введите пароль по требованиям ниже.</p>')}}decoratePasswordInput('ap','current-password');if(reg)decoratePasswordInput('ap2','new-password');let input=$('ap');if(input)input.addEventListener('input',updatePasswordHint);updatePasswordHint()}
+'''
+
 def _page_replace(needle, replacement):
     global PAGE
     if needle not in PAGE:
         raise RuntimeError("H-Point page template changed; UI override target is missing")
     PAGE=PAGE.replace(needle, replacement, 1)
 
-_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+"</style></head>")
+_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+PASSWORD_CSS+"</style></head>")
 _page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg"><link rel="apple-touch-icon" href="/assets/hpoint-logo.png"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
 _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandLogo" href="/" aria-label="H-Point"><img src="/assets/hpoint-logo-dark.png" alt="H-Point"></a>')
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
 _page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
