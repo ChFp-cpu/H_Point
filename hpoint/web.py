@@ -95,7 +95,7 @@ def password_error(password):
     return None
 
 def email_delivery_configured():
-    return bool(SMTP_HOST and SMTP_FROM)
+    return bool(SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD and SMTP_FROM)
 
 def send_email_verification_code(address, code):
     """Send a short code through the configured transactional SMTP mailbox."""
