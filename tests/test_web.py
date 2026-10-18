@@ -42,12 +42,13 @@ class Web(unittest.TestCase):
    req=urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers=headers,method="POST")
    return urllib.request.urlopen(req,timeout=3)
   try:
-   with post("/api/auth/register",{"name":"New User","email":"new@example.com","password":"correct horse"}) as response:
+   password="SecurePass123A"
+   with post("/api/auth/register",{"name":"New User","email":"new@example.com","password":password,"password_confirm":password}) as response:
     created=json.load(response);cookie=response.headers["Set-Cookie"].split(";",1)[0]
    self.assertTrue(created["ok"])
    with urllib.request.urlopen(urllib.request.Request(base+"/api/me",headers={"Cookie":cookie}),timeout=3) as response:
     self.assertEqual(json.load(response)["user"]["email"],"new@example.com")
-   with post("/api/auth/login",{"email":"new@example.com","password":"correct horse"}) as response:
+   with post("/api/auth/login",{"email":"new@example.com","password":password}) as response:
     self.assertTrue(json.load(response)["ok"])
    with self.assertRaises(urllib.error.HTTPError) as denied:
     urllib.request.urlopen(base+"/api/me",timeout=3)
@@ -58,6 +59,48 @@ class Web(unittest.TestCase):
     urllib.request.urlopen(urllib.request.Request(base+"/api/admin/summary",headers={"Cookie":cookie}),timeout=3)
    self.assertEqual(forbidden.exception.code,403)
    forbidden.exception.close()
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_email_code_is_one_time_and_required_for_email_actions(self):
+  old_configured,old_send=web.email_delivery_configured,web.send_email_verification_code
+  delivered=[];web.email_delivery_configured=lambda:True;web.send_email_verification_code=lambda address,code:delivered.append((address,code)) or True
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  base=f"http://127.0.0.1:{server.server_address[1]}"
+  def post(path,payload,cookie=None):
+   headers={"Content-Type":"application/json"}
+   if cookie:headers["Cookie"]=cookie
+   return urllib.request.urlopen(urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers=headers,method="POST"),timeout=3)
+  try:
+   password="SecurePass123A"
+   with post("/api/auth/register",{"name":"Verified User","email":"verified@example.com","password":password,"password_confirm":password}) as response:
+    created=json.load(response);cookie=response.headers["Set-Cookie"].split(";",1)[0]
+   self.assertTrue(created["email_verification_sent"]);self.assertEqual(delivered[0][0],"verified@example.com")
+   request={"what":"Нужна помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"}
+   with self.assertRaises(urllib.error.HTTPError) as blocked:
+    post("/api/requests",request,cookie)
+   self.assertEqual(blocked.exception.code,403);blocked.exception.close()
+   with self.assertRaises(urllib.error.HTTPError) as wrong:
+    post("/api/auth/email/verify",{"code":"000000"},cookie)
+   self.assertEqual(wrong.exception.code,400);wrong.exception.close()
+   with post("/api/auth/email/verify",{"code":delivered[0][1]},cookie) as response:self.assertTrue(json.load(response)["verified"])
+   with post("/api/requests",request,cookie) as response:self.assertTrue(json.load(response)["ok"])
+   with self.assertRaises(urllib.error.HTTPError) as reused:
+    post("/api/auth/email/verify",{"code":delivered[0][1]},cookie)
+   self.assertEqual(reused.exception.code,400);reused.exception.close()
+  finally:
+   web.email_delivery_configured,web.send_email_verification_code=old_configured,old_send
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_registration_requires_matching_strong_password(self):
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  base=f"http://127.0.0.1:{server.server_address[1]}"
+  try:
+   def register(payload):return urllib.request.urlopen(urllib.request.Request(base+"/api/auth/register",data=json.dumps(payload).encode(),headers={"Content-Type":"application/json"},method="POST"),timeout=3)
+   with self.assertRaises(urllib.error.HTTPError) as weak:
+    register({"name":"Weak User","email":"weak@example.com","password":"weakpassword12","password_confirm":"weakpassword12"})
+   self.assertEqual(weak.exception.code,400);weak.exception.close()
+   with self.assertRaises(urllib.error.HTTPError) as mismatch:
+    register({"name":"Mismatch User","email":"mismatch@example.com","password":"SecurePass123A","password_confirm":"SecurePass123B"})
+   self.assertEqual(mismatch.exception.code,400);mismatch.exception.close()
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_telegram_login_creates_one_shared_profile(self):

@@ -1,7 +1,8 @@
 """H-Point web-first application: dashboard, requests, Smart Match, chat, profile and RUB billing."""
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-import asyncio, json, logging, os, secrets, hashlib, hmac, datetime as dt, re
+from email.message import EmailMessage
+import asyncio, json, logging, os, secrets, hashlib, hmac, datetime as dt, re, smtplib, ssl
 from pathlib import Path
 from html import escape
 from . import database
@@ -85,6 +86,50 @@ def pv(password, stored):
     except Exception: return False
 def password_needs_upgrade(stored): return not stored.startswith("scrypt$")
 
+def password_error(password):
+    if not 12 <= len(password) <= 256:
+        return "Пароль должен быть от 12 до 256 символов."
+    if not re.search(r"[a-z]", password) or not re.search(r"[A-Z]", password) or not re.search(r"\d", password):
+        return "В пароле нужны строчная и заглавная латинские буквы, а также цифра."
+    return None
+
+def email_delivery_configured():
+    return bool(SMTP_HOST and SMTP_FROM)
+
+def send_email_verification_code(address, code):
+    """Send a short code through the configured transactional SMTP mailbox."""
+    if not email_delivery_configured():
+        return False
+    message = EmailMessage()
+    message["Subject"] = "Код подтверждения H-Point"
+    message["From"] = SMTP_FROM
+    message["To"] = address
+    message.set_content(
+        "Ваш код подтверждения H-Point: " + code + "\n\n"
+        f"Код действует {max(1, EMAIL_VERIFICATION_TTL_SECONDS // 60)} минут. "
+        "Никому его не сообщайте."
+    )
+    try:
+        context = ssl.create_default_context()
+        if SMTP_USE_SSL:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS, context=context) as client:
+                if SMTP_USERNAME:
+                    client.login(SMTP_USERNAME, SMTP_PASSWORD)
+                client.send_message(message)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as client:
+                client.ehlo()
+                if SMTP_USE_TLS:
+                    client.starttls(context=context)
+                    client.ehlo()
+                if SMTP_USERNAME:
+                    client.login(SMTP_USERNAME, SMTP_PASSWORD)
+                client.send_message(message)
+        return True
+    except Exception:
+        logging.exception("Email verification delivery failed")
+        return False
+
 def cookie_value(h, name):
     c=h.headers.get("Cookie","")
     return next((x.strip().split("=",1)[1] for x in c.split(";") if x.strip().startswith(name+"=")),None)
@@ -138,6 +183,15 @@ def auth(h):
         reply(h,{"ok":False,"error":"account_blocked"},403); return None
     return u
 
+def account_is_verified(u):
+    return bool(u["tg_user_id"] or u["email_verified"])
+
+def verified_community_account(h, u):
+    if account_is_verified(u):
+        return True
+    reply(h, {"ok": False, "error": "Подтвердите email кодом из письма или привяжите Telegram, прежде чем пользоваться заявками."}, 403)
+    return False
+
 def admin_auth(h):
     u = auth(h)
     if u and u["role"] != "admin":
@@ -167,7 +221,7 @@ def user_payload(u):
     code_valid=bool(u["verification_code"] and u["verification_code_expires_at"] and u["verification_code_expires_at"]>now().isoformat())
     identity=database.get_identity_verification(u["user_id"])
     identity_payload={"status":identity["status"],"submitted_at":identity["submitted_at"],"reviewed_at":identity["reviewed_at"],"note":identity["note"]} if identity else {"status":"not_requested"}
-    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code":u["verification_code"] if code_valid else None,"pro_until":u["pro_until"],"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats}
+    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"email_verified":bool(u["email_verified"]),"account_verified":account_is_verified(u),"email_delivery_configured":email_delivery_configured(),"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code":u["verification_code"] if code_valid else None,"pro_until":u["pro_until"],"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats}
 
 def request_payload(r):
     d=dict(r); d["category_name"]=CATEGORIES.get(r["category"],"Другое"); d["status_title"]=STATUS_TITLES.get(r["status"],r["status"]); return d
@@ -367,17 +421,43 @@ async function requests(data){renderRequests(data||await api('/api/requests/mine
 async function syncTick(){try{let d=await api('/api/sync');applySync(d);let tab=document.querySelector('.tab.active')?.dataset.t;if(tab==='requests'){await loadOpenRequests();await loadHelperOffers()}if(tab==='history')await history();if(tab==='profile')await profile(d.user);if(tab==='billing')await billing();if(tab==='chat')loadChats()}catch(e){if(e.message==='auth_required'){stopSync();stopChatPolling()}}}
 '''
 
+SECURITY_CSS=r'''
+/* Clear account verification and small-screen layout. */
+html,body{overflow-x:hidden;overflow-x:clip}
+@media(max-width:500px){.nav .in{gap:6px}.brandLogo img{width:106px;height:35px}.nav .sp{min-width:0}.nav #nav{display:flex;align-items:center;gap:6px;flex-shrink:0}.nav #nav .btn{padding:9px 10px;font-size:10px;white-space:nowrap}}
+.landingMetrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.landingMetric{padding:22px 20px;background:linear-gradient(145deg,#1b2119,#141812);border:1px solid rgba(184,243,107,.24);border-radius:18px}.landingMetric b{display:block;color:#b8f36b;font:700 25px 'Space Mono',monospace}.landingMetric span{display:block;margin-top:7px;color:#c5cbc0;font-size:13px;line-height:1.45}.safetyGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.safetyCard{padding:24px 21px;min-height:188px;background:#171a14;border:1px solid #3a4035;border-radius:18px}.safetyCard .safetyMark{display:grid;place-items:center;width:38px;height:38px;border-radius:12px;background:#27391c;color:#d5ff8a;font-size:18px}.safetyCard h3{margin:17px 0 8px;font-size:17px}.safetyCard p{margin:0;color:#b9c0b3;font-size:13px;line-height:1.6}.landingCta{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:34px;background:linear-gradient(135deg,#1e2b21,#172419);border:1px solid rgba(184,243,107,.34);border-radius:22px}.landingCta h2{margin:0;max-width:620px;font-size:clamp(28px,4vw,48px)}.passwordRules{margin:0;padding:0;display:grid;gap:4px;color:#c5cbc0;font-size:12px;line-height:1.45;list-style:none}.passwordRules li:before{content:'•';color:#b8f36b;margin-right:7px}.passwordHint{font-size:12px;line-height:1.45}.emailVerificationCard{margin-top:14px;padding:17px;border:1px solid #4f7049;background:#1a2118;border-radius:16px}.emailVerificationCard p{margin:7px 0 13px}.emailVerificationCard .form{grid-template-columns:1fr auto;align-items:center}.emailVerificationCard .input{min-width:0;letter-spacing:.15em}.emailVerificationCard .profileActions{margin:0}.emailVerificationCard .badge{display:inline-flex;margin-bottom:8px}.emailVerificationCard.warn{border-color:#70632e;background:#282516}@media(max-width:760px){.landingMetrics,.safetyGrid{grid-template-columns:1fr}.landingMetric{padding:18px}.safetyCard{min-height:0}.landingCta{align-items:flex-start;flex-direction:column;padding:25px 20px}.landingCta .btn{width:100%}.emailVerificationCard .form{grid-template-columns:1fr}.emailVerificationCard .form .btn{width:100%}}@media(max-width:420px){.modal{padding:10px}.box{max-height:calc(100svh - 20px)}.actions .btn{flex:1}.chatbar{align-items:stretch;flex-direction:column}.chatbar .btn{width:100%}.emailVerificationCard{padding:14px}.landingCta{border-radius:18px}}
+'''
+
+LANDING_ENHANCEMENTS=r'''
+<section class="section"><div class="sectionIntro"><span class="ey">ВСЁ ПОД КОНТРОЛЕМ</span><h2>Понятный путь к реальной помощи</h2><p class="muted">Профиль, заявки, подбор и сообщения работают как единый сервис на сайте и в Telegram.</p></div><div class="landingMetrics"><div class="landingMetric"><b>01</b><span>Создайте заявку и укажите только нужные детали.</span></div><div class="landingMetric"><b>02</b><span>Выберите добровольца из общей живой очереди.</span></div><div class="landingMetric"><b>03</b><span>Помощник сам подтвердит участие до назначения.</span></div></div></section>
+<section class="section"><div class="sectionIntro"><span class="ey">БЕЗОПАСНОСТЬ</span><h2>Контакты открываются только после взаимного решения</h2></div><div class="safetyGrid"><article class="safetyCard"><div class="safetyMark">✉</div><h3>Подтверждённый контакт</h3><p>Почтовый аккаунт активируется одноразовым кодом. Telegram-профиль подтверждается через бота.</p></article><article class="safetyCard"><div class="safetyMark">◎</div><h3>Адрес остаётся приватным</h3><p>В общей ленте виден только район. Детали доступны участникам после согласия на помощь.</p></article><article class="safetyCard"><div class="safetyMark">✓</div><h3>Помощь только по согласию</h3><p>Выбранный помощник подтверждает предложение сам. Чат появляется после его согласия.</p></article></div></section>
+<section class="section"><div class="landingCta"><div><span class="ey">НАЧНИТЕ СЕЙЧАС</span><h2>Нужна помощь рядом или хотите помочь кому-то?</h2></div><button class="btn grad" onclick="authForm(true)">Создать защищённый профиль</button></div></section>
+'''
+
+ACCOUNT_SECURITY_UI=r'''
+function passwordClientProblem(password){if(password.length<12||password.length>256)return 'Пароль должен быть от 12 до 256 символов.';if(!/[a-z]/.test(password)||!/[A-Z]/.test(password)||!/\d/.test(password))return 'Нужны строчная и заглавная латинские буквы, а также цифра.';return ''}
+function updatePasswordHint(){let hint=$('passwordHint'),problem=passwordClientProblem($('ap')?.value||'');if(hint)hint.textContent=problem||'Пароль соответствует требованиям.'}
+function authForm(reg){$('modal').style.display='flex';$('modalbody').innerHTML=reg?`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Создайте защищённый профиль</h2><p class="muted">Telegram сразу объединяет сайт с ботом. Для входа по email подтвердите почту кодом из письма.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Продолжить с Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="an" class="input" maxlength="50" autocomplete="name" placeholder="Имя"><input id="ae" class="input" type="email" autocomplete="email" placeholder="Email"><input id="ap" class="input" type="password" autocomplete="new-password" placeholder="Придумайте пароль"><ul class="passwordRules"><li>от 12 до 256 символов</li><li>строчная и заглавная латинские буквы</li><li>хотя бы одна цифра</li></ul><input id="ap2" class="input" type="password" autocomplete="new-password" placeholder="Повторите пароль"><p id="passwordHint" class="muted passwordHint" aria-live="polite"></p><button class="btn light" onclick="register()">Создать аккаунт</button><div id="err" class="muted" aria-live="polite"></div></div>`:`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Войти в H·Point</h2><p class="muted">Войдите через Telegram или подтверждённый email.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Войти через Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="ae" class="input" type="email" autocomplete="email" placeholder="Email"><input id="ap" class="input" type="password" autocomplete="current-password" placeholder="Пароль"><button class="btn light" onclick="login()">Войти</button><div id="err" class="muted" aria-live="polite"></div></div>`;if(reg){$('ap').addEventListener('input',updatePasswordHint);$('ap2').addEventListener('input',()=>{let err=$('err');if($('ap2').value&&$('ap').value!==$('ap2').value)err.textContent='Пароли пока не совпадают.';else err.textContent=''})}}
+function showEmailVerification(){let modal=$('modal'),body=$('modalbody');modal.style.display='flex';body.innerHTML=`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Подтвердите email</h2><p class="muted">Мы отправили шестизначный код. Он действует 10 минут и используется один раз.</p><div class="form"><input id="emailCode" class="input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="Код из письма"><button class="btn grad" onclick="verifyEmailCode()">Подтвердить почту</button><button class="btn light" onclick="resendEmailCode()">Отправить новый код</button><div id="err" class="muted" aria-live="polite"></div></div>`}
+async function register(){let password=$('ap').value,confirm=$('ap2').value,problem=passwordClientProblem(password);if(problem){$('err').textContent=problem;return}if(password!==confirm){$('err').textContent='Пароли не совпадают.';return}try{let d=await api('/api/auth/register',{method:'POST',body:JSON.stringify({name:$('an').value,email:$('ae').value,password:password,password_confirm:confirm})});await load();if(d.email_verification_sent){showEmailVerification();toast('Аккаунт создан: подтвердите почту кодом')}else{closeModal();toast('Аккаунт создан. Подтвердите email в профиле, когда отправка кодов будет доступна.')}}catch(e){$('err').textContent=e.message}}
+async function verifyEmailCode(){try{await api('/api/auth/email/verify',{method:'POST',body:JSON.stringify({code:$('emailCode').value.trim()})});closeModal();toast('Email подтверждён');await syncTick();if(document.querySelector('.tab.active')?.dataset.t==='profile')await profile()}catch(e){$('err').textContent=e.message}}
+async function resendEmailCode(){try{await api('/api/auth/email/resend',{method:'POST',body:'{}'});toast('Новый код отправлен')}catch(e){$('err').textContent=e.message}}
+function emailVerificationCard(u){let card=$('emailState');if(!card){card=document.createElement('div');card.id='emailState';let anchor=$('profInfo');anchor.parentElement.insertBefore(card,anchor.nextSibling)}if(u.email_verified){card.className='emailVerificationCard';card.innerHTML='<span class="badge ok">✓ Email подтверждён</span><p class="muted">Почта подтверждена одноразовым кодом и может использоваться для входа.</p>';return}card.className='emailVerificationCard warn';let configured=u.email_delivery_configured;card.innerHTML='<span class="badge warn">Требуется подтверждение email</span><p class="muted">'+(configured?'Подтвердите код из письма, чтобы публиковать заявки и отвечать на них.':'Отправка кодов ещё не настроена. Можно сразу подтвердить профиль через Telegram.')+'</p><div class="profileActions">'+(configured?'<button class="btn grad" onclick="showEmailVerification()">Ввести код</button><button class="btn light" onclick="resendEmailCode()">Новый код</button>':'')+'</div>'}
+async function profile(providedUser){let u=providedUser||(await api('/api/me')).user,linked=Boolean(u.tg_linked);$('pn').value=u.name||'';$('pc').value=u.city||'';$('pb').value=u.bio||'';$('profInfo').innerHTML=`<p><b>${esc(u.name)}</b></p><p class="muted">${esc(u.email||'')}<br>Рейтинг: ${u.stats.helped_avg?u.stats.helped_avg.toFixed(1):'—'} · ${u.stats.helped} помощей</p>`;emailVerificationCard(u);$('tgState').innerHTML=(linked?'<span class="badge ok">✓ Telegram привязан</span>':'<span class="badge warn">Telegram не привязан</span>')+(u.telegram_url?` <a class="btn light" href="${esc(u.telegram_url)}" target="_blank" rel="noopener">Перейти в Telegram</a>`:'');$('tgLinkButton').style.display=linked?'none':'';$('code').textContent=linked?'Подключено':u.link_code||'Код не создан';$('tgGuide').innerHTML=linked?'Сайт и бот используют один профиль. Входить можно одновременно с нескольких устройств; выход завершает только текущий сеанс.':'Получите код и отправьте в боте: <b>/link КОД</b>.';renderIdentityCard(u)}
+'''
+
 def _page_replace(needle, replacement):
     global PAGE
     if needle not in PAGE:
         raise RuntimeError("H-Point page template changed; UI override target is missing")
     PAGE=PAGE.replace(needle, replacement, 1)
 
-_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+"</style></head>")
+_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+"</style></head>")
 _page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
 _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandLogo" href="/" aria-label="H-Point"><img src="/assets/hpoint-logo-dark.png" alt="H-Point"></a>')
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
+_page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
@@ -559,28 +639,64 @@ class Handler(BaseHTTPRequestHandler):
                 database.record_auth_failure("telegram_start",subject)
                 return reply(self,{"ok":True,"ticket":ticket,"bot_url":f"https://t.me/{_telegram_username}?start=login_{ticket}"})
             if p.path=="/api/auth/register":
-                n=str(d.get("name","")).strip();e=str(d.get("email","")).strip().lower();pw=str(d.get("password",""))
-                if database.auth_is_rate_limited("register",e,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"too_many_attempts"},429)
+                n=str(d.get("name","")).strip();e=str(d.get("email","")).strip().lower();pw=str(d.get("password",""));confirm=str(d.get("password_confirm",""))
+                subject=client_key(self)
+                if database.auth_is_rate_limited("register",e,AUTH_ATTEMPT_LIMIT) or database.auth_is_rate_limited("register_ip",subject,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"too_many_attempts"},429)
                 if not 2<=len(n)<=MAX_NAME_LEN:return reply(self,{"ok":False,"error":"Имя должно быть от 2 до 50 символов."},400)
                 if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",e):return reply(self,{"ok":False,"error":"Введите корректный email."},400)
-                if not 12<=len(pw)<=256:return reply(self,{"ok":False,"error":"Пароль должен быть от 12 до 256 символов."},400)
+                if pw!=confirm:return reply(self,{"ok":False,"error":"Пароли не совпадают."},400)
+                problem=password_error(pw)
+                if problem:return reply(self,{"ok":False,"error":problem},400)
                 if get_user_by_email(e):
-                    database.record_auth_failure("register",e)
-                    return reply(self,{"ok":False,"error":"Этот email уже зарегистрирован."},409)
-                uid=create_web_user(n,e,ph(pw));c=database.create_link_code(uid)
-                database.clear_auth_failures("register",e)
-                return reply(self,{"ok":True,"link_code":c},headers=session_headers(self,uid))
+                    database.record_auth_failure("register",e);database.record_auth_failure("register_ip",subject)
+                    return reply(self,{"ok":False,"error":"Не удалось создать аккаунт с этим email."},409)
+                try:
+                    uid=create_web_user(n,e,ph(pw));c=database.create_link_code(uid)
+                except Exception:
+                    logging.exception("Registration could not be completed")
+                    database.record_auth_failure("register",e);database.record_auth_failure("register_ip",subject)
+                    return reply(self,{"ok":False,"error":"Не удалось создать аккаунт с этим email."},409)
+                sent=False
+                if email_delivery_configured():
+                    code=database.create_email_verification_code(uid)
+                    sent=send_email_verification_code(e,code)
+                database.clear_auth_failures("register",e);database.clear_auth_failures("register_ip",subject)
+                return reply(self,{"ok":True,"link_code":c,"email_verification_sent":sent,"email_delivery_configured":email_delivery_configured()},headers=session_headers(self,uid))
             if p.path=="/api/auth/login":
                 email=str(d.get("email","")).strip().lower()
-                if database.auth_is_rate_limited("login",email,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"too_many_attempts"},429)
+                subject=client_key(self)
+                if database.auth_is_rate_limited("login",email,AUTH_ATTEMPT_LIMIT) or database.auth_is_rate_limited("login_ip",subject,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"too_many_attempts"},429)
                 u=get_user_by_email(email)
                 if not u or not u["password_hash"] or not pv(str(d.get("password","")),u["password_hash"]):
-                    database.record_auth_failure("login",email)
+                    database.record_auth_failure("login",email);database.record_auth_failure("login_ip",subject)
                     return reply(self,{"ok":False,"error":"Неверный email или пароль."},401)
                 if u["is_blocked"]:return reply(self,{"ok":False,"error":"Аккаунт заблокирован."},403)
-                database.clear_auth_failures("login",email)
+                database.clear_auth_failures("login",email);database.clear_auth_failures("login_ip",subject)
                 if password_needs_upgrade(u["password_hash"]):db.execute("UPDATE users SET password_hash=? WHERE user_id=?",(ph(str(d.get("password",""))),u["user_id"]))
                 return reply(self,{"ok":True},headers=session_headers(self,u["user_id"]))
+            if p.path=="/api/auth/email/resend":
+                u=auth(self)
+                if not u:return
+                if u["email_verified"]:return reply(self,{"ok":True,"already_verified":True})
+                if not u["email"]:return reply(self,{"ok":False,"error":"В профиле нет email для подтверждения."},409)
+                if not email_delivery_configured():return reply(self,{"ok":False,"error":"Отправка кодов временно не настроена."},503)
+                if database.auth_is_rate_limited("email_resend",str(u["user_id"]),3):return reply(self,{"ok":False,"error":"Слишком много кодов. Повторите позже."},429)
+                code=database.create_email_verification_code(u["user_id"])
+                if not send_email_verification_code(u["email"],code):return reply(self,{"ok":False,"error":"Не удалось отправить код. Повторите позже."},503)
+                database.record_auth_failure("email_resend",str(u["user_id"]))
+                return reply(self,{"ok":True,"sent":True})
+            if p.path=="/api/auth/email/verify":
+                u=auth(self)
+                if not u:return
+                subject=str(u["user_id"])+":"+client_key(self)
+                if database.auth_is_rate_limited("email_verify",subject,5):return reply(self,{"ok":False,"error":"Слишком много попыток. Запросите новый код."},429)
+                ok,status=database.verify_email_code(u["user_id"],str(d.get("code","")).strip())
+                if not ok:
+                    database.record_auth_failure("email_verify",subject)
+                    messages={"expired":"Код истёк. Запросите новый.","too_many_attempts":"Слишком много попыток. Запросите новый код.","invalid":"Неверный код."}
+                    return reply(self,{"ok":False,"error":messages.get(status,"Не удалось подтвердить email.")},400)
+                database.clear_auth_failures("email_verify",subject)
+                return reply(self,{"ok":True,"verified":True})
             if p.path=="/api/auth/logout":
                 c=self.headers.get("Cookie","");t=next((x.strip().split("=",1)[1] for x in c.split(";") if x.strip().startswith("hpoint_session=")),None)
                 if t:db.execute("DELETE FROM sessions WHERE token=?",(t,))
@@ -629,6 +745,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/requests":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
                 if get_active_own_request(u["user_id"]):return reply(self,{"ok":False,"error":"У вас уже есть активная заявка."},409)
                 if u["balance"]<REQUEST_COST:return reply(self,{"ok":False,"error":f"Нужно {REQUEST_COST} HP."},400)
                 f={k:str(d.get(k,"" )).strip() for k in ("what","place","time_needed","urgency","details")}
@@ -651,6 +768,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/helper/queue":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
                 if get_active_own_request(u["user_id"]):
                     return reply(self,{"ok":False,"error":"Сначала завершите или отмените свою активную заявку."},409)
                 if get_active_help(u["user_id"]):
@@ -660,6 +778,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/requests/accept":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
                 try: rid=int(d.get("request_id"))
                 except (TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
                 request=get_request(rid)
@@ -674,6 +793,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/assistant/candidates":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
                 try: rid=int(d["request_id"])
                 except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
                 request=get_request(rid)
@@ -685,6 +805,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/smart-match/assign":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
                 try:rid=int(d["request_id"]);hid=int(d["helper_id"])
                 except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректные данные."},400)
                 r=get_request(rid)
@@ -705,6 +826,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/helper/offers/respond":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
                 try:rid=int(d["request_id"])
                 except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
                 accept=d.get("accept")
@@ -725,6 +847,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/requests/finish":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
                 try:rid=int(d["request_id"])
                 except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
                 if not complete_request(rid,u["user_id"]):return reply(self,{"ok":False,"error":"Завершить может только назначенный помощник."},409)
@@ -732,6 +855,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/reviews":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
                 try:rid=int(d["request_id"]);rating=int(d["rating"])
                 except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная оценка."},400)
                 side=str(d.get("side", ""))
@@ -743,6 +867,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/chats/send":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
                 try:rid=int(d["request_id"])
                 except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректный request_id."},400)
                 text=str(d.get("text","")).strip()[:1000]
