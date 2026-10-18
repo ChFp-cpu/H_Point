@@ -458,8 +458,15 @@ function updatePasswordHint(){let password=$('ap')?.value||'',checks=passwordChe
 function togglePassword(id,button){let input=$(id),visible=input.type==='text';input.type=visible?'password':'text';button.textContent=visible?'👁️':'🙈';button.setAttribute('aria-label',visible?'Показать пароль':'Скрыть пароль')}
 function decoratePasswordInput(id,autocomplete){let input=$(id);if(!input)return;let wrap=document.createElement('div');wrap.className='passwordField';input.parentNode.insertBefore(wrap,input);wrap.appendChild(input);let button=document.createElement('button');button.type='button';button.className='passwordToggle';button.textContent='👁️';button.setAttribute('aria-label','Показать пароль');button.onclick=()=>togglePassword(id,button);wrap.appendChild(button);input.autocomplete=autocomplete}
 function passwordRulesMarkup(){return '<ul id="passwordRules" class="passwordRules"><li data-rule="length">от 6 до 256 символов</li><li data-rule="lower">строчная латинская буква</li><li data-rule="upper">заглавная латинская буква</li><li data-rule="digit">хотя бы одна цифра</li></ul>'}
-const originalAuthForm=authForm;
-function authForm(reg){originalAuthForm(reg);let body=$('modalbody'),rules=body.querySelector('.passwordRules');if(rules){rules.id='passwordRules';rules.innerHTML='<li data-rule="length">от 6 до 256 символов</li><li data-rule="lower">строчная латинская буква</li><li data-rule="upper">заглавная латинская буква</li><li data-rule="digit">хотя бы одна цифра</li>'}else{let input=$('ap');if(input){input.insertAdjacentHTML('afterend',passwordRulesMarkup());input.insertAdjacentHTML('afterend','<p id="passwordHint" class="muted passwordHint" aria-live="polite">Введите пароль по требованиям ниже.</p>')}}decoratePasswordInput('ap','current-password');if(reg)decoratePasswordInput('ap2','new-password');let input=$('ap');if(input)input.addEventListener('input',updatePasswordHint);updatePasswordHint()}
+const originalAuthForm=window.authForm;
+window.authForm=function(reg){originalAuthForm(reg);let body=$('modalbody'),rules=body.querySelector('.passwordRules');if(rules){rules.id='passwordRules';rules.innerHTML='<li data-rule="length">от 6 до 256 символов</li><li data-rule="lower">строчная латинская буква</li><li data-rule="upper">заглавная латинская буква</li><li data-rule="digit">хотя бы одна цифра</li>'}else{let input=$('ap');if(input){input.insertAdjacentHTML('afterend',passwordRulesMarkup());input.insertAdjacentHTML('afterend','<p id="passwordHint" class="muted passwordHint" aria-live="polite">Введите пароль по требованиям ниже.</p>')}}decoratePasswordInput('ap','current-password');if(reg)decoratePasswordInput('ap2','new-password');let input=$('ap');if(input)input.addEventListener('input',updatePasswordHint);updatePasswordHint()}
+'''
+
+ACCOUNT_ACTIONS_UI=r'''
+function showAccountActions(){let host=$('accountActions');if(!host){host=document.createElement('div');host.id='accountActions';host.className='profileActions';$('profInfo').after(host)}host.innerHTML='<button class="btn light" onclick="logout()">Выйти из аккаунта</button><button class="btn danger" onclick="deleteAccount()">Удалить аккаунт</button>'}
+async function deleteAccount(){let confirmation=prompt('Удаление необратимо: профиль, заявки, чаты и сессии будут удалены. Введите УДАЛИТЬ для подтверждения.');if(confirmation!=="УДАЛИТЬ")return;try{await api('/api/auth/account/delete',{method:'POST',body:JSON.stringify({confirmation})});stopSync();sessionStorage.removeItem('hpointTelegramLoginTicket');location.reload()}catch(e){toast(e.message)}}
+const originalProfileForAccountActions=window.profile;
+window.profile=async function(providedUser){let result=await originalProfileForAccountActions(providedUser);showAccountActions();return result}
 '''
 
 def _page_replace(needle, replacement):
@@ -472,8 +479,9 @@ _page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+P
 _page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg"><link rel="apple-touch-icon" href="/assets/hpoint-logo.png"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
 _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandLogo" href="/" aria-label="H-Point"><img src="/assets/hpoint-logo-dark.png" alt="H-Point"></a>')
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
+_page_replace('<p class="audiencePortrait">H·Point создан для Ильи: он недавно переехал в новый район, работает до вечера и хочет быстро найти надёжного человека рядом, чтобы настроить роутер, донести коробки или решить другую небольшую, но срочную задачу.</p>', '')
 _page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
@@ -716,6 +724,12 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/auth/logout":
                 c=self.headers.get("Cookie","");t=next((x.strip().split("=",1)[1] for x in c.split(";") if x.strip().startswith("hpoint_session=")),None)
                 if t:db.execute("DELETE FROM sessions WHERE token=?",(t,))
+                return reply(self,{"ok":True},headers={"Set-Cookie":session_cookie("", 0)})
+            if p.path=="/api/auth/account/delete":
+                u=auth(self)
+                if not u:return
+                if str(d.get("confirmation","")).strip()!="УДАЛИТЬ":return reply(self,{"ok":False,"error":"Введите УДАЛИТЬ для подтверждения."},400)
+                database.delete_user_account(u["user_id"])
                 return reply(self,{"ok":True},headers={"Set-Cookie":session_cookie("", 0)})
             if p.path=="/api/profiles/switch":
                 u=auth(self)

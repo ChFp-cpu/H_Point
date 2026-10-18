@@ -255,6 +255,35 @@ def get_user_by_email(email):
 def get_user_by_tg(tg_user_id):
     return db.execute("SELECT * FROM users WHERE tg_user_id=?",(tg_user_id,)).fetchone()
 
+def delete_user_account(user_id):
+    """Permanently erase an account and data that can identify or authenticate it."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        # A deleted helper must no longer be assigned to another person's request.
+        db.execute("UPDATE requests SET helper_id=NULL, status=CASE WHEN status IN ('assigned','in_progress') THEN 'open' ELSE status END WHERE helper_id=?", (user_id,))
+        db.execute("DELETE FROM admin_audit_log WHERE admin_user_id=? OR target_user_id=?", (user_id, user_id))
+        db.execute("UPDATE identity_verification_requests SET reviewer_id=NULL WHERE reviewer_id=?", (user_id,))
+        db.execute("DELETE FROM chats WHERE user_a_id=? OR user_b_id=?", (user_id, user_id))
+        db.execute("DELETE FROM chat_messages WHERE user_id=?", (user_id,))
+        db.execute("DELETE FROM requests WHERE requester_id=?", (user_id,))
+        db.execute("DELETE FROM helper_queue WHERE user_id=?", (user_id,))
+        db.execute("DELETE FROM request_candidates WHERE candidate_id=?", (user_id,))
+        db.execute("DELETE FROM favorites WHERE user_id=? OR favorite_user_id=?", (user_id, user_id))
+        db.execute("DELETE FROM ads WHERE user_id=?", (user_id,))
+        db.execute("DELETE FROM commercial_orders WHERE user_id=?", (user_id,))
+        db.execute("DELETE FROM subscriptions WHERE user_id=?", (user_id,))
+        db.execute("DELETE FROM billing_events WHERE invoice_id IN (SELECT id FROM billing_invoices WHERE user_id=?)", (user_id,))
+        db.execute("DELETE FROM billing_invoices WHERE user_id=?", (user_id,))
+        db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        db.execute("DELETE FROM web_login_tickets WHERE user_id=?", (user_id,))
+        db.execute("DELETE FROM telegram_auth_tickets WHERE user_id=?", (user_id,))
+        db.execute("DELETE FROM email_verification_codes WHERE user_id=?", (user_id,))
+        db.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
 def insert_id(sql, params=()):
     """Insert a row and return its generated numeric id on both supported engines."""
     if getattr(db, "is_postgres", False):

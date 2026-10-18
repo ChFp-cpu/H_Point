@@ -220,6 +220,19 @@ class Web(unittest.TestCase):
    with get(second) as response:self.assertEqual(json.load(response)["user"]["id"],uid)
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_account_deletion_requires_confirmation_and_revokes_session(self):
+  uid=database.create_web_user("Erase Me","erase@example.com","hash");token=web.new_sess(uid)
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Content-Type":"application/json","Cookie":f"hpoint_session={token}"}
+   bad=urllib.request.Request(base+"/api/auth/account/delete",data=json.dumps({"confirmation":"нет"}).encode(),headers=headers,method="POST")
+   with self.assertRaises(urllib.error.HTTPError) as denied:urllib.request.urlopen(bad,timeout=3)
+   self.assertEqual(denied.exception.code,400);denied.exception.close();self.assertIsNotNone(database.get_user(uid))
+   good=urllib.request.Request(base+"/api/auth/account/delete",data=json.dumps({"confirmation":"УДАЛИТЬ"}).encode(),headers=headers,method="POST")
+   with urllib.request.urlopen(good,timeout=3) as response:self.assertTrue(json.load(response)["ok"])
+   self.assertIsNone(database.get_user(uid))
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
  def test_chat_is_private_live_and_input_is_validated(self):
   for uid,name in ((1,"Requester"),(2,"Helper"),(3,"Outsider")):database.create_user(uid,name)
   rid=services.create_request(1,{"what":"Нужна помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
