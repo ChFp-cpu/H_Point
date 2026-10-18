@@ -191,6 +191,18 @@ def init_db():
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY(request_id,candidate_id)
     );
+    CREATE TABLE IF NOT EXISTS request_views(
+      request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+      viewer_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(request_id,viewer_id)
+    );
+    CREATE TABLE IF NOT EXISTS support_tickets(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      subject TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
+      admin_reply TEXT, replied_by INTEGER REFERENCES users(user_id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      replied_at TEXT
+    );
     CREATE TABLE IF NOT EXISTS ai_usage(
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
       request_count INTEGER NOT NULL DEFAULT 0, token_count INTEGER NOT NULL DEFAULT 0,
@@ -204,6 +216,7 @@ def init_db():
     );
     CREATE INDEX IF NOT EXISTS idx_request_candidates_request ON request_candidates(request_id,status,score);
     CREATE INDEX IF NOT EXISTS idx_request_candidates_candidate ON request_candidates(candidate_id,status);
+    CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status,created_at);
     CREATE INDEX IF NOT EXISTS idx_chat_messages_chat ON chat_messages(chat_id,id);
     CREATE INDEX IF NOT EXISTS idx_identity_verification_status ON identity_verification_requests(status,submitted_at);
     CREATE INDEX IF NOT EXISTS idx_requests_open ON requests(status,created_at);

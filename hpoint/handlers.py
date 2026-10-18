@@ -1043,6 +1043,19 @@ async def link_account(message: Message):
         reply_markup=main_menu_kb(),
     )
 
+@router.message(Command("unlink"))
+async def unlink_account(message: Message):
+    """Detach the current Telegram identity so it can be linked to another site profile."""
+    source=get_user(message.from_user.id)
+    if not source or not source["tg_user_id"]:
+        await message.answer("Telegram уже используется как отдельный профиль. Для привязки к сайту получите код в разделе «Профиль» и отправьте /link КОД.")
+        return
+    detached=detach_telegram_to_web_profile(message.from_user.id)
+    if detached is None:
+        await message.answer("Не удалось отвязать профиль. Попробуйте позже.")
+        return
+    await message.answer("✅ Telegram отвязан от сайта. Теперь получите код в нужном профиле сайта и отправьте сюда /link КОД.", reply_markup=main_menu_kb())
+
 def web_payment_url(item_type, request_id=None):
     from urllib.parse import urlencode
     q={"item":item_type}

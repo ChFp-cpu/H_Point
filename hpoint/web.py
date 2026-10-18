@@ -228,7 +228,7 @@ def user_payload(u):
     code_valid=bool(u["verification_code"] and u["verification_code_expires_at"] and u["verification_code_expires_at"]>now().isoformat())
     identity=database.get_identity_verification(u["user_id"])
     identity_payload={"status":identity["status"],"submitted_at":identity["submitted_at"],"reviewed_at":identity["reviewed_at"],"note":identity["note"]} if identity else {"status":"not_requested"}
-    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"email_verified":bool(u["email_verified"]),"account_verified":account_is_verified(u),"email_delivery_configured":email_delivery_configured(),"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code":u["verification_code"] if code_valid else None,"pro_until":u["pro_until"],"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats}
+    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"role":u["role"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"email_verified":bool(u["email_verified"]),"account_verified":account_is_verified(u),"email_delivery_configured":email_delivery_configured(),"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code":u["verification_code"] if code_valid else None,"pro_until":u["pro_until"],"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats}
 
 def request_payload(r):
     d=dict(r); d["category_name"]=CATEGORIES.get(r["category"],"Другое"); d["status_title"]=STATUS_TITLES.get(r["status"],r["status"]); return d
@@ -239,7 +239,11 @@ def public_request_payload(r):
             "category_name": CATEGORIES.get(r["category"], "Другое"), "urgency": r["urgency"],
             # The free-text place field can contain a home address.  It is
             # shared only with the assigned helper through the private flow.
-            "place": "Район уточняется после назначения", "lat": None, "lon": None}
+            "place": "Район уточняется после назначения", "lat": None, "lon": None, "views": r["views"] if "views" in r.keys() else 0}
+
+def record_request_view(request_id, viewer_id):
+    inserted=db.execute("INSERT OR IGNORE INTO request_views(request_id,viewer_id) VALUES(?,?)", (request_id,viewer_id))
+    if getattr(inserted,"rowcount",0): db.execute("UPDATE requests SET views=COALESCE(views,0)+1 WHERE id=?",(request_id,))
 
 def coordinates_from_payload(data):
     """Read an optional browser position and reject incomplete or invalid input."""
@@ -528,10 +532,18 @@ async function buildRoute(id){let task=hpointMapTasks.find(function(row){return 
 # A full reload after a switch clears all rendered data and in-memory polling
 # state that belonged to the previous account.
 PROFILE_MENU_UI=r'''
-function openProfileMenu(){api('/api/me').then(function(data){let u=data.user;$('modal').style.display='flex';$('modalbody').innerHTML='<button class="close" onclick="closeModal()">×</button><h2>'+esc(u.name)+'</h2><p class="muted">'+esc(u.email||'Профиль Telegram')+'</p><div class="profileActions"><button class="btn grad" onclick="closeModal();go(\'profile\')">Мой профиль</button><button class="btn light" onclick="openProfiles()">Сменить аккаунт</button><button class="btn light" onclick="closeModal();authForm(true)">Добавить аккаунт</button><button class="btn light" onclick="logout()">Выйти из аккаунта</button><button class="btn danger" onclick="deleteAccount()">Удалить аккаунт</button></div>'}).catch(function(e){toast(e.message)})}
+function openProfileMenu(){api('/api/me').then(function(data){let u=data.user,admin=u.role==='admin'?'<button class="btn grad" onclick="openAdminSupport()">Панель администратора</button>':'';$('modal').style.display='flex';$('modalbody').innerHTML='<button class="close" onclick="closeModal()">×</button><h2>'+esc(u.name)+'</h2><p class="muted">'+esc(u.email||'Профиль Telegram')+'</p><div class="profileActions"><button class="btn grad" onclick="closeModal();go(\'profile\')">Мой профиль</button>'+admin+'<button class="btn light" onclick="openProfiles()">Сменить аккаунт</button><button class="btn light" onclick="closeModal();authForm(true)">Добавить аккаунт</button><button class="btn light" onclick="logout()">Выйти из аккаунта</button><button class="btn danger" onclick="deleteAccount()">Удалить аккаунт</button></div>'}).catch(function(e){toast(e.message)})}
 async function switchProfile(id){try{stopSync();await api('/api/profiles/switch',{method:'POST',body:JSON.stringify({user_id:id})});sessionStorage.removeItem('hpointLastLocation');sessionStorage.removeItem('hpointTelegramLoginTicket');location.replace('/')}catch(e){toast(e.message)}}
 const originalLoadForProfileMenu=window.load;
-window.load=async function(){await originalLoadForProfileMenu();let nav=$('nav');if(nav)nav.innerHTML='<button class="btn light" onclick="openProfileMenu()">👤 Профиль</button><button class="btn dark" onclick="requestForm()">+ Заявка</button>'}
+window.load=async function(){await originalLoadForProfileMenu();let nav=$('nav');if(nav)nav.innerHTML='<button class="btn light" onclick="openSupport()">Поддержка</button><button class="btn light" onclick="openProfileMenu()">👤 Профиль</button><button class="btn dark" onclick="requestForm()">+ Заявка</button>'}
+'''
+
+SUPPORT_UI=r'''
+function openSupport(){$('modal').style.display='flex';$('modalbody').innerHTML='<button class="close" onclick="closeModal()">×</button><h2>Поддержка</h2><div class="form"><input id="supportSubject" class="input" maxlength="120" placeholder="Тема вопроса"><textarea id="supportMessage" class="input textarea" maxlength="2000" placeholder="Опишите проблему"></textarea><button class="btn grad" onclick="createSupportTicket()">Отправить</button></div><div id="supportTickets" style="margin-top:18px"></div>';loadSupportTickets()}
+async function createSupportTicket(){try{await api('/api/support',{method:'POST',body:JSON.stringify({subject:$('supportSubject').value,message:$('supportMessage').value})});toast('Обращение отправлено');await loadSupportTickets()}catch(e){toast(e.message)}}
+async function loadSupportTickets(){try{let data=await api('/api/support');let host=$('supportTickets');if(host)host.innerHTML=(data.tickets||[]).map(function(ticket){return '<div class="request"><div class="requestmain"><b>'+esc(ticket.subject)+'</b><div class="muted">'+esc(ticket.message)+'</div>'+ (ticket.admin_reply?'<p><b>Ответ поддержки:</b> '+esc(ticket.admin_reply)+'</p>':'<span class="badge warn">Ожидает ответа</span>')+'</div></div>'}).join('')||'<p class="muted">Обращений пока нет.</p>'}catch(e){toast(e.message)}}
+async function openAdminSupport(){try{let data=await api('/api/admin/support'),open=(data.summary.requests||{}).open||0;$('modal').style.display='flex';$('modalbody').innerHTML='<button class="close" onclick="closeModal()">×</button><h2>Панель поддержки</h2><p class="muted">Пользователей: '+Number(data.summary.users||0)+' · открытых заявок: '+Number(open)+'</p><div id="adminTickets">'+data.tickets.map(function(ticket){return '<div class="request"><div class="requestmain"><b>#'+ticket.id+' · '+esc(ticket.subject)+'</b><div class="muted">'+esc(ticket.user_name)+' · '+esc(ticket.user_email||'')+'</div><p>'+esc(ticket.message)+'</p><textarea id="reply'+ticket.id+'" class="input textarea" placeholder="Ответ пользователю">'+esc(ticket.admin_reply||'')+'</textarea><button class="btn grad" onclick="replySupport('+ticket.id+')">Ответить</button></div></div>'}).join('')+'</div>'}catch(e){toast(e.message)}}
+async function replySupport(id){try{await api('/api/admin/support/reply',{method:'POST',body:JSON.stringify({ticket_id:id,message:$('reply'+id).value})});toast('Ответ сохранён');openAdminSupport()}catch(e){toast(e.message)}}
 '''
 
 PASSWORD_RESET_UI=r'''
@@ -584,7 +596,7 @@ _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandL
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
 _page_replace('<p class="audiencePortrait">H·Point создан для Ильи: он недавно переехал в новый район, работает до вечера и хочет быстро найти надёжного человека рядом, чтобы настроить роутер, донести коробки или решить другую небольшую, но срочную задачу.</p>', '')
 _page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+LOCATION_PICKER_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+SUPPORT_UI+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+LOCATION_PICKER_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
@@ -685,6 +697,16 @@ class Handler(BaseHTTPRequestHandler):
                 u=auth(self)
                 if not u:return
                 return reply(self,{"ok":True,"offers":[dict(row) for row in get_helper_offers(u["user_id"])]})
+            if p.path=="/api/support":
+                u=auth(self)
+                if not u:return
+                rows=db.execute("SELECT * FROM support_tickets WHERE user_id=? ORDER BY id DESC LIMIT 50",(u["user_id"],)).fetchall()
+                return reply(self,{"ok":True,"tickets":[dict(row) for row in rows]})
+            if p.path=="/api/admin/support":
+                admin=admin_auth(self)
+                if not admin:return
+                rows=db.execute("SELECT t.*,u.name user_name,u.email user_email FROM support_tickets t JOIN users u ON u.user_id=t.user_id ORDER BY CASE t.status WHEN 'open' THEN 0 ELSE 1 END,t.id DESC LIMIT 100").fetchall()
+                return reply(self,{"ok":True,"tickets":[dict(row) for row in rows],"summary":admin_summary()})
             if p.path=="/api/history":
                 u=auth(self)
                 if not u:return
@@ -704,7 +726,7 @@ class Handler(BaseHTTPRequestHandler):
                     if cat and r["category"]!=cat: continue
                     hay=(r["what"]+" "+r["details"]+" "+r["place"]).lower()
                     if q and q not in hay: continue
-                    out.append(request_payload(r))
+                    record_request_view(r["id"],u["user_id"]); out.append(request_payload(r))
                 return reply(self,{"ok":True,"requests":[public_request_payload(r) for r in out[:30]]})
             if p.path=="/api/requests":
                 u=auth(self)
@@ -712,6 +734,7 @@ class Handler(BaseHTTPRequestHandler):
                 expire_open_requests()
                 if parse_qs(p.query).get("open",[""])[0]:
                     rs=db.execute("SELECT * FROM requests WHERE status=? AND requester_id!=? ORDER BY priority_boost DESC,created_at DESC LIMIT 100",(STATUS_OPEN,u["user_id"])).fetchall()
+                    for row in rs: record_request_view(row["id"],u["user_id"])
                     return reply(self,{"ok":True,"requests":[public_request_payload(r) for r in rs]})
                 return reply(self,{"ok":True,"requests":[request_payload(r) for r in get_history(u["user_id"],HISTORY_LIMIT)]})
             if p.path=="/api/smart-match":
@@ -900,6 +923,23 @@ class Handler(BaseHTTPRequestHandler):
                 n=str(d.get("name",u["name"])).strip()[:MAX_NAME_LEN];city=str(d.get("city","")).strip()[:80];bio=str(d.get("bio","")).strip()[:500]
                 if len(n)<2:return reply(self,{"ok":False,"error":"Имя слишком короткое."},400)
                 db.execute("UPDATE users SET name=?,city=?,bio=? WHERE user_id=?",(n,city,bio,u["user_id"]));return reply(self,{"ok":True})
+            if p.path=="/api/support":
+                u=auth(self)
+                if not u:return
+                subject=str(d.get("subject","")).strip()[:120]; message=str(d.get("message","")).strip()[:2000]
+                if not subject or not message:return reply(self,{"ok":False,"error":"Заполните тему и сообщение."},400)
+                ticket=database.insert_id("INSERT INTO support_tickets(user_id,subject,message) VALUES(?,?,?)",(u["user_id"],subject,message))
+                return reply(self,{"ok":True,"ticket_id":ticket})
+            if p.path=="/api/admin/support/reply":
+                admin=admin_auth(self)
+                if not admin:return
+                try: ticket_id=int(d.get("ticket_id"))
+                except (TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректное обращение."},400)
+                message=str(d.get("message","")).strip()[:2000]
+                if not message:return reply(self,{"ok":False,"error":"Введите ответ."},400)
+                changed=db.execute("UPDATE support_tickets SET admin_reply=?,replied_by=?,replied_at=CURRENT_TIMESTAMP,status='answered' WHERE id=?",(message,admin["user_id"],ticket_id)).rowcount
+                if not changed:return reply(self,{"ok":False,"error":"Обращение не найдено."},404)
+                return reply(self,{"ok":True})
             if p.path=="/api/identity-verification":
                 u=auth(self)
                 if not u:return
