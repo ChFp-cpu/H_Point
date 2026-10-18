@@ -1,7 +1,7 @@
 """Database persistence with SQLite development and PostgreSQL production support."""
 import sqlite3, hashlib, re, threading, json, secrets
 from datetime import datetime, timedelta, timezone
-from .config import DATABASE_URL, DB_PATH, START_BALANCE, STATUS_OPEN, STATUS_IN_PROGRESS, STATUS_DONE, ADMIN_TELEGRAM_IDS, TELEGRAM_AUTH_TTL_SECONDS, TELEGRAM_LINK_TTL_SECONDS, EMAIL_VERIFICATION_TTL_SECONDS, AUTH_ATTEMPT_WINDOW_SECONDS
+from .config import DATABASE_URL, DB_PATH, START_BALANCE, STATUS_OPEN, STATUS_IN_PROGRESS, STATUS_DONE, ADMIN_TELEGRAM_IDS, TELEGRAM_AUTH_TTL_SECONDS, TELEGRAM_LINK_TTL_SECONDS, EMAIL_VERIFICATION_TTL_SECONDS, PHONE_VERIFICATION_TTL_SECONDS, AUTH_ATTEMPT_WINDOW_SECONDS
 
 
 class PostgresConnection:
@@ -118,6 +118,7 @@ def init_db():
       business_until TEXT, favorite_slots INTEGER NOT NULL DEFAULT 3,
       tg_user_id INTEGER UNIQUE, verification_code TEXT, verification_code_expires_at TEXT, web_verified INTEGER NOT NULL DEFAULT 0,
       email_verified INTEGER NOT NULL DEFAULT 0,
+      full_name TEXT DEFAULT '', birth_date TEXT, phone TEXT, phone_verified INTEGER NOT NULL DEFAULT 0,
       lat REAL, lon REAL, city TEXT DEFAULT '', bio TEXT DEFAULT '',
       role TEXT NOT NULL DEFAULT 'user', is_blocked INTEGER NOT NULL DEFAULT 0, blocked_reason TEXT,
       last_seen_at TEXT
@@ -147,6 +148,11 @@ def init_db():
       user_id INTEGER PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
       code_hash TEXT NOT NULL, expires_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS phone_verification_codes(
+      user_id INTEGER PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+      phone TEXT NOT NULL, code_hash TEXT NOT NULL, expires_at TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS requests(
       id INTEGER PRIMARY KEY AUTOINCREMENT, requester_id INTEGER NOT NULL REFERENCES users(user_id),
@@ -224,6 +230,7 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS idx_telegram_auth_tickets_expires ON telegram_auth_tickets(expires_at);
     CREATE INDEX IF NOT EXISTS idx_email_verification_codes_expires ON email_verification_codes(expires_at);
+    CREATE INDEX IF NOT EXISTS idx_phone_verification_codes_expires ON phone_verification_codes(expires_at);
     """
     if getattr(db, "is_postgres", False):
         schema = schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY").replace("INTEGER", "BIGINT")
@@ -234,6 +241,7 @@ def init_db():
     for t,n,d in [
       ("users","email","TEXT"),("users","password_hash","TEXT"),("users","tg_user_id","INTEGER"),
       ("users","verification_code","TEXT"),("users","verification_code_expires_at","TEXT"),("users","web_verified","INTEGER NOT NULL DEFAULT 0"),("users","email_verified","INTEGER NOT NULL DEFAULT 0"),
+      ("users","full_name","TEXT DEFAULT ''"),("users","birth_date","TEXT"),("users","phone","TEXT"),("users","phone_verified","INTEGER NOT NULL DEFAULT 0"),
       ("users","lat","REAL"),("users","lon","REAL"),("users","city","TEXT DEFAULT ''"),("users","bio","TEXT DEFAULT ''"),
       ("users","role","TEXT NOT NULL DEFAULT 'user'"),("users","is_blocked","INTEGER NOT NULL DEFAULT 0"),("users","blocked_reason","TEXT"),
       ("users","last_seen_at","TEXT"),
@@ -445,6 +453,86 @@ def verify_email_code(user_id, code, max_attempts=5):
         db.execute("ROLLBACK")
         raise
 
+def normalize_phone(phone):
+    """Return one canonical E.164 number or None without guessing a country."""
+    value = re.sub(r"[\s()\-.]", "", str(phone or ""))
+    if re.fullmatch(r"8\d{10}", value):
+        value = "+7" + value[1:]
+    elif re.fullmatch(r"7\d{10}", value):
+        value = "+" + value
+    if not re.fullmatch(r"\+[1-9]\d{9,14}", value):
+        return None
+    return value
+
+def update_contact_details(user_id, full_name, birth_date, phone):
+    """Store profile data; replacing a phone invalidates its previous check."""
+    name = " ".join(str(full_name or "").split())
+    if not 2 <= len(name) <= 120:
+        return False, "Укажите имя от 2 до 120 символов."
+    try:
+        born = datetime.strptime(str(birth_date or ""), "%Y-%m-%d").date()
+    except ValueError:
+        return False, "Укажите корректную дату рождения."
+    today = datetime.now(timezone.utc).date()
+    if born > today or born.year < today.year - 120:
+        return False, "Укажите корректную дату рождения."
+    normalized = normalize_phone(phone)
+    if not normalized:
+        return False, "Введите телефон в международном формате, например +7 999 123-45-67."
+    current = get_user(user_id)
+    if not current:
+        return False, "Профиль не найден."
+    changed_phone = current["phone"] != normalized
+    db.execute("UPDATE users SET full_name=?,birth_date=?,phone=?,phone_verified=CASE WHEN ? THEN 0 ELSE phone_verified END WHERE user_id=?",
+               (name, born.isoformat(), normalized, int(changed_phone), user_id))
+    if changed_phone:
+        db.execute("DELETE FROM phone_verification_codes WHERE user_id=?", (user_id,))
+    return True, "saved"
+
+def create_phone_verification_code(user_id):
+    user = get_user(user_id)
+    if not user or not user["phone"]:
+        return None
+    code = f"{secrets.randbelow(900_000) + 100_000:06d}"
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=PHONE_VERIFICATION_TTL_SECONDS)).isoformat()
+    db.execute("DELETE FROM phone_verification_codes WHERE user_id=? OR expires_at<=?", (user_id, datetime.now(timezone.utc).isoformat()))
+    db.execute("INSERT INTO phone_verification_codes(user_id,phone,code_hash,expires_at) VALUES(?,?,?,?)", (user_id, user["phone"], _email_code_hash(code), expires))
+    return code
+
+def verify_phone_code(user_id, code, max_attempts=5):
+    """Consume a phone code atomically and only verify the currently stored number."""
+    current_time = datetime.now(timezone.utc).isoformat()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        row = db.execute("SELECT phone,code_hash,expires_at,attempts FROM phone_verification_codes WHERE user_id=?", (user_id,)).fetchone()
+        user = get_user(user_id)
+        if not row or not user or row["expires_at"] <= current_time or row["phone"] != user["phone"]:
+            db.execute("DELETE FROM phone_verification_codes WHERE user_id=?", (user_id,))
+            db.execute("COMMIT")
+            return False, "expired"
+        if row["attempts"] >= max_attempts:
+            db.execute("DELETE FROM phone_verification_codes WHERE user_id=?", (user_id,))
+            db.execute("COMMIT")
+            return False, "too_many_attempts"
+        valid = isinstance(code, str) and bool(re.fullmatch(r"\d{6}", code)) and secrets.compare_digest(row["code_hash"], _email_code_hash(code))
+        if not valid:
+            attempts = int(row["attempts"]) + 1
+            if attempts >= max_attempts:
+                db.execute("DELETE FROM phone_verification_codes WHERE user_id=?", (user_id,))
+                result = "too_many_attempts"
+            else:
+                db.execute("UPDATE phone_verification_codes SET attempts=? WHERE user_id=?", (attempts, user_id))
+                result = "invalid"
+            db.execute("COMMIT")
+            return False, result
+        db.execute("UPDATE users SET phone_verified=1 WHERE user_id=?", (user_id,))
+        db.execute("DELETE FROM phone_verification_codes WHERE user_id=?", (user_id,))
+        db.execute("COMMIT")
+        return True, "verified"
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
 def create_user(user_id,name,username=None,email=None,password_hash=None,tg_user_id=None,web_verified=False):
     # Telegram registrations use the Telegram id as both the primary user id
     # and the linked Telegram identity. Web accounts are created separately
@@ -480,14 +568,14 @@ def detach_telegram_to_web_profile(user_id):
         # independent website record can be inserted.
         db.execute("UPDATE users SET email=NULL WHERE user_id=?", (user_id,))
         db.execute("""INSERT INTO users(user_id,name,username,email,password_hash,balance,helper_categories,created_at,
-                   pro_until,verified_until,business_until,favorite_slots,web_verified,email_verified,lat,lon,city,bio,role,is_blocked,blocked_reason)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   pro_until,verified_until,business_until,favorite_slots,web_verified,email_verified,full_name,birth_date,phone,phone_verified,lat,lon,city,bio,role,is_blocked,blocked_reason)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                    (web_id,source["name"],None,source["email"],source["password_hash"],source["balance"],source["helper_categories"],source["created_at"],
-                    source["pro_until"],source["verified_until"],source["business_until"],source["favorite_slots"],0,source["email_verified"],source["lat"],source["lon"],source["city"],source["bio"],source["role"],source["is_blocked"],source["blocked_reason"]))
+                    source["pro_until"],source["verified_until"],source["business_until"],source["favorite_slots"],0,source["email_verified"],source["full_name"],source["birth_date"],source["phone"],source["phone_verified"],source["lat"],source["lon"],source["city"],source["bio"],source["role"],source["is_blocked"],source["blocked_reason"]))
         for table, column in [
             ("requests","requester_id"),("requests","helper_id"),("helper_queue","user_id"),
             ("billing_invoices","user_id"),("subscriptions","user_id"),("web_login_tickets","user_id"),
-            ("email_verification_codes","user_id"),
+            ("email_verification_codes","user_id"),("phone_verification_codes","user_id"),
             ("ai_usage","user_id"),("ads","user_id"),("commercial_orders","user_id"),
             ("chats","user_a_id"),("chats","user_b_id"),("chat_messages","user_id"),
             ("request_candidates","candidate_id"),("sessions","user_id"),
@@ -500,7 +588,7 @@ def detach_telegram_to_web_profile(user_id):
         # Keep the Telegram primary id available for a fresh, isolated bot profile.
         db.execute("""UPDATE users SET email=NULL,password_hash=NULL,balance=?,helper_categories='',pro_until=NULL,
                    verified_until=NULL,business_until=NULL,favorite_slots=3,web_verified=1,verification_code=NULL,
-                   verification_code_expires_at=NULL,email_verified=0,lat=NULL,lon=NULL,city='',bio='',tg_user_id=? WHERE user_id=?""",
+                   verification_code_expires_at=NULL,email_verified=0,full_name='',birth_date=NULL,phone=NULL,phone_verified=0,lat=NULL,lon=NULL,city='',bio='',tg_user_id=? WHERE user_id=?""",
                    (START_BALANCE, telegram_id, user_id))
         db.execute("COMMIT")
         return web_id
@@ -837,9 +925,10 @@ def link_by_code(code,tg_user_id,username=None):
             db.execute("UPDATE sessions SET user_id=? WHERE user_id=?",(canonical,web_uid))
             db.execute("UPDATE identity_verification_requests SET user_id=? WHERE user_id=?", (canonical, web_uid))
             db.execute("UPDATE email_verification_codes SET user_id=? WHERE user_id=?", (canonical, web_uid))
+            db.execute("UPDATE phone_verification_codes SET user_id=? WHERE user_id=?", (canonical, web_uid))
             db.execute("DELETE FROM users WHERE user_id=?",(web_uid,))
-            db.execute("UPDATE users SET name=?,username=COALESCE(?,username),email=?,password_hash=?,balance=?,helper_categories=?,created_at=?,pro_until=?,verified_until=?,business_until=?,favorite_slots=?,verification_code=NULL,verification_code_expires_at=NULL,web_verified=1,email_verified=?,lat=?,lon=?,city=?,bio=? WHERE user_id=?",
-                       (row["name"],username or row["username"],row["email"],row["password_hash"],row["balance"],row["helper_categories"],row["created_at"],row["pro_until"],row["verified_until"],row["business_until"],row["favorite_slots"],row["email_verified"],row["lat"],row["lon"],row["city"],row["bio"],canonical))
+            db.execute("UPDATE users SET name=?,username=COALESCE(?,username),email=?,password_hash=?,balance=?,helper_categories=?,created_at=?,pro_until=?,verified_until=?,business_until=?,favorite_slots=?,verification_code=NULL,verification_code_expires_at=NULL,web_verified=1,email_verified=?,full_name=?,birth_date=?,phone=?,phone_verified=?,lat=?,lon=?,city=?,bio=? WHERE user_id=?",
+                       (row["name"],username or row["username"],row["email"],row["password_hash"],row["balance"],row["helper_categories"],row["created_at"],row["pro_until"],row["verified_until"],row["business_until"],row["favorite_slots"],row["email_verified"],row["full_name"],row["birth_date"],row["phone"],row["phone_verified"],row["lat"],row["lon"],row["city"],row["bio"],canonical))
             db.execute("COMMIT")
             return True,"linked"
 
@@ -859,6 +948,10 @@ def link_by_code(code,tg_user_id,username=None):
         merged_bio=tg_row["bio"] or row["bio"]
         merged_lat=tg_row["lat"] if tg_row["lat"] is not None else row["lat"]
         merged_lon=tg_row["lon"] if tg_row["lon"] is not None else row["lon"]
+        merged_full_name=tg_row["full_name"] or row["full_name"]
+        merged_birth_date=tg_row["birth_date"] or row["birth_date"]
+        merged_phone=tg_row["phone"] or row["phone"]
+        merged_phone_verified=tg_row["phone_verified"] if tg_row["phone"] else row["phone_verified"]
         merged_balance=max(int(tg_row["balance"] or 0),int(row["balance"] or 0))
         merged_favorite_slots=max(int(tg_row["favorite_slots"] or 0),int(row["favorite_slots"] or 0))
         merged_pro=max(x for x in (tg_row["pro_until"],row["pro_until"]) if x is not None) if (tg_row["pro_until"] or row["pro_until"]) else None
@@ -911,6 +1004,7 @@ def link_by_code(code,tg_user_id,username=None):
         # the already-open browser remains logged in after linking.
         db.execute("UPDATE sessions SET user_id=? WHERE user_id=?",(canonical,web_uid))
         db.execute("DELETE FROM email_verification_codes WHERE user_id=?", (web_uid,))
+        db.execute("DELETE FROM phone_verification_codes WHERE user_id=?", (web_uid,))
 
         # Remove the old web shadow before copying its unique email/password
         # onto the canonical Telegram row. All dependent rows were migrated above.
@@ -920,11 +1014,11 @@ def link_by_code(code,tg_user_id,username=None):
         db.execute("""UPDATE users SET
             name=?,username=?,email=?,password_hash=?,balance=?,helper_categories=?,
             pro_until=?,verified_until=?,business_until=?,favorite_slots=?,
-            tg_user_id=?,web_verified=1,verification_code=NULL,verification_code_expires_at=NULL,email_verified=?,lat=?,lon=?,city=?,bio=?
+            tg_user_id=?,web_verified=1,verification_code=NULL,verification_code_expires_at=NULL,email_verified=?,full_name=?,birth_date=?,phone=?,phone_verified=?,lat=?,lon=?,city=?,bio=?
             WHERE user_id=?""",
             (merged_name,merged_username,merged_email,merged_password,merged_balance,merged_categories,
              merged_pro,merged_verified,merged_business,merged_favorite_slots,tg_user_id,
-             merged_email_verified,merged_lat,merged_lon,merged_city,merged_bio,canonical))
+             merged_email_verified,merged_full_name,merged_birth_date,merged_phone,merged_phone_verified,merged_lat,merged_lon,merged_city,merged_bio,canonical))
 
         db.execute("COMMIT")
         return True,"linked"

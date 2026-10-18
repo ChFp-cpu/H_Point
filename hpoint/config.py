@@ -33,6 +33,7 @@ AUTH_ATTEMPT_WINDOW_SECONDS = int(os.getenv("AUTH_ATTEMPT_WINDOW_SECONDS", str(1
 TELEGRAM_AUTH_TTL_SECONDS = int(os.getenv("TELEGRAM_AUTH_TTL_SECONDS", "300"))
 TELEGRAM_LINK_TTL_SECONDS = int(os.getenv("TELEGRAM_LINK_TTL_SECONDS", "600"))
 EMAIL_VERIFICATION_TTL_SECONDS = int(os.getenv("EMAIL_VERIFICATION_TTL_SECONDS", "600"))
+PHONE_VERIFICATION_TTL_SECONDS = int(os.getenv("PHONE_VERIFICATION_TTL_SECONDS", "600"))
 SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "2525"))
 SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
@@ -41,6 +42,10 @@ SMTP_FROM = os.getenv("SMTP_FROM", "").strip()
 SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "1").strip().lower() not in ("0", "false", "no", "off")
 SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "0").strip().lower() in ("1", "true", "yes", "on")
 SMTP_TIMEOUT_SECONDS = int(os.getenv("SMTP_TIMEOUT_SECONDS", "10"))
+# A transactional SMS provider is optional.  The UI never claims that a phone
+# is verified until a code was actually sent and checked.
+BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
+SMS_SENDER = os.getenv("SMS_SENDER", "HPoint").strip()
 YANDEX_MAPS_API_KEY = os.getenv("YANDEX_MAPS_API_KEY", "").strip()
 MAX_PAYMENT_BODY = int(os.getenv("MAX_PAYMENT_BODY", "10000"))
 

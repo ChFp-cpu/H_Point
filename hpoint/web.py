@@ -1,6 +1,7 @@
 """H-Point web-first application: dashboard, requests, Smart Match, chat, profile and RUB billing."""
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+from urllib import request as urlrequest, error as urlerror
 from email.message import EmailMessage
 import asyncio, json, logging, os, secrets, hashlib, hmac, datetime as dt, re, smtplib, ssl
 from pathlib import Path
@@ -88,40 +89,20 @@ def password_error(password):
 def email_delivery_configured():
     return bool(SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD and SMTP_FROM)
 
-def send_email_verification_code(address, code):
-    """Send a short code through the configured transactional SMTP mailbox."""
+def _send_email(address, subject, body):
+    """Send a transactional mail using either STARTTLS or implicit TLS."""
     if not email_delivery_configured():
         return False
-
-def send_password_reset_code(address, code):
-    """Deliver a one-time password-reset code without exposing account data."""
-    if not email_delivery_configured(): return False
-    message = EmailMessage(); message["Subject"] = "Восстановление пароля H-Point"; message["From"] = SMTP_FROM; message["To"] = address
-    message.set_content(f"Код для восстановления пароля H-Point: {code}\n\nКод действует 10 минут. Никому его не сообщайте.")
-    try:
-        context=ssl.create_default_context()
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as client:
-            client.ehlo()
-            if SMTP_USE_TLS: client.starttls(context=context); client.ehlo()
-            client.login(SMTP_USERNAME, SMTP_PASSWORD); client.send_message(message)
-        return True
-    except Exception:
-        logging.exception("Password reset delivery failed"); return False
     message = EmailMessage()
-    message["Subject"] = "Код подтверждения H-Point"
+    message["Subject"] = subject
     message["From"] = SMTP_FROM
     message["To"] = address
-    message.set_content(
-        "Ваш код подтверждения H-Point: " + code + "\n\n"
-        f"Код действует {max(1, EMAIL_VERIFICATION_TTL_SECONDS // 60)} минут. "
-        "Никому его не сообщайте."
-    )
+    message.set_content(body)
     try:
         context = ssl.create_default_context()
         if SMTP_USE_SSL:
             with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS, context=context) as client:
-                if SMTP_USERNAME:
-                    client.login(SMTP_USERNAME, SMTP_PASSWORD)
+                client.login(SMTP_USERNAME, SMTP_PASSWORD)
                 client.send_message(message)
         else:
             with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as client:
@@ -129,12 +110,50 @@ def send_password_reset_code(address, code):
                 if SMTP_USE_TLS:
                     client.starttls(context=context)
                     client.ehlo()
-                if SMTP_USERNAME:
-                    client.login(SMTP_USERNAME, SMTP_PASSWORD)
+                client.login(SMTP_USERNAME, SMTP_PASSWORD)
                 client.send_message(message)
         return True
     except Exception:
-        logging.exception("Email verification delivery failed")
+        logging.exception("Transactional email delivery failed")
+        return False
+
+def send_email_verification_code(address, code):
+    return _send_email(
+        address,
+        "Код подтверждения H-Point",
+        "Ваш код подтверждения H-Point: " + code + "\n\n"
+        + f"Код действует {max(1, EMAIL_VERIFICATION_TTL_SECONDS // 60)} минут. Никому его не сообщайте.",
+    )
+
+def send_password_reset_code(address, code):
+    return _send_email(
+        address,
+        "Восстановление пароля H-Point",
+        "Код для восстановления пароля H-Point: " + code + "\n\n"
+        + f"Код действует {max(1, EMAIL_VERIFICATION_TTL_SECONDS // 60)} минут. Никому его не сообщайте.",
+    )
+
+def sms_delivery_configured():
+    return bool(BREVO_API_KEY and SMS_SENDER)
+
+def send_phone_verification_code(phone, code):
+    """Deliver an SMS through Brevo only when an API key was configured."""
+    if not sms_delivery_configured():
+        return False
+    payload = json.dumps({
+        "type": "transactional", "unicodeEnabled": True,
+        "sender": SMS_SENDER, "recipient": phone.lstrip("+"),
+        "content": f"H-Point: код подтверждения телефона {code}. Никому его не сообщайте.",
+    }).encode("utf-8")
+    req = urlrequest.Request(
+        "https://api.brevo.com/v3/transactionalSMS", data=payload, method="POST",
+        headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json", "Accept": "application/json"},
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=SMTP_TIMEOUT_SECONDS) as response:
+            return 200 <= response.status < 300
+    except (urlerror.URLError, TimeoutError, ValueError):
+        logging.exception("Phone verification SMS delivery failed")
         return False
 
 def cookie_value(h, name):
@@ -229,7 +248,8 @@ def user_payload(u):
     code_valid=bool(u["verification_code"] and u["verification_code_expires_at"] and u["verification_code_expires_at"]>now().isoformat())
     identity=database.get_identity_verification(u["user_id"])
     identity_payload={"status":identity["status"],"submitted_at":identity["submitted_at"],"reviewed_at":identity["reviewed_at"],"note":identity["note"]} if identity else {"status":"not_requested"}
-    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"role":u["role"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"email_verified":bool(u["email_verified"]),"account_verified":account_is_verified(u),"email_delivery_configured":email_delivery_configured(),"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code":u["verification_code"] if code_valid else None,"pro_until":u["pro_until"],"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats}
+    contacts_ready=bool((u["full_name"] or "").strip() and u["birth_date"] and u["email_verified"] and u["phone_verified"] and u["tg_user_id"])
+    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"role":u["role"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"email_verified":bool(u["email_verified"]),"account_verified":account_is_verified(u),"email_delivery_configured":email_delivery_configured(),"sms_delivery_configured":sms_delivery_configured(),"full_name":u["full_name"] or "","birth_date":u["birth_date"] or "","phone":u["phone"] or "","phone_verified":bool(u["phone_verified"]),"contacts_verified":contacts_ready,"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code":u["verification_code"] if code_valid else None,"pro_until":u["pro_until"],"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats}
 
 def request_payload(r):
     d=dict(r); d["category_name"]=CATEGORIES.get(r["category"],"Другое"); d["status_title"]=STATUS_TITLES.get(r["status"],r["status"]); return d
@@ -533,23 +553,23 @@ async function buildRoute(id){let task=hpointMapTasks.find(function(row){return 
 # A full reload after a switch clears all rendered data and in-memory polling
 # state that belonged to the previous account.
 PROFILE_MENU_UI=r'''
-function openProfileMenu(){api('/api/me').then(function(data){let u=data.user,admin=u.role==='admin'?'<button class="btn grad" onclick="openAdminSupport()">Панель администратора</button>':'';$('modal').style.display='flex';$('modalbody').innerHTML='<button class="close" onclick="closeModal()">×</button><h2>'+esc(u.name)+'</h2><p class="muted">'+esc(u.email||'Профиль Telegram')+'</p><div class="profileActions"><button class="btn grad" onclick="closeModal();go(\'profile\')">Мой профиль</button>'+admin+'<button class="btn light" onclick="openProfiles()">Сменить аккаунт</button><button class="btn light" onclick="closeModal();authForm(true)">Добавить аккаунт</button><button class="btn light" onclick="logout()">Выйти из аккаунта</button><button class="btn danger" onclick="deleteAccount()">Удалить аккаунт</button></div>'}).catch(function(e){toast(e.message)})}
+function openProfileMenu(){api('/api/me').then(function(data){let u=data.user,admin=u.role==='admin'?'<button class="btn grad" onclick="openAdminSupport()">Панель администратора</button>':'';$('modal').style.display='flex';$('modalbody').innerHTML='<h2>'+esc(u.name)+'</h2><p class="muted">'+esc(u.email||'Профиль Telegram')+'</p><div class="profileActions"><button class="btn grad" onclick="closeModal();go(\'profile\')">Мой профиль</button>'+admin+'<button class="btn light" onclick="openProfiles()">Сменить аккаунт</button><button class="btn light" onclick="closeModal();authForm(true)">Добавить аккаунт</button><button class="btn light" onclick="logout()">Выйти из аккаунта</button><button class="btn danger" onclick="deleteAccount()">Удалить аккаунт</button></div>'}).catch(function(e){toast(e.message)})}
 async function switchProfile(id){try{stopSync();await api('/api/profiles/switch',{method:'POST',body:JSON.stringify({user_id:id})});sessionStorage.removeItem('hpointLastLocation');sessionStorage.removeItem('hpointTelegramLoginTicket');location.replace('/')}catch(e){toast(e.message)}}
 const originalLoadForProfileMenu=window.load;
 window.load=async function(){await originalLoadForProfileMenu();let nav=$('nav');if(nav)nav.innerHTML='<button class="btn light" onclick="openSupport()">Поддержка</button><button class="btn light" onclick="openProfileMenu()">👤 Профиль</button><button class="btn dark" onclick="requestForm()">+ Заявка</button>'}
 '''
 
 SUPPORT_UI=r'''
-function openSupport(){$('modal').style.display='flex';$('modalbody').innerHTML='<button class="close" onclick="closeModal()">×</button><h2>Поддержка</h2><div class="form"><input id="supportSubject" class="input" maxlength="120" placeholder="Тема вопроса"><textarea id="supportMessage" class="input textarea" maxlength="2000" placeholder="Опишите проблему"></textarea><button class="btn grad" onclick="createSupportTicket()">Отправить</button></div><div id="supportTickets" style="margin-top:18px"></div>';loadSupportTickets()}
+function openSupport(){$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Поддержка</h2><div class="form"><input id="supportSubject" class="input" maxlength="120" placeholder="Тема вопроса"><textarea id="supportMessage" class="input textarea" maxlength="2000" placeholder="Опишите проблему"></textarea><button class="btn grad" onclick="createSupportTicket()">Отправить</button></div><div id="supportTickets" style="margin-top:18px"></div>';loadSupportTickets()}
 async function createSupportTicket(){try{await api('/api/support',{method:'POST',body:JSON.stringify({subject:$('supportSubject').value,message:$('supportMessage').value})});toast('Обращение отправлено');await loadSupportTickets()}catch(e){toast(e.message)}}
 async function loadSupportTickets(){try{let data=await api('/api/support');let host=$('supportTickets');if(host)host.innerHTML=(data.tickets||[]).map(function(ticket){return '<div class="request"><div class="requestmain"><b>'+esc(ticket.subject)+'</b><div class="muted">'+esc(ticket.message)+'</div>'+ (ticket.admin_reply?'<p><b>Ответ поддержки:</b> '+esc(ticket.admin_reply)+'</p>':'<span class="badge warn">Ожидает ответа</span>')+'</div></div>'}).join('')||'<p class="muted">Обращений пока нет.</p>'}catch(e){toast(e.message)}}
-async function openAdminSupport(){try{let data=await api('/api/admin/support'),open=(data.summary.requests||{}).open||0;$('modal').style.display='flex';$('modalbody').innerHTML='<button class="close" onclick="closeModal()">×</button><h2>Панель поддержки</h2><p class="muted">Пользователей: '+Number(data.summary.users||0)+' · открытых заявок: '+Number(open)+'</p><div id="adminTickets">'+data.tickets.map(function(ticket){return '<div class="request"><div class="requestmain"><b>#'+ticket.id+' · '+esc(ticket.subject)+'</b><div class="muted">'+esc(ticket.user_name)+' · '+esc(ticket.user_email||'')+'</div><p>'+esc(ticket.message)+'</p><textarea id="reply'+ticket.id+'" class="input textarea" placeholder="Ответ пользователю">'+esc(ticket.admin_reply||'')+'</textarea><button class="btn grad" onclick="replySupport('+ticket.id+')">Ответить</button></div></div>'}).join('')+'</div>'}catch(e){toast(e.message)}}
+async function openAdminSupport(){try{let data=await api('/api/admin/support'),open=(data.summary.requests||{}).open||0;$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Панель поддержки</h2><p class="muted">Пользователей: '+Number(data.summary.users||0)+' · открытых заявок: '+Number(open)+'</p><div id="adminTickets">'+data.tickets.map(function(ticket){return '<div class="request"><div class="requestmain"><b>#'+ticket.id+' · '+esc(ticket.subject)+'</b><div class="muted">'+esc(ticket.user_name)+' · '+esc(ticket.user_email||'')+'</div><p>'+esc(ticket.message)+'</p><textarea id="reply'+ticket.id+'" class="input textarea" placeholder="Ответ пользователю">'+esc(ticket.admin_reply||'')+'</textarea><button class="btn grad" onclick="replySupport('+ticket.id+')">Ответить</button></div></div>'}).join('')+'</div>'}catch(e){toast(e.message)}}
 async function replySupport(id){try{await api('/api/admin/support/reply',{method:'POST',body:JSON.stringify({ticket_id:id,message:$('reply'+id).value})});toast('Ответ сохранён');openAdminSupport()}catch(e){toast(e.message)}}
 '''
 
 PASSWORD_RESET_UI=r'''
-function openPasswordReset(){ $('modal').style.display='flex';$('modalbody').innerHTML='<button class="close" onclick="closeModal()">×</button><h2>Восстановить пароль</h2><p class="muted">Введите email. Если аккаунт существует, код придёт на эту почту.</p><div class="form"><input id="resetEmail" class="input" type="email" autocomplete="email" placeholder="Email"><button class="btn grad" onclick="requestPasswordReset()">Получить код</button><div id="err" class="muted"></div></div>' }
-async function requestPasswordReset(){try{await api('/api/auth/password/reset/request',{method:'POST',body:JSON.stringify({email:$('resetEmail').value})});$('modalbody').innerHTML='<button class="close" onclick="closeModal()">×</button><h2>Новый пароль</h2><p class="muted">Введите код из письма и новый пароль.</p><div class="form"><input id="resetCode" class="input" inputmode="numeric" maxlength="6" placeholder="Код из письма"><input id="resetPassword" class="input" type="password" placeholder="Новый пароль"><input id="resetConfirm" class="input" type="password" placeholder="Повторите пароль"><button class="btn grad" onclick="confirmPasswordReset()">Сохранить пароль</button><div id="err" class="muted"></div></div>'}catch(e){$('err').textContent=e.message}}
+function openPasswordReset(){ $('modal').style.display='flex';$('modalbody').innerHTML='<h2>Восстановить пароль</h2><p class="muted">Введите email. Если аккаунт существует, код придёт на эту почту.</p><div class="form"><input id="resetEmail" class="input" type="email" autocomplete="email" placeholder="Email"><button class="btn grad" onclick="requestPasswordReset()">Получить код</button><div id="err" class="muted"></div></div>' }
+async function requestPasswordReset(){try{await api('/api/auth/password/reset/request',{method:'POST',body:JSON.stringify({email:$('resetEmail').value})});$('modalbody').innerHTML='<h2>Новый пароль</h2><p class="muted">Введите код из письма и новый пароль.</p><div class="form"><input id="resetCode" class="input" inputmode="numeric" maxlength="6" placeholder="Код из письма"><input id="resetPassword" class="input" type="password" placeholder="Новый пароль"><input id="resetConfirm" class="input" type="password" placeholder="Повторите пароль"><button class="btn grad" onclick="confirmPasswordReset()">Сохранить пароль</button><div id="err" class="muted"></div></div>'}catch(e){$('err').textContent=e.message}}
 async function confirmPasswordReset(){let password=$('resetPassword').value,problem=passwordClientProblem(password);if(problem){$('err').textContent=problem;return}try{await api('/api/auth/password/reset/confirm',{method:'POST',body:JSON.stringify({email:$('resetEmail')?.value||window.__resetEmail,code:$('resetCode').value,password:password,password_confirm:$('resetConfirm').value})});closeModal();toast('Пароль изменён. Войдите с новым паролем.');authForm(false)}catch(e){$('err').textContent=e.message}}
 const originalRequestPasswordReset=requestPasswordReset;requestPasswordReset=async function(){window.__resetEmail=$('resetEmail').value;return originalRequestPasswordReset()}
 const originalAuthFormWithReset=window.authForm;window.authForm=function(reg){originalAuthFormWithReset(reg);if(!reg){let error=$('err');if(error)error.insertAdjacentHTML('beforebegin','<button class="btn light" type="button" onclick="openPasswordReset()">Забыли пароль?</button>')}}
@@ -563,6 +583,10 @@ ADMIN_DASHBOARD_CSS=r'''
 @media(max-width:600px){.adminTop{align-items:flex-start;flex-direction:column;gap:12px}.adminMetrics{grid-template-columns:repeat(2,minmax(0,1fr))}.adminMetric b{font-size:23px}.adminWorkspace h2{font-size:25px}.adminUser{align-items:flex-start;flex-wrap:wrap}.adminUserActions{width:100%}.adminUserActions .btn{flex:1}.adminSearch{flex-direction:column}.adminSearch .btn{width:100%}.adminChart{height:135px}.adminCard{padding:14px}}
 '''
 
+CONTACT_VERIFICATION_CSS=r'''
+.contactVerification{grid-column:1/-1}.contactVerification h2{margin:0}.contactLead{margin:8px 0 18px;max-width:760px;line-height:1.6}.contactChecks{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:16px 0}.contactCheck{padding:12px;border:1px solid #394035;background:#11140f;color:#a9afa1;font-size:12px}.contactCheck.ok{border-color:#53723c;background:#1d2918;color:#d5ff8a}.contactCheck b{display:block;margin-bottom:4px;color:#edf0e7}.contactForm{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:12px}.contactForm .contactWide{grid-column:1/-1}.contactActions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.contactHint{margin:10px 0 0;font-size:12px;line-height:1.55}.phoneVerify{display:flex;gap:8px;align-items:center;margin-top:10px}.phoneVerify .input{max-width:190px;letter-spacing:.16em}@media(max-width:700px){.contactChecks,.contactForm{grid-template-columns:1fr}.contactForm .contactWide{grid-column:auto}.phoneVerify{align-items:stretch;flex-direction:column}.phoneVerify .input{max-width:none}.contactVerification{grid-column:auto}}.modal.adminModal{align-items:flex-start;overflow:auto;padding:30px 20px}.modal.adminModal>.box.adminShell{position:relative;width:min(1280px,100%);max-width:1280px;max-height:none;overflow:visible;margin:auto;padding:0;background:#11140f}.modal.adminModal>.box.adminShell>.close{position:absolute;z-index:4;right:18px;top:14px;float:none;padding:4px 10px;color:#edf0e7}.adminWorkspace{padding:32px;min-width:0}.adminWorkspace .adminCharts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.adminWorkspace .adminChart{overflow:hidden}.adminWorkspace .adminActivity{max-height:360px}.adminWorkspace .adminTickets{max-height:560px}@media(max-width:900px){.modal.adminModal{padding:12px}.modal.adminModal>.box.adminShell{width:100%}.adminWorkspace{padding:24px 18px}.adminWorkspace .adminCharts{grid-template-columns:1fr}}@media(max-width:600px){.adminWorkspace{padding:20px 14px}.modal.adminModal>.box.adminShell>.close{right:7px;top:8px}.adminWorkspace .adminTop{padding-right:42px}.adminWorkspace .adminCharts{grid-template-columns:1fr}.adminWorkspace .adminMetrics{grid-template-columns:repeat(2,minmax(0,1fr)}}
+'''
+
 ADMIN_DASHBOARD_UI=r'''
 function adminDate(value,withTime=true){if(!value)return 'нет данных';let date=new Date(value);if(Number.isNaN(date.getTime()))return String(value);return date.toLocaleString('ru-RU',withTime?{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}:{day:'2-digit',month:'short'})}
 function adminMetric(value,label){return '<div class="adminMetric"><b>'+Number(value||0).toLocaleString('ru-RU')+'</b><span>'+esc(label)+'</span></div>'}
@@ -570,7 +594,7 @@ function adminChart(series,key,label){let values=series.map(function(point){retu
 function adminUserRow(user){let states=(user.telegram_linked?'<span class="badge ok">Telegram</span>':'')+(user.email_verified?'<span class="badge ok">email</span>':'')+(user.blocked?'<span class="badge warn">заблокирован</span>':'')+(user.role==='admin'?'<span class="badge">админ</span>':'');let safety=user.role==='admin'?'':user.blocked?'<button class="btn light" onclick="adminSetBlock('+Number(user.id)+',false)">Разблокировать</button>':'<button class="btn danger" onclick="adminSetBlock('+Number(user.id)+',true)">Ограничить</button>';return '<div class="adminUser"><div class="avatar">'+esc((user.name||'?')[0])+'</div><div class="adminUserCopy"><b>'+esc(user.name)+'</b><span>'+esc(user.email||'Email не указан')+' · '+esc(user.city||'Город не указан')+'</span><span>Последняя активность: '+esc(adminDate(user.last_seen_at))+' · заявок: '+Number(user.request_count||0)+' · активных: '+Number(user.active_request_count||0)+'</span><div class="adminState">'+states+'</div></div><div class="adminUserActions">'+safety+'</div></div>'}
 function adminTicketRow(ticket){return '<article class="adminTicket"><h4>#'+Number(ticket.id)+' · '+esc(ticket.subject)+'</h4><small>'+esc(ticket.user_name)+' · '+esc(ticket.user_email||'без email')+' · '+esc(adminDate(ticket.created_at))+'</small><p>'+esc(ticket.message)+'</p>'+(ticket.admin_reply?'<p><b>Ваш ответ:</b> '+esc(ticket.admin_reply)+'</p>':'')+'<textarea id="adminReply'+Number(ticket.id)+'" class="input textarea" maxlength="2000" placeholder="Ответ пользователю">'+esc(ticket.admin_reply||'')+'</textarea><button class="btn grad" onclick="replySupport('+Number(ticket.id)+',true)">Сохранить ответ</button></article>'}
 function adminActivityRow(item){let action=item.kind==='request'&&['open','in_progress'].includes(item.status)?'<button class="btn light" onclick="adminCancelRequest('+Number(item.target_id)+')">Закрыть</button>':'';return '<div class="adminActivityItem"><i class="adminActivityDot"></i><div class="grow"><b>'+esc(item.title)+'</b><span>'+esc(item.meta)+' · '+esc(adminDate(item.at))+'</span></div>'+action+'</div>'}
-function renderAdminDashboard(data){let summary=data.summary||{},series=data.series||[],users=data.users||[],tickets=data.tickets||[],activities=data.activities||[];$('modal').style.display='flex';$('modalbody').className='box adminWorkspace';$('modalbody').innerHTML='<button class="close" onclick="closeAdminPanel()">×</button><div class="adminTop"><div><p class="adminKicker">H·POINT · ADMIN</p><h2>Управление сообществом</h2><p class="adminSub">Статистика, обращения и доступ пользователей. Обновлено: '+esc(adminDate(new Date().toISOString()))+'</p></div><button class="btn light adminRefresh" onclick="openAdminSupport()">Обновить</button></div><div class="adminMetrics">'+adminMetric(summary.users,'Всего пользователей')+adminMetric(summary.active_24h,'Активны за 24 часа')+adminMetric(summary.active_7d,'Активны за 7 дней')+adminMetric((summary.requests||{}).open,'Открытые заявки')+adminMetric((summary.support||{}).open,'Ожидают ответа')+'</div><div class="adminGrid"><section class="adminCard"><h3>Динамика за 14 дней</h3><div class="adminGrid">'+adminChart(series,'users','Регистрации')+adminChart(series,'requests','Новые заявки')+'</div></section><section class="adminCard"><h3>Последняя активность</h3><div class="adminActivity">'+(activities.map(adminActivityRow).join('')||'<p class="adminEmpty">Событий пока нет.</p>')+'</div></section><section class="adminCard"><h3>Пользователи</h3><div class="adminSearch"><input id="adminUserSearch" class="input" maxlength="80" placeholder="Имя или email"><button class="btn light" onclick="adminSearchUsers()">Найти</button></div><div class="adminTable">'+(users.map(adminUserRow).join('')||'<p class="adminEmpty">Пользователи не найдены.</p>')+'</div></section><section class="adminCard"><h3>Обращения в поддержку</h3><div class="adminTickets">'+(tickets.map(adminTicketRow).join('')||'<p class="adminEmpty">Обращений пока нет.</p>')+'</div></section></div>';}
+function renderAdminDashboard(data){let summary=data.summary||{},series=data.series||[],users=data.users||[],tickets=data.tickets||[],activities=data.activities||[];$('modal').style.display='flex';$('modalbody').className='box adminWorkspace';$('modalbody').innerHTML='<div class="adminTop"><div><p class="adminKicker">H·POINT · ADMIN</p><h2>Управление сообществом</h2><p class="adminSub">Статистика, обращения и доступ пользователей. Обновлено: '+esc(adminDate(new Date().toISOString()))+'</p></div><button class="btn light adminRefresh" onclick="openAdminSupport()">Обновить</button></div><div class="adminMetrics">'+adminMetric(summary.users,'Всего пользователей')+adminMetric(summary.active_24h,'Активны за 24 часа')+adminMetric(summary.active_7d,'Активны за 7 дней')+adminMetric((summary.requests||{}).open,'Открытые заявки')+adminMetric((summary.support||{}).open,'Ожидают ответа')+'</div><div class="adminGrid"><section class="adminCard"><h3>Динамика за 14 дней</h3><div class="adminGrid">'+adminChart(series,'users','Регистрации')+adminChart(series,'requests','Новые заявки')+'</div></section><section class="adminCard"><h3>Последняя активность</h3><div class="adminActivity">'+(activities.map(adminActivityRow).join('')||'<p class="adminEmpty">Событий пока нет.</p>')+'</div></section><section class="adminCard"><h3>Пользователи</h3><div class="adminSearch"><input id="adminUserSearch" class="input" maxlength="80" placeholder="Имя или email"><button class="btn light" onclick="adminSearchUsers()">Найти</button></div><div class="adminTable">'+(users.map(adminUserRow).join('')||'<p class="adminEmpty">Пользователи не найдены.</p>')+'</div></section><section class="adminCard"><h3>Обращения в поддержку</h3><div class="adminTickets">'+(tickets.map(adminTicketRow).join('')||'<p class="adminEmpty">Обращений пока нет.</p>')+'</div></section></div>';}
 function closeAdminPanel(){$('modalbody').className='box';closeModal()}
 async function openAdminSupport(query){try{let suffix=query?'?q='+encodeURIComponent(query):'';let data=await api('/api/admin/dashboard'+suffix);renderAdminDashboard(data)}catch(e){toast(e.message||'Не удалось открыть панель администратора')}}
 async function adminSearchUsers(){return openAdminSupport(($('adminUserSearch')?.value||'').trim())}
@@ -579,11 +603,29 @@ async function adminSetBlock(id,blocked){let reason='';if(blocked){reason=prompt
 async function adminCancelRequest(id){let reason=prompt('Причина закрытия заявки:');if(reason===null)return;try{await api('/api/admin/requests/cancel',{method:'POST',body:JSON.stringify({request_id:Number(id),reason:reason})});toast('Заявка закрыта');openAdminSupport()}catch(e){toast(e.message)}}
 '''
 
+ADMIN_MODAL_FIXES=r'''
+const hpointBaseCloseModal=window.closeModal;
+window.closeModal=function(){let modal=$('modal'),shell=modal&&modal.firstElementChild;if(modal)modal.classList.remove('adminModal');if(shell)shell.className='box';let body=$('modalbody');if(body)body.className='';return hpointBaseCloseModal()}
+function closeAdminPanel(){closeModal()}
+function renderAdminDashboard(data){let summary=data.summary||{},series=data.series||[],users=data.users||[],tickets=data.tickets||[],activities=data.activities||[],modal=$('modal'),shell=modal.firstElementChild,body=$('modalbody');modal.classList.add('adminModal');shell.className='box adminShell';body.className='adminWorkspace';modal.style.display='flex';body.innerHTML='<div class="adminTop"><div><p class="adminKicker">H·POINT · ADMIN</p><h2>Управление сообществом</h2><p class="adminSub">Статистика, обращения и доступ пользователей. Обновлено: '+esc(adminDate(new Date().toISOString()))+'</p></div><button class="btn light adminRefresh" onclick="openAdminSupport()">Обновить</button></div><div class="adminMetrics">'+adminMetric(summary.users,'Всего пользователей')+adminMetric(summary.active_24h,'Активны за 24 часа')+adminMetric(summary.active_7d,'Активны за 7 дней')+adminMetric((summary.requests||{}).open,'Открытые заявки')+adminMetric((summary.support||{}).open,'Ожидают ответа')+'</div><div class="adminGrid"><section class="adminCard"><h3>Динамика за 14 дней</h3><div class="adminCharts">'+adminChart(series,'users','Регистрации')+adminChart(series,'requests','Новые заявки')+'</div></section><section class="adminCard"><h3>Последняя активность</h3><div class="adminActivity">'+(activities.map(adminActivityRow).join('')||'<p class="adminEmpty">Событий пока нет.</p>')+'</div></section><section class="adminCard"><h3>Пользователи</h3><div class="adminSearch"><input id="adminUserSearch" class="input" maxlength="80" placeholder="Имя или email"><button class="btn light" onclick="adminSearchUsers()">Найти</button></div><div class="adminTable">'+(users.map(adminUserRow).join('')||'<p class="adminEmpty">Пользователи не найдены.</p>')+'</div></section><section class="adminCard"><h3>Обращения в поддержку</h3><div class="adminTickets">'+(tickets.map(adminTicketRow).join('')||'<p class="adminEmpty">Обращений пока нет.</p>')+'</div></section></div>'}
+'''
+
+CONTACT_VERIFICATION_UI=r'''
+function contactStatus(ok,title,text){return '<div class="contactCheck '+(ok?'ok':'')+'"><b>'+(ok?'✓ ':'○ ')+esc(title)+'</b><span>'+esc(text)+'</span></div>'}
+function contactVerificationCard(u){let host=document.querySelector('#p-profile .profileGrid'),card=$('identityCard');if(!host)return;if(!card){card=document.createElement('section');card.id='identityCard';host.appendChild(card)}card.className='card identityCard contactVerification';let personal=Boolean((u.full_name||'').trim()&&u.birth_date),email=Boolean(u.email_verified),phone=Boolean(u.phone_verified),telegram=Boolean(u.tg_linked),ready=personal&&email&&phone&&telegram;let birth=u.birth_date||'',number=u.phone||'',sms=u.sms_delivery_configured;let phoneAction=phone?'<span class="badge ok">✓ Телефон подтверждён</span>':sms?'<button class="btn light" type="button" onclick="sendPhoneCode()">Получить SMS-код</button>':'<span class="badge warn">SMS ещё не подключены</span>';card.innerHTML='<h2>Проверка контактов</h2><p class="muted contactLead">Заполните данные и подтвердите контакты кодами. Проверка выполняется автоматически: ручное рассмотрение не требуется. Эти данные не показываются в заявках.</p><div class="contactChecks">'+contactStatus(personal,'Данные профиля',personal?'заполнены':'укажите имя и дату рождения')+contactStatus(email,'Email',email?'подтверждён':'подтвердите кодом из письма')+contactStatus(telegram,'Telegram',telegram?'привязан':'привяжите через бота')+contactStatus(phone,'Телефон',phone?'подтверждён':sms?'подтвердите SMS-кодом':'нужно подключить SMS')+'</div>'+(ready?'<span class="badge ok">✓ Контакты подтверждены</span>':'')+'<div class="contactForm"><label><span class="muted">Имя и фамилия</span><input id="contactFullName" class="input" maxlength="120" autocomplete="name" value="'+esc(u.full_name||'')+'" placeholder="Иван Петров"></label><label><span class="muted">Дата рождения</span><input id="contactBirthDate" class="input" type="date" value="'+esc(birth)+'"></label><label class="contactWide"><span class="muted">Телефон</span><input id="contactPhone" class="input" inputmode="tel" autocomplete="tel" maxlength="20" value="'+esc(number)+'" placeholder="+7 999 123-45-67"></label></div><div class="contactActions"><button class="btn grad" type="button" onclick="saveContactDetails()">Сохранить данные</button>'+(email?'<span class="badge ok">✓ Email подтверждён</span>':'<button class="btn light" type="button" onclick="showEmailVerification()">Подтвердить email</button>')+(telegram?'<span class="badge ok">✓ Telegram привязан</span>':'<button class="btn light" type="button" onclick="linkcode()">Получить код Telegram</button>')+phoneAction+'</div>'+(sms&&!phone?'<div id="phoneVerify" class="phoneVerify" style="display:none"><input id="phoneCode" class="input" inputmode="numeric" maxlength="6" placeholder="Код из SMS"><button class="btn grad" type="button" onclick="verifyPhoneCode()">Подтвердить телефон</button></div>':'')+'<p id="contactNotice" class="muted contactHint">'+(!sms&&!phone?'SMS-подтверждение станет доступно после подключения провайдера на сервере.':'')+'</p>'}
+async function saveContactDetails(){let note=$('contactNotice');try{await api('/api/profile/contacts',{method:'POST',body:JSON.stringify({full_name:$('contactFullName').value,birth_date:$('contactBirthDate').value,phone:$('contactPhone').value})});note.textContent='Данные сохранены. Подтвердите контакты кодами.';await profile()}catch(error){note.textContent=error.message}}
+async function sendPhoneCode(){let note=$('contactNotice');try{await api('/api/profile/phone/send-code',{method:'POST',body:'{}'});let field=$('phoneVerify');if(field)field.style.display='flex';note.textContent='Код отправлен в SMS. Он действует 10 минут.'}catch(error){note.textContent=error.message}}
+async function verifyPhoneCode(){let note=$('contactNotice');try{await api('/api/profile/phone/verify',{method:'POST',body:JSON.stringify({code:$('phoneCode').value.trim()})});toast('Телефон подтверждён');await profile()}catch(error){note.textContent=error.message}}
+// Replaces the older manual-review card.  It is intentionally defined last so
+// every profile refresh uses the automatic contact check above.
+function renderIdentityCard(u){contactVerificationCard(u)}
+'''
+
 LOCATION_PICKER_UI=r'''
 function locationPicker(id,onPick){if(!window.ymaps){toast('Яндекс Карты ещё загружаются.');return}ymaps.ready(function(){let host=$(id);if(!host)return;let map=new ymaps.Map(id,{center:[55.751244,37.618423],zoom:11,controls:['zoomControl','searchControl']},{suppressMapOpenBlock:true});let mark=null;map.events.add('click',function(event){let point=event.get('coords');if(mark)map.geoObjects.remove(mark);mark=new ymaps.Placemark(point,{balloonContent:'Выбранная точка'},{preset:'islands#blueDotIcon'});map.geoObjects.add(mark);onPick({lat:point[0],lon:point[1]})});let hint=document.createElement('p');hint.className='muted';hint.textContent='Нажмите на карте в нужном месте, чтобы поставить точку.';host.after(hint)})}
 function requestForm(){hpointRequestPoint=null;$('modal').style.display='flex';$('modalbody').innerHTML=`<h2>Новая заявка</h2><p class="muted">Укажите адрес или вручную поставьте точку на карте. Точный адрес виден только после назначения помощника.</p><div class="form"><input id="qw" class="input" placeholder="Что нужно сделать?"><input id="qp" class="input" placeholder="Город, улица, дом или ориентир"><div id="requestPicker" class="map" style="height:230px"></div><input id="qt" class="input" placeholder="Когда нужна помощь?"><label class="muted">Срок публикации: <b id="requestDuration">2 дня</b></label><input id="requestHours" type="range" min="1" max="168" value="48" step="1" oninput="$('requestDuration').textContent=this.value==24?'1 день':this.value==48?'2 дня':this.value+' ч.'"><select id="qc" class="input"><option value="other">Другое</option><option value="carry">Перенос / переезд</option><option value="shopping">Покупки</option><option value="snow">Снег / уборка</option><option value="tools">Инструменты</option><option value="transport">Транспорт</option><option value="tech">Техника</option><option value="study">Учёба</option></select><select id="qu" class="input"><option>🔥 Очень срочно</option><option>⏳ В течение дня</option><option>🕊 Не срочно</option></select><textarea id="qd" class="input textarea" placeholder="Детали"></textarea><button class="btn grad" onclick="createReq()">Создать заявку</button><div id="rqerr" class="muted"></div></div>`;setTimeout(function(){locationPicker('requestPicker',function(point){hpointRequestPoint=point;$('rqerr').textContent='Точка выбрана на карте.'})},20)}
 function createReq(){if(window.hpointRequestPoint){sendReq(hpointRequestPoint.lat,hpointRequestPoint.lon);return}let fallback=function(){sendReq(null,null)};let address=(qp&&qp.value||'').trim();if(!address||!window.ymaps){fallback();return}ymaps.ready(function(){ymaps.geocode(address,{results:1}).then(function(result){let first=result.geoObjects.get(0),coords=first&&first.geometry.getCoordinates();if(coords){sendReq(coords[0],coords[1])}else{fallback()}},fallback)})}
-function helperGeoFallback(message,requestId){window.hpointHelperPoint=null;$('modal').style.display='flex';$('modalbody').innerHTML='<button class="close" onclick="closeModal()">×</button><h2>Укажите местоположение</h2><p class="muted">'+esc(message)+' Поставьте точку на карте или введите адрес. Автор увидит только расстояние, без вашей точки.</p><div class="form"><input id="helperAddress" class="input" placeholder="Город, улица, дом или ориентир"><div id="helperPicker" class="map" style="height:230px"></div><button class="btn grad" onclick="helperUsePoint('+(requestId?Number(requestId):'')+')">Использовать выбранную точку</button><button class="btn light" onclick="helperByAddress('+(requestId?Number(requestId):'')+')">Найти по адресу</button><button class="btn light" onclick="helper('+(requestId?Number(requestId):'')+')">Повторить запрос GPS</button></div>';setTimeout(function(){locationPicker('helperPicker',function(point){hpointHelperPoint=point})},20)}
+function helperGeoFallback(message,requestId){window.hpointHelperPoint=null;$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Укажите местоположение</h2><p class="muted">'+esc(message)+' Поставьте точку на карте или введите адрес. Автор увидит только расстояние, без вашей точки.</p><div class="form"><input id="helperAddress" class="input" placeholder="Город, улица, дом или ориентир"><div id="helperPicker" class="map" style="height:230px"></div><button class="btn grad" onclick="helperUsePoint('+(requestId?Number(requestId):'')+')">Использовать выбранную точку</button><button class="btn light" onclick="helperByAddress('+(requestId?Number(requestId):'')+')">Найти по адресу</button><button class="btn light" onclick="helper('+(requestId?Number(requestId):'')+')">Повторить запрос GPS</button></div>';setTimeout(function(){locationPicker('helperPicker',function(point){hpointHelperPoint=point})},20)}
 function helperUsePoint(requestId){if(!window.hpointHelperPoint){toast('Нажмите на карте, чтобы выбрать точку.');return}joinHelper(hpointHelperPoint,requestId)}
 '''
 
@@ -602,7 +644,7 @@ async function buildRoute(id){let task=hpointMapTasks.find(function(row){return 
 function requestForm(){ $('modal').style.display='flex';$('modalbody').innerHTML=`<h2>Новая заявка</h2><p class="muted">Укажите город и адрес или ориентир: Яндекс Карты поставят точку по этому адресу. Точный адрес виден только после назначения помощника.</p><div class="form"><input id="qw" class="input" placeholder="Что нужно сделать?"><input id="qp" class="input" placeholder="Город, улица, дом или ориентир"><input id="qt" class="input" placeholder="Когда нужна помощь?"><label class="muted">Срок публикации: <b id="requestDuration">2 дня</b></label><input id="requestHours" type="range" min="1" max="168" value="48" step="1" oninput="$('requestDuration').textContent=this.value==24?'1 день':this.value==48?'2 дня':this.value+' ч.'"><select id="qc" class="input"><option value="other">Другое</option><option value="carry">Перенос / переезд</option><option value="shopping">Покупки</option><option value="snow">Снег / уборка</option><option value="tools">Инструменты</option><option value="transport">Транспорт</option><option value="tech">Техника</option><option value="study">Учёба</option></select><select id="qu" class="input"><option>🔥 Очень срочно</option><option>⏳ В течение дня</option><option>🕊 Не срочно</option></select><textarea id="qd" class="input textarea" placeholder="Детали"></textarea><button class="btn grad" onclick="createReq()">Создать заявку</button><div id="rqerr" class="muted"></div></div>`}
 function createReq(){let fallback=function(){navigator.geolocation?navigator.geolocation.getCurrentPosition(function(p){sendReq(p.coords.latitude,p.coords.longitude)},function(){sendReq(null,null)},{timeout:5000,maximumAge:60000}):sendReq(null,null)};let address=(qp&&qp.value||'').trim();if(!address||!window.ymaps){fallback();return}ymaps.ready(function(){ymaps.geocode(address,{results:1}).then(function(result){let first=result.geoObjects.get(0),coords=first&&first.geometry.getCoordinates();if(coords){sendReq(coords[0],coords[1])}else{fallback()}},fallback)})}
 async function sendReq(lat,lon){try{let d=await api('/api/requests',{method:'POST',body:JSON.stringify({what:qw.value,place:qp.value,time_needed:qt.value,urgency:qu.value,details:qd.value,category:qc.value,lat,lon,expires_in_hours:Number($('requestHours').value)})});closeModal();await requests();toast('Заявка #'+d.request_id+' создана');go('match')}catch(e){$('rqerr').textContent=e.message}}
-function helperGeoFallback(message,requestId){$('modal').style.display='flex';$('modalbody').innerHTML='<button class="close" onclick="closeModal()">×</button><h2>Укажите местоположение</h2><p class="muted">'+esc(message)+' Адрес нужен только для расчёта расстояния: автор заявки не увидит вашу точку.</p><div class="form"><input id="helperAddress" class="input" placeholder="Город, улица, дом или ориентир"><button class="btn grad" onclick="helperByAddress('+(requestId?Number(requestId):'')+')">Указать адрес на карте</button><button class="btn light" onclick="helper('+(requestId?Number(requestId):'')+')">Повторить запрос геолокации</button><button class="btn light" onclick="helperWithoutLocation('+(requestId?Number(requestId):'')+')">Продолжить без геолокации</button></div>'}
+function helperGeoFallback(message,requestId){$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Укажите местоположение</h2><p class="muted">'+esc(message)+' Адрес нужен только для расчёта расстояния: автор заявки не увидит вашу точку.</p><div class="form"><input id="helperAddress" class="input" placeholder="Город, улица, дом или ориентир"><button class="btn grad" onclick="helperByAddress('+(requestId?Number(requestId):'')+')">Указать адрес на карте</button><button class="btn light" onclick="helper('+(requestId?Number(requestId):'')+')">Повторить запрос геолокации</button><button class="btn light" onclick="helperWithoutLocation('+(requestId?Number(requestId):'')+')">Продолжить без геолокации</button></div>'}
 function helperByAddress(requestId){let address=($('helperAddress').value||'').trim();if(!address){toast('Введите адрес или ориентир.');return}if(!window.ymaps){toast('Яндекс Карты ещё загружаются.');return}ymaps.ready(function(){ymaps.geocode(address,{results:1}).then(function(result){let first=result.geoObjects.get(0),coords=first&&first.geometry.getCoordinates();if(!coords){toast('Адрес не найден. Добавьте город и номер дома.');return}joinHelper({lat:coords[0],lon:coords[1]},requestId)},function(){toast('Не удалось найти адрес. Попробуйте уточнить его.')})})}
 async function mapLocateMe(){try{let point=await hpointGetBrowserLocation();hpointSetMapNotice('Ваше местоположение обновлено.');await loadBigMap()}catch(error){helperGeoFallback(hpointGeoMessage(error),null)}}
 '''
@@ -613,7 +655,7 @@ def _page_replace(needle, replacement):
         raise RuntimeError("H-Point page template changed; UI override target is missing")
     PAGE=PAGE.replace(needle, replacement, 1)
 
-_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+PASSWORD_CSS+MAP_CSS+ADMIN_DASHBOARD_CSS+"</style></head>")
+_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+PASSWORD_CSS+MAP_CSS+ADMIN_DASHBOARD_CSS+CONTACT_VERIFICATION_CSS+"</style></head>")
 _page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg"><link rel="apple-touch-icon" href="/assets/hpoint-logo.png"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
 if YANDEX_MAPS_API_KEY:
     PAGE=PAGE.replace('<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>', f'<script src="https://api-maps.yandex.ru/2.1/?apikey={escape(YANDEX_MAPS_API_KEY, quote=True)}&lang=ru_RU"></script>')
@@ -621,7 +663,7 @@ _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandL
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
 _page_replace('<p class="audiencePortrait">H·Point создан для Ильи: он недавно переехал в новый район, работает до вечера и хочет быстро найти надёжного человека рядом, чтобы настроить роутер, донести коробки или решить другую небольшую, но срочную задачу.</p>', '')
 _page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+SUPPORT_UI+ADMIN_DASHBOARD_UI+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+LOCATION_PICKER_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+SUPPORT_UI+ADMIN_DASHBOARD_UI+ADMIN_MODAL_FIXES+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+LOCATION_PICKER_UI+CONTACT_VERIFICATION_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
@@ -950,6 +992,38 @@ class Handler(BaseHTTPRequestHandler):
                 u=auth(self)
                 if not u:return
                 c=database.create_link_code(u["user_id"]);return reply(self,{"ok":True,"code":c})
+            if p.path=="/api/profile/contacts":
+                u=auth(self)
+                if not u:return
+                ok,message=database.update_contact_details(u["user_id"],d.get("full_name"),d.get("birth_date"),d.get("phone"))
+                if not ok:return reply(self,{"ok":False,"error":message},400)
+                return reply(self,{"ok":True})
+            if p.path=="/api/profile/phone/send-code":
+                u=auth(self)
+                if not u:return
+                if not u["phone"]:return reply(self,{"ok":False,"error":"Сначала сохраните номер телефона."},409)
+                if u["phone_verified"]:return reply(self,{"ok":True,"already_verified":True})
+                if not sms_delivery_configured():return reply(self,{"ok":False,"error":"SMS-подтверждение ещё не подключено администратором."},503)
+                subject=str(u["user_id"])
+                if database.auth_is_rate_limited("phone_resend",subject,3):return reply(self,{"ok":False,"error":"Слишком много кодов. Повторите позже."},429)
+                code=database.create_phone_verification_code(u["user_id"])
+                if not code or not send_phone_verification_code(u["phone"],code):
+                    db.execute("DELETE FROM phone_verification_codes WHERE user_id=?",(u["user_id"],))
+                    return reply(self,{"ok":False,"error":"Не удалось отправить SMS. Повторите позже."},503)
+                database.record_auth_failure("phone_resend",subject)
+                return reply(self,{"ok":True,"sent":True})
+            if p.path=="/api/profile/phone/verify":
+                u=auth(self)
+                if not u:return
+                subject=str(u["user_id"])+":"+client_key(self)
+                if database.auth_is_rate_limited("phone_verify",subject,5):return reply(self,{"ok":False,"error":"Слишком много попыток. Запросите новый код."},429)
+                ok,status=database.verify_phone_code(u["user_id"],str(d.get("code","")).strip())
+                if not ok:
+                    database.record_auth_failure("phone_verify",subject)
+                    messages={"expired":"Код истёк. Запросите новый.","too_many_attempts":"Слишком много попыток. Запросите новый код.","invalid":"Неверный код."}
+                    return reply(self,{"ok":False,"error":messages.get(status,"Не удалось подтвердить номер.")},400)
+                database.clear_auth_failures("phone_verify",subject)
+                return reply(self,{"ok":True,"verified":True})
             if p.path=="/api/profile":
                 u=auth(self)
                 if not u:return
