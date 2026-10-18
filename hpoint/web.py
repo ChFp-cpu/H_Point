@@ -12,7 +12,6 @@ from .services import *
 from .billing import create_pending_invoice, create_payment, fulfill_invoice, purchase_with_points, verify_robokassa_result
 
 database.init_db()
-YANDEX_MAPS_API_KEY = os.getenv("YANDEX_MAPS_API_KEY", "")
 _telegram_bot = None
 _telegram_loop = None
 _telegram_username = BOT_USERNAME or None
@@ -25,20 +24,12 @@ ASSETS = {
     "hpoint-route-network.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-route-network.png", "image/png"),
     "hpoint-match-field.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-match-field.png", "image/png"),
 }
-CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' "
-       "https://api-maps.yandex.ru https://*.api-maps.yandex.ru "
-       "https://suggest-maps.yandex.ru https://yastatic.net https://yandex.ru; "
-       "style-src 'self' 'unsafe-inline' blob: https://api-maps.yandex.ru "
-       "https://*.api-maps.yandex.ru https://yastatic.net https://fonts.googleapis.com; "
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com; "
+       "style-src 'self' 'unsafe-inline' blob: https://unpkg.com https://fonts.googleapis.com; "
        "font-src 'self' data: https://fonts.gstatic.com; "
-       "img-src 'self' data: https://api-maps.yandex.ru https://*.api-maps.yandex.ru "
-       "https://*.maps.yandex.net https://yastatic.net https://yandex.ru; "
-       "connect-src 'self' https://api-maps.yandex.ru https://*.api-maps.yandex.ru "
-       "https://*.maps.yandex.net https://suggest-maps.yandex.ru "
-       "https://search-maps.yandex.ru https://api.routing.yandex.net https://yandex.ru; "
-       "worker-src data: blob: https://api-maps.yandex.ru https://*.api-maps.yandex.ru "
-       "https://yastatic.net; child-src https://api-maps.yandex.ru; "
-       "frame-src https://api-maps.yandex.ru; frame-ancestors 'none'; "
+       "img-src 'self' data: https://tile.openstreetmap.org https://*.tile.openstreetmap.org; "
+       "connect-src 'self' https://router.project-osrm.org; "
+       "worker-src 'self' data: blob:; child-src 'self'; frame-src 'none'; frame-ancestors 'none'; "
        "base-uri 'self'; form-action 'self'")
 
 def configure_telegram_notifications(bot, username=None):
@@ -235,11 +226,26 @@ def public_request_payload(r):
             # shared only with the assigned helper through the private flow.
             "place": "Район уточняется после назначения", "lat": None, "lon": None}
 
+def coordinates_from_payload(data):
+    """Read an optional browser position and reject incomplete or invalid input."""
+    raw_lat, raw_lon = data.get("lat"), data.get("lon")
+    if raw_lat is None and raw_lon is None:
+        return None, None
+    if raw_lat is None or raw_lon is None:
+        raise ValueError("incomplete coordinates")
+    try:
+        lat, lon = float(raw_lat), float(raw_lon)
+    except (TypeError, ValueError):
+        raise ValueError("invalid coordinates")
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise ValueError("invalid coordinates")
+    return lat, lon
+
 def chat_for_request(rid):
     return database.get_or_create_chat_for_request(rid)
 
 PAGE=r'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>H·Point — помощь рядом</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet"><script src="https://api-maps.yandex.ru/2.1/?apikey=__YANDEX_MAPS_API_KEY__&lang=ru_RU&csp=true" type="text/javascript"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet"><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
 :root{--bg:#f5f7fb;--surface:#fff;--ink:#101828;--muted:#667085;--line:#e6eaf0;--brand:#5b5cf0;--brand2:#7c3aed;--ok:#12b76a;--warn:#f79009;--shadow:0 16px 50px rgba(16,24,40,.08)}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 80% -10%,#e9e8ff 0,transparent 35%),var(--bg);color:var(--ink);font-family:Manrope,system-ui,-apple-system,sans-serif}.nav{position:sticky;top:0;z-index:40;background:rgba(245,247,251,.86);backdrop-filter:blur(18px);border-bottom:1px solid rgba(230,234,240,.8)}.in,.wrap{width:min(1240px,100%);margin:auto;padding:0 24px}.in{height:74px;display:flex;align-items:center;gap:12px}.logo{font-size:25px;font-weight:800;letter-spacing:-1px}.logo b{color:var(--brand)}.sp{flex:1}.btn{border:0;border-radius:14px;padding:12px 17px;font:inherit;font-weight:800;cursor:pointer;transition:.2s;display:inline-flex;align-items:center;justify-content:center;gap:7px}.btn:hover{transform:translateY(-1px)}.dark{background:var(--ink);color:white}.light{background:var(--surface);color:var(--ink);border:1px solid var(--line)}.grad{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff}.danger{color:#b42318;background:#fff;border:1px solid #fecdca}.ey{display:inline-flex;padding:7px 10px;border-radius:999px;background:#eeefff;color:#4c4fd0;font-size:11px;font-weight:800}.landingHero{padding:76px 0 55px;display:grid;grid-template-columns:1.1fr .9fr;gap:44px;align-items:center}.hero h1{font-size:clamp(46px,6vw,82px);line-height:.95;letter-spacing:-5px;margin:18px 0}.hero p{font-size:18px;line-height:1.7;color:var(--muted);max-width:650px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:25px}.cover{min-height:430px;border-radius:34px;background:linear-gradient(145deg,#111326,#2f3270);box-shadow:0 30px 80px rgba(31,35,90,.28);padding:22px;color:white;position:relative;overflow:hidden}.cover:before{content:"";position:absolute;width:270px;height:270px;border-radius:50%;background:#7778ff55;filter:blur(8px);right:-70px;top:-70px}.coverCard{position:relative;background:#ffffff12;border:1px solid #ffffff1f;border-radius:22px;padding:19px;margin-bottom:12px;backdrop-filter:blur(8px)}.coverCard strong{display:block;font-size:18px}.coverCard small{display:block;color:#cfd2e7;margin-top:7px;line-height:1.5}.coverMap{position:absolute;left:22px;right:22px;bottom:22px;height:110px;border-radius:18px;background:linear-gradient(135deg,#34386e,#171a35);border:1px solid #ffffff1f;display:flex;align-items:center;justify-content:center;color:#cfd2e7}.section{padding:54px 0}.section h2{font-size:34px;letter-spacing:-1.5px}.featureGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.card{background:rgba(255,255,255,.88);border:1px solid var(--line);border-radius:22px;padding:21px;box-shadow:0 8px 30px rgba(16,24,40,.04)}.muted{color:var(--muted)}.price{font-size:28px;font-weight:800}.app{display:none}.appHead{padding:35px 0 0}.welcome{display:flex;align-items:flex-end;gap:15px;justify-content:space-between}.welcome h1{font-size:42px;letter-spacing:-2px;margin:9px 0}.tabs{display:flex;gap:7px;overflow:auto;padding:22px 0 10px;position:sticky;top:74px;z-index:15;background:linear-gradient(var(--bg) 80%,transparent)}.tab{padding:10px 14px;border-radius:12px;border:1px solid transparent;background:transparent;white-space:nowrap;font:inherit;font-weight:700;color:var(--muted);cursor:pointer}.tab.active{background:white;border-color:var(--line);color:var(--ink);box-shadow:0 5px 20px #1018280b}.panel{display:none;padding:18px 0 60px}.panel.active{display:block}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{padding:20px}.stat .big{font-size:28px;font-weight:800;margin-top:5px}.layout{display:grid;grid-template-columns:1.25fr .75fr;gap:16px}.form{display:grid;gap:11px}.input{width:100%;padding:13px 14px;border:1px solid var(--line);border-radius:13px;background:#fff;font:inherit;outline:none}.input:focus{border-color:#8d8ff7;box-shadow:0 0 0 4px #5b5cf012}.textarea{min-height:110px;resize:vertical}.request{display:flex;gap:14px;align-items:center;padding:16px;border:1px solid var(--line);border-radius:17px;background:#fff;margin:9px 0}.requestmain{flex:1;min-width:0}.badge{padding:6px 9px;border-radius:999px;background:#f2f4f7;font-size:11px;font-weight:800;white-space:nowrap}.badge.ok{background:#ecfdf3;color:#027a48}.badge.warn{background:#fffaeb;color:#b54708}.map{height:460px;border-radius:22px;overflow:hidden;border:1px solid var(--line);background:#eef0f5}.match{padding:16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}.avatar{width:42px;height:42px;border-radius:14px;background:linear-gradient(135deg,#ececff,#ddd8ff);display:flex;align-items:center;justify-content:center;font-weight:800}.grow{flex:1;min-width:0}.modal{position:fixed;inset:0;background:#10182899;display:none;align-items:center;justify-content:center;z-index:100;padding:20px}.box{background:#fff;border-radius:26px;padding:26px;width:min(600px,100%);max-height:90vh;overflow:auto;box-shadow:0 30px 100px #10182833}.close{float:right;border:0;background:none;font-size:25px;cursor:pointer}.chat{height:480px;display:flex;flex-direction:column}.messages{flex:1;overflow:auto;padding:12px;background:#f7f8fb;border-radius:17px}.msg{max-width:78%;padding:10px 13px;border-radius:16px;background:#fff;margin:7px 0;border:1px solid var(--line)}.msg.mine{margin-left:auto;background:#eef0ff;border-color:#d9dbff}.msg small{display:block;color:var(--muted);font-size:10px;margin-top:4px}.chatbar{display:flex;gap:8px;margin-top:10px}.empty{padding:32px;text-align:center;color:var(--muted)}.toast{position:fixed;right:20px;bottom:20px;z-index:200;background:#101828;color:#fff;border-radius:14px;padding:13px 16px;box-shadow:var(--shadow);display:none}.verify{background:linear-gradient(135deg,#f0f0ff,#fff);border:1px solid #dfe1ff}.profileGrid{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:900px){.landingHero,.layout,.profileGrid{grid-template-columns:1fr}.featureGrid{grid-template-columns:1fr 1fr}.stats{grid-template-columns:1fr 1fr}}@media(max-width:600px){.in,.wrap{padding:0 15px}.featureGrid,.stats{grid-template-columns:1fr}.hero h1{letter-spacing:-3px}.welcome h1{font-size:32px}.cover{min-height:390px}.request{align-items:flex-start;flex-wrap:wrap}}
 #p-billing .layout{grid-template-columns:minmax(0,1.7fr) minmax(280px,.8fr);align-items:start}#appprices{grid-template-columns:repeat(2,minmax(0,1fr))}#appprices>.card{min-width:0;display:flex;flex-direction:column;align-items:flex-start}#appprices>.card h3{min-height:2.8em;margin-bottom:8px}#appprices>.card .muted{min-height:3em}#appprices>.card .price{margin-top:auto;padding:12px 0 16px;white-space:nowrap}#appprices>.card .btn{width:100%}@media(max-width:900px){#p-billing .layout{grid-template-columns:minmax(0,1fr)}#appprices{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){#appprices{grid-template-columns:minmax(0,1fr)}}
@@ -469,19 +475,53 @@ const originalProfileForAccountActions=window.profile;
 window.profile=async function(providedUser){let result=await originalProfileForAccountActions(providedUser);showAccountActions();return result}
 '''
 
+MAP_CSS=r'''
+/* H·Point open map: branded controls above the Leaflet canvas. */
+.mapToolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:13px 0}.mapToolbar .muted{font-size:12px;flex:1;min-width:220px}.mapTasks{display:grid;gap:9px;margin:0 0 14px}.mapTask{display:flex;align-items:center;gap:11px;padding:12px 14px;background:#fff;border:1px solid var(--line);border-radius:14px}.mapTaskCopy{flex:1;min-width:0}.mapTaskCopy b{display:block;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mapTaskCopy span{display:block;margin-top:3px;color:var(--muted);font-size:12px}.mapPrivacy{margin:0 0 12px;padding:12px 14px;border:1px solid #cdeefa;border-radius:14px;background:#effcff;color:#245270;font-size:12px;line-height:1.55}.candidateMapNote{margin:11px 0 0;color:var(--muted);font-size:12px;line-height:1.5}.leaflet-container{font-family:Manrope,Inter,system-ui,sans-serif;background:#eaf2f7}.leaflet-control-attribution{font-size:10px}.leaflet-popup-content{font:600 13px/1.45 Manrope,Inter,system-ui,sans-serif;margin:12px 14px}.hpointPinWrap{background:transparent!important;border:0!important}.hpointPin{display:grid;place-items:center;width:34px;height:34px;border:3px solid #fff;border-radius:50% 50% 50% 8px;transform:rotate(-45deg);box-shadow:0 5px 15px rgba(20,50,75,.25);color:#fff;font:800 16px/1 system-ui}.hpointPin>span{transform:rotate(45deg)}.hpointPin.me{background:#087bff}.hpointPin.task{background:#12a886}.hpointPin.match{background:#7058e8}.mapRouteInfo{font-size:12px;color:#245270;font-weight:700}@media(max-width:650px){.mapToolbar .btn{width:100%}.mapTask{align-items:flex-start;flex-wrap:wrap}.mapTask .btn{width:100%}.map{height:360px}}
+'''
+
+MAP_UI=r'''
+const HPOINT_MAP_CENTER=[55.751244,37.618423];
+let hpointMaps={},hpointMapLayers={},hpointMapTasks=[],hpointLastLocation=null;
+function hpointCoordinates(value){return value&&Number.isFinite(Number(value.lat))&&Number.isFinite(Number(value.lon))?{lat:Number(value.lat),lon:Number(value.lon)}:null}
+function hpointDistanceText(value){return value===null||value===undefined?'геопозиция не указана':'≈ '+Number(value).toLocaleString('ru-RU',{maximumFractionDigits:1})+' км от заявки'}
+function hpointGeoMessage(error){if(error&&error.code===1)return 'Доступ к геопозиции запрещён. Разрешите его в настройках браузера.';if(error&&error.code===2)return 'Не удалось определить местоположение.';if(error&&error.code===3)return 'Время определения местоположения истекло.';return 'Не удалось получить геопозицию.'}
+function hpointGetBrowserLocation(){return new Promise(function(resolve,reject){if(!navigator.geolocation){reject(new Error('Геолокация не поддерживается браузером.'));return}navigator.geolocation.getCurrentPosition(function(position){let point={lat:position.coords.latitude,lon:position.coords.longitude};hpointLastLocation=point;try{sessionStorage.setItem('hpointLastLocation',JSON.stringify(point))}catch(e){}resolve(point)},function(error){reject(error)},{enableHighAccuracy:true,timeout:12000,maximumAge:120000})})}
+function hpointSavedLocation(){if(hpointLastLocation)return hpointLastLocation;try{return hpointCoordinates(JSON.parse(sessionStorage.getItem('hpointLastLocation')||'null'))}catch(e){return null}}
+function hpointPin(symbol,kind){return L.divIcon({className:'hpointPinWrap',html:'<span class="hpointPin '+kind+'"><span>'+symbol+'</span></span>',iconSize:[34,34],iconAnchor:[17,30],popupAnchor:[0,-29]})}
+function hpointMap(id,key){if(!window.L){toast('Карта загружается. Повторите через секунду.');return null}let element=$(id);if(!element)return null;if(hpointMaps[key]){setTimeout(function(){hpointMaps[key].invalidateSize()},60);return hpointMaps[key]}let map=L.map(element,{zoomControl:true,attributionControl:true}).setView(HPOINT_MAP_CENTER,11);L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors'}).addTo(map);hpointMaps[key]=map;hpointMapLayers[key]=L.layerGroup().addTo(map);setTimeout(function(){map.invalidateSize()},100);return map}
+function hpointClearMap(key){let group=hpointMapLayers[key];if(group)group.clearLayers()}
+function hpointFit(map,points){if(!points.length)return;if(points.length===1){map.setView(points[0],14);return}map.fitBounds(points,{padding:[42,42],maxZoom:15})}
+function hpointAddMe(map,key,point){if(!point)return;L.marker([point.lat,point.lon],{icon:hpointPin('●','me'),zIndexOffset:500}).addTo(hpointMapLayers[key]).bindPopup('Вы здесь')}
+function hpointSetupMapPanel(){let panel=$('p-map');if(!panel||$('mapTools'))return;let intro=panel.querySelector('p');if(intro)intro.textContent='Ваша геопозиция видна только вам. Точка задачи и маршрут появляются после взаимного согласия на помощь.';let tools=document.createElement('div');tools.id='mapTools';tools.innerHTML='<div class="mapToolbar"><button class="btn light" onclick="mapLocateMe()">◎ Показать меня</button><span id="mapNotice" class="muted">Откройте геолокацию, чтобы увидеть себя на карте.</span></div><div id="mapTasks" class="mapTasks"></div>';let map=$('bigMap');map.parentNode.insertBefore(tools,map)}
+function hpointRenderMapTasks(tasks){let host=$('mapTasks');if(!host)return;host.innerHTML=tasks.length?'<p class="mapPrivacy">Точки активных заявок видны только участникам после того, как помощник подтвердил участие.</p>'+tasks.map(function(task){return '<div class="mapTask"><div class="mapTaskCopy"><b>'+esc(task.what)+'</b><span>Активная заявка · маршрут строится по вашему действию</span></div><button class="btn grad" onclick="buildRoute('+Number(task.id)+')">Построить маршрут</button></div>'}).join(''):'<p class="mapPrivacy">Сейчас нет активных заявок с подтверждённым помощником. На карте остаётся только ваша точка.</p>'}
+function hpointSetMapNotice(text){let node=$('mapNotice');if(node)node.textContent=text}
+async function mapLocateMe(){try{let point=await hpointGetBrowserLocation();hpointSetMapNotice('Ваше местоположение обновлено.');await loadBigMap()}catch(error){hpointSetMapNotice(hpointGeoMessage(error));toast(hpointGeoMessage(error))}}
+function helperGeoFallback(message,requestId){$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Поделитесь геопозицией</h2><p class="muted">Так автор заявки увидит только расстояние до вас, без вашей точки и адреса. '+esc(message)+'</p><div class="form"><button class="btn grad" onclick="helper('+(requestId?Number(requestId):'')+')">Разрешить геолокацию</button><button class="btn light" onclick="helperWithoutLocation('+(requestId?Number(requestId):'')+')">Продолжить без геолокации</button></div>'}
+async function joinHelper(position,requestId){let body=position?{lat:position.lat,lon:position.lon}:{};if(requestId)body.request_id=Number(requestId);let endpoint=requestId?'/api/requests/accept':'/api/helper/queue';let result=await api(endpoint,{method:'POST',body:JSON.stringify(body)});closeModal();toast(result.message);go('requests');await requests();return result}
+async function helper(requestId){try{toast('Запрашиваем геопозицию…');let point=await hpointGetBrowserLocation();return await joinHelper(point,requestId)}catch(error){helperGeoFallback(hpointGeoMessage(error),requestId)}}
+async function helperWithoutLocation(requestId){try{return await joinHelper(null,requestId)}catch(error){let target=$('err');if(target)target.textContent=error.message;else toast(error.message)}}
+async function acceptOpenRequest(id){return helper(Number(id))}
+function initMatchMap(){return hpointMap('mapMatch','match')}
+function hpointRenderCandidateMap(data){let map=initMatchMap();if(!map)return;hpointClearMap('match');let location=hpointCoordinates(data.request_location);if(!location){map.setView(HPOINT_MAP_CENTER,11);return}L.marker([location.lat,location.lon],{icon:hpointPin('⌂','match')}).addTo(hpointMapLayers.match).bindPopup('Ваша заявка');let distances=(data.matches||[]).map(function(candidate){return candidate.distance_km}).filter(function(distance){return distance!==null&&distance!==undefined}).sort(function(a,b){return a-b});if(distances.length){let closest=distances[0];L.circle([location.lat,location.lon],{radius:Math.max(100,closest*1000),color:'#7058e8',fillColor:'#7058e8',fillOpacity:.08,dashArray:'7 7',weight:2}).addTo(hpointMapLayers.match).bindPopup('Ближайший помощник: '+hpointDistanceText(closest)+'. Его точка скрыта до подтверждения помощи.')}hpointFit(map,[[location.lat,location.lon]]);let note=$('candidateMapNote');if(!note){note=document.createElement('p');note.id='candidateMapNote';note.className='candidateMapNote';$('mapMatch').after(note)}note.textContent=distances.length?'На карте показана ваша заявка и радиус ближайшего кандидата. Точные точки помощников не показываются до согласия.':'У кандидатов пока нет геолокации: расстояние появится, когда они разрешат доступ к ней.'}
+async function match(){if(!rid.value)return;try{let data=await api('/api/assistant/candidates',{method:'POST',body:JSON.stringify({request_id:Number(rid.value),question:$('matchQuestion').value})});if(data.offer){$('matches').innerHTML='<div class="empty">⏳ Ожидаем ответ от <b>'+esc(data.offer.name)+'</b>. После отказа можно выбрать другого кандидата.</div>';hpointRenderCandidateMap(data);return}let matches=data.matches||[];$('matches').innerHTML=matches.length?matches.map(function(candidate){return '<div class="match"><div class="avatar">'+esc((candidate.name||'?')[0])+'</div><div class="grow"><b>'+esc(candidate.name)+' '+(candidate.verified?'✓':'')+'</b><div class="muted">⭐ '+(candidate.rating||'—')+' · '+hpointDistanceText(candidate.distance_km)+' · '+candidate.reviews+' отзывов · match '+Math.round(candidate.score)+'%</div><div class="muted">'+esc((candidate.reasons||[]).join(' · '))+'</div></div><button class="btn grad" onclick="assign('+Number(rid.value)+','+Number(candidate.user_id)+')">Выбрать</button></div>'}).join(''):'<div class="empty">Сейчас в очереди нет подходящих добровольцев.</div>';hpointRenderCandidateMap(data)}catch(error){toast(error.message)}}
+async function loadBigMap(){hpointSetupMapPanel();let map=hpointMap('bigMap','big');if(!map)return;try{let data=await api('/api/map/active');hpointMapTasks=data.tasks||[];if(data.user_location)hpointLastLocation=hpointCoordinates(data.user_location)||hpointLastLocation;hpointClearMap('big');let points=[];let me=hpointSavedLocation();if(me){hpointAddMe(map,'big',me);points.push([me.lat,me.lon]);hpointSetMapNotice('Показана ваша текущая или последняя сохранённая геопозиция.')}for(let task of hpointMapTasks){let destination=hpointCoordinates(task.destination);if(!destination)continue;points.push([destination.lat,destination.lon]);L.marker([destination.lat,destination.lon],{icon:hpointPin('⌂','task')}).addTo(hpointMapLayers.big).bindPopup('Активная заявка: '+esc(task.what))}hpointFit(map,points);hpointRenderMapTasks(hpointMapTasks)}catch(error){hpointSetMapNotice('Не удалось загрузить карту: '+error.message)}}
+async function buildRoute(id){let task=hpointMapTasks.find(function(row){return Number(row.id)===Number(id)});let destination=task&&hpointCoordinates(task.destination);if(!destination){toast('У этой заявки нет геопозиции.');return}let start=null;try{start=await hpointGetBrowserLocation()}catch(error){start=hpointSavedLocation();if(!start){toast(hpointGeoMessage(error));return}}try{let url='https://router.project-osrm.org/route/v1/driving/'+start.lon+','+start.lat+';'+destination.lon+','+destination.lat+'?overview=full&geometries=geojson&steps=false';let response=await fetch(url);let data=await response.json();if(!response.ok||data.code!=='Ok'||!data.routes||!data.routes[0])throw new Error('маршрут пока недоступен');let route=data.routes[0];let map=hpointMap('bigMap','big');if(hpointMapLayers.route)hpointMapLayers.route.clearLayers();else hpointMapLayers.route=L.layerGroup().addTo(map);let routeLayer=L.geoJSON(route.geometry,{style:{color:'#087bff',weight:6,opacity:.86}}).addTo(hpointMapLayers.route);map.fitBounds(routeLayer.getBounds(),{padding:[42,42]});let km=(route.distance/1000).toLocaleString('ru-RU',{maximumFractionDigits:1});let minutes=Math.max(1,Math.round(route.duration/60));hpointSetMapNotice('Маршрут: '+km+' км · около '+minutes+' мин.')}catch(error){toast('Не удалось построить маршрут: '+error.message)}}
+'''
+
 def _page_replace(needle, replacement):
     global PAGE
     if needle not in PAGE:
         raise RuntimeError("H-Point page template changed; UI override target is missing")
     PAGE=PAGE.replace(needle, replacement, 1)
 
-_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+PASSWORD_CSS+"</style></head>")
+_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+PASSWORD_CSS+MAP_CSS+"</style></head>")
 _page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg"><link rel="apple-touch-icon" href="/assets/hpoint-logo.png"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
 _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandLogo" href="/" aria-label="H-Point"><img src="/assets/hpoint-logo-dark.png" alt="H-Point"></a>')
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
 _page_replace('<p class="audiencePortrait">H·Point создан для Ильи: он недавно переехал в новый район, работает до вечера и хочет быстро найти надёжного человека рядом, чтобы настроить роутер, донести коробки или решить другую небольшую, но срочную задачу.</p>', '')
 _page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
@@ -501,7 +541,7 @@ class Handler(BaseHTTPRequestHandler):
         body=item[0].read_bytes()
         self.send_response(200);self.send_header("Content-Type",item[1]);self.send_header("X-Content-Type-Options","nosniff");self.send_header("Cache-Control","public, max-age=604800, immutable");self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
     def html(self):
-        b=PAGE.replace("__YANDEX_MAPS_API_KEY__", YANDEX_MAPS_API_KEY).encode();self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
+        b=PAGE.encode();self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
     def do_HEAD(self):
         """Serve metadata for public resources without a response body."""
         p = urlparse(self.path)
@@ -513,7 +553,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200);self.send_header("Content-Type",item[1]);self.send_header("X-Content-Type-Options","nosniff");self.send_header("Cache-Control","public, max-age=604800, immutable");self.send_header("Content-Length",str(item[0].stat().st_size));self.end_headers()
             return
         if p.path in ("/", "/index.html", "/payment/result"):
-            size = len(PAGE.replace("__YANDEX_MAPS_API_KEY__", YANDEX_MAPS_API_KEY).encode())
+            size = len(PAGE.encode())
             self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(size));self.end_headers()
             return
         if p.path == "/api/health":
@@ -563,6 +603,20 @@ class Handler(BaseHTTPRequestHandler):
                 if not u:return
                 rs=get_history(u["user_id"],HISTORY_LIMIT)
                 return reply(self,{"ok":True,"current_user_id":u["user_id"],"requests":[request_payload(r) for r in rs]})
+            if p.path=="/api/map/active":
+                u=auth(self)
+                if not u:return
+                rows=db.execute(
+                    "SELECT * FROM requests WHERE status=? AND (requester_id=? OR helper_id=?) ORDER BY id DESC",
+                    (STATUS_IN_PROGRESS,u["user_id"],u["user_id"]),
+                ).fetchall()
+                tasks=[]
+                for row in rows:
+                    if row["lat"] is None or row["lon"] is None:
+                        continue
+                    tasks.append({"id":row["id"],"what":row["what"],"destination":{"lat":row["lat"],"lon":row["lon"]}})
+                location={"lat":u["lat"],"lon":u["lon"]} if u["lat"] is not None and u["lon"] is not None else None
+                return reply(self,{"ok":True,"user_location":location,"tasks":tasks})
             if p.path=="/api/helper/offers":
                 u=auth(self)
                 if not u:return
@@ -781,12 +835,13 @@ class Handler(BaseHTTPRequestHandler):
                 f={k:str(d.get(k,"" )).strip() for k in ("what","place","time_needed","urgency","details")}
                 if not all(f.values()):return reply(self,{"ok":False,"error":"Заполните все поля."},400)
                 if any(len(value)>MAX_TEXT_LEN for value in f.values()):return reply(self,{"ok":False,"error":f"Каждое поле должно быть не длиннее {MAX_TEXT_LEN} символов."},400)
-                try:lat=float(d["lat"]) if d.get("lat") is not None else None;lon=float(d["lon"]) if d.get("lon") is not None else None
-                except:lat=lon=None
+                try:lat,lon=coordinates_from_payload(d)
+                except ValueError:return reply(self,{"ok":False,"error":"Некорректные координаты."},400)
                 f["category"]=str(d.get("category","other"))
                 if f["category"] not in CATEGORIES:return reply(self,{"ok":False,"error":"Некорректная категория."},400)
-                if (lat is None) != (lon is None) or (lat is not None and not (-90<=lat<=90 and -180<=lon<=180)):return reply(self,{"ok":False,"error":"Некорректные координаты."},400)
                 rid=create_request(u["user_id"],{**f,"lat":lat,"lon":lon})
+                if lat is not None:
+                    db.execute("UPDATE users SET lat=?,lon=? WHERE user_id=?",(lat,lon,u["user_id"]))
                 req=get_request(rid)
                 if u["tg_user_id"]:
                     notify_telegram_user(
@@ -799,18 +854,25 @@ class Handler(BaseHTTPRequestHandler):
                 u=auth(self)
                 if not u:return
                 if not verified_community_account(self,u):return
+                try:lat,lon=coordinates_from_payload(d)
+                except ValueError:return reply(self,{"ok":False,"error":"Некорректные координаты."},400)
                 if get_active_own_request(u["user_id"]):
                     return reply(self,{"ok":False,"error":"Сначала завершите или отмените свою активную заявку."},409)
                 if get_active_help(u["user_id"]):
                     return reply(self,{"ok":False,"error":"Сначала завершите текущую помощь."},409)
+                if lat is not None:
+                    db.execute("UPDATE users SET lat=?,lon=? WHERE user_id=?",(lat,lon,u["user_id"]))
                 add_to_queue(u["user_id"])
-                return reply(self,{"ok":True,"matched":False,"message":"Вы в общей очереди помощников. Когда вас выберут, вы сами подтвердите или отклоните предложение."})
+                suffix=" Расстояние видно автору заявки, ваша точка скрыта." if lat is not None else " Геопозиция не указана, поэтому расстояние не будет показано."
+                return reply(self,{"ok":True,"matched":False,"message":"Вы в общей очереди помощников. Когда вас выберут, вы сами подтвердите или отклоните предложение."+suffix})
             if p.path=="/api/requests/accept":
                 u=auth(self)
                 if not u:return
                 if not verified_community_account(self,u):return
                 try: rid=int(d.get("request_id"))
                 except (TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
+                try:lat,lon=coordinates_from_payload(d)
+                except ValueError:return reply(self,{"ok":False,"error":"Некорректные координаты."},400)
                 request=get_request(rid)
                 if not request or request["status"]!=STATUS_OPEN or request["requester_id"]==u["user_id"]:
                     return reply(self,{"ok":False,"error":"Эта заявка недоступна."},409)
@@ -818,8 +880,11 @@ class Handler(BaseHTTPRequestHandler):
                     return reply(self,{"ok":False,"error":"Сначала завершите или отмените свою активную заявку."},409)
                 if get_active_help(u["user_id"]):
                     return reply(self,{"ok":False,"error":"Сначала завершите текущую помощь."},409)
+                if lat is not None:
+                    db.execute("UPDATE users SET lat=?,lon=? WHERE user_id=?",(lat,lon,u["user_id"]))
                 add_to_queue(u["user_id"])
-                return reply(self,{"ok":True,"request_id":rid,"queued":True,"message":"Вы в очереди помощников. Автор заявки сам выберет кандидата."})
+                suffix=" Расстояние видно автору заявки, ваша точка скрыта." if lat is not None else " Геопозиция не указана, поэтому расстояние не будет показано."
+                return reply(self,{"ok":True,"request_id":rid,"queued":True,"message":"Вы в очереди помощников. Автор заявки сам выберет кандидата."+suffix})
             if p.path=="/api/assistant/candidates":
                 u=auth(self)
                 if not u:return
@@ -831,7 +896,8 @@ class Handler(BaseHTTPRequestHandler):
                     return reply(self,{"ok":False,"error":"Подбор доступен только для вашей открытой заявки."},403)
                 question=str(d.get("question", "")).strip()[:MAX_TEXT_LEN]
                 offer=get_current_helper_offer(rid)
-                return reply(self,{"ok":True,"matches":smart_match(rid,query=question),"offer":dict(offer) if offer else None})
+                request_location={"lat":request["lat"],"lon":request["lon"]} if request["lat"] is not None and request["lon"] is not None else None
+                return reply(self,{"ok":True,"matches":smart_match(rid,query=question),"offer":dict(offer) if offer else None,"request_location":request_location})
             if p.path=="/api/smart-match/assign":
                 u=auth(self)
                 if not u:return

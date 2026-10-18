@@ -14,7 +14,6 @@ SESSION_COOKIE_SECURE = (
     if _cookie_secure_value
     else WEB_PUBLIC_URL.startswith("https://")
 )
-YANDEX_MAPS_API_KEY = os.getenv("YANDEX_MAPS_API_KEY", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 RUN_TELEGRAM_BOT = os.getenv("RUN_TELEGRAM_BOT", "1").strip().lower() not in ("0", "false", "no", "off")

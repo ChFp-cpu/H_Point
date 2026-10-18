@@ -16,13 +16,14 @@ class Web(unittest.TestCase):
   self.assertIn("Smart Match",web.PAGE);self.assertIn("Telegram",web.PAGE);self.assertIn("руб",web.PAGE)
   self.assertIn('rel="icon" type="image/svg+xml" href="/assets/favicon.svg"',web.PAGE)
   self.assertIn("timeout:2500",web.PAGE)
-  self.assertIn("&csp=true",web.PAGE)
+  self.assertIn("leaflet@1.9.4",web.PAGE)
   self.assertIn("Создать профиль",web.PAGE)
   self.assertIn("resumeTelegramLogin",web.PAGE)
   self.assertIn("/api/helper/offers",web.PAGE)
   self.assertIn("Предложения помощи",web.PAGE)
-  self.assertIn("https://*.maps.yandex.net",web.CSP)
-  self.assertIn("https://api-maps.yandex.ru",web.CSP)
+  self.assertIn("https://tile.openstreetmap.org",web.CSP)
+  self.assertIn("https://router.project-osrm.org",web.CSP)
+  self.assertNotIn("api-maps.yandex.ru",web.PAGE)
  def test_head_for_public_page_and_health(self):
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
   try:
@@ -133,6 +134,28 @@ class Web(unittest.TestCase):
    base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Cookie":f"hpoint_session={token}"}
    with urllib.request.urlopen(urllib.request.Request(base+"/api/requests?open=1",headers=headers),timeout=3) as response: row=json.load(response)["requests"][0]
    self.assertEqual(row["id"],rid);self.assertIsNone(row["lat"]);self.assertIsNone(row["lon"]);self.assertNotIn("details",row);self.assertNotEqual(row["place"],"район")
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_helper_location_updates_distance_and_active_map_stays_private(self):
+  database.create_user(1,"Requester");database.create_user(2,"Helper")
+  rid=services.create_request(1,{"what":"Нужна дрель","place":"район","time_needed":"сегодня","urgency":"обычная","details":"Точный адрес","lat":55.75123,"lon":37.61987})
+  requester_token=web.new_sess(1);helper_token=web.new_sess(2)
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   base=f"http://127.0.0.1:{server.server_address[1]}"
+   def post(path,payload,cookie):
+    return urllib.request.urlopen(urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers={"Content-Type":"application/json","Cookie":cookie},method="POST"),timeout=3)
+   with post("/api/helper/queue",{"lat":55.752,"lon":37.62},f"hpoint_session={helper_token}") as response:
+    self.assertTrue(json.load(response)["ok"])
+   with urllib.request.urlopen(urllib.request.Request(base+f"/api/smart-match?request_id={rid}",headers={"Cookie":f"hpoint_session={requester_token}"}),timeout=3) as response:
+    candidate=json.load(response)["matches"][0]
+   self.assertIsNotNone(candidate["distance_km"]);self.assertIsNone(candidate["lat"]);self.assertIsNone(candidate["lon"])
+   with urllib.request.urlopen(urllib.request.Request(base+"/api/map/active",headers={"Cookie":f"hpoint_session={helper_token}"}),timeout=3) as response:
+    self.assertEqual(json.load(response)["tasks"],[])
+   self.assertTrue(services.try_assign_helper(rid,2))
+   with urllib.request.urlopen(urllib.request.Request(base+"/api/map/active",headers={"Cookie":f"hpoint_session={helper_token}"}),timeout=3) as response:
+    task=json.load(response)["tasks"][0]
+   self.assertEqual(task["id"],rid);self.assertEqual(task["destination"]["lat"],55.75123)
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_production_requires_same_origin_for_state_changes(self):
