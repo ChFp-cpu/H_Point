@@ -487,7 +487,7 @@ def community_progress(days=30):
     ]
     categories.sort(key=lambda item: (-item["count"], item["title"]))
     daily = db.execute(
-        "SELECT substr(created_at,1,10) day,COUNT(*) n FROM requests WHERE created_at>=? GROUP BY substr(created_at,1,10) ORDER BY day",
+        "SELECT substr(created_at,1,10) AS created_day,COUNT(*) n FROM requests WHERE created_at>=? GROUP BY substr(created_at,1,10) ORDER BY created_day",
         (since,),
     ).fetchall()
     rewards = int(db.execute("SELECT COALESCE(SUM(reward_rub),0) n FROM requests WHERE reward_rub>0").fetchone()["n"] or 0)
