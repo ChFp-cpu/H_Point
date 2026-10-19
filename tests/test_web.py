@@ -22,6 +22,9 @@ class Web(unittest.TestCase):
   self.assertIn("resumeTelegramLogin",web.PAGE)
   self.assertIn("/api/helper/offers",web.PAGE)
   self.assertIn("Предложения помощи",web.PAGE)
+  self.assertIn("ratingPodium",web.PAGE)
+  self.assertIn("activityStats",web.PAGE)
+  self.assertIn("hpointShowcaseGo",web.PAGE)
   self.assertIn("https://*.yandex.ru",web.CSP)
   self.assertIn("https://*.yandex.net",web.CSP)
  def test_head_for_public_page_and_health(self):
