@@ -214,23 +214,23 @@ def geocode_address(query):
         if moment - GEOCODE_LAST_REQUEST_AT < 1.05:
             raise RuntimeError("Подождите секунду и повторите поиск адреса.")
         GEOCODE_LAST_REQUEST_AT = moment
-    request_url = "https://nominatim.openstreetmap.org/search?" + urlencode({
-        "format": "jsonv2", "limit": 1, "accept-language": "ru", "q": value,
-    })
+    request_url = "https://photon.komoot.io/api/?" + urlencode({"q": value, "limit": 1})
     request_obj = urlrequest.Request(request_url, headers={
         "User-Agent": "H-Point/1.0 (+https://gethpoint.ru)", "Accept": "application/json",
     })
     try:
         with urlrequest.urlopen(request_obj, timeout=8) as response:
-            rows = json.loads(response.read().decode("utf-8"))
+            payload = json.loads(response.read().decode("utf-8"))
     except (urlerror.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
         logging.warning("Fallback geocoding is unavailable: %s", type(exc).__name__)
         raise RuntimeError("Поиск адреса временно недоступен. Поставьте точку на карте.") from exc
+    rows = payload.get("features") if isinstance(payload, dict) else None
     if not isinstance(rows, list) or not rows:
         raise ValueError("Адрес не найден. Уточните город, улицу и номер дома.")
     try:
-        point = {"lat": float(rows[0]["lat"]), "lon": float(rows[0]["lon"])}
-    except (KeyError, TypeError, ValueError) as exc:
+        lon, lat = rows[0]["geometry"]["coordinates"][:2]
+        point = {"lat": float(lat), "lon": float(lon)}
+    except (KeyError, TypeError, ValueError, IndexError) as exc:
         raise RuntimeError("Не удалось определить координаты адреса.") from exc
     if not (-90 <= point["lat"] <= 90 and -180 <= point["lon"] <= 180):
         raise RuntimeError("Сервис вернул некорректные координаты.")
