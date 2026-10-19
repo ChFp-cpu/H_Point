@@ -472,14 +472,77 @@ def create_community_event(creator_id, title, description, place, starts_at, end
                       VALUES(?,?,?,?,?,?,?,?)""", (creator_id, title, description, place, start, end, capacity, image_data or ""))
 
 def community_progress(days=30):
-    days=max(7,min(int(days),365)); since=(datetime.now(timezone.utc)-timedelta(days=days)).isoformat()
-    total=db.execute("SELECT COUNT(*) n FROM requests").fetchone()["n"]
-    done=db.execute("SELECT COUNT(*) n FROM requests WHERE status='done'").fetchone()["n"]
-    active=db.execute("SELECT COUNT(*) n FROM requests WHERE status IN ('open','in_progress')").fetchone()["n"]
-    categories=db.execute("SELECT category,COUNT(*) n FROM requests GROUP BY category ORDER BY n DESC,category LIMIT 12").fetchall()
-    daily=db.execute("SELECT substr(created_at,1,10) day,COUNT(*) n FROM requests WHERE created_at>=? GROUP BY substr(created_at,1,10) ORDER BY day",(since,)).fetchall()
-    rewards=db.execute("SELECT COALESCE(SUM(reward_rub),0) n FROM requests WHERE reward_rub>0").fetchone()["n"]
-    return {"summary":{"total":int(total),"done":int(done),"active":int(active),"rewards":int(rewards)},"categories":[{"key":r["category"],"title":CATEGORIES.get(r["category"],"Другое"),"count":int(r["n"])} for r in categories],"daily":[dict(r) for r in daily],"period_days":days}
+    """Return aggregate-only community metrics safe to display publicly."""
+    days = max(7, min(int(days), 365))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    total = int(db.execute("SELECT COUNT(*) n FROM requests").fetchone()["n"] or 0)
+    done = int(db.execute("SELECT COUNT(*) n FROM requests WHERE status=?", (STATUS_DONE,)).fetchone()["n"] or 0)
+    active = int(db.execute("SELECT COUNT(*) n FROM requests WHERE status IN ('open','in_progress')").fetchone()["n"] or 0)
+    counts = {row["category"]: int(row["n"] or 0) for row in db.execute(
+        "SELECT category,COUNT(*) n FROM requests GROUP BY category"
+    ).fetchall()}
+    categories = [
+        {"key": key, "title": title, "count": counts.get(key, 0)}
+        for key, title in CATEGORIES.items()
+    ]
+    categories.sort(key=lambda item: (-item["count"], item["title"]))
+    daily = db.execute(
+        "SELECT substr(created_at,1,10) day,COUNT(*) n FROM requests WHERE created_at>=? GROUP BY substr(created_at,1,10) ORDER BY day",
+        (since,),
+    ).fetchall()
+    rewards = int(db.execute("SELECT COALESCE(SUM(reward_rub),0) n FROM requests WHERE reward_rub>0").fetchone()["n"] or 0)
+    leaders = db.execute("""SELECT u.user_id,u.name,u.city,COUNT(r.id) helped,
+                                  AVG(r.requester_rating) rating,COUNT(r.requester_rating) reviews
+                           FROM users u JOIN requests r ON r.helper_id=u.user_id
+                           WHERE r.status=?
+                           GROUP BY u.user_id,u.name,u.city
+                           HAVING COUNT(r.id)>0
+                           ORDER BY COUNT(r.id) DESC,COALESCE(AVG(r.requester_rating),0) DESC,u.user_id ASC
+                           LIMIT 20""", (STATUS_DONE,)).fetchall()
+    leaderboard = []
+    for position, row in enumerate(leaders, 1):
+        helped = int(row["helped"] or 0)
+        rating = round(float(row["rating"]), 1) if row["rating"] is not None else None
+        leaderboard.append({
+            "position": position, "user_id": int(row["user_id"]), "name": row["name"],
+            "city": row["city"] or "", "helped": helped, "rating": rating,
+            "reviews": int(row["reviews"] or 0),
+            "score": helped * 20 + int((rating or 0) * 10),
+        })
+    return {
+        "summary": {"total": total, "done": done, "active": active, "rewards": rewards},
+        "categories": categories, "daily": [dict(row) for row in daily], "period_days": days,
+        "completion_percent": round(done / total * 100) if total else 0,
+        "leaderboard": leaderboard,
+    }
+
+def community_profile(user_id):
+    """Public community card: only reputation data, never contact or location data."""
+    user = db.execute("SELECT user_id,name,city FROM users WHERE user_id=? AND is_blocked=0", (user_id,)).fetchone()
+    if not user:
+        return None
+    stats = get_user_stats(user_id)
+    reviews = db.execute("""SELECT * FROM (
+          SELECT r.id,r.completed_at,r.requester_rating rating,r.requester_review review,
+                 u.name reviewer_name,'За помощь' review_kind
+          FROM requests r JOIN users u ON u.user_id=r.requester_id
+          WHERE r.helper_id=? AND r.status=? AND r.requester_rating IS NOT NULL
+          UNION ALL
+          SELECT r.id,r.completed_at,r.helper_rating rating,r.helper_review review,
+                 u.name reviewer_name,'Как заказчику' review_kind
+          FROM requests r JOIN users u ON u.user_id=r.helper_id
+          WHERE r.requester_id=? AND r.status=? AND r.helper_rating IS NOT NULL
+        ) reputation ORDER BY completed_at DESC,id DESC LIMIT 30""", (user_id, STATUS_DONE, user_id, STATUS_DONE)).fetchall()
+    return {
+        "id": int(user["user_id"]), "name": user["name"], "city": user["city"] or "",
+        "stats": stats,
+        "reviews": [
+            {"request_id": int(row["id"]), "title": "Завершённая заявка", "at": row["completed_at"],
+             "rating": int(row["rating"]), "review": row["review"] or "",
+             "reviewer_name": row["reviewer_name"], "kind": row["review_kind"]}
+            for row in reviews
+        ],
+    }
 
 def community_events_for_user(user_id, mine=False, limit=100):
     current = datetime.now(timezone.utc).isoformat()
@@ -976,8 +1039,8 @@ def get_unrated_request(uid): return db.execute("SELECT * FROM requests WHERE re
 def get_unrated_help(uid): return db.execute("SELECT * FROM requests WHERE helper_id=? AND status=? AND helper_rating IS NULL ORDER BY id DESC LIMIT 1",(uid,STATUS_DONE)).fetchone()
 def get_history(uid,limit=20): return db.execute("SELECT * FROM requests WHERE requester_id=? OR helper_id=? ORDER BY id DESC LIMIT ?",(uid,uid,limit)).fetchall()
 def get_user_stats(uid):
-    a=db.execute("SELECT COUNT(*) n,AVG(helper_rating) avg FROM requests WHERE helper_id=? AND status=?",(uid,STATUS_DONE)).fetchone()
-    b=db.execute("SELECT COUNT(*) n,AVG(requester_rating) avg FROM requests WHERE requester_id=? AND status=?",(uid,STATUS_DONE)).fetchone()
+    a=db.execute("SELECT COUNT(*) n,AVG(requester_rating) avg FROM requests WHERE helper_id=? AND status=?",(uid,STATUS_DONE)).fetchone()
+    b=db.execute("SELECT COUNT(*) n,AVG(helper_rating) avg FROM requests WHERE requester_id=? AND status=?",(uid,STATUS_DONE)).fetchone()
     return {"helped":a["n"] or 0,"helped_avg":float(a["avg"]) if a["avg"] is not None else None,
             "received":b["n"] or 0,"received_avg":float(b["avg"]) if b["avg"] is not None else None}
 def save_request_candidates(request_id, candidates):
