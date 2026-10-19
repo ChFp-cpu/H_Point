@@ -33,12 +33,15 @@ def create_request(user_id: int, data: dict) -> int:
     category = data.get("category") or infer_category(data["what"])
     hours = max(1, min(int(data.get("expires_in_hours", 48)), 168))
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+    reward = int(data.get("reward_rub") or 0)
+    if not 0 <= reward <= 100_000:
+        raise ValueError("reward_rub")
     return insert_id(
         """INSERT INTO requests
-        (requester_id, category, what, place, time_needed, urgency, details, status, priority_boost, lat, lon, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+        (requester_id, category, what, place, time_needed, urgency, details, status, priority_boost, lat, lon, expires_at, reward_rub)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
         (user_id, category, data["what"], data["place"], data["time_needed"], data["urgency"], data["details"], STATUS_OPEN,
-         data.get("lat"), data.get("lon"), expires_at),
+         data.get("lat"), data.get("lon"), expires_at, reward),
     )
 
 def expire_open_requests() -> None:

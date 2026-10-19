@@ -13,6 +13,17 @@ def create_pending_invoice(user_id,item_type,metadata=None):
                           VALUES(?,?,?,?,?,?)""",(user_id,item_type,item["rub"],PAYMENT_CURRENCY,payload,json.dumps(metadata or {},ensure_ascii=False)))
     return invoice_id,payload,item["rub"]
 
+def create_request_reward_invoice(user_id, request_id):
+    request=get_request(request_id)
+    if not request or request["requester_id"]!=user_id or request["status"]!="open": raise ValueError("request unavailable")
+    amount=int(request["reward_rub"] or 0)
+    if amount<1: raise ValueError("reward is zero")
+    existing=db.execute("SELECT * FROM billing_invoices WHERE item_type='request_reward' AND user_id=? AND metadata LIKE ? AND status='pending' ORDER BY id DESC LIMIT 1",(user_id,f'%\"request_id\": {request_id}%')).fetchone()
+    if existing:return existing["id"],existing["payload"],amount
+    payload=f"hpoint:reward:{uuid.uuid4().hex}"
+    invoice_id=insert_id("INSERT INTO billing_invoices(user_id,item_type,amount_rub,currency,payload,metadata) VALUES(?,?,?,?,?,?)",(user_id,'request_reward',amount,PAYMENT_CURRENCY,payload,json.dumps({'request_id':request_id},ensure_ascii=False)))
+    return invoice_id,payload,amount
+
 def _signature(value, password):
     try: digest=getattr(hashlib, ROBOKASSA_HASH_ALGORITHM.lower())
     except AttributeError: raise RuntimeError("Unsupported ROBOKASSA_HASH_ALGORITHM")
@@ -25,7 +36,7 @@ def create_payment(invoice_id):
     if not ROBOKASSA_MERCHANT_LOGIN or not ROBOKASSA_PASSWORD_1 or not ROBOKASSA_PASSWORD_2:
         raise RuntimeError("Robokassa is not configured: set ROBOKASSA_MERCHANT_LOGIN, ROBOKASSA_PASSWORD_1 and ROBOKASSA_PASSWORD_2")
     amount=f'{inv["amount_rub"]:.2f}'
-    description=MONETIZATION_ITEMS[inv["item_type"]]["title"][:100]
+    description=(MONETIZATION_ITEMS.get(inv["item_type"]) or {"title":"Вознаграждение за помощь"})["title"][:100]
     params={"MerchantLogin":ROBOKASSA_MERCHANT_LOGIN,"OutSum":amount,"InvId":str(invoice_id),
             "Description":description,"Culture":"ru","Encoding":"utf-8",
             "SignatureValue":_signature(f"{amount}:{invoice_id}",ROBOKASSA_PASSWORD_1),
@@ -63,7 +74,10 @@ def fulfill_invoice(invoice_id,payment_id=None):
             db.execute("ROLLBACK"); return False,"already_processed"
         db.execute("INSERT OR IGNORE INTO billing_events(invoice_id,event_type,provider_event_id,payload) VALUES(?,?,?,?)",
                    (invoice_id,"successful_payment",payment_id or inv["provider_payment_id"],json.dumps(meta,ensure_ascii=False)))
-        grant_entitlement(inv["user_id"],inv["item_type"],request_id=meta.get("request_id"),ad_text=meta.get("ad_text"))
+        if inv["item_type"]=="request_reward":
+            db.execute("UPDATE requests SET reward_payment_status='paid' WHERE id=? AND requester_id=?",(meta.get("request_id"),inv["user_id"]))
+        else:
+            grant_entitlement(inv["user_id"],inv["item_type"],request_id=meta.get("request_id"),ad_text=meta.get("ad_text"))
         db.execute("COMMIT")
     except Exception:
         db.execute("ROLLBACK"); raise

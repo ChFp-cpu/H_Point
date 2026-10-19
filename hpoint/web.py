@@ -3,14 +3,14 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urlrequest, error as urlerror
 from email.message import EmailMessage
-import asyncio, json, logging, os, secrets, hashlib, hmac, datetime as dt, re, smtplib, ssl
+import asyncio, json, logging, os, secrets, hashlib, hmac, datetime as dt, re, smtplib, ssl, base64, binascii
 from pathlib import Path
 from html import escape
 from . import database
 from .database import db, get_user, get_user_by_email, create_web_user, get_request, get_user_stats, get_active_own_request, get_history, get_billing_history, is_user_blocked, admin_summary, set_user_blocked
 from .config import *
 from .services import *
-from .billing import create_pending_invoice, create_payment, fulfill_invoice, purchase_with_points, verify_robokassa_result
+from .billing import create_pending_invoice, create_request_reward_invoice, create_payment, fulfill_invoice, purchase_with_points, verify_robokassa_result
 
 database.init_db()
 _telegram_bot = None
@@ -187,12 +187,25 @@ def session_headers(h, uid):
     return {"Set-Cookie": [session_cookie(new_sess(uid, device), SESSION_TTL), device_cookie(device)]}
 
 MAX_JSON_BODY = 20_000
+EVENT_JSON_BODY = EVENT_IMAGE_MAX_BYTES * 2 + 10_000
 
-def read(h):
+def read(h, max_body=MAX_JSON_BODY):
     try: length = int(h.headers.get("Content-Length", "0"))
     except ValueError: raise ValueError("Некорректный размер запроса")
-    if length < 0 or length > MAX_JSON_BODY: raise ValueError("Слишком большой запрос")
+    if length < 0 or length > max_body: raise ValueError("Слишком большой запрос")
     return json.loads(h.rfile.read(length) or b"{}")
+
+def event_image_data(value):
+    raw=str(value or "").strip()
+    if not raw:return ""
+    match=re.fullmatch(r"data:(image/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)",raw)
+    if not match:raise ValueError("Фото должно быть PNG, JPEG или WebP.")
+    try:payload=base64.b64decode(match.group(2),validate=True)
+    except (binascii.Error,ValueError):raise ValueError("Не удалось прочитать фото.")
+    if not payload or len(payload)>EVENT_IMAGE_MAX_BYTES:raise ValueError("Фото должно быть не больше 800 КБ.")
+    signatures={"image/jpeg":b"\xff\xd8\xff","image/png":b"\x89PNG\r\n\x1a\n","image/webp":b"RIFF"}
+    if not payload.startswith(signatures[match.group(1)]):raise ValueError("Формат фото не совпадает с файлом.")
+    return f"data:{match.group(1)};base64,"+base64.b64encode(payload).decode("ascii")
 
 def reply(h,d,status=200,headers=None):
     b=json.dumps(d,ensure_ascii=False).encode()
@@ -260,7 +273,9 @@ def public_request_payload(r):
             "category_name": CATEGORIES.get(r["category"], "Другое"), "urgency": r["urgency"],
             # The free-text place field can contain a home address.  It is
             # shared only with the assigned helper through the private flow.
-            "place": "Район уточняется после назначения", "lat": None, "lon": None, "views": r["views"] if "views" in r.keys() else 0}
+            "place": "Район уточняется после назначения", "lat": None, "lon": None, "views": r["views"] if "views" in r.keys() else 0,
+            "reward_rub": int(r["reward_rub"] or 0) if "reward_rub" in r.keys() else 0,
+            "reward_payment_status": r["reward_payment_status"] if "reward_payment_status" in r.keys() else "none"}
 
 def record_request_view(request_id, viewer_id):
     inserted=db.execute("INSERT OR IGNORE INTO request_views(request_id,viewer_id) VALUES(?,?)", (request_id,viewer_id))
@@ -640,6 +655,22 @@ async function cancelEvent(id){if(!confirm('Отменить мероприят�
 const hpointBaseGoForActivities=window.go;window.go=function(tab){ensureActivitiesPanel();hpointBaseGoForActivities(tab);if(tab==='activities')loadActivities()};ensureActivitiesPanel();
 '''
 
+PROGRESS_CSS=r'''
+.progressGrid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.progressMetric{padding:18px;border:1px solid #3a4035;background:#171a14}.progressMetric b{display:block;color:#cfff73;font-size:28px}.categoryBar{display:grid;grid-template-columns:minmax(110px,1fr) 3fr 45px;gap:10px;align-items:center;margin:12px 0}.categoryBar i{height:10px;background:#b8f36b;display:block}.eventPhoto{width:112px;height:84px;object-fit:cover;border:1px solid #4a5146}.donationCard{margin-top:30px;padding:18px;border:1px dashed #566050;color:#a9afa1;font-size:13px}.donationCard a{color:#cfff73}@media(max-width:650px){.progressGrid{grid-template-columns:repeat(2,1fr)}.eventPhoto{grid-column:1/-1;width:100%;height:180px}.categoryBar{grid-template-columns:105px 1fr 38px}}
+'''
+PROGRESS_UI=r'''
+function ensureProgressPanel(){let tabs=document.querySelector('.tabs'),app=$('app');if(!tabs||!app)return;if(!document.querySelector('[data-t="progress"]')){let tab=document.createElement('button');tab.className='tab';tab.dataset.t='progress';tab.textContent='Прогресс';tab.onclick=function(){go('progress')};let profile=document.querySelector('[data-t="profile"]');tabs.insertBefore(tab,profile||null)}if(!$('p-progress')){let panel=document.createElement('section');panel.id='p-progress';panel.className='panel';panel.innerHTML='<span class="ey">СООБЩЕСТВО</span><h2>Прогресс H-Point</h2><p class="muted">Общая открытая статистика по заявкам и категориям.</p><div id="progressData"></div>';app.appendChild(panel)}}
+async function loadProgress(){ensureProgressPanel();let host=$('progressData');host.innerHTML='<div class="eventEmpty">Собираем статистику…</div>';try{let d=await api('/api/progress');let max=Math.max(1,...d.categories.map(x=>x.count));host.innerHTML='<div class="progressGrid"><div class="progressMetric"><b>'+d.summary.total+'</b><span>всего заявок</span></div><div class="progressMetric"><b>'+d.summary.active+'</b><span>активных</span></div><div class="progressMetric"><b>'+d.summary.done+'</b><span>завершено</span></div><div class="progressMetric"><b>'+Number(d.summary.rewards).toLocaleString('ru-RU')+' ₽</b><span>обещано за помощь</span></div></div><div class="card" style="margin-top:16px"><h3>Категории заявок</h3>'+(d.categories.length?d.categories.map(x=>'<div class="categoryBar"><span>'+esc(x.title)+'</span><i style="width:'+Math.max(4,Math.round(x.count/max*100))+'%"></i><b>'+x.count+'</b></div>').join(''):'<p class="muted">Данных пока нет.</p>')+'</div>'}catch(e){host.innerHTML='<div class="eventEmpty">Не удалось загрузить статистику.</div>'}}
+function readEventPhoto(input){let file=input.files&&input.files[0],note=$('eventError');window.hpointEventPhoto='';if(!file)return;if(file.size>800000){note.textContent='Фото должно быть не больше 800 КБ.';input.value='';return}let reader=new FileReader();reader.onload=function(){window.hpointEventPhoto=String(reader.result);note.textContent='Фото добавлено.'};reader.readAsDataURL(file)}
+function activityForm(){$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Новое мероприятие</h2><p class="muted eventFormNote">Место и описание видны пользователям раздела «Активности». Контакты организатора не публикуются.</p><div class="form" style="margin-top:16px"><input id="eventTitle" class="input" maxlength="120" placeholder="Например: Турнир по настольному теннису"><input id="eventPlace" class="input" maxlength="180" placeholder="Место: парк, клуб, адрес или ориентир"><label class="muted">Фото мероприятия<input class="input" type="file" accept="image/png,image/jpeg,image/webp" onchange="readEventPhoto(this)"></label><label class="muted">Начало<input id="eventStart" class="input" type="datetime-local" style="margin-top:5px"></label><label class="muted">Окончание, если известно<input id="eventEnd" class="input" type="datetime-local" style="margin-top:5px"></label><input id="eventCapacity" class="input" type="number" min="2" max="1000" inputmode="numeric" placeholder="Количество мест, если ограничено"><textarea id="eventDescription" class="input textarea" maxlength="2000" placeholder="Расскажите, что будет на мероприятии и что взять с собой"></textarea><button class="btn grad" onclick="createEvent()">Опубликовать мероприятие</button><p id="eventError" class="eventFormError" role="alert"></p></div>'}
+function eventCard(event){let date=eventDateParts(event.starts_at),full=Number(event.capacity||0)>0&&Number(event.participant_count)>=Number(event.capacity),capacity=Number(event.capacity||0)>0?Number(event.participant_count)+' / '+Number(event.capacity)+' мест':Number(event.participant_count)+' участников',action=event.status!=='published'?'<span class="muted">Архив</span>':event.is_creator?'<button class="btn danger" onclick="cancelEvent('+Number(event.id)+')">Отменить</button>':event.joined?'<button class="btn light" onclick="leaveEvent('+Number(event.id)+')">Не участвовать</button>':full?'<button class="btn light" disabled>Мест нет</button>':'<button class="btn grad" onclick="joinEvent('+Number(event.id)+')">Участвовать</button>';return '<article class="eventCard"><div class="eventDate"><b>'+esc(date.day)+'</b><span>'+esc(date.month)+'</span></div>'+(event.has_image?'<img class="eventPhoto" src="/api/events/image?id='+Number(event.id)+'" alt="Фото мероприятия">':'')+'<div class="eventCopy"><h3>'+esc(event.title)+'</h3><div class="eventMeta"><span>◷ '+esc(eventTimeRange(event))+'</span><span>⌖ '+esc(event.place)+'</span><span>Организатор: '+esc(event.creator_name)+'</span></div>'+(event.description?'<p class="eventDescription">'+esc(event.description)+'</p>':'')+'</div><div class="eventActions"><span class="eventCapacity">'+esc(capacity)+'</span>'+action+'</div></article>'}
+async function createEvent(){let error=$('eventError'),title=$('eventTitle').value.trim(),place=$('eventPlace').value.trim(),starts=eventIso('eventStart');error.textContent='';if(title.length<3){error.textContent='Название должно содержать минимум 3 символа.';return}if(place.length<2){error.textContent='Укажите место проведения.';return}if(!starts){error.textContent='Укажите дату и время начала.';return}try{await api('/api/events',{method:'POST',body:JSON.stringify({title:title,place:place,starts_at:starts,ends_at:eventIso('eventEnd'),capacity:$('eventCapacity').value,description:$('eventDescription').value,image_data:window.hpointEventPhoto||''})});closeModal();toast('Мероприятие опубликовано');go('activities');await loadActivities()}catch(e){error.textContent=e.message;toast('Не удалось опубликовать мероприятие')}}
+function requestForm(){$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Новая заявка</h2><p class="muted">Выберите вознаграждение: 0 ₽ означает бесплатную помощь.</p><div class="form"><input id="qw" class="input" placeholder="Что нужно сделать?"><input id="qp" class="input" placeholder="Город, улица, дом или ориентир"><input id="qt" class="input" placeholder="Когда нужна помощь?"><label class="muted">Вознаграждение: <b id="rewardValue">0 ₽</b><input id="rewardRub" type="range" min="0" max="10000" step="100" value="0" oninput="rewardValue.textContent=Number(this.value).toLocaleString(\'ru-RU\')+\' ₽\'"></label><select id="qc" class="input"><option value="other">Другое</option><option value="carry">Перенос / переезд</option><option value="shopping">Покупки</option><option value="snow">Снег / уборка</option><option value="tools">Инструменты</option><option value="transport">Транспорт</option><option value="tech">Техника</option><option value="study">Учёба</option></select><select id="qu" class="input"><option>🔥 Очень срочно</option><option>⏳ В течение дня</option><option>🕊 Не срочно</option></select><textarea id="qd" class="input textarea" placeholder="Детали"></textarea><button class="btn grad" onclick="createReq()">Создать заявку</button><div id="rqerr" class="eventFormError"></div></div>'}
+async function sendReq(lat,lon){try{let reward=Number($('rewardRub').value),d=await api('/api/requests',{method:'POST',body:JSON.stringify({what:qw.value,place:qp.value,time_needed:qt.value,urgency:qu.value,details:qd.value,category:qc.value,lat,lon,expires_in_hours:48,reward_rub:reward})});closeModal();if(reward>0){try{let payment=await api('/api/requests/reward/pay',{method:'POST',body:JSON.stringify({request_id:d.request_id})});location.href=payment.confirmation_url;return}catch(error){toast('Заявка создана. Оплату можно повторить позже: '+error.message)}}await requests();toast('Заявка #'+d.request_id+' создана');go('match')}catch(e){$('rqerr').textContent=e.message}}
+async function loadOpenRequests(){try{let d=await api('/api/requests?open=1'),host=openRequestHost();host.innerHTML='<h3>Открытые заявки</h3>'+(d.requests.length?d.requests.map(r=>'<div class="request"><div class="requestmain"><b>#'+r.id+' · '+esc(r.what)+'</b><div class="muted">'+esc(r.category_name)+' · '+esc(r.urgency)+(Number(r.reward_rub)>0?' · вознаграждение '+Number(r.reward_rub).toLocaleString('ru-RU')+' ₽':' · без оплаты')+'</div></div><button class="btn grad" onclick="acceptOpenRequest('+r.id+')">Помочь</button></div>').join(''):'<div class="empty">Сейчас нет открытых заявок от других пользователей.</div>')}catch(e){openRequestHost().innerHTML='<div class="empty">Не удалось загрузить заявки.</div>'}}
+async function loadDonation(){try{let d=await fetch('/api/public-config',{credentials:'same-origin'}).then(x=>x.json());if(!d.donation_url||document.getElementById('donationCard'))return;let card=document.createElement('aside');card.id='donationCard';card.className='donationCard';let text=document.createElement('span');text.textContent='H-Point развивается благодаря сообществу. ';let link=document.createElement('a');link.href=d.donation_url;link.target='_blank';link.rel='noopener';link.textContent=d.donation_title||'Поддержать проект';card.append(text,link);document.querySelector('#landing .wrap')?.append(card)}catch(e){}}
+const hpointBaseGoForProgress=window.go;window.go=function(tab){ensureActivitiesPanel();ensureProgressPanel();hpointBaseGoForProgress(tab);if(tab==='activities')loadActivities();if(tab==='progress')loadProgress()};ensureProgressPanel();loadDonation();
+'''
 LOCATION_PICKER_UI=r'''
 function locationPicker(id,onPick){if(!window.ymaps){toast('Яндекс Карты ещё загружаются.');return}ymaps.ready(function(){let host=$(id);if(!host)return;let map=new ymaps.Map(id,{center:[55.751244,37.618423],zoom:11,controls:['zoomControl','searchControl']},{suppressMapOpenBlock:true});let mark=null;map.events.add('click',function(event){let point=event.get('coords');if(mark)map.geoObjects.remove(mark);mark=new ymaps.Placemark(point,{balloonContent:'Выбранная точка'},{preset:'islands#blueDotIcon'});map.geoObjects.add(mark);onPick({lat:point[0],lon:point[1]})});let hint=document.createElement('p');hint.className='muted';hint.textContent='Нажмите на карте в нужном месте, чтобы поставить точку.';host.after(hint)})}
 function requestForm(){hpointRequestPoint=null;$('modal').style.display='flex';$('modalbody').innerHTML=`<h2>Новая заявка</h2><p class="muted">Укажите адрес или вручную поставьте точку на карте. Точный адрес виден только после назначения помощника.</p><div class="form"><input id="qw" class="input" placeholder="Что нужно сделать?"><input id="qp" class="input" placeholder="Город, улица, дом или ориентир"><div id="requestPicker" class="map" style="height:230px"></div><input id="qt" class="input" placeholder="Когда нужна помощь?"><label class="muted">Срок публикации: <b id="requestDuration">2 дня</b></label><input id="requestHours" type="range" min="1" max="168" value="48" step="1" oninput="$('requestDuration').textContent=this.value==24?'1 день':this.value==48?'2 дня':this.value+' ч.'"><select id="qc" class="input"><option value="other">Другое</option><option value="carry">Перенос / переезд</option><option value="shopping">Покупки</option><option value="snow">Снег / уборка</option><option value="tools">Инструменты</option><option value="transport">Транспорт</option><option value="tech">Техника</option><option value="study">Учёба</option></select><select id="qu" class="input"><option>🔥 Очень срочно</option><option>⏳ В течение дня</option><option>🕊 Не срочно</option></select><textarea id="qd" class="input textarea" placeholder="Детали"></textarea><button class="btn grad" onclick="createReq()">Создать заявку</button><div id="rqerr" class="muted"></div></div>`;setTimeout(function(){locationPicker('requestPicker',function(point){hpointRequestPoint=point;$('rqerr').textContent='Точка выбрана на карте.'})},20)}
@@ -674,7 +705,7 @@ def _page_replace(needle, replacement):
         raise RuntimeError("H-Point page template changed; UI override target is missing")
     PAGE=PAGE.replace(needle, replacement, 1)
 
-_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+PASSWORD_CSS+MAP_CSS+ADMIN_DASHBOARD_CSS+CONTACT_VERIFICATION_CSS+EVENTS_CSS+"</style></head>")
+_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+PASSWORD_CSS+MAP_CSS+ADMIN_DASHBOARD_CSS+CONTACT_VERIFICATION_CSS+EVENTS_CSS+PROGRESS_CSS+"</style></head>")
 _page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg"><link rel="apple-touch-icon" href="/assets/hpoint-logo.png"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
 if YANDEX_MAPS_API_KEY:
     PAGE=PAGE.replace('<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>', f'<script src="https://api-maps.yandex.ru/2.1/?apikey={escape(YANDEX_MAPS_API_KEY, quote=True)}&lang=ru_RU"></script>')
@@ -682,7 +713,7 @@ _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandL
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
 _page_replace('<p class="audiencePortrait">H·Point создан для Ильи: он недавно переехал в новый район, работает до вечера и хочет быстро найти надёжного человека рядом, чтобы настроить роутер, донести коробки или решить другую небольшую, но срочную задачу.</p>', '')
 _page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+SUPPORT_UI+ADMIN_DASHBOARD_UI+ADMIN_MODAL_FIXES+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+LOCATION_PICKER_UI+CONTACT_VERIFICATION_UI+EVENTS_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+SUPPORT_UI+ADMIN_DASHBOARD_UI+ADMIN_MODAL_FIXES+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+LOCATION_PICKER_UI+CONTACT_VERIFICATION_UI+EVENTS_UI+PROGRESS_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
@@ -738,6 +769,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if p.path in ("/","/index.html","/payment/result"): return self.html()
             if p.path=="/api/health": return reply(self,{"ok":True,"database":True})
+            if p.path=="/api/public-config": return reply(self,{"ok":True,"donation_url":DONATION_URL,"donation_title":DONATION_TITLE})
             if p.path=="/api/auth/telegram/complete":
                 ticket=parse_qs(p.query).get("ticket",[""])[0]
                 uid=database.consume_telegram_auth_ticket(ticket)
@@ -762,6 +794,10 @@ class Handler(BaseHTTPRequestHandler):
                 u=auth(self)
                 if not u:return
                 return reply(self,{"ok":True,"user":user_payload(u)})
+            if p.path=="/api/progress":
+                u=auth(self)
+                if not u:return
+                return reply(self,{"ok":True,**database.community_progress(parse_qs(p.query).get("days",[30])[0])})
             if p.path=="/api/sync":
                 u=auth(self)
                 if not u:return
@@ -773,6 +809,16 @@ class Handler(BaseHTTPRequestHandler):
                 expire_open_requests()
                 rs=get_history(u["user_id"],HISTORY_LIMIT)
                 return reply(self,{"ok":True,"current_user_id":u["user_id"],"requests":[request_payload(r) for r in rs]})
+            if p.path=="/api/events/image":
+                u=auth(self)
+                if not u:return
+                try:event_id=int(parse_qs(p.query).get("id",[0])[0])
+                except (TypeError,ValueError):return self.send_error(404)
+                row=db.execute("SELECT image_data FROM community_events WHERE id=? AND status='published'",(event_id,)).fetchone()
+                if not row or not row["image_data"]:return self.send_error(404)
+                try: mime,payload=row["image_data"].split(",",1); mime=mime[5:].split(";",1)[0]; body=base64.b64decode(payload,validate=True)
+                except (ValueError,binascii.Error):return self.send_error(404)
+                self.send_response(200);self.send_header("Content-Type",mime);self.send_header("Cache-Control","private, max-age=3600");self.send_header("X-Content-Type-Options","nosniff");self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body);return
             if p.path=="/api/map/active":
                 u=auth(self)
                 if not u:return
@@ -817,6 +863,7 @@ class Handler(BaseHTTPRequestHandler):
                 events=[]
                 for row in rows:
                     item=dict(row)
+                    item["has_image"]=bool(item.pop("image_data", ""))
                     item["joined"]=bool(item["joined"])
                     item["is_creator"]=item["creator_id"]==u["user_id"]
                     events.append(item)
@@ -900,7 +947,7 @@ class Handler(BaseHTTPRequestHandler):
                 logging.exception("Payment callback failed")
                 return self._text("payment callback failed",500)
         if not valid_origin(self): return reply(self,{"ok":False,"error":"invalid_origin"},403)
-        try:d=read(self)
+        try:d=read(self, EVENT_JSON_BODY if p.path=="/api/events" else MAX_JSON_BODY)
         except:return reply(self,{"ok":False,"error":"Некорректный JSON"},400)
         try:
             if p.path=="/api/auth/telegram/start":
@@ -1070,7 +1117,8 @@ class Handler(BaseHTTPRequestHandler):
                 u=auth(self)
                 if not u:return
                 try:
-                    event_id=database.create_community_event(u["user_id"],d.get("title"),d.get("description"),d.get("place"),d.get("starts_at"),d.get("ends_at"),d.get("capacity"))
+                    image=event_image_data(d.get("image_data"))
+                    event_id=database.create_community_event(u["user_id"],d.get("title"),d.get("description"),d.get("place"),d.get("starts_at"),d.get("ends_at"),d.get("capacity"),image)
                 except ValueError as exc:
                     return reply(self,{"ok":False,"error":str(exc)},400)
                 if u["tg_user_id"]:
@@ -1162,12 +1210,13 @@ class Handler(BaseHTTPRequestHandler):
                 if any(len(value)>MAX_TEXT_LEN for value in f.values()):return reply(self,{"ok":False,"error":f"Каждое поле должно быть не длиннее {MAX_TEXT_LEN} символов."},400)
                 try:lat,lon=coordinates_from_payload(d)
                 except ValueError:return reply(self,{"ok":False,"error":"Некорректные координаты."},400)
-                try: expires_in_hours=int(d.get("expires_in_hours",48))
+                try: expires_in_hours=int(d.get("expires_in_hours",48)); reward_rub=int(d.get("reward_rub",0) or 0)
                 except (TypeError,ValueError): return reply(self,{"ok":False,"error":"Некорректный срок заявки."},400)
                 if not 1 <= expires_in_hours <= 168:return reply(self,{"ok":False,"error":"Срок заявки — от 1 часа до 7 дней."},400)
+                if not 0 <= reward_rub <= 100_000:return reply(self,{"ok":False,"error":"Вознаграждение — от 0 до 100 000 ₽."},400)
                 f["category"]=str(d.get("category","other"))
                 if f["category"] not in CATEGORIES:return reply(self,{"ok":False,"error":"Некорректная категория."},400)
-                rid=create_request(u["user_id"],{**f,"lat":lat,"lon":lon,"expires_in_hours":expires_in_hours})
+                rid=create_request(u["user_id"],{**f,"lat":lat,"lon":lon,"expires_in_hours":expires_in_hours,"reward_rub":reward_rub})
                 if lat is not None:
                     db.execute("UPDATE users SET lat=?,lon=? WHERE user_id=?",(lat,lon,u["user_id"]))
                 req=get_request(rid)
@@ -1276,6 +1325,13 @@ class Handler(BaseHTTPRequestHandler):
                 except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
                 if not complete_request(rid,u["user_id"]):return reply(self,{"ok":False,"error":"Завершить может только назначенный помощник."},409)
                 return reply(self,{"ok":True})
+            if p.path=="/api/requests/reward/pay":
+                u=auth(self)
+                if not u:return
+                try:rid=int(d.get("request_id")); invoice,_,_=create_request_reward_invoice(u["user_id"],rid); url,pid=create_payment(invoice)
+                except ValueError:return reply(self,{"ok":False,"error":"Оплата для этой заявки недоступна."},409)
+                except Exception:return reply(self,{"ok":False,"error":"Платёжный сервис временно недоступен."},503)
+                return reply(self,{"ok":True,"invoice_id":invoice,"confirmation_url":url,"payment_id":pid})
             if p.path=="/api/reviews":
                 u=auth(self)
                 if not u:return

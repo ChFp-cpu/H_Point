@@ -1,7 +1,7 @@
 """Database persistence with SQLite development and PostgreSQL production support."""
 import sqlite3, hashlib, re, threading, json, secrets
 from datetime import datetime, timedelta, timezone
-from .config import DATABASE_URL, DB_PATH, START_BALANCE, STATUS_OPEN, STATUS_IN_PROGRESS, STATUS_DONE, ADMIN_TELEGRAM_IDS, TELEGRAM_AUTH_TTL_SECONDS, TELEGRAM_LINK_TTL_SECONDS, EMAIL_VERIFICATION_TTL_SECONDS, PHONE_VERIFICATION_TTL_SECONDS, AUTH_ATTEMPT_WINDOW_SECONDS
+from .config import DATABASE_URL, DB_PATH, START_BALANCE, STATUS_OPEN, STATUS_IN_PROGRESS, STATUS_DONE, ADMIN_TELEGRAM_IDS, TELEGRAM_AUTH_TTL_SECONDS, TELEGRAM_LINK_TTL_SECONDS, EMAIL_VERIFICATION_TTL_SECONDS, PHONE_VERIFICATION_TTL_SECONDS, AUTH_ATTEMPT_WINDOW_SECONDS, CATEGORIES
 
 
 class PostgresConnection:
@@ -162,7 +162,8 @@ def init_db():
       requester_rating INTEGER, requester_review TEXT, helper_rating INTEGER, helper_review TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT,
       priority_boost INTEGER NOT NULL DEFAULT 0, lat REAL, lon REAL,
-      expires_at TEXT, views INTEGER NOT NULL DEFAULT 0
+      expires_at TEXT, views INTEGER NOT NULL DEFAULT 0, reward_rub INTEGER NOT NULL DEFAULT 0,
+      reward_payment_status TEXT NOT NULL DEFAULT 'none'
     );
     CREATE TABLE IF NOT EXISTS helper_queue(user_id INTEGER PRIMARY KEY REFERENCES users(user_id), joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS billing_invoices(
@@ -214,7 +215,7 @@ def init_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT, creator_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
       title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', place TEXT NOT NULL,
       starts_at TEXT NOT NULL, ends_at TEXT, capacity INTEGER NOT NULL DEFAULT 0,
-      status TEXT NOT NULL DEFAULT 'published', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      status TEXT NOT NULL DEFAULT 'published', image_data TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS event_participants(
       event_id INTEGER NOT NULL REFERENCES community_events(id) ON DELETE CASCADE,
@@ -259,7 +260,7 @@ def init_db():
       ("users","lat","REAL"),("users","lon","REAL"),("users","city","TEXT DEFAULT ''"),("users","bio","TEXT DEFAULT ''"),
       ("users","role","TEXT NOT NULL DEFAULT 'user'"),("users","is_blocked","INTEGER NOT NULL DEFAULT 0"),("users","blocked_reason","TEXT"),
       ("users","last_seen_at","TEXT"),
-      ("requests","lat","REAL"),("requests","lon","REAL"),("requests","expires_at","TEXT"),("requests","views","INTEGER NOT NULL DEFAULT 0"),("billing_invoices","amount_rub","INTEGER NOT NULL DEFAULT 0"),
+      ("requests","lat","REAL"),("requests","lon","REAL"),("requests","expires_at","TEXT"),("requests","views","INTEGER NOT NULL DEFAULT 0"),("requests","reward_rub","INTEGER NOT NULL DEFAULT 0"),("requests","reward_payment_status","TEXT NOT NULL DEFAULT 'none'"),("community_events","image_data","TEXT NOT NULL DEFAULT ''"),("billing_invoices","amount_rub","INTEGER NOT NULL DEFAULT 0"),
       ("billing_invoices","currency","TEXT NOT NULL DEFAULT 'RUB'"),("billing_invoices","provider_payment_id","TEXT")
       ,("sessions","device_id","TEXT")
     ]: _add_column(t,n,d)
@@ -438,7 +439,7 @@ def _event_timestamp(value, required=True):
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc).isoformat()
 
-def create_community_event(creator_id, title, description, place, starts_at, ends_at=None, capacity=0):
+def create_community_event(creator_id, title, description, place, starts_at, ends_at=None, capacity=0, image_data=""):
     title = " ".join(str(title or "").split())
     description = str(description or "").strip()
     place = " ".join(str(place or "").split())
@@ -467,8 +468,18 @@ def create_community_event(creator_id, title, description, place, starts_at, end
     future_count = db.execute("SELECT COUNT(*) total FROM community_events WHERE creator_id=? AND status='published' AND starts_at>?", (creator_id, current.isoformat())).fetchone()["total"]
     if int(future_count) >= 20:
         raise ValueError("У вас уже слишком много запланированных мероприятий.")
-    return insert_id("""INSERT INTO community_events(creator_id,title,description,place,starts_at,ends_at,capacity)
-                      VALUES(?,?,?,?,?,?,?)""", (creator_id, title, description, place, start, end, capacity))
+    return insert_id("""INSERT INTO community_events(creator_id,title,description,place,starts_at,ends_at,capacity,image_data)
+                      VALUES(?,?,?,?,?,?,?,?)""", (creator_id, title, description, place, start, end, capacity, image_data or ""))
+
+def community_progress(days=30):
+    days=max(7,min(int(days),365)); since=(datetime.now(timezone.utc)-timedelta(days=days)).isoformat()
+    total=db.execute("SELECT COUNT(*) n FROM requests").fetchone()["n"]
+    done=db.execute("SELECT COUNT(*) n FROM requests WHERE status='done'").fetchone()["n"]
+    active=db.execute("SELECT COUNT(*) n FROM requests WHERE status IN ('open','in_progress')").fetchone()["n"]
+    categories=db.execute("SELECT category,COUNT(*) n FROM requests GROUP BY category ORDER BY n DESC,category LIMIT 12").fetchall()
+    daily=db.execute("SELECT substr(created_at,1,10) day,COUNT(*) n FROM requests WHERE created_at>=? GROUP BY substr(created_at,1,10) ORDER BY day",(since,)).fetchall()
+    rewards=db.execute("SELECT COALESCE(SUM(reward_rub),0) n FROM requests WHERE reward_rub>0").fetchone()["n"]
+    return {"summary":{"total":int(total),"done":int(done),"active":int(active),"rewards":int(rewards)},"categories":[{"key":r["category"],"title":CATEGORIES.get(r["category"],"Другое"),"count":int(r["n"])} for r in categories],"daily":[dict(r) for r in daily],"period_days":days}
 
 def community_events_for_user(user_id, mine=False, limit=100):
     current = datetime.now(timezone.utc).isoformat()

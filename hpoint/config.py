@@ -47,6 +47,9 @@ SMTP_TIMEOUT_SECONDS = int(os.getenv("SMTP_TIMEOUT_SECONDS", "10"))
 BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
 SMS_SENDER = os.getenv("SMS_SENDER", "HPoint").strip()
 YANDEX_MAPS_API_KEY = os.getenv("YANDEX_MAPS_API_KEY", "").strip()
+DONATION_URL = os.getenv("DONATION_URL", "").strip()
+DONATION_TITLE = os.getenv("DONATION_TITLE", "Поддержать H-Point").strip()[:80]
+EVENT_IMAGE_MAX_BYTES = int(os.getenv("EVENT_IMAGE_MAX_BYTES", "800000"))
 MAX_PAYMENT_BODY = int(os.getenv("MAX_PAYMENT_BODY", "10000"))
 
 BTN_NEED_HELP = "🆘 Мне нужна помощь"
