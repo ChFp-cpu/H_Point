@@ -1,9 +1,9 @@
 """H-Point web-first application: dashboard, requests, Smart Match, chat, profile and RUB billing."""
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 from urllib import request as urlrequest, error as urlerror
 from email.message import EmailMessage
-import asyncio, json, logging, os, secrets, hashlib, hmac, datetime as dt, re, smtplib, ssl, base64, binascii
+import asyncio, json, logging, os, secrets, hashlib, hmac, datetime as dt, re, smtplib, ssl, base64, binascii, threading, time
 from pathlib import Path
 from html import escape
 from . import database
@@ -194,6 +194,52 @@ def read(h, max_body=MAX_JSON_BODY):
     except ValueError: raise ValueError("Некорректный размер запроса")
     if length < 0 or length > max_body: raise ValueError("Слишком большой запрос")
     return json.loads(h.rfile.read(length) or b"{}")
+
+GEOCODE_CACHE = {}
+GEOCODE_LOCK = threading.Lock()
+GEOCODE_LAST_REQUEST_AT = 0.0
+
+def geocode_address(query):
+    """Resolve an explicitly submitted address without retaining it in the database."""
+    global GEOCODE_LAST_REQUEST_AT
+    value = " ".join(str(query or "").split())
+    if not 4 <= len(value) <= 180:
+        raise ValueError("Укажите адрес от 4 до 180 символов.")
+    cache_key = value.casefold()
+    moment = time.monotonic()
+    with GEOCODE_LOCK:
+        cached = GEOCODE_CACHE.get(cache_key)
+        if cached and moment - cached[0] < 6 * 60 * 60:
+            return cached[1]
+        if moment - GEOCODE_LAST_REQUEST_AT < 1.05:
+            raise RuntimeError("Подождите секунду и повторите поиск адреса.")
+        GEOCODE_LAST_REQUEST_AT = moment
+    request_url = "https://nominatim.openstreetmap.org/search?" + urlencode({
+        "format": "jsonv2", "limit": 1, "accept-language": "ru", "q": value,
+    })
+    request_obj = urlrequest.Request(request_url, headers={
+        "User-Agent": "H-Point/1.0 (+https://gethpoint.ru)", "Accept": "application/json",
+    })
+    try:
+        with urlrequest.urlopen(request_obj, timeout=8) as response:
+            rows = json.loads(response.read().decode("utf-8"))
+    except (urlerror.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+        logging.warning("Fallback geocoding is unavailable: %s", type(exc).__name__)
+        raise RuntimeError("Поиск адреса временно недоступен. Поставьте точку на карте.") from exc
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("Адрес не найден. Уточните город, улицу и номер дома.")
+    try:
+        point = {"lat": float(rows[0]["lat"]), "lon": float(rows[0]["lon"])}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Не удалось определить координаты адреса.") from exc
+    if not (-90 <= point["lat"] <= 90 and -180 <= point["lon"] <= 180):
+        raise RuntimeError("Сервис вернул некорректные координаты.")
+    with GEOCODE_LOCK:
+        GEOCODE_CACHE[cache_key] = (time.monotonic(), point)
+        if len(GEOCODE_CACHE) > 256:
+            oldest = min(GEOCODE_CACHE, key=lambda key: GEOCODE_CACHE[key][0])
+            GEOCODE_CACHE.pop(oldest, None)
+    return point
 
 def event_image_data(value):
     raw=str(value or "").strip()
@@ -716,7 +762,7 @@ async function loadDonation(){try{let response=await fetch('/api/public-config',
 function hpointGetBrowserLocation(){return new Promise(function(resolve,reject){if(!navigator.geolocation){reject(new Error('Геолокация не поддерживается браузером.'));return}navigator.geolocation.getCurrentPosition(function(position){let point={lat:Number(position.coords.latitude),lon:Number(position.coords.longitude)};hpointLastLocation=point;try{sessionStorage.setItem('hpointLastLocation',JSON.stringify(point))}catch(e){}resolve(point)},reject,{enableHighAccuracy:true,timeout:15000,maximumAge:0})})}
 function hpointPickerPoint(id,point){window.hpointLocationPickers=window.hpointLocationPickers||{};let picker=window.hpointLocationPickers[id];if(!picker)return;if(picker.mark)picker.map.geoObjects.remove(picker.mark);picker.mark=new ymaps.Placemark([point.lat,point.lon],{balloonContent:'Выбранная точка'},{preset:'islands#blueCircleDotIcon'});picker.map.geoObjects.add(picker.mark);picker.map.setCenter([point.lat,point.lon],15,{duration:180})}
 function locationPicker(id,onPick){let host=$(id);if(!host)return;if(!window.ymaps){host.innerHTML='<div class="eventEmpty">Карта пока недоступна. Введите адрес или повторите запрос геолокации.</div>';return}ymaps.ready(function(){if(!$(id))return;window.hpointLocationPickers=window.hpointLocationPickers||{};let old=window.hpointLocationPickers[id];if(old){try{old.map.destroy()}catch(e){}}let map=new ymaps.Map(id,{center:[55.751244,37.618423],zoom:11,controls:['zoomControl','searchControl']},{suppressMapOpenBlock:true}),picker={map:map,mark:null};window.hpointLocationPickers[id]=picker;map.events.add('click',function(event){let coords=event.get('coords'),point={lat:Number(coords[0]),lon:Number(coords[1])};hpointPickerPoint(id,point);onPick(point)});let hint=document.createElement('p');hint.className='muted';hint.textContent='Нажмите на карте, чтобы выбрать точку.';host.after(hint);if(id==='requestPicker'&&window.hpointRequestPoint)hpointPickerPoint(id,window.hpointRequestPoint)})}
-function hpointGeocodeAddress(address){return new Promise(function(resolve,reject){if(!window.ymaps){reject(new Error('Яндекс Карты ещё загружаются.'));return}ymaps.ready(function(){ymaps.geocode(address,{results:1}).then(function(result){let first=result.geoObjects.get(0),coords=first&&first.geometry&&first.geometry.getCoordinates();if(!coords){reject(new Error('Адрес не найден. Укажите город, улицу и номер дома.'));return}resolve({lat:Number(coords[0]),lon:Number(coords[1])})},function(){reject(new Error('Не удалось найти адрес. Попробуйте уточнить его.'))})})})}
+async function hpointGeocodeAddress(address){if(window.ymaps){try{return await new Promise(function(resolve,reject){ymaps.ready(function(){ymaps.geocode(address,{results:1}).then(function(result){let first=result.geoObjects.get(0),coords=first&&first.geometry&&first.geometry.getCoordinates();if(!coords){reject(new Error('Адрес не найден.'));return}resolve({lat:Number(coords[0]),lon:Number(coords[1])})},function(){reject(new Error('Яндекс Карты временно не ответили.'))})})})}catch(error){console.warn('yandex geocoder',error)}}let response=await api('/api/geocode?q='+encodeURIComponent(address));return response.point}
 async function requestDeviceLocation(submitAfter){let note=$('rqerr');if(note)note.textContent='Запрашиваем геолокацию…';try{let point=await hpointGetBrowserLocation();window.hpointRequestPoint=point;hpointPickerPoint('requestPicker',point);if(note)note.textContent='Местоположение определено. Точка поставлена на карте.';if(submitAfter)await sendReq(point.lat,point.lon)}catch(error){if(note)note.textContent=(typeof hpointGeoMessage==='function'?hpointGeoMessage(error):'Не удалось определить геолокацию.')+' Разрешите доступ в браузере или выберите точку на карте.';if(submitAfter)toast('Укажите адрес или точку на карте, чтобы создать заявку.')}}
 async function requestFindAddress(submitAfter){let address=(($('qp')||{}).value||'').trim(),note=$('rqerr');if(!address){if(note)note.textContent='Введите адрес, затем нажмите «Найти по адресу». ';return}if(note)note.textContent='Ищем адрес…';try{let point=await hpointGeocodeAddress(address);window.hpointRequestPoint=point;hpointPickerPoint('requestPicker',point);if(note)note.textContent='Адрес найден. Точка поставлена на карте.';if(submitAfter)await sendReq(point.lat,point.lon)}catch(error){if(note)note.textContent=error.message||'Не удалось найти адрес.';toast(error.message||'Не удалось найти адрес.')}}
 function createReq(){if(window.hpointRequestPoint){sendReq(window.hpointRequestPoint.lat,window.hpointRequestPoint.lon);return}let address=(($('qp')||{}).value||'').trim();if(address){requestFindAddress(true);return}requestDeviceLocation(true)}
@@ -827,6 +873,18 @@ class Handler(BaseHTTPRequestHandler):
                 try: days=int(parse_qs(p.query).get("days",[30])[0])
                 except (TypeError,ValueError): days=30
                 return reply(self,{"ok":True,**database.community_progress(days)})
+            if p.path=="/api/geocode":
+                u=auth(self)
+                if not u:return
+                query=" ".join(parse_qs(p.query).get("q",[""])[0].split())
+                if not 4 <= len(query) <= 180:return reply(self,{"ok":False,"error":"Укажите адрес от 4 до 180 символов."},400)
+                if database.auth_is_rate_limited("geocode",str(u["user_id"]),10):
+                    return reply(self,{"ok":False,"error":"Слишком много поисков адреса. Повторите позже."},429)
+                database.record_auth_failure("geocode",str(u["user_id"]))
+                try: point=geocode_address(query)
+                except ValueError as exc:return reply(self,{"ok":False,"error":str(exc)},400)
+                except RuntimeError as exc:return reply(self,{"ok":False,"error":str(exc)},503)
+                return reply(self,{"ok":True,"point":point})
             if p.path=="/api/community/profile":
                 u=auth(self)
                 if not u:return
