@@ -734,7 +734,7 @@ class Handler(BaseHTTPRequestHandler):
         body=item[0].read_bytes()
         self.send_response(200);self.send_header("Content-Type",item[1]);self.send_header("X-Content-Type-Options","nosniff");self.send_header("Cache-Control","public, max-age=604800, immutable");self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
     def html(self):
-        b=PAGE.encode();self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
+        b=PAGE.encode();self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
     def do_HEAD(self):
         """Serve metadata for public resources without a response body."""
         p = urlparse(self.path)
@@ -747,7 +747,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if p.path in ("/", "/index.html", "/payment/result"):
             size = len(PAGE.encode())
-            self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(size));self.end_headers()
+            self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(size));self.end_headers()
             return
         if p.path == "/api/health":
             b = json.dumps({"ok":True,"database":True}).encode()
