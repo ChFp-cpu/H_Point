@@ -746,10 +746,9 @@ async def need_help_start(message: Message, state: FSMContext) -> None:
     if not await ensure_registered(message, state) or not await check_not_busy(message):
         return
     user_id = message.from_user.id
-    active = get_active_own_request(user_id)
-    if active:
-        markup = cancel_request_kb(active["id"]) if active["status"] == STATUS_OPEN else None
-        await message.answer(f"У вас уже есть активная заявка.\n\n{request_text(active)}", reply_markup=markup)
+    open_count = db.execute("SELECT COUNT(*) n FROM requests WHERE requester_id=? AND status=?", (user_id, STATUS_OPEN)).fetchone()["n"]
+    if int(open_count or 0) >= 10:
+        await message.answer("Одновременно можно опубликовать до 10 открытых заявок. Закройте или отмените одну из текущих.")
         return
     if is_in_queue(user_id):
         await message.answer("Вы сейчас в очереди помощников. Выйдите из очереди, чтобы создать заявку.", reply_markup=leave_queue_kb())
@@ -821,8 +820,9 @@ async def q_details(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.update_data(details=text)
     await state.clear()
     user_id = message.from_user.id
-    if get_active_own_request(user_id):
-        await show_main_menu(message, "У вас уже есть активная заявка. Новая не создана.")
+    open_count = db.execute("SELECT COUNT(*) n FROM requests WHERE requester_id=? AND status=?", (user_id, STATUS_OPEN)).fetchone()["n"]
+    if int(open_count or 0) >= 10:
+        await show_main_menu(message, "Одновременно можно опубликовать до 10 открытых заявок. Новая не создана.")
         return
     request_id = create_request(user_id, data)
     req = get_request(request_id)

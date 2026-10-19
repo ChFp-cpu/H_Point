@@ -205,6 +205,14 @@ def init_db():
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY(request_id,viewer_id)
     );
+    CREATE TABLE IF NOT EXISTS request_events(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+      actor_id INTEGER REFERENCES users(user_id) ON DELETE SET NULL,
+      event_type TEXT NOT NULL,
+      message TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE TABLE IF NOT EXISTS support_tickets(
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
       subject TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
@@ -260,13 +268,14 @@ def init_db():
       ("users","lat","REAL"),("users","lon","REAL"),("users","city","TEXT DEFAULT ''"),("users","bio","TEXT DEFAULT ''"),
       ("users","role","TEXT NOT NULL DEFAULT 'user'"),("users","is_blocked","INTEGER NOT NULL DEFAULT 0"),("users","blocked_reason","TEXT"),
       ("users","last_seen_at","TEXT"),
-      ("requests","lat","REAL"),("requests","lon","REAL"),("requests","expires_at","TEXT"),("requests","views","INTEGER NOT NULL DEFAULT 0"),("requests","reward_rub","INTEGER NOT NULL DEFAULT 0"),("requests","reward_payment_status","TEXT NOT NULL DEFAULT 'none'"),("community_events","image_data","TEXT NOT NULL DEFAULT ''"),("billing_invoices","amount_rub","INTEGER NOT NULL DEFAULT 0"),
+      ("requests","lat","REAL"),("requests","lon","REAL"),("requests","expires_at","TEXT"),("requests","views","INTEGER NOT NULL DEFAULT 0"),("requests","reward_rub","INTEGER NOT NULL DEFAULT 0"),("requests","reward_payment_status","TEXT NOT NULL DEFAULT 'none'"),("requests","cancel_reason","TEXT"),("requests","cancelled_at","TEXT"),("community_events","image_data","TEXT NOT NULL DEFAULT ''"),("billing_invoices","amount_rub","INTEGER NOT NULL DEFAULT 0"),
       ("billing_invoices","currency","TEXT NOT NULL DEFAULT 'RUB'"),("billing_invoices","provider_payment_id","TEXT")
       ,("sessions","device_id","TEXT")
     ]: _add_column(t,n,d)
     # Legacy payment columns remain for backwards-compatible data, but new code never uses them.
     db.execute("CREATE INDEX IF NOT EXISTS idx_requests_geo ON requests(status,lat,lon)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_requests_expires ON requests(status,expires_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_request_events_request ON request_events(request_id, id DESC)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_device ON sessions(device_id,expires_at)")
     if not getattr(db, "is_postgres", False):
         try: db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tg ON users(tg_user_id) WHERE tg_user_id IS NOT NULL")

@@ -36,17 +36,38 @@ def create_request(user_id: int, data: dict) -> int:
     reward = int(data.get("reward_rub") or 0)
     if not 0 <= reward <= 100_000:
         raise ValueError("reward_rub")
-    return insert_id(
+    request_id = insert_id(
         """INSERT INTO requests
         (requester_id, category, what, place, time_needed, urgency, details, status, priority_boost, lat, lon, expires_at, reward_rub)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
         (user_id, category, data["what"], data["place"], data["time_needed"], data["urgency"], data["details"], STATUS_OPEN,
          data.get("lat"), data.get("lon"), expires_at, reward),
     )
+    db.execute(
+        "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
+        (request_id, user_id, "created", "Заявка опубликована и ожидает помощника."),
+    )
+    return request_id
 
 def expire_open_requests() -> None:
     """Close only unassigned requests whose chosen publication term ended."""
-    db.execute("UPDATE requests SET status=? WHERE status=? AND expires_at IS NOT NULL AND expires_at<=?", (STATUS_CANCELLED, STATUS_OPEN, datetime.now(timezone.utc).isoformat()))
+    expired = db.execute(
+        "SELECT id FROM requests WHERE status=? AND expires_at IS NOT NULL AND expires_at<=?",
+        (STATUS_OPEN, datetime.now(timezone.utc).isoformat()),
+    ).fetchall()
+    if not expired:
+        return
+    ids = [row["id"] for row in expired]
+    marks = ",".join("?" for _ in ids)
+    db.execute(
+        f"UPDATE requests SET status=?,cancel_reason=?,cancelled_at=CURRENT_TIMESTAMP WHERE id IN ({marks})",
+        (STATUS_CANCELLED, "Срок публикации истёк", *ids),
+    )
+    for request_id in ids:
+        db.execute(
+            "INSERT INTO request_events(request_id,event_type,message) VALUES(?,?,?)",
+            (request_id, "expired", "Срок публикации истёк. Заявка закрыта."),
+        )
 
 
 def is_in_queue(user_id: int) -> bool:
@@ -119,6 +140,10 @@ def offer_helper(request_id: int, helper_id: int) -> bool:
             (request_id, helper_id, match_score(request, helper_id)),
         )
         db.execute("COMMIT")
+        db.execute(
+            "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
+            (request_id, helper_id, "helper_invited", "Помощнику отправлено предложение подтвердить участие."),
+        )
         return True
     except Exception:
         db.execute("ROLLBACK")
@@ -145,6 +170,10 @@ def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool) -> bo
                 (request_id, helper_id),
             )
             db.execute("COMMIT")
+            db.execute(
+                "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
+                (request_id, helper_id, "helper_declined", "Помощник отказался от предложения."),
+            )
             return True
 
         current = db.execute(
@@ -176,6 +205,10 @@ def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool) -> bo
             (helper_id, request_id),
         )
         db.execute("COMMIT")
+        db.execute(
+            "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
+            (request_id, helper_id, "helper_accepted", "Помощник подтвердил участие. Заявка в работе."),
+        )
         return True
     except Exception:
         db.execute("ROLLBACK")
@@ -228,6 +261,10 @@ def try_assign_helper(request_id: int, helper_id: int) -> bool:
         if cur.rowcount == 1:
             remove_from_queue(helper_id)
             db.execute("COMMIT")
+            db.execute(
+                "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
+                (request_id, helper_id, "helper_assigned", "Помощник назначен. Заявка в работе."),
+            )
             return True
         db.execute("ROLLBACK")
         return False
@@ -257,6 +294,10 @@ def complete_request(request_id: int, helper_id: int) -> bool:
         db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (REQUEST_COST, req["requester_id"]))
         db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (HELPER_REWARD, helper_id))
         db.execute("COMMIT")
+        db.execute(
+            "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
+            (request_id, helper_id, "completed", "Помощник отметил заявку как завершённую. Можно оставить отзыв."),
+        )
         return True
     except Exception:
         db.execute("ROLLBACK")
@@ -295,12 +336,30 @@ def set_review(request_id: int, user_id: int, review: str, side: str) -> bool:
     return cur.rowcount == 1
 
 
-def cancel_request(request_id: int, user_id: int) -> bool:
-    cur = db.execute(
-        "UPDATE requests SET status = ? WHERE id = ? AND requester_id = ? AND status = ?",
-        (STATUS_CANCELLED, request_id, user_id, STATUS_OPEN),
-    )
-    return cur.rowcount == 1
+def cancel_request(request_id: int, user_id: int, reason: str = "") -> bool:
+    reason = str(reason).strip()[:300] or "Отменено автором заявки"
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        cur = db.execute(
+            "UPDATE requests SET status=?,cancel_reason=?,cancelled_at=CURRENT_TIMESTAMP WHERE id=? AND requester_id=? AND status=?",
+            (STATUS_CANCELLED, reason, request_id, user_id, STATUS_OPEN),
+        )
+        if cur.rowcount != 1:
+            db.execute("ROLLBACK")
+            return False
+        db.execute(
+            "UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND status IN ('pending','offered')",
+            (request_id,),
+        )
+        db.execute(
+            "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
+            (request_id, user_id, "cancelled", f"Автор отменил заявку. Причина: {reason}"),
+        )
+        db.execute("COMMIT")
+        return True
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
 
 
 # --- Monetization / billing business logic ---

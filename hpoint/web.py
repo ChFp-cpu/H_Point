@@ -772,13 +772,34 @@ async function sendReq(lat,lon){let error=$('rqerr');try{let reward=Number(($('r
 ensureProgressPanel();loadDonation();
 '''
 
+REQUEST_TRACKING_CSS=r'''
+.requestActions{display:flex;flex-wrap:wrap;gap:7px;align-items:center}.requestMeta{display:flex;flex-wrap:wrap;gap:5px}.requestTracking{display:grid;gap:12px;margin-top:16px}.trackingSummary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.trackingMetric{padding:12px;border:1px solid #3b4735;border-radius:12px;background:#171b15}.trackingMetric b,.trackingMetric span{display:block}.trackingMetric span{margin-top:4px;color:#aeb6a8;font-size:12px}.trackingList{display:grid;gap:9px}.trackingEvent{padding:11px 12px;border-left:3px solid #b8f36b;background:#171b15;border-radius:0 10px 10px 0}.trackingEvent small{display:block;margin-top:4px;color:#9ea79a}.trackingCandidate{display:flex;justify-content:space-between;gap:8px;padding:10px 0;border-bottom:1px solid #30382c}.trackingCandidate:last-child{border-bottom:0}@media(max-width:560px){.request{align-items:flex-start}.requestActions{width:100%}.requestActions .btn{flex:1}.trackingSummary{grid-template-columns:1fr}}
+'''
+
+REQUEST_TRACKING_UI=r'''
+function requestExpiresText(value){if(!value)return 'не указан';let delta=new Date(value).getTime()-Date.now();if(!Number.isFinite(delta))return 'указан';if(delta<=0)return 'срок истёк';let hours=Math.ceil(delta/3600000);return hours<24?'ещё '+hours+' ч.':'ещё '+Math.ceil(hours/24)+' дн.'}
+function requestCandidateStatus(status){return ({pending:'в очереди',offered:'ожидает ответ',accepted:'подтвердил участие',declined:'отказался',withdrawn:'предложение снято'})[status]||status}
+function requestActions(r,currentUserId){let mine=r.requester_id===currentUserId,actions='<button class="btn light" type="button" onclick="openRequestTracking('+Number(r.id)+')">Статус</button>';if(mine&&r.status==='open')actions+='<button class="btn danger" type="button" onclick="cancelOwnRequest('+Number(r.id)+')">Отменить</button>';if(r.status==='in_progress')actions+='<button class="btn light" type="button" onclick="openChat('+Number(r.id)+')">Чат</button>';if(r.status==='in_progress'&&r.helper_id===currentUserId)actions+='<button class="btn grad" type="button" onclick="finish('+Number(r.id)+')">Завершить</button>';if(r.status==='done'&&mine&&!r.requester_rating)actions+='<button class="btn light" type="button" onclick="review('+Number(r.id)+',\'requester\')">Оценить</button>';if(r.status==='done'&&r.helper_id===currentUserId&&!r.helper_rating)actions+='<button class="btn light" type="button" onclick="review('+Number(r.id)+',\'helper\')">Оценить</button>';return actions}
+function renderRequests(d){let current=Number(d.current_user_id);$('mine').innerHTML=d.requests.length?d.requests.map(function(r){let extra=r.status==='open'?' · '+requestExpiresText(r.expires_at):r.status==='cancelled'&&r.cancel_reason?' · '+esc(r.cancel_reason):'';return '<div class="request"><div class="avatar">'+esc((r.what||'?')[0].toUpperCase())+'</div><div class="requestmain"><b>#'+Number(r.id)+' · '+esc(r.what)+'</b><div class="muted requestMeta">'+esc(r.category_name)+' · '+esc(r.place)+' · '+esc(r.status_title)+' · 👁 '+Number(r.views||0)+extra+'</div></div><span class="badge '+(r.status==='done'?'ok':r.status==='in_progress'?'warn':'')+'">'+esc(r.urgency)+'</span><div class="requestActions">'+requestActions(r,current)+'</div></div>'}).join(''):'<div class="empty">Здесь появятся ваши заявки.</div>';$('rid').innerHTML=d.requests.filter(function(r){return r.status==='open'&&r.requester_id===current}).map(function(r){return '<option value="'+Number(r.id)+'">#'+Number(r.id)+' — '+esc(r.what)+'</option>'}).join('')||'<option value="">Нет открытых заявок</option>'}
+async function cancelOwnRequest(id){let reason=window.prompt('Почему отменяете заявку? Это увидите только вы и предложенные помощники.','Помощь больше не нужна');if(reason===null)return;try{await api('/api/requests/cancel',{method:'POST',body:JSON.stringify({request_id:id,reason:reason})});toast('Заявка отменена.');await requests()}catch(error){toast(error.message||'Не удалось отменить заявку.')}}
+function trackingDate(value){try{return new Date(value).toLocaleString('ru-RU',{dateStyle:'short',timeStyle:'short'})}catch(error){return value||''}}
+async function openRequestTracking(id){try{let data=await api('/api/requests/tracking?request_id='+Number(id)),r=data.request,events=data.events||[],candidates=data.candidates||[];$('modal').style.display='flex';let candidateHtml=candidates.length?'<section><h3>Помощники</h3><div class="trackingList">'+candidates.map(function(c){return '<div class="trackingCandidate"><b>'+esc(c.name)+'</b><span class="muted">'+esc(requestCandidateStatus(c.status))+'</span></div>'}).join('')+'</div></section>':'';let eventHtml=events.length?events.map(function(event){return '<article class="trackingEvent"><b>'+esc(event.message)+'</b><small>'+esc(event.actor_name||'H-Point')+' · '+esc(trackingDate(event.created_at))+'</small></article>'}).join(''):'<div class="empty">История пока пуста.</div>';$('modalbody').innerHTML='<h2>Заявка #'+Number(r.id)+'</h2><p class="muted">'+esc(r.what)+'</p><div class="trackingSummary"><div class="trackingMetric"><b>'+esc(r.status_title)+'</b><span>текущий статус</span></div><div class="trackingMetric"><b>👁 '+Number(r.views||0)+'</b><span>уникальных просмотров</span></div><div class="trackingMetric"><b>'+esc(requestExpiresText(r.expires_at))+'</b><span>срок публикации</span></div><div class="trackingMetric"><b>'+((Number(r.reward_rub)||0)>0?Number(r.reward_rub).toLocaleString('ru-RU')+' ₽':'без вознаграждения')+'</b><span>условия помощи</span></div></div>'+candidateHtml+'<section><h3>Что происходит с заявкой</h3><div class="trackingList">'+eventHtml+'</div></section>'}catch(error){toast(error.message||'Не удалось загрузить статус заявки.')}}
+'''
+
+DONATION_MENU_UI=r'''
+function ensureDonationPanel(){let tabs=document.querySelector('.tabs'),app=$('app');if(!tabs||!app)return;if(!document.querySelector('[data-t="donate"]')){let tab=document.createElement('button');tab.className='tab';tab.dataset.t='donate';tab.textContent='Поддержать';tab.onclick=function(){go('donate')};let profile=document.querySelector('[data-t="profile"]');tabs.insertBefore(tab,profile||null)}if(!$('p-donate')){let panel=document.createElement('section');panel.id='p-donate';panel.className='panel';panel.innerHTML='<span class="ey">ПОДДЕРЖКА ПРОЕКТА</span><h2>Поддержать H-Point</h2><p class="muted">Добровольное пожертвование помогает развивать сервис помощи рядом.</p><div id="donateContent" class="card"></div>';app.appendChild(panel)}}
+async function loadDonationMenu(){ensureDonationPanel();let host=$('donateContent');if(!host)return;host.innerHTML='<p class="muted">Загружаем способ поддержки…</p>';try{let response=await fetch('/api/public-config',{credentials:'same-origin'}),data=await response.json(),title=esc(data.donation_title||'Поддержать H-Point');host.innerHTML='<h3>'+title+'</h3><p class="muted">Пожертвование добровольное. Сумму и способ оплаты вы выбираете на странице платёжного сервиса.</p>'+(data.donation_url?'<a class="btn grad" href="'+esc(data.donation_url)+'" target="_blank" rel="noopener">Перейти к пожертвованию</a>':'<div class="eventEmpty"><b>Способ пожертвования ещё настраивается.</b><br><span class="muted">Кнопка станет активной после добавления платёжной ссылки.</span></div>')}catch(error){host.innerHTML='<div class="eventEmpty">Не удалось загрузить данные о пожертвовании.</div>'}}
+function go(t){document.querySelectorAll('.tab').forEach(function(x){x.classList.toggle('active',x.dataset.t===t)});document.querySelectorAll('.panel').forEach(function(x){x.classList.toggle('active',x.id==='p-'+t)});if(t!=='chat')stopChatPolling();if(t==='requests')requests();if(t==='match'){requests();setTimeout(initMatchMap,50)}if(t==='chat'){loadChats();if(currentChat)startChatPolling()}if(t==='map')setTimeout(loadBigMap,50);if(t==='history')history();if(t==='profile')profile();if(t==='billing'){prices('appprices',true);billing()}if(t==='progress')loadProgress();if(t==='events')loadEvents();if(t==='donate')loadDonationMenu()}
+ensureDonationPanel();
+'''
+
 def _page_replace(needle, replacement):
     global PAGE
     if needle not in PAGE:
         raise RuntimeError("H-Point page template changed; UI override target is missing")
     PAGE=PAGE.replace(needle, replacement, 1)
 
-_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+PASSWORD_CSS+MAP_CSS+ADMIN_DASHBOARD_CSS+CONTACT_VERIFICATION_CSS+EVENTS_CSS+PROGRESS_CSS+COMMUNITY_CSS+"</style></head>")
+_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+PASSWORD_CSS+MAP_CSS+ADMIN_DASHBOARD_CSS+CONTACT_VERIFICATION_CSS+EVENTS_CSS+PROGRESS_CSS+COMMUNITY_CSS+REQUEST_TRACKING_CSS+"</style></head>")
 _page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg"><link rel="apple-touch-icon" href="/assets/hpoint-logo.png"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
 if YANDEX_MAPS_API_KEY:
     PAGE=PAGE.replace('<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>', f'<script src="https://api-maps.yandex.ru/2.1/?apikey={escape(YANDEX_MAPS_API_KEY, quote=True)}&lang=ru_RU"></script>')
@@ -786,7 +807,7 @@ _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandL
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
 _page_replace('<p class="audiencePortrait">H·Point создан для Ильи: он недавно переехал в новый район, работает до вечера и хочет быстро найти надёжного человека рядом, чтобы настроить роутер, донести коробки или решить другую небольшую, но срочную задачу.</p>', '')
 _page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+SUPPORT_UI+ADMIN_DASHBOARD_UI+ADMIN_MODAL_FIXES+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+LOCATION_PICKER_UI+CONTACT_VERIFICATION_UI+EVENTS_UI+PROGRESS_UI+COMMUNITY_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+SUPPORT_UI+ADMIN_DASHBOARD_UI+ADMIN_MODAL_FIXES+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+LOCATION_PICKER_UI+CONTACT_VERIFICATION_UI+EVENTS_UI+PROGRESS_UI+COMMUNITY_UI+REQUEST_TRACKING_UI+DONATION_MENU_UI+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
@@ -905,6 +926,31 @@ class Handler(BaseHTTPRequestHandler):
                 expire_open_requests()
                 rs=get_history(u["user_id"],HISTORY_LIMIT)
                 return reply(self,{"ok":True,"current_user_id":u["user_id"],"requests":[request_payload(r) for r in rs]})
+            if p.path=="/api/requests/tracking":
+                u=auth(self)
+                if not u:return
+                try: request_id=int(parse_qs(p.query).get("request_id",[""])[0])
+                except (TypeError,ValueError): return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
+                expire_open_requests()
+                request_row=get_request(request_id)
+                if not request_row or u["user_id"] not in (request_row["requester_id"],request_row["helper_id"]):
+                    return reply(self,{"ok":False,"error":"Нет доступа к этой заявке."},403)
+                events=db.execute(
+                    """SELECT e.event_type,e.message,e.created_at,u.name actor_name
+                       FROM request_events e LEFT JOIN users u ON u.user_id=e.actor_id
+                       WHERE e.request_id=? ORDER BY e.id DESC LIMIT 50""",
+                    (request_id,),
+                ).fetchall()
+                candidates=[]
+                if request_row["requester_id"]==u["user_id"]:
+                    candidate_rows=db.execute(
+                        """SELECT rc.status,rc.updated_at,u.name
+                           FROM request_candidates rc JOIN users u ON u.user_id=rc.candidate_id
+                           WHERE rc.request_id=? ORDER BY rc.updated_at DESC LIMIT 30""",
+                        (request_id,),
+                    ).fetchall()
+                    candidates=[dict(row) for row in candidate_rows]
+                return reply(self,{"ok":True,"request":request_payload(request_row),"events":[dict(row) for row in events],"candidates":candidates})
             if p.path=="/api/events/image":
                 u=auth(self)
                 if not u:return
@@ -1299,7 +1345,8 @@ class Handler(BaseHTTPRequestHandler):
                 u=auth(self)
                 if not u:return
                 if not verified_community_account(self,u):return
-                if get_active_own_request(u["user_id"]):return reply(self,{"ok":False,"error":"У вас уже есть активная заявка."},409)
+                open_count=db.execute("SELECT COUNT(*) n FROM requests WHERE requester_id=? AND status=?",(u["user_id"],STATUS_OPEN)).fetchone()["n"]
+                if int(open_count or 0)>=10:return reply(self,{"ok":False,"error":"Одновременно можно опубликовать до 10 открытых заявок."},409)
                 if u["balance"]<REQUEST_COST:return reply(self,{"ok":False,"error":f"Нужно {REQUEST_COST} HP."},400)
                 f={k:str(d.get(k,"" )).strip() for k in ("what","place","time_needed","urgency","details")}
                 if not all(f.values()):return reply(self,{"ok":False,"error":"Заполните все поля."},400)
@@ -1413,6 +1460,15 @@ class Handler(BaseHTTPRequestHandler):
                     if requester and requester["tg_user_id"]:
                         notify_telegram_user(requester["tg_user_id"],f"ℹ️ Помощник отклонил предложение по заявке №{rid}. Выберите другого кандидата.")
                 return reply(self,{"ok":True,"accepted":accept,"request_id":rid})
+            if p.path=="/api/requests/cancel":
+                u=auth(self)
+                if not u:return
+                try: rid=int(d["request_id"])
+                except (KeyError,TypeError,ValueError): return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
+                reason=str(d.get("reason","")).strip()[:300]
+                if not cancel_request(rid,u["user_id"],reason):
+                    return reply(self,{"ok":False,"error":"Отменить можно только свою заявку, пока она ожидает помощника."},409)
+                return reply(self,{"ok":True,"request_id":rid})
             if p.path=="/api/requests/finish":
                 u=auth(self)
                 if not u:return
