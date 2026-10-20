@@ -32,6 +32,8 @@ class Web(unittest.TestCase):
   self.assertIn("grid-template-areas",web.PAGE)
   self.assertIn("hpointAuditWallet",web.PAGE)
   self.assertIn("window.load();",web.PAGE)
+  self.assertIn("soloBoard",web.PAGE)
+  self.assertIn("ПЕРВОПРОХОДЕЦ СЕЗОНА",web.PAGE)
   self.assertIn("hpointShowcaseGo",web.PAGE)
   self.assertIn("https://*.yandex.ru",web.CSP)
   self.assertIn("https://*.yandex.net",web.CSP)
