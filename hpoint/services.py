@@ -2,7 +2,7 @@
 import json, re
 from datetime import datetime, timedelta, timezone
 from .config import *
-from .database import db, get_request, get_user, get_active_help, save_request_candidates, get_request_candidates, insert_id, request_identity_verification
+from .database import db, get_request, get_user, get_active_help, save_request_candidates, get_request_candidates, insert_id, request_identity_verification, wallet_add_entry
 
 
 def infer_category(what: str) -> str:
@@ -52,7 +52,7 @@ def create_request(user_id: int, data: dict) -> int:
 def expire_open_requests() -> None:
     """Close only unassigned requests whose chosen publication term ended."""
     expired = db.execute(
-        "SELECT id FROM requests WHERE status=? AND expires_at IS NOT NULL AND expires_at<=?",
+        "SELECT id,requester_id,reward_rub,reward_payment_status FROM requests WHERE status=? AND expires_at IS NOT NULL AND expires_at<=?",
         (STATUS_OPEN, datetime.now(timezone.utc).isoformat()),
     ).fetchall()
     if not expired:
@@ -63,7 +63,12 @@ def expire_open_requests() -> None:
         f"UPDATE requests SET status=?,cancel_reason=?,cancelled_at=CURRENT_TIMESTAMP WHERE id IN ({marks})",
         (STATUS_CANCELLED, "Срок публикации истёк", *ids),
     )
-    for request_id in ids:
+    for row in expired:
+        request_id = row["id"]
+        if row["reward_payment_status"] == "paid" and int(row["reward_rub"] or 0) > 0:
+            amount = int(row["reward_rub"])
+            wallet_add_entry(row["requester_id"], amount, "reward_refund", "Вознаграждение возвращено в кошелёк: срок заявки истёк", f"request:{request_id}:expiry-refund", request_id)
+            db.execute("UPDATE requests SET reward_payment_status='wallet_refunded' WHERE id=?", (request_id,))
         db.execute(
             "INSERT INTO request_events(request_id,event_type,message) VALUES(?,?,?)",
             (request_id, "expired", "Срок публикации истёк. Заявка закрыта."),
@@ -293,6 +298,10 @@ def complete_request(request_id: int, helper_id: int) -> bool:
         db.execute("UPDATE requests SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?", (STATUS_DONE, request_id))
         db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (REQUEST_COST, req["requester_id"]))
         db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (HELPER_REWARD, helper_id))
+        if req["reward_payment_status"] == "paid" and int(req["reward_rub"] or 0) > 0:
+            amount = int(req["reward_rub"])
+            wallet_add_entry(helper_id, amount, "reward_earned", "Вознаграждение за завершённую заявку", f"request:{request_id}:earned", request_id)
+            db.execute("UPDATE requests SET reward_payment_status='released' WHERE id=?", (request_id,))
         db.execute("COMMIT")
         db.execute(
             "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
@@ -340,6 +349,10 @@ def cancel_request(request_id: int, user_id: int, reason: str = "") -> bool:
     reason = str(reason).strip()[:300] or "Отменено автором заявки"
     try:
         db.execute("BEGIN IMMEDIATE")
+        request = db.execute("SELECT requester_id,reward_rub,reward_payment_status FROM requests WHERE id=?", (request_id,)).fetchone()
+        if not request or request["requester_id"] != user_id or request["reward_payment_status"] not in ("none", "paid", "wallet_refunded"):
+            db.execute("ROLLBACK")
+            return False
         cur = db.execute(
             "UPDATE requests SET status=?,cancel_reason=?,cancelled_at=CURRENT_TIMESTAMP WHERE id=? AND requester_id=? AND status=?",
             (STATUS_CANCELLED, reason, request_id, user_id, STATUS_OPEN),
@@ -351,6 +364,10 @@ def cancel_request(request_id: int, user_id: int, reason: str = "") -> bool:
             "UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND status IN ('pending','offered')",
             (request_id,),
         )
+        if request["reward_payment_status"] == "paid" and int(request["reward_rub"] or 0) > 0:
+            amount = int(request["reward_rub"])
+            wallet_add_entry(user_id, amount, "reward_refund", "Вознаграждение возвращено в кошелёк после отмены заявки", f"request:{request_id}:cancel-refund", request_id)
+            db.execute("UPDATE requests SET reward_payment_status='wallet_refunded' WHERE id=?", (request_id,))
         db.execute(
             "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
             (request_id, user_id, "cancelled", f"Автор отменил заявку. Причина: {reason}"),

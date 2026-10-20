@@ -2,7 +2,7 @@
 import json, uuid, hashlib, hmac
 from urllib.parse import urlencode
 from .config import *
-from .database import db, get_invoice, get_request, get_user, insert_id
+from .database import db, get_invoice, get_request, get_user, insert_id, wallet_add_entry
 from .services import grant_entitlement
 
 def create_pending_invoice(user_id,item_type,metadata=None):
@@ -75,7 +75,14 @@ def fulfill_invoice(invoice_id,payment_id=None):
         db.execute("INSERT OR IGNORE INTO billing_events(invoice_id,event_type,provider_event_id,payload) VALUES(?,?,?,?)",
                    (invoice_id,"successful_payment",payment_id or inv["provider_payment_id"],json.dumps(meta,ensure_ascii=False)))
         if inv["item_type"]=="request_reward":
-            db.execute("UPDATE requests SET reward_payment_status='paid' WHERE id=? AND requester_id=?",(meta.get("request_id"),inv["user_id"]))
+            request_id = meta.get("request_id")
+            request = get_request(request_id)
+            if not request or request["requester_id"] != inv["user_id"]:
+                db.execute("ROLLBACK"); return False,"request_unavailable"
+            amount = int(inv["amount_rub"] or 0)
+            db.execute("UPDATE requests SET reward_payment_status='paid' WHERE id=? AND requester_id=?",(request_id,inv["user_id"]))
+            wallet_add_entry(inv["user_id"], amount, "payment", "Оплата вознаграждения за помощь", f"invoice:{invoice_id}:payment", request_id, invoice_id)
+            wallet_add_entry(inv["user_id"], -amount, "reward_reserve", "Вознаграждение зарезервировано до завершения заявки", f"request:{request_id}:reserve", request_id, invoice_id)
         else:
             grant_entitlement(inv["user_id"],inv["item_type"],request_id=meta.get("request_id"),ad_text=meta.get("ad_text"))
         db.execute("COMMIT")

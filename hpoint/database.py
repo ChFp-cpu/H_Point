@@ -175,6 +175,17 @@ def init_db():
     CREATE TABLE IF NOT EXISTS billing_events(id INTEGER PRIMARY KEY AUTOINCREMENT, invoice_id INTEGER REFERENCES billing_invoices(id),
       event_type TEXT NOT NULL, provider_event_id TEXT UNIQUE, payload TEXT NOT NULL DEFAULT '{}',
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS wallet_transactions(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      amount_rub INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      description TEXT NOT NULL,
+      request_id INTEGER REFERENCES requests(id) ON DELETE SET NULL,
+      invoice_id INTEGER REFERENCES billing_invoices(id) ON DELETE SET NULL,
+      reference TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE TABLE IF NOT EXISTS subscriptions(
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
       invoice_id INTEGER UNIQUE REFERENCES billing_invoices(id), plan TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
@@ -276,6 +287,7 @@ def init_db():
     db.execute("CREATE INDEX IF NOT EXISTS idx_requests_geo ON requests(status,lat,lon)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_requests_expires ON requests(status,expires_at)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_request_events_request ON request_events(request_id, id DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_wallet_transactions_user ON wallet_transactions(user_id, id DESC)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_device ON sessions(device_id,expires_at)")
     if not getattr(db, "is_postgres", False):
         try: db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tg ON users(tg_user_id) WHERE tg_user_id IS NOT NULL")
@@ -919,12 +931,21 @@ def admin_cancel_request(admin_user_id, request_id, reason=""):
         return False, None
     if request["status"] not in (STATUS_OPEN, STATUS_IN_PROGRESS):
         return False, request
+    clean_reason = str(reason).strip()[:300] or "Заявка закрыта поддержкой"
     changed = db.execute(
-        "UPDATE requests SET status='cancelled' WHERE id=? AND status IN (?,?)",
-        (request_id, STATUS_OPEN, STATUS_IN_PROGRESS),
+        "UPDATE requests SET status='cancelled',cancel_reason=?,cancelled_at=CURRENT_TIMESTAMP WHERE id=? AND status IN (?,?)",
+        (clean_reason, request_id, STATUS_OPEN, STATUS_IN_PROGRESS),
     ).rowcount
     if not changed:
         return False, get_request(request_id)
+    if request["reward_payment_status"] == "paid" and int(request["reward_rub"] or 0) > 0:
+        amount = int(request["reward_rub"])
+        wallet_add_entry(request["requester_id"], amount, "reward_refund", "Вознаграждение возвращено в кошелёк: заявка закрыта поддержкой", f"request:{request_id}:admin-refund", request_id)
+        db.execute("UPDATE requests SET reward_payment_status='wallet_refunded' WHERE id=?", (request_id,))
+    db.execute(
+        "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
+        (request_id, admin_user_id, "admin_cancelled", f"Заявка закрыта поддержкой. Причина: {clean_reason}"),
+    )
     record_admin_action(admin_user_id, "request_cancelled", request["requester_id"], {"request_id": request_id, "reason": str(reason).strip()[:300]})
     return True, request
 
@@ -1077,6 +1098,39 @@ def get_invoice_by_payload(payload): return db.execute("SELECT * FROM billing_in
 def record_billing_event(invoice_id,event_type,provider_event_id=None,payload="{}"):
     db.execute("INSERT OR IGNORE INTO billing_events(invoice_id,event_type,provider_event_id,payload) VALUES(?,?,?,?)",(invoice_id,event_type,provider_event_id,payload))
 def get_billing_history(uid,limit=20): return db.execute("SELECT * FROM billing_invoices WHERE user_id=? ORDER BY id DESC LIMIT ?",(uid,limit)).fetchall()
+
+def wallet_add_entry(user_id, amount_rub, kind, description, reference, request_id=None, invoice_id=None):
+    """Append an idempotent RUB wallet ledger entry. Amounts are integer kopeck-free RUB."""
+    amount = int(amount_rub)
+    if not amount:
+        return False
+    result = db.execute(
+        """INSERT OR IGNORE INTO wallet_transactions
+           (user_id,amount_rub,kind,description,request_id,invoice_id,reference)
+           VALUES(?,?,?,?,?,?,?)""",
+        (user_id, amount, str(kind)[:64], str(description)[:300], request_id, invoice_id, str(reference)[:160]),
+    )
+    return bool(getattr(result, "rowcount", 0))
+
+def wallet_summary(user_id, limit=50):
+    balance = db.execute(
+        "SELECT COALESCE(SUM(amount_rub),0) amount FROM wallet_transactions WHERE user_id=?", (user_id,)
+    ).fetchone()["amount"]
+    reserved = db.execute(
+        """SELECT COALESCE(SUM(reward_rub),0) amount FROM requests
+           WHERE requester_id=? AND reward_payment_status='paid' AND status IN (?,?)""",
+        (user_id, STATUS_OPEN, STATUS_IN_PROGRESS),
+    ).fetchone()["amount"]
+    incoming = db.execute(
+        """SELECT COALESCE(SUM(reward_rub),0) amount FROM requests
+           WHERE helper_id=? AND reward_payment_status='paid' AND status=?""",
+        (user_id, STATUS_IN_PROGRESS),
+    ).fetchone()["amount"]
+    rows = db.execute(
+        "SELECT amount_rub,kind,description,request_id,invoice_id,created_at FROM wallet_transactions WHERE user_id=? ORDER BY id DESC LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    return {"balance_rub": int(balance or 0), "reserved_rub": int(reserved or 0), "incoming_rub": int(incoming or 0), "transactions": [dict(row) for row in rows]}
 
 def link_by_code(code,tg_user_id,username=None):
     """Link a Telegram identity to the existing web account and merge prior activity.
