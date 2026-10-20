@@ -154,3 +154,71 @@ def purchase_with_points(user_id, item_type, metadata=None, idempotency_key=None
         except Exception:
             pass
         raise
+
+def purchase_with_wallet(user_id, item_type, metadata=None, idempotency_key=None):
+    """Pay for an H-Point+ entitlement from the user's RUB wallet.
+
+    Wallet entries are an append-only ledger, so the available balance is
+    checked and the debit is recorded in the same write transaction as the
+    entitlement.  Retrying a request with the same key is safe.
+    """
+    item = MONETIZATION_ITEMS.get(item_type)
+    if not item or "rub" not in item:
+        raise ValueError("unknown billing item")
+    metadata = dict(metadata or {})
+    key = str(idempotency_key or "").strip()
+    if not key or len(key) > 100:
+        raise ValueError("invalid purchase key")
+    payload = f"hpoint:wallet:{key}"
+    price = int(item["rub"])
+
+    if item_type in ("boost", "more_responses"):
+        request_id = metadata.get("request_id")
+        if not isinstance(request_id, int):
+            raise ValueError("request_id required")
+        request = get_request(request_id)
+        if not request or request["requester_id"] != user_id or request["status"] != "open":
+            raise ValueError("request is unavailable")
+    if item_type == "verification" and not get_user(user_id)["tg_user_id"]:
+        raise ValueError("telegram link required")
+    if item_type == "ad" and not str(metadata.get("ad_text", "")).strip():
+        raise ValueError("ad_text required")
+
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        existing = db.execute("SELECT * FROM billing_invoices WHERE payload=?", (payload,)).fetchone()
+        if existing:
+            if existing["user_id"] != user_id or existing["currency"] != "WALLET":
+                db.execute("ROLLBACK")
+                raise ValueError("purchase key already used")
+            db.execute("COMMIT")
+            return existing["id"], False
+        balance = db.execute(
+            "SELECT COALESCE(SUM(amount_rub), 0) AS balance FROM wallet_transactions WHERE user_id=?",
+            (user_id,),
+        ).fetchone()["balance"]
+        if int(balance or 0) < price:
+            db.execute("ROLLBACK")
+            raise ValueError("insufficient_wallet")
+        invoice_id = insert_id(
+            """INSERT INTO billing_invoices(user_id,item_type,amount_rub,currency,payload,metadata,status,paid_at)
+               VALUES(?,?,?,?,?,?, 'paid', CURRENT_TIMESTAMP)""",
+            (user_id, item_type, price, "WALLET", payload, json.dumps(metadata, ensure_ascii=False)),
+        )
+        wallet_add_entry(
+            user_id, -price, "hpoint_purchase", f"Оплата H-Point+: {item['title']}",
+            f"wallet-purchase:{key}", invoice_id=invoice_id,
+        )
+        grant_entitlement(user_id, item_type, request_id=metadata.get("request_id"), ad_text=metadata.get("ad_text"))
+        db.execute(
+            "INSERT OR IGNORE INTO billing_events(invoice_id,event_type,provider_event_id,payload) VALUES(?,?,?,?)",
+            (invoice_id, "wallet_purchase", payload, json.dumps(metadata, ensure_ascii=False)),
+        )
+        db.execute("COMMIT")
+        return invoice_id, True
+    except Exception:
+        try:
+            db.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
