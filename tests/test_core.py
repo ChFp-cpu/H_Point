@@ -66,6 +66,20 @@ class Core(unittest.TestCase):
         self.assertTrue(services.set_rating(rid,1,5));self.assertTrue(services.set_helper_rating(rid,2,4))
         self.assertTrue(services.set_review(rid,1,"Отлично","requester"))
         self.assertTrue(services.set_review(rid,2,"Хорошо","helper"))
+    def test_paid_request_releases_rubles_without_changing_hpoints(self):
+        self.add(1, 0);self.add(2, 17)
+        rid=services.create_request(1,{"what":"paid","place":"x","time_needed":"x","urgency":"x","details":"x","reward_rub":750})
+        self.assertFalse(services.try_assign_helper(rid,2))
+        self.db.execute("UPDATE requests SET reward_payment_status='paid' WHERE id=?",(rid,))
+        self.assertTrue(services.try_assign_helper(rid,2))
+        self.assertTrue(services.complete_request(rid,2))
+        self.assertFalse(services.complete_request(rid,2))
+        self.assertEqual(database.get_user(1)["balance"],0)
+        self.assertEqual(database.get_user(2)["balance"],17)
+        self.assertEqual(database.get_request(rid)["reward_payment_status"],"released")
+        wallet=database.wallet_summary(2)
+        self.assertEqual(wallet["balance_rub"],750)
+        self.assertEqual(len(wallet["transactions"]),1)
     def test_concurrent_assignment_cannot_double_book_helper(self):
         old_db, old_service_db = database.db, services.db
         temp = tempfile.TemporaryDirectory(dir=os.getcwd())

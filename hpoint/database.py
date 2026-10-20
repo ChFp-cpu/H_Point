@@ -289,6 +289,10 @@ def init_db():
     db.execute("CREATE INDEX IF NOT EXISTS idx_request_events_request ON request_events(request_id, id DESC)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_wallet_transactions_user ON wallet_transactions(user_id, id DESC)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_device ON sessions(device_id,expires_at)")
+    # The personal dashboard reads both sides of the request relationship on
+    # every sync.  These indexes keep that query fast as request history grows.
+    db.execute("CREATE INDEX IF NOT EXISTS idx_requests_requester_history ON requests(requester_id, id DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_requests_helper_history ON requests(helper_id, id DESC)")
     if not getattr(db, "is_postgres", False):
         try: db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tg ON users(tg_user_id) WHERE tg_user_id IS NOT NULL")
         except sqlite3.IntegrityError:

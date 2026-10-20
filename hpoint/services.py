@@ -126,7 +126,8 @@ def offer_helper(request_id: int, helper_id: int) -> bool:
             "SELECT 1 FROM requests WHERE helper_id = ? AND status = ?" + lock,
             (helper_id, STATUS_IN_PROGRESS),
         ).fetchone()
-        if not request or request["status"] != STATUS_OPEN or request["requester_id"] == helper_id or not available or busy:
+        reward_ready = (int(request["reward_rub"] or 0) == 0 or request["reward_payment_status"] == "paid") if request else False
+        if not request or request["status"] != STATUS_OPEN or request["requester_id"] == helper_id or not reward_ready or not available or busy:
             db.execute("ROLLBACK")
             return False
 
@@ -165,7 +166,8 @@ def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool) -> bo
             (request_id, helper_id),
         ).fetchone()
         request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
-        if not offer or not request or request["status"] != STATUS_OPEN:
+        reward_ready = (int(request["reward_rub"] or 0) == 0 or request["reward_payment_status"] == "paid") if request else False
+        if not offer or not request or request["status"] != STATUS_OPEN or not reward_ready:
             db.execute("ROLLBACK")
             return False
         if not accept:
@@ -257,6 +259,7 @@ def try_assign_helper(request_id: int, helper_id: int) -> bool:
         cur = db.execute(
             """UPDATE requests SET helper_id = ?, status = ?
             WHERE id = ? AND status = ? AND helper_id IS NULL AND requester_id != ?
+            AND (reward_rub = 0 OR reward_payment_status = 'paid')
             AND NOT EXISTS (
                 SELECT 1 FROM requests active
                 WHERE active.helper_id = ? AND active.status = ?
@@ -286,18 +289,28 @@ def complete_request(request_id: int, helper_id: int) -> bool:
         if req is None or req["status"] != STATUS_IN_PROGRESS or req["helper_id"] != helper_id:
             db.execute("ROLLBACK")
             return False
-        user_rows = db.execute(
-            "SELECT user_id,balance FROM users WHERE user_id IN (?,?) ORDER BY user_id" + lock,
-            (req["requester_id"], helper_id),
-        ).fetchall()
-        balances = {row["user_id"]: row["balance"] for row in user_rows}
-        requester_balance = balances.get(req["requester_id"])
-        if requester_balance is None or helper_id not in balances or requester_balance < REQUEST_COST:
+        paid_request = int(req["reward_rub"] or 0) > 0
+        if paid_request and req["reward_payment_status"] != "paid":
             db.execute("ROLLBACK")
             return False
+        # H-Points are the incentive only for free neighbourly help.  A request
+        # with a RUB reward is settled exclusively through the wallet ledger.
+        # Loading and checking point balances for such requests used to make a
+        # RUB job fail or alter HP despite the advertised payment method.
+        if not paid_request:
+            user_rows = db.execute(
+                "SELECT user_id,balance FROM users WHERE user_id IN (?,?) ORDER BY user_id" + lock,
+                (req["requester_id"], helper_id),
+            ).fetchall()
+            balances = {row["user_id"]: row["balance"] for row in user_rows}
+            requester_balance = balances.get(req["requester_id"])
+            if requester_balance is None or helper_id not in balances or requester_balance < REQUEST_COST:
+                db.execute("ROLLBACK")
+                return False
         db.execute("UPDATE requests SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?", (STATUS_DONE, request_id))
-        db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (REQUEST_COST, req["requester_id"]))
-        db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (HELPER_REWARD, helper_id))
+        if not paid_request:
+            db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (REQUEST_COST, req["requester_id"]))
+            db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (HELPER_REWARD, helper_id))
         if req["reward_payment_status"] == "paid" and int(req["reward_rub"] or 0) > 0:
             amount = int(req["reward_rub"])
             wallet_add_entry(helper_id, amount, "reward_earned", "Вознаграждение за завершённую заявку", f"request:{request_id}:earned", request_id)

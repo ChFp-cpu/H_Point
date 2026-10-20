@@ -24,6 +24,9 @@ class Web(unittest.TestCase):
   self.assertIn("Предложения помощи",web.PAGE)
   self.assertIn("ratingPodium",web.PAGE)
   self.assertIn("activityStats",web.PAGE)
+  self.assertIn("globalBalance",web.PAGE)
+  self.assertIn("homePulse",web.PAGE)
+  self.assertIn("telegramSummary",web.PAGE)
   self.assertIn("hpointShowcaseGo",web.PAGE)
   self.assertIn("https://*.yandex.ru",web.CSP)
   self.assertIn("https://*.yandex.net",web.CSP)
@@ -66,6 +69,28 @@ class Web(unittest.TestCase):
    forbidden.exception.close()
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_paid_request_does_not_require_hpoints_and_sync_has_wallet(self):
+  database.create_user(1,"Requester")
+  self.db.execute("UPDATE users SET balance=0,email_verified=1 WHERE user_id=1")
+  token=web.new_sess(1)
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Content-Type":"application/json","Cookie":f"hpoint_session={token}"}
+  try:
+   payload={"what":"Оплатить работу","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test","reward_rub":500}
+   with urllib.request.urlopen(urllib.request.Request(base+"/api/requests",data=json.dumps(payload).encode(),headers=headers,method="POST"),timeout=3) as response:
+    created=json.load(response);self.assertTrue(created["ok"])
+   self.assertEqual(database.get_user(1)["balance"],0)
+   with urllib.request.urlopen(urllib.request.Request(base+"/api/sync",headers={"Cookie":f"hpoint_session={token}"}),timeout=3) as response:
+    synced=json.load(response)
+   self.assertIn("wallet",synced);self.assertEqual(synced["wallet"]["balance_rub"],0)
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_user_payload_includes_safe_telegram_summary(self):
+  database.create_user(7,"Telegram Person","tgperson")
+  self.db.execute("UPDATE users SET tg_user_id=7 WHERE user_id=7")
+  payload=web.user_payload(database.get_user(7))
+  self.assertTrue(payload["tg_linked"])
+  self.assertEqual(payload["telegram"],{"name":"Telegram Person","username":"tgperson","avatar_url":None})
  def test_email_code_is_one_time_and_required_for_email_actions(self):
   old_configured,old_send=web.email_delivery_configured,web.send_email_verification_code
   delivered=[];web.email_delivery_configured=lambda:True;web.send_email_verification_code=lambda address,code:delivered.append((address,code)) or True
