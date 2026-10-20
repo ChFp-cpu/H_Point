@@ -1,0 +1,2 @@
+# Keep deployment scripts executable and portable on Linux hosts.
+*.sh text eol=lf

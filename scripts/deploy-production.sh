@@ -13,7 +13,7 @@ docker compose up -d --build --remove-orphans
 
 attempt=1
 while [ "$attempt" -le 12 ]; do
-  if curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8080/api/health >/dev/null; then
+  if docker compose exec -T app python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=5)" >/dev/null 2>&1; then
     docker compose ps
     printf 'H-Point deployed: %s\n' "$commit"
     exit 0

@@ -1,21 +1,26 @@
 """H-Point web-first application: dashboard, requests, Smart Match, chat, profile and RUB billing."""
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
-import asyncio, json, logging, os, secrets, hashlib, hmac, datetime as dt, re
+from urllib.parse import urlparse, parse_qs, urlencode
+from urllib import request as urlrequest, error as urlerror
+from email.message import EmailMessage
+import asyncio, json, logging, os, secrets, hashlib, hmac, datetime as dt, re, smtplib, ssl, base64, binascii, threading, time
 from pathlib import Path
 from html import escape
 from . import database
+from . import games
 from .database import db, get_user, get_user_by_email, create_web_user, get_request, get_user_stats, get_active_own_request, get_history, get_billing_history, is_user_blocked, admin_summary, set_user_blocked
 from .config import *
+from .games_page import GAMES_PAGE
 from .services import *
-from .billing import create_pending_invoice, create_payment, fulfill_invoice, purchase_with_points, verify_robokassa_result
+from .billing import create_pending_invoice, create_request_reward_invoice, create_payment, fulfill_invoice, purchase_with_points, purchase_with_wallet, verify_robokassa_result
+from .keyboards import helper_offer_kb
 
 database.init_db()
-YANDEX_MAPS_API_KEY = os.getenv("YANDEX_MAPS_API_KEY", "")
 _telegram_bot = None
 _telegram_loop = None
 _telegram_username = BOT_USERNAME or None
 ASSETS = {
+    "favicon.svg": (Path(__file__).resolve().parent.parent / "assets" / "favicon.svg", "image/svg+xml"),
     "hpoint-logo.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-logo.png", "image/png"),
     "hpoint-logo-dark.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-logo-dark.png", "image/png"),
     "hpoint-brand-hero.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-brand-hero.png", "image/png"),
@@ -23,20 +28,12 @@ ASSETS = {
     "hpoint-route-network.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-route-network.png", "image/png"),
     "hpoint-match-field.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-match-field.png", "image/png"),
 }
-CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' "
-       "https://api-maps.yandex.ru https://*.api-maps.yandex.ru "
-       "https://suggest-maps.yandex.ru https://yastatic.net https://yandex.ru; "
-       "style-src 'self' 'unsafe-inline' blob: https://api-maps.yandex.ru "
-       "https://*.api-maps.yandex.ru https://yastatic.net https://fonts.googleapis.com; "
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://*.yandex.ru https://yastatic.net; "
+       "style-src 'self' 'unsafe-inline' blob: https://fonts.googleapis.com https://yastatic.net; "
        "font-src 'self' data: https://fonts.gstatic.com; "
-       "img-src 'self' data: https://api-maps.yandex.ru https://*.api-maps.yandex.ru "
-       "https://*.maps.yandex.net https://yastatic.net https://yandex.ru; "
-       "connect-src 'self' https://api-maps.yandex.ru https://*.api-maps.yandex.ru "
-       "https://*.maps.yandex.net https://suggest-maps.yandex.ru "
-       "https://search-maps.yandex.ru https://api.routing.yandex.net https://yandex.ru; "
-       "worker-src data: blob: https://api-maps.yandex.ru https://*.api-maps.yandex.ru "
-       "https://yastatic.net; child-src https://api-maps.yandex.ru; "
-       "frame-src https://api-maps.yandex.ru; frame-ancestors 'none'; "
+       "img-src 'self' data: https://*.yandex.net https://*.yandex.ru https://yastatic.net; "
+       "connect-src 'self' https://*.yandex.ru https://*.yandex.net https://yastatic.net; "
+       "worker-src 'self' data: blob:; child-src 'self'; frame-src 'none'; frame-ancestors 'none'; "
        "base-uri 'self'; form-action 'self'")
 
 def configure_telegram_notifications(bot, username=None):
@@ -46,12 +43,12 @@ def configure_telegram_notifications(bot, username=None):
     _telegram_loop = asyncio.get_running_loop()
     _telegram_username = username
 
-def notify_telegram_user(user_id, text):
+def notify_telegram_user(user_id, text, reply_markup=None):
     if _telegram_bot is None or _telegram_loop is None:
         return
     try:
         future = asyncio.run_coroutine_threadsafe(
-            _telegram_bot.send_message(user_id, text), _telegram_loop
+            _telegram_bot.send_message(user_id, text, reply_markup=reply_markup), _telegram_loop
         )
     except RuntimeError:
         logging.warning("Telegram notification could not be scheduled")
@@ -85,6 +82,83 @@ def pv(password, stored):
     except Exception: return False
 def password_needs_upgrade(stored): return not stored.startswith("scrypt$")
 
+def password_error(password):
+    if not 6 <= len(password) <= 256:
+        return "Пароль должен быть от 6 до 256 символов."
+    if not re.search(r"[a-z]", password) or not re.search(r"[A-Z]", password) or not re.search(r"\d", password):
+        return "В пароле нужны строчная и заглавная латинские буквы, а также цифра."
+    return None
+
+def email_delivery_configured():
+    return bool(SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD and SMTP_FROM)
+
+def _send_email(address, subject, body):
+    """Send a transactional mail using either STARTTLS or implicit TLS."""
+    if not email_delivery_configured():
+        return False
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = SMTP_FROM
+    message["To"] = address
+    message.set_content(body)
+    try:
+        context = ssl.create_default_context()
+        if SMTP_USE_SSL:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS, context=context) as client:
+                client.login(SMTP_USERNAME, SMTP_PASSWORD)
+                client.send_message(message)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as client:
+                client.ehlo()
+                if SMTP_USE_TLS:
+                    client.starttls(context=context)
+                    client.ehlo()
+                client.login(SMTP_USERNAME, SMTP_PASSWORD)
+                client.send_message(message)
+        return True
+    except Exception:
+        logging.exception("Transactional email delivery failed")
+        return False
+
+def send_email_verification_code(address, code):
+    return _send_email(
+        address,
+        "Код подтверждения H-Point",
+        "Ваш код подтверждения H-Point: " + code + "\n\n"
+        + f"Код действует {max(1, EMAIL_VERIFICATION_TTL_SECONDS // 60)} минут. Никому его не сообщайте.",
+    )
+
+def send_password_reset_code(address, code):
+    return _send_email(
+        address,
+        "Восстановление пароля H-Point",
+        "Код для восстановления пароля H-Point: " + code + "\n\n"
+        + f"Код действует {max(1, EMAIL_VERIFICATION_TTL_SECONDS // 60)} минут. Никому его не сообщайте.",
+    )
+
+def sms_delivery_configured():
+    return bool(BREVO_API_KEY and SMS_SENDER)
+
+def send_phone_verification_code(phone, code):
+    """Deliver an SMS through Brevo only when an API key was configured."""
+    if not sms_delivery_configured():
+        return False
+    payload = json.dumps({
+        "type": "transactional", "unicodeEnabled": True,
+        "sender": SMS_SENDER, "recipient": phone.lstrip("+"),
+        "content": f"H-Point: код подтверждения телефона {code}. Никому его не сообщайте.",
+    }).encode("utf-8")
+    req = urlrequest.Request(
+        "https://api.brevo.com/v3/transactionalSMS", data=payload, method="POST",
+        headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json", "Accept": "application/json"},
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=SMTP_TIMEOUT_SECONDS) as response:
+            return 200 <= response.status < 300
+    except (urlerror.URLError, TimeoutError, ValueError):
+        logging.exception("Phone verification SMS delivery failed")
+        return False
+
 def cookie_value(h, name):
     c=h.headers.get("Cookie","")
     return next((x.strip().split("=",1)[1] for x in c.split(";") if x.strip().startswith(name+"=")),None)
@@ -100,6 +174,7 @@ def new_sess(uid, device_id=None):
     e=(now()+dt.timedelta(seconds=SESSION_TTL)).isoformat()
     db.execute("DELETE FROM sessions WHERE expires_at<=?", (now().isoformat(),))
     db.execute("INSERT INTO sessions(token,user_id,expires_at,device_id) VALUES(?,?,?,?)",(t,uid,e,device_id))
+    database.touch_user_activity(uid)
     return t
 
 def session_cookie(value, max_age):
@@ -115,12 +190,71 @@ def session_headers(h, uid):
     return {"Set-Cookie": [session_cookie(new_sess(uid, device), SESSION_TTL), device_cookie(device)]}
 
 MAX_JSON_BODY = 20_000
+EVENT_JSON_BODY = EVENT_IMAGE_MAX_BYTES * 2 + 10_000
 
-def read(h):
+def read(h, max_body=MAX_JSON_BODY):
     try: length = int(h.headers.get("Content-Length", "0"))
     except ValueError: raise ValueError("Некорректный размер запроса")
-    if length < 0 or length > MAX_JSON_BODY: raise ValueError("Слишком большой запрос")
+    if length < 0 or length > max_body: raise ValueError("Слишком большой запрос")
     return json.loads(h.rfile.read(length) or b"{}")
+
+GEOCODE_CACHE = {}
+GEOCODE_LOCK = threading.Lock()
+GEOCODE_LAST_REQUEST_AT = 0.0
+
+def geocode_address(query):
+    """Resolve an explicitly submitted address without retaining it in the database."""
+    global GEOCODE_LAST_REQUEST_AT
+    value = " ".join(str(query or "").split())
+    if not 4 <= len(value) <= 180:
+        raise ValueError("Укажите адрес от 4 до 180 символов.")
+    cache_key = value.casefold()
+    moment = time.monotonic()
+    with GEOCODE_LOCK:
+        cached = GEOCODE_CACHE.get(cache_key)
+        if cached and moment - cached[0] < 6 * 60 * 60:
+            return cached[1]
+        if moment - GEOCODE_LAST_REQUEST_AT < 1.05:
+            raise RuntimeError("Подождите секунду и повторите поиск адреса.")
+        GEOCODE_LAST_REQUEST_AT = moment
+    request_url = "https://photon.komoot.io/api/?" + urlencode({"q": value, "limit": 1})
+    request_obj = urlrequest.Request(request_url, headers={
+        "User-Agent": "H-Point/1.0 (+https://gethpoint.ru)", "Accept": "application/json",
+    })
+    try:
+        with urlrequest.urlopen(request_obj, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urlerror.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+        logging.warning("Fallback geocoding is unavailable: %s", type(exc).__name__)
+        raise RuntimeError("Поиск адреса временно недоступен. Поставьте точку на карте.") from exc
+    rows = payload.get("features") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("Адрес не найден. Уточните город, улицу и номер дома.")
+    try:
+        lon, lat = rows[0]["geometry"]["coordinates"][:2]
+        point = {"lat": float(lat), "lon": float(lon)}
+    except (KeyError, TypeError, ValueError, IndexError) as exc:
+        raise RuntimeError("Не удалось определить координаты адреса.") from exc
+    if not (-90 <= point["lat"] <= 90 and -180 <= point["lon"] <= 180):
+        raise RuntimeError("Сервис вернул некорректные координаты.")
+    with GEOCODE_LOCK:
+        GEOCODE_CACHE[cache_key] = (time.monotonic(), point)
+        if len(GEOCODE_CACHE) > 256:
+            oldest = min(GEOCODE_CACHE, key=lambda key: GEOCODE_CACHE[key][0])
+            GEOCODE_CACHE.pop(oldest, None)
+    return point
+
+def event_image_data(value):
+    raw=str(value or "").strip()
+    if not raw:return ""
+    match=re.fullmatch(r"data:(image/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)",raw)
+    if not match:raise ValueError("Фото должно быть PNG, JPEG или WebP.")
+    try:payload=base64.b64decode(match.group(2),validate=True)
+    except (binascii.Error,ValueError):raise ValueError("Не удалось прочитать фото.")
+    if not payload or len(payload)>EVENT_IMAGE_MAX_BYTES:raise ValueError("Фото должно быть не больше 800 КБ.")
+    signatures={"image/jpeg":b"\xff\xd8\xff","image/png":b"\x89PNG\r\n\x1a\n","image/webp":b"RIFF"}
+    if not payload.startswith(signatures[match.group(1)]):raise ValueError("Формат фото не совпадает с файлом.")
+    return f"data:{match.group(1)};base64,"+base64.b64encode(payload).decode("ascii")
 
 def reply(h,d,status=200,headers=None):
     b=json.dumps(d,ensure_ascii=False).encode()
@@ -137,6 +271,15 @@ def auth(h):
     if u["is_blocked"]:
         reply(h,{"ok":False,"error":"account_blocked"},403); return None
     return u
+
+def account_is_verified(u):
+    return bool(u["tg_user_id"] or u["email_verified"])
+
+def verified_community_account(h, u):
+    if account_is_verified(u):
+        return True
+    reply(h, {"ok": False, "error": "Подтвердите email кодом из письма или привяжите Telegram, прежде чем пользоваться заявками."}, 403)
+    return False
 
 def admin_auth(h):
     u = auth(h)
@@ -167,7 +310,11 @@ def user_payload(u):
     code_valid=bool(u["verification_code"] and u["verification_code_expires_at"] and u["verification_code_expires_at"]>now().isoformat())
     identity=database.get_identity_verification(u["user_id"])
     identity_payload={"status":identity["status"],"submitted_at":identity["submitted_at"],"reviewed_at":identity["reviewed_at"],"note":identity["note"]} if identity else {"status":"not_requested"}
-    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code":u["verification_code"] if code_valid else None,"pro_until":u["pro_until"],"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats}
+    contacts_ready=bool((u["full_name"] or "").strip() and u["birth_date"] and u["email_verified"] and u["phone_verified"] and u["tg_user_id"])
+    telegram = None
+    if u["tg_user_id"]:
+        telegram = {"name": u["name"], "username": u["username"] or "", "avatar_url": None}
+    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"role":u["role"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"email_verified":bool(u["email_verified"]),"account_verified":account_is_verified(u),"email_delivery_configured":email_delivery_configured(),"sms_delivery_configured":sms_delivery_configured(),"full_name":u["full_name"] or "","birth_date":u["birth_date"] or "","phone":u["phone"] or "","phone_verified":bool(u["phone_verified"]),"contacts_verified":contacts_ready,"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram":telegram,"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code":u["verification_code"] if code_valid else None,"pro_until":u["pro_until"],"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats}
 
 def request_payload(r):
     d=dict(r); d["category_name"]=CATEGORIES.get(r["category"],"Другое"); d["status_title"]=STATUS_TITLES.get(r["status"],r["status"]); return d
@@ -178,13 +325,37 @@ def public_request_payload(r):
             "category_name": CATEGORIES.get(r["category"], "Другое"), "urgency": r["urgency"],
             # The free-text place field can contain a home address.  It is
             # shared only with the assigned helper through the private flow.
-            "place": "Район уточняется после назначения", "lat": None, "lon": None}
+            "place": "Район уточняется после назначения", "lat": None, "lon": None, "views": r["views"] if "views" in r.keys() else 0,
+            "reward_rub": int(r["reward_rub"] or 0) if "reward_rub" in r.keys() else 0,
+            "reward_payment_status": r["reward_payment_status"] if "reward_payment_status" in r.keys() else "none",
+            # Used only to open the already access-controlled public profile;
+            # it is never rendered as an identifier or paired with contacts.
+            "author_profile_id": int(r["requester_id"])}
+
+def record_request_view(request_id, viewer_id):
+    inserted=db.execute("INSERT OR IGNORE INTO request_views(request_id,viewer_id) VALUES(?,?)", (request_id,viewer_id))
+    if getattr(inserted,"rowcount",0): db.execute("UPDATE requests SET views=COALESCE(views,0)+1 WHERE id=?",(request_id,))
+
+def coordinates_from_payload(data):
+    """Read an optional browser position and reject incomplete or invalid input."""
+    raw_lat, raw_lon = data.get("lat"), data.get("lon")
+    if raw_lat is None and raw_lon is None:
+        return None, None
+    if raw_lat is None or raw_lon is None:
+        raise ValueError("incomplete coordinates")
+    try:
+        lat, lon = float(raw_lat), float(raw_lon)
+    except (TypeError, ValueError):
+        raise ValueError("invalid coordinates")
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise ValueError("invalid coordinates")
+    return lat, lon
 
 def chat_for_request(rid):
     return database.get_or_create_chat_for_request(rid)
 
 PAGE=r'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>H·Point — помощь рядом</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet"><script src="https://api-maps.yandex.ru/2.1/?apikey=__YANDEX_MAPS_API_KEY__&lang=ru_RU&csp=true" type="text/javascript"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet"><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
 :root{--bg:#f5f7fb;--surface:#fff;--ink:#101828;--muted:#667085;--line:#e6eaf0;--brand:#5b5cf0;--brand2:#7c3aed;--ok:#12b76a;--warn:#f79009;--shadow:0 16px 50px rgba(16,24,40,.08)}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 80% -10%,#e9e8ff 0,transparent 35%),var(--bg);color:var(--ink);font-family:Manrope,system-ui,-apple-system,sans-serif}.nav{position:sticky;top:0;z-index:40;background:rgba(245,247,251,.86);backdrop-filter:blur(18px);border-bottom:1px solid rgba(230,234,240,.8)}.in,.wrap{width:min(1240px,100%);margin:auto;padding:0 24px}.in{height:74px;display:flex;align-items:center;gap:12px}.logo{font-size:25px;font-weight:800;letter-spacing:-1px}.logo b{color:var(--brand)}.sp{flex:1}.btn{border:0;border-radius:14px;padding:12px 17px;font:inherit;font-weight:800;cursor:pointer;transition:.2s;display:inline-flex;align-items:center;justify-content:center;gap:7px}.btn:hover{transform:translateY(-1px)}.dark{background:var(--ink);color:white}.light{background:var(--surface);color:var(--ink);border:1px solid var(--line)}.grad{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff}.danger{color:#b42318;background:#fff;border:1px solid #fecdca}.ey{display:inline-flex;padding:7px 10px;border-radius:999px;background:#eeefff;color:#4c4fd0;font-size:11px;font-weight:800}.landingHero{padding:76px 0 55px;display:grid;grid-template-columns:1.1fr .9fr;gap:44px;align-items:center}.hero h1{font-size:clamp(46px,6vw,82px);line-height:.95;letter-spacing:-5px;margin:18px 0}.hero p{font-size:18px;line-height:1.7;color:var(--muted);max-width:650px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:25px}.cover{min-height:430px;border-radius:34px;background:linear-gradient(145deg,#111326,#2f3270);box-shadow:0 30px 80px rgba(31,35,90,.28);padding:22px;color:white;position:relative;overflow:hidden}.cover:before{content:"";position:absolute;width:270px;height:270px;border-radius:50%;background:#7778ff55;filter:blur(8px);right:-70px;top:-70px}.coverCard{position:relative;background:#ffffff12;border:1px solid #ffffff1f;border-radius:22px;padding:19px;margin-bottom:12px;backdrop-filter:blur(8px)}.coverCard strong{display:block;font-size:18px}.coverCard small{display:block;color:#cfd2e7;margin-top:7px;line-height:1.5}.coverMap{position:absolute;left:22px;right:22px;bottom:22px;height:110px;border-radius:18px;background:linear-gradient(135deg,#34386e,#171a35);border:1px solid #ffffff1f;display:flex;align-items:center;justify-content:center;color:#cfd2e7}.section{padding:54px 0}.section h2{font-size:34px;letter-spacing:-1.5px}.featureGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.card{background:rgba(255,255,255,.88);border:1px solid var(--line);border-radius:22px;padding:21px;box-shadow:0 8px 30px rgba(16,24,40,.04)}.muted{color:var(--muted)}.price{font-size:28px;font-weight:800}.app{display:none}.appHead{padding:35px 0 0}.welcome{display:flex;align-items:flex-end;gap:15px;justify-content:space-between}.welcome h1{font-size:42px;letter-spacing:-2px;margin:9px 0}.tabs{display:flex;gap:7px;overflow:auto;padding:22px 0 10px;position:sticky;top:74px;z-index:15;background:linear-gradient(var(--bg) 80%,transparent)}.tab{padding:10px 14px;border-radius:12px;border:1px solid transparent;background:transparent;white-space:nowrap;font:inherit;font-weight:700;color:var(--muted);cursor:pointer}.tab.active{background:white;border-color:var(--line);color:var(--ink);box-shadow:0 5px 20px #1018280b}.panel{display:none;padding:18px 0 60px}.panel.active{display:block}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{padding:20px}.stat .big{font-size:28px;font-weight:800;margin-top:5px}.layout{display:grid;grid-template-columns:1.25fr .75fr;gap:16px}.form{display:grid;gap:11px}.input{width:100%;padding:13px 14px;border:1px solid var(--line);border-radius:13px;background:#fff;font:inherit;outline:none}.input:focus{border-color:#8d8ff7;box-shadow:0 0 0 4px #5b5cf012}.textarea{min-height:110px;resize:vertical}.request{display:flex;gap:14px;align-items:center;padding:16px;border:1px solid var(--line);border-radius:17px;background:#fff;margin:9px 0}.requestmain{flex:1;min-width:0}.badge{padding:6px 9px;border-radius:999px;background:#f2f4f7;font-size:11px;font-weight:800;white-space:nowrap}.badge.ok{background:#ecfdf3;color:#027a48}.badge.warn{background:#fffaeb;color:#b54708}.map{height:460px;border-radius:22px;overflow:hidden;border:1px solid var(--line);background:#eef0f5}.match{padding:16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}.avatar{width:42px;height:42px;border-radius:14px;background:linear-gradient(135deg,#ececff,#ddd8ff);display:flex;align-items:center;justify-content:center;font-weight:800}.grow{flex:1;min-width:0}.modal{position:fixed;inset:0;background:#10182899;display:none;align-items:center;justify-content:center;z-index:100;padding:20px}.box{background:#fff;border-radius:26px;padding:26px;width:min(600px,100%);max-height:90vh;overflow:auto;box-shadow:0 30px 100px #10182833}.close{float:right;border:0;background:none;font-size:25px;cursor:pointer}.chat{height:480px;display:flex;flex-direction:column}.messages{flex:1;overflow:auto;padding:12px;background:#f7f8fb;border-radius:17px}.msg{max-width:78%;padding:10px 13px;border-radius:16px;background:#fff;margin:7px 0;border:1px solid var(--line)}.msg.mine{margin-left:auto;background:#eef0ff;border-color:#d9dbff}.msg small{display:block;color:var(--muted);font-size:10px;margin-top:4px}.chatbar{display:flex;gap:8px;margin-top:10px}.empty{padding:32px;text-align:center;color:var(--muted)}.toast{position:fixed;right:20px;bottom:20px;z-index:200;background:#101828;color:#fff;border-radius:14px;padding:13px 16px;box-shadow:var(--shadow);display:none}.verify{background:linear-gradient(135deg,#f0f0ff,#fff);border:1px solid #dfe1ff}.profileGrid{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:900px){.landingHero,.layout,.profileGrid{grid-template-columns:1fr}.featureGrid{grid-template-columns:1fr 1fr}.stats{grid-template-columns:1fr 1fr}}@media(max-width:600px){.in,.wrap{padding:0 15px}.featureGrid,.stats{grid-template-columns:1fr}.hero h1{letter-spacing:-3px}.welcome h1{font-size:32px}.cover{min-height:390px}.request{align-items:flex-start;flex-wrap:wrap}}
 #p-billing .layout{grid-template-columns:minmax(0,1.7fr) minmax(280px,.8fr);align-items:start}#appprices{grid-template-columns:repeat(2,minmax(0,1fr))}#appprices>.card{min-width:0;display:flex;flex-direction:column;align-items:flex-start}#appprices>.card h3{min-height:2.8em;margin-bottom:8px}#appprices>.card .muted{min-height:3em}#appprices>.card .price{margin-top:auto;padding:12px 0 16px;white-space:nowrap}#appprices>.card .btn{width:100%}@media(max-width:900px){#p-billing .layout{grid-template-columns:minmax(0,1fr)}#appprices{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){#appprices{grid-template-columns:minmax(0,1fr)}}
@@ -332,7 +503,7 @@ products[3]=['verification','Проверка личности','Рассмот�
 function authForm(reg){$('modal').style.display='flex';$('modalbody').innerHTML=reg?`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Создайте общий профиль</h2><p class="muted">Telegram создаёт профиль бесплатно и сразу объединяет сайт с ботом. Email можно добавить для отдельного входа.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Продолжить бесплатно с Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="an" class="input" placeholder="Имя"><input id="ae" class="input" placeholder="Email"><input id="ap" class="input" type="password" autocomplete="new-password" placeholder="Пароль от 12 символов"><button class="btn light" onclick="register()">Создать аккаунт</button><div id="err" class="muted"></div></div>`:`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Войти в H·Point</h2><p class="muted">Через Telegram вы попадёте в тот же профиль и историю заявок.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Войти через Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="ae" class="input" placeholder="Email" autocomplete="email"><input id="ap" class="input" type="password" autocomplete="current-password" placeholder="Пароль"><button class="btn light" onclick="login()">Войти по email</button><div id="err" class="muted"></div></div>`}
 async function telegramLogin(){const popup=window.open('', 'hpointTelegramLogin', 'popup,width=480,height=720');if(popup)popup.opener=null;try{let d=await api('/api/auth/telegram/start',{method:'POST',body:'{}'});if(popup)popup.location.replace(d.bot_url);else window.location.assign(d.bot_url);$('modalbody').innerHTML=`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Подтвердите вход в Telegram</h2><p class="muted">В открывшемся боте нажмите Start. После этого сайт автоматически откроет ваш общий профиль.</p><div id="tgLoginStatus" class="ey">Ожидаем подтверждение…</div>`;let tries=0,poll=setInterval(async()=>{tries++;try{let r=await fetch('/api/auth/telegram/complete?ticket='+encodeURIComponent(d.ticket),{credentials:'same-origin'});if(r.status===202){if(tries>150){clearInterval(poll);$('tgLoginStatus').textContent='Ссылка истекла. Начните вход заново.'}return}let done=await r.json();if(done.ok){clearInterval(poll);closeModal();await load();toast('Вход через Telegram выполнен')}}catch(e){clearInterval(poll);$('tgLoginStatus').textContent='Не удалось подтвердить вход.'}},2000)}catch(e){if(popup)popup.close();let target=$('err');if(target)target.textContent=e.message==='telegram_login_unavailable'?'Вход через Telegram пока настраивается.':'Не удалось начать вход через Telegram.'}}
 let chatTimer=null,chatRefreshing=false,chatSending=false;
-function renderRequests(d){$('mine').innerHTML=d.requests.length?d.requests.map(r=>`<div class="request"><div class="avatar">${esc((r.what||'?')[0].toUpperCase())}</div><div class="requestmain"><b>#${r.id} · ${esc(r.what)}</b><div class="muted">${esc(r.category_name)} · ${esc(r.place)} · ${esc(r.status_title)}</div></div><span class="badge ${r.status==='done'?'ok':r.status==='in_progress'?'warn':''}">${esc(r.urgency)}</span>${r.status==='in_progress'&&r.helper_id===d.current_user_id?`<button class="btn grad" onclick="finish(${r.id})">Завершить</button>`:''}${r.status==='in_progress'?`<button class="btn light" onclick="openChat(${r.id})">Чат</button>`:''}${r.status==='done'&&r.requester_id===d.current_user_id&&!r.requester_rating?`<button class="btn light" onclick="review(${r.id},'requester')">Оценить</button>`:''}${r.status==='done'&&r.helper_id===d.current_user_id&&!r.helper_rating?`<button class="btn light" onclick="review(${r.id},'helper')">Оценить</button>`:''}</div>`).join(''):'<div class="empty">Здесь появятся ваши заявки.</div>';$('rid').innerHTML=d.requests.filter(r=>r.status==='open').map(r=>`<option value="${r.id}">#${r.id} — ${esc(r.what)}</option>`).join('')||'<option value="">Нет открытых заявок</option>'}
+function renderRequests(d){$('mine').innerHTML=d.requests.length?d.requests.map(r=>`<div class="request"><div class="avatar">${esc((r.what||'?')[0].toUpperCase())}</div><div class="requestmain"><b>#${r.id} · ${esc(r.what)}</b><div class="muted">${esc(r.category_name)} · ${esc(r.place)} · ${esc(r.status_title)} · 👁 ${Number(r.views||0)}</div></div><span class="badge ${r.status==='done'?'ok':r.status==='in_progress'?'warn':''}">${esc(r.urgency)}</span>${r.status==='in_progress'&&r.helper_id===d.current_user_id?`<button class="btn grad" onclick="finish(${r.id})">Завершить</button>`:''}${r.status==='in_progress'?`<button class="btn light" onclick="openChat(${r.id})">Чат</button>`:''}${r.status==='done'&&r.requester_id===d.current_user_id&&!r.requester_rating?`<button class="btn light" onclick="review(${r.id},'requester')">Оценить</button>`:''}${r.status==='done'&&r.helper_id===d.current_user_id&&!r.helper_rating?`<button class="btn light" onclick="review(${r.id},'helper')">Оценить</button>`:''}</div>`).join(''):'<div class="empty">Здесь появятся ваши заявки.</div>';$('rid').innerHTML=d.requests.filter(r=>r.status==='open').map(r=>`<option value="${r.id}">#${r.id} — ${esc(r.what)}</option>`).join('')||'<option value="">Нет открытых заявок</option>'}
 function updateDashboard(u){$('welcome').textContent='Добро пожаловать, '+u.name;$('bal').textContent=u.balance+' HP';$('rate').textContent=u.stats.helped_avg?'⭐ '+u.stats.helped_avg.toFixed(1):'—';$('helped').textContent=u.stats.helped;$('received').textContent=u.stats.received;let state=u.identity_verification?.status||'not_requested';let text=!u.tg_linked?'Привяжите Telegram: сайт и бот будут работать с одной историей заявок.':state==='approved'?'Личность подтверждена вручную. Статус действует 365 дней.':state==='pending'?'Заявка на ручную проверку личности уже принята.':'Telegram привязан. При необходимости отправьте заявку на ручное подтверждение личности.';$('verifyText').textContent=text;$('verifyNotice').innerHTML=u.tg_linked?'<span class="badge ok">✓ Telegram подключён</span>':'<span class="badge warn">Нужно подключить Telegram</span>'}
 function applySync(d){updateDashboard(d.user);renderRequests(d)}
 function go(t){document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.t===t));document.querySelectorAll('.panel').forEach(x=>x.classList.toggle('active',x.id==='p-'+t));if(t!=='chat')stopChatPolling();if(t==='requests')requests();if(t==='match'){requests();setTimeout(initMatchMap,50)}if(t==='chat'){loadChats();if(currentChat)startChatPolling()}if(t==='map')setTimeout(loadBigMap,50);if(t==='history')history();if(t==='profile')profile();if(t==='billing'){prices('appprices',true);billing()}}
@@ -354,17 +525,449 @@ async function sendChat(){let input=$('chatInput'),button=$('sendChatButton'),te
 async function billing(){let d=await api('/api/billing');$('subs').innerHTML=`<p>PRO: <b>${d.user.pro_until?new Date(d.user.pro_until).toLocaleDateString('ru-RU'):'нет'}</b></p><p>Проверка личности: <b>${d.user.identity_verified?'подтверждена':d.user.identity_verification?.status==='pending'?'на проверке':'нет'}</b></p><p>Business: <b>${d.user.business_until?new Date(d.user.business_until).toLocaleDateString('ru-RU'):'нет'}</b></p>`;$('payments').innerHTML=d.history.length?d.history.map(x=>`<div class="request"><div class="requestmain"><b>${esc(x.item_type)}</b><div class="muted">${x.amount_rub} ₽ · ${x.status}</div></div></div>`).join(''):'<div class="muted">Платежей пока нет.</div>'}
 '''
 
+CONSENT_MATCH_UI=r'''
+async function match(){if(!rid.value)return;try{let d=await api('/api/assistant/candidates',{method:'POST',body:JSON.stringify({request_id:Number(rid.value),question:$('matchQuestion').value})});if(d.offer){$('matches').innerHTML=`<div class="empty">⏳ Ожидаем ответ от <b>${esc(d.offer.name)}</b>. После отказа можно выбрать другого кандидата.</div>`;return}$('matches').innerHTML=d.matches.length?d.matches.map(x=>`<div class="match"><div class="avatar">${esc((x.name||'?')[0])}</div><div class="grow"><b>${esc(x.name)} ${x.verified?'✓':''}</b><div class="muted">⭐ ${x.rating||'—'} · ${x.distance_km??'—'} км · ${x.reviews} отзывов · match ${Math.round(x.score)}%</div><div class="muted">${esc((x.reasons||[]).join(' · '))}</div></div><button class="btn grad" onclick="assign(${rid.value},${x.user_id})">Выбрать</button></div>`).join(''):'<div class="empty">Сейчас в очереди нет подходящих добровольцев.</div>';initMatchMap();d.matches.filter(x=>x.lat&&x.lon).forEach(x=>{const pm=new ymaps.Placemark([x.lat,x.lon],{balloonContent:esc(x.name)});matchMap.geoObjects.add(pm)});}catch(e){toast(e.message)}}
+async function assign(requestId,helperId){try{let d=await api('/api/smart-match/assign',{method:'POST',body:JSON.stringify({request_id:requestId,helper_id:helperId})});toast(d.offered?'Предложение отправлено. Ждём ответ помощника.':'Не удалось отправить предложение');await requests();await match()}catch(e){toast(e.message)}}
+async function loadOpenRequests(){try{let d=await api('/api/requests?open=1');let host=openRequestHost();host.innerHTML=`<h3>Открытые заявки</h3>${d.requests.length?d.requests.map(r=>`<div class="request"><div class="requestmain"><b>#${r.id} · ${esc(r.what)}</b><div class="muted">${esc(r.category_name)} · ${esc(r.place)} · ${esc(r.urgency)}</div></div><button class="btn grad" onclick="helper()">Готов помочь</button></div>`).join(''):'<div class="empty">Сейчас нет открытых заявок от других пользователей.</div>'}`; }catch(e){let host=openRequestHost();host.innerHTML='<div class="empty">Не удалось загрузить открытые заявки.</div>'}}
+async function acceptOpenRequest(id){try{let d=await api('/api/requests/accept',{method:'POST',body:JSON.stringify({request_id:id})});toast(d.message);await requests()}catch(e){toast(e.message);await loadOpenRequests()}}
+async function helper(){try{let d=await api('/api/helper/queue',{method:'POST',body:'{}'});toast(d.message);go('requests')}catch(e){toast(e.message)}}
+function helperOffersHost(){let host=$('helperOffers');if(host)return host;host=document.createElement('div');host.id='helperOffers';host.style.marginTop='18px';let anchor=openRequestHost();if(anchor&&anchor.parentElement)anchor.parentElement.appendChild(host);return host}
+async function loadHelperOffers(){try{let d=await api('/api/helper/offers');let host=helperOffersHost();host.innerHTML=`<h3>Предложения помощи</h3>${d.offers.length?d.offers.map(o=>`<div class="request"><div class="requestmain"><b>Заявка #${o.request_id} · ${esc(o.what)}</b><div class="muted">${esc(o.requester_name)} · ${esc(o.place)} · ${esc(o.time_needed)}</div></div><button class="btn grad" onclick="respondToOffer(${o.request_id},true)">Помогу</button><button class="btn light" onclick="respondToOffer(${o.request_id},false)">Не смогу</button></div>`).join(''):'<div class="empty">Новых предложений нет. Готовность к помощи синхронизирована с ботом.</div>'}`; }catch(e){let host=helperOffersHost();host.innerHTML='<div class="empty">Не удалось загрузить предложения.</div>'}}
+async function respondToOffer(id,accept){try{let d=await api('/api/helper/offers/respond',{method:'POST',body:JSON.stringify({request_id:id,accept})});toast(accept?'Помощь подтверждена, чат создан':'Предложение отклонено');await requests();if(d.accepted)openChat(id)}catch(e){toast(e.message);await loadHelperOffers()}}
+async function requests(data){renderRequests(data||await api('/api/requests/mine'));if(document.querySelector('.tab.active')?.dataset.t==='requests'){await loadOpenRequests();await loadHelperOffers()}}
+async function syncTick(){try{let d=await api('/api/sync');applySync(d);let tab=document.querySelector('.tab.active')?.dataset.t;if(tab==='requests'){await loadOpenRequests();await loadHelperOffers()}if(tab==='history')await history();if(tab==='profile')await profile(d.user);if(tab==='billing')await billing();if(tab==='chat')loadChats()}catch(e){if(e.message==='auth_required'){stopSync();stopChatPolling()}}}
+'''
+
+SECURITY_CSS=r'''
+/* Clear account verification and small-screen layout. */
+@media(max-width:500px){.nav .in{gap:6px}.brandLogo img{width:106px;height:35px}.nav .sp{min-width:0}.nav #nav{display:flex;align-items:center;gap:6px;flex-shrink:0}.nav #nav .btn{padding:9px 10px;font-size:10px;white-space:nowrap}}
+.landingMetrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.landingMetric{padding:22px 20px;background:linear-gradient(145deg,#1b2119,#141812);border:1px solid rgba(184,243,107,.24);border-radius:18px}.landingMetric b{display:block;color:#b8f36b;font:700 25px 'Space Mono',monospace}.landingMetric span{display:block;margin-top:7px;color:#c5cbc0;font-size:13px;line-height:1.45}.safetyGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.safetyCard{padding:24px 21px;min-height:188px;background:#171a14;border:1px solid #3a4035;border-radius:18px}.safetyCard .safetyMark{display:grid;place-items:center;width:38px;height:38px;border-radius:12px;background:#27391c;color:#d5ff8a;font-size:18px}.safetyCard h3{margin:17px 0 8px;font-size:17px}.safetyCard p{margin:0;color:#b9c0b3;font-size:13px;line-height:1.6}.landingCta{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:34px;background:linear-gradient(135deg,#1e2b21,#172419);border:1px solid rgba(184,243,107,.34);border-radius:22px}.landingCta h2{margin:0;max-width:620px;font-size:clamp(28px,4vw,48px)}.passwordRules{margin:0;padding:0;display:grid;gap:4px;color:#c5cbc0;font-size:12px;line-height:1.45;list-style:none}.passwordRules li:before{content:'•';color:#b8f36b;margin-right:7px}.passwordHint{font-size:12px;line-height:1.45}.emailVerificationCard{margin-top:14px;padding:17px;border:1px solid #4f7049;background:#1a2118;border-radius:16px}.emailVerificationCard p{margin:7px 0 13px}.emailVerificationCard .form{grid-template-columns:1fr auto;align-items:center}.emailVerificationCard .input{min-width:0;letter-spacing:.15em}.emailVerificationCard .profileActions{margin:0}.emailVerificationCard .badge{display:inline-flex;margin-bottom:8px}.emailVerificationCard.warn{border-color:#70632e;background:#282516}@media(max-width:760px){.landingMetrics,.safetyGrid{grid-template-columns:1fr}.landingMetric{padding:18px}.safetyCard{min-height:0}.landingCta{align-items:flex-start;flex-direction:column;padding:25px 20px}.landingCta .btn{width:100%}.emailVerificationCard .form{grid-template-columns:1fr}.emailVerificationCard .form .btn{width:100%}}@media(max-width:420px){.modal{padding:10px}.box{max-height:calc(100svh - 20px)}.actions .btn{flex:1}.chatbar{align-items:stretch;flex-direction:column}.chatbar .btn{width:100%}.emailVerificationCard{padding:14px}.landingCta{border-radius:18px}}
+'''
+
+LANDING_ENHANCEMENTS=r'''
+<section class="section"><div class="sectionIntro"><span class="ey">ВСЁ ПОД КОНТРОЛЕМ</span><h2>Понятный путь к реальной помощи</h2><p class="muted">Профиль, заявки, подбор и сообщения работают как единый сервис на сайте и в Telegram.</p></div><div class="landingMetrics"><div class="landingMetric"><b>01</b><span>Создайте заявку и укажите только нужные детали.</span></div><div class="landingMetric"><b>02</b><span>Выберите добровольца из общей живой очереди.</span></div><div class="landingMetric"><b>03</b><span>Помощник сам подтвердит участие до назначения.</span></div></div></section>
+<section class="section"><div class="sectionIntro"><span class="ey">БЕЗОПАСНОСТЬ</span><h2>Контакты открываются только после взаимного решения</h2></div><div class="safetyGrid"><article class="safetyCard"><div class="safetyMark">✉</div><h3>Подтверждённый контакт</h3><p>Почтовый аккаунт активируется одноразовым кодом. Telegram-профиль подтверждается через бота.</p></article><article class="safetyCard"><div class="safetyMark">◎</div><h3>Адрес остаётся приватным</h3><p>В общей ленте виден только район. Детали доступны участникам после согласия на помощь.</p></article><article class="safetyCard"><div class="safetyMark">✓</div><h3>Помощь только по согласию</h3><p>Выбранный помощник подтверждает предложение сам. Чат появляется после его согласия.</p></article></div></section>
+<section class="section"><div class="landingCta"><div><span class="ey">НАЧНИТЕ СЕЙЧАС</span><h2>Нужна помощь рядом или хотите помочь кому-то?</h2></div><button class="btn grad" onclick="authForm(true)">Создать защищённый профиль</button></div></section>
+'''
+
+ACCOUNT_SECURITY_UI=r'''
+function passwordClientProblem(password){if(password.length<12||password.length>256)return 'Пароль должен быть от 12 до 256 символов.';if(!/[a-z]/.test(password)||!/[A-Z]/.test(password)||!/\d/.test(password))return 'Нужны строчная и заглавная латинские буквы, а также цифра.';return ''}
+function updatePasswordHint(){let hint=$('passwordHint'),problem=passwordClientProblem($('ap')?.value||'');if(hint)hint.textContent=problem||'Пароль соответствует требованиям.'}
+function authForm(reg){$('modal').style.display='flex';$('modalbody').innerHTML=reg?`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Создайте защищённый профиль</h2><p class="muted">Telegram сразу объединяет сайт с ботом. Для входа по email подтвердите почту кодом из письма.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Продолжить с Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="an" class="input" maxlength="50" autocomplete="name" placeholder="Имя"><input id="ae" class="input" type="email" autocomplete="email" placeholder="Email"><input id="ap" class="input" type="password" autocomplete="new-password" placeholder="Придумайте пароль"><ul class="passwordRules"><li>от 12 до 256 символов</li><li>строчная и заглавная латинские буквы</li><li>хотя бы одна цифра</li></ul><input id="ap2" class="input" type="password" autocomplete="new-password" placeholder="Повторите пароль"><p id="passwordHint" class="muted passwordHint" aria-live="polite"></p><button class="btn light" onclick="register()">Создать аккаунт</button><div id="err" class="muted" aria-live="polite"></div></div>`:`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Войти в H·Point</h2><p class="muted">Войдите через Telegram или подтверждённый email.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Войти через Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="ae" class="input" type="email" autocomplete="email" placeholder="Email"><input id="ap" class="input" type="password" autocomplete="current-password" placeholder="Пароль"><button class="btn light" onclick="login()">Войти</button><div id="err" class="muted" aria-live="polite"></div></div>`;if(reg){$('ap').addEventListener('input',updatePasswordHint);$('ap2').addEventListener('input',()=>{let err=$('err');if($('ap2').value&&$('ap').value!==$('ap2').value)err.textContent='Пароли пока не совпадают.';else err.textContent=''})}}
+function showEmailVerification(){let modal=$('modal'),body=$('modalbody');modal.style.display='flex';body.innerHTML=`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Подтвердите email</h2><p class="muted">Мы отправили шестизначный код. Он действует 10 минут и используется один раз.</p><div class="form"><input id="emailCode" class="input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="Код из письма"><button class="btn grad" onclick="verifyEmailCode()">Подтвердить почту</button><button class="btn light" onclick="resendEmailCode()">Отправить новый код</button><div id="err" class="muted" aria-live="polite"></div></div>`}
+async function register(){let password=$('ap').value,confirm=$('ap2').value,problem=passwordClientProblem(password);if(problem){$('err').textContent=problem;return}if(password!==confirm){$('err').textContent='Пароли не совпадают.';return}try{let d=await api('/api/auth/register',{method:'POST',body:JSON.stringify({name:$('an').value,email:$('ae').value,password:password,password_confirm:confirm})});await load();if(d.email_verification_sent){showEmailVerification();toast('Аккаунт создан: подтвердите почту кодом')}else{closeModal();toast('Аккаунт создан. Подтвердите email в профиле, когда отправка кодов будет доступна.')}}catch(e){$('err').textContent=e.message}}
+async function verifyEmailCode(){try{await api('/api/auth/email/verify',{method:'POST',body:JSON.stringify({code:$('emailCode').value.trim()})});closeModal();toast('Email подтверждён');await syncTick();if(document.querySelector('.tab.active')?.dataset.t==='profile')await profile()}catch(e){$('err').textContent=e.message}}
+async function resendEmailCode(){try{await api('/api/auth/email/resend',{method:'POST',body:'{}'});toast('Новый код отправлен')}catch(e){$('err').textContent=e.message}}
+function emailVerificationCard(u){let card=$('emailState');if(!card){card=document.createElement('div');card.id='emailState';let anchor=$('profInfo');anchor.parentElement.insertBefore(card,anchor.nextSibling)}if(u.email_verified){card.className='emailVerificationCard';card.innerHTML='<span class="badge ok">✓ Email подтверждён</span><p class="muted">Почта подтверждена одноразовым кодом и может использоваться для входа.</p>';return}card.className='emailVerificationCard warn';let configured=u.email_delivery_configured;card.innerHTML='<span class="badge warn">Требуется подтверждение email</span><p class="muted">'+(configured?'Подтвердите код из письма, чтобы публиковать заявки и отвечать на них.':'Отправка кодов ещё не настроена. Можно сразу подтвердить профиль через Telegram.')+'</p><div class="profileActions">'+(configured?'<button class="btn grad" onclick="showEmailVerification()">Ввести код</button><button class="btn light" onclick="resendEmailCode()">Новый код</button>':'')+'</div>'}
+async function profile(providedUser){let u=providedUser||(await api('/api/me')).user,linked=Boolean(u.tg_linked);$('pn').value=u.name||'';$('pc').value=u.city||'';$('pb').value=u.bio||'';$('profInfo').innerHTML=`<p><b>${esc(u.name)}</b></p><p class="muted">${esc(u.email||'')}<br>Рейтинг: ${u.stats.helped_avg?u.stats.helped_avg.toFixed(1):'—'} · ${u.stats.helped} помощей</p>`;emailVerificationCard(u);$('tgState').innerHTML=(linked?'<span class="badge ok">✓ Telegram привязан</span>':'<span class="badge warn">Telegram не привязан</span>')+(u.telegram_url?` <a class="btn light" href="${esc(u.telegram_url)}" target="_blank" rel="noopener">Перейти в Telegram</a>`:'');$('tgLinkButton').style.display=linked?'none':'';$('code').textContent=linked?'Подключено':u.link_code||'Код не создан';$('tgGuide').innerHTML=linked?'Сайт и бот используют один профиль. Входить можно одновременно с нескольких устройств; выход завершает только текущий сеанс.':'Получите код и отправьте в боте: <b>/link КОД</b>.';renderIdentityCard(u)}
+'''
+
+PASSWORD_CSS=r'''
+.passwordRules li.bad{color:#ff6b6b;text-decoration:underline;text-decoration-color:#ff6b6b;text-decoration-thickness:2px;text-underline-offset:3px}.passwordRules li.bad:before{color:#ff6b6b}.passwordRules li.ok{color:#b8f36b}.passwordHint.bad{color:#ff6b6b!important}.passwordHint.good{color:#b8f36b!important}.passwordField{position:relative}.passwordField .input{padding-right:48px}.passwordToggle{position:absolute;right:8px;top:50%;transform:translateY(-50%);border:0;background:transparent;color:#a9afa1;cursor:pointer;font-size:18px;line-height:1;padding:7px}.passwordToggle:hover{color:#b8f36b}
+'''
+
+PASSWORD_UI_ENHANCEMENTS=r'''
+function passwordChecks(password){return {length:password.length>=6&&password.length<=256,lower:/[a-z]/.test(password),upper:/[A-Z]/.test(password),digit:/\d/.test(password)}}
+function passwordClientProblem(password){let c=passwordChecks(password);if(!c.length)return 'Пароль должен быть от 6 до 256 символов.';if(!c.lower||!c.upper||!c.digit)return 'Нужны строчная и заглавная латинские буквы, а также цифра.';return ''}
+function updatePasswordHint(){let password=$('ap')?.value||'',checks=passwordChecks(password),items=document.querySelectorAll('#passwordRules li');items.forEach(item=>{let key=item.dataset.rule;item.classList.toggle('ok',Boolean(checks[key]));item.classList.toggle('bad',Boolean(password)&&!checks[key])});let hint=$('passwordHint');if(hint){let problem=passwordClientProblem(password);hint.textContent=password?(problem||'Пароль соответствует требованиям.'):'Введите пароль по требованиям ниже.';hint.className='passwordHint '+(password&&!problem?'good':password?'bad':'')}}
+function togglePassword(id,button){let input=$(id),visible=input.type==='text';input.type=visible?'password':'text';button.textContent=visible?'👁️':'🙈';button.setAttribute('aria-label',visible?'Показать пароль':'Скрыть пароль')}
+function decoratePasswordInput(id,autocomplete){let input=$(id);if(!input)return;let wrap=document.createElement('div');wrap.className='passwordField';input.parentNode.insertBefore(wrap,input);wrap.appendChild(input);let button=document.createElement('button');button.type='button';button.className='passwordToggle';button.textContent='👁️';button.setAttribute('aria-label','Показать пароль');button.onclick=()=>togglePassword(id,button);wrap.appendChild(button);input.autocomplete=autocomplete}
+function passwordRulesMarkup(){return '<ul id="passwordRules" class="passwordRules"><li data-rule="length">от 6 до 256 символов</li><li data-rule="lower">строчная латинская буква</li><li data-rule="upper">заглавная латинская буква</li><li data-rule="digit">хотя бы одна цифра</li></ul>'}
+const originalAuthForm=window.authForm;
+window.authForm=function(reg){originalAuthForm(reg);let body=$('modalbody'),rules=body.querySelector('.passwordRules');if(rules){rules.id='passwordRules';rules.innerHTML='<li data-rule="length">от 6 до 256 символов</li><li data-rule="lower">строчная латинская буква</li><li data-rule="upper">заглавная латинская буква</li><li data-rule="digit">хотя бы одна цифра</li>'}else{let input=$('ap');if(input){input.insertAdjacentHTML('afterend',passwordRulesMarkup());input.insertAdjacentHTML('afterend','<p id="passwordHint" class="muted passwordHint" aria-live="polite">Введите пароль по требованиям ниже.</p>')}}decoratePasswordInput('ap','current-password');if(reg)decoratePasswordInput('ap2','new-password');let input=$('ap');if(input)input.addEventListener('input',updatePasswordHint);updatePasswordHint()}
+'''
+
+ACCOUNT_ACTIONS_UI=r'''
+function showAccountActions(){let host=$('accountActions');if(!host){host=document.createElement('div');host.id='accountActions';host.className='profileActions';$('profInfo').after(host)}host.innerHTML='<button class="btn light" onclick="logout()">Выйти из аккаунта</button><button class="btn danger" onclick="deleteAccount()">Удалить аккаунт</button>'}
+async function deleteAccount(){let confirmation=prompt('Удаление необратимо: профиль, заявки, чаты и сессии будут удалены. Введите УДАЛИТЬ для подтверждения.');if(confirmation!=="УДАЛИТЬ")return;try{await api('/api/auth/account/delete',{method:'POST',body:JSON.stringify({confirmation})});stopSync();sessionStorage.removeItem('hpointTelegramLoginTicket');location.reload()}catch(e){toast(e.message)}}
+const originalProfileForAccountActions=window.profile;
+window.profile=async function(providedUser){let result=await originalProfileForAccountActions(providedUser);showAccountActions();return result}
+'''
+
+MAP_CSS=r'''
+/* H·Point open map: branded controls above the Leaflet canvas. */
+.mapToolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:13px 0}.mapToolbar .muted{font-size:12px;flex:1;min-width:220px}.mapTasks{display:grid;gap:9px;margin:0 0 14px}.mapTask{display:flex;align-items:center;gap:11px;padding:12px 14px;background:#fff;border:1px solid var(--line);border-radius:14px}.mapTaskCopy{flex:1;min-width:0}.mapTaskCopy b{display:block;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mapTaskCopy span{display:block;margin-top:3px;color:var(--muted);font-size:12px}.mapPrivacy{margin:0 0 12px;padding:12px 14px;border:1px solid #cdeefa;border-radius:14px;background:#effcff;color:#245270;font-size:12px;line-height:1.55}.candidateMapNote{margin:11px 0 0;color:var(--muted);font-size:12px;line-height:1.5}.leaflet-container{font-family:Manrope,Inter,system-ui,sans-serif;background:#eaf2f7}.leaflet-control-attribution{font-size:10px}.leaflet-popup-content{font:600 13px/1.45 Manrope,Inter,system-ui,sans-serif;margin:12px 14px}.hpointPinWrap{background:transparent!important;border:0!important}.hpointPin{display:grid;place-items:center;width:34px;height:34px;border:3px solid #fff;border-radius:50% 50% 50% 8px;transform:rotate(-45deg);box-shadow:0 5px 15px rgba(20,50,75,.25);color:#fff;font:800 16px/1 system-ui}.hpointPin>span{transform:rotate(45deg)}.hpointPin.me{background:#087bff}.hpointPin.task{background:#12a886}.hpointPin.match{background:#7058e8}.mapRouteInfo{font-size:12px;color:#245270;font-weight:700}@media(max-width:650px){.mapToolbar .btn{width:100%}.mapTask{align-items:flex-start;flex-wrap:wrap}.mapTask .btn{width:100%}.map{height:360px}}
+'''
+
+MAP_UI=r'''
+const HPOINT_MAP_CENTER=[55.751244,37.618423];
+let hpointMaps={},hpointMapLayers={},hpointMapTasks=[],hpointLastLocation=null;
+function hpointCoordinates(value){return value&&Number.isFinite(Number(value.lat))&&Number.isFinite(Number(value.lon))?{lat:Number(value.lat),lon:Number(value.lon)}:null}
+function hpointDistanceText(value){return value===null||value===undefined?'геопозиция не указана':'≈ '+Number(value).toLocaleString('ru-RU',{maximumFractionDigits:1})+' км от заявки'}
+function hpointGeoMessage(error){if(error&&error.code===1)return 'Доступ к геопозиции запрещён. Разрешите его в настройках браузера.';if(error&&error.code===2)return 'Не удалось определить местоположение.';if(error&&error.code===3)return 'Время определения местоположения истекло.';return 'Не удалось получить геопозицию.'}
+function hpointGetBrowserLocation(){return new Promise(function(resolve,reject){if(!navigator.geolocation){reject(new Error('Геолокация не поддерживается браузером.'));return}navigator.geolocation.getCurrentPosition(function(position){let point={lat:position.coords.latitude,lon:position.coords.longitude};hpointLastLocation=point;try{sessionStorage.setItem('hpointLastLocation',JSON.stringify(point))}catch(e){}resolve(point)},function(error){reject(error)},{enableHighAccuracy:true,timeout:12000,maximumAge:120000})})}
+function hpointSavedLocation(){if(hpointLastLocation)return hpointLastLocation;try{return hpointCoordinates(JSON.parse(sessionStorage.getItem('hpointLastLocation')||'null'))}catch(e){return null}}
+function hpointPin(symbol,kind){return L.divIcon({className:'hpointPinWrap',html:'<span class="hpointPin '+kind+'"><span>'+symbol+'</span></span>',iconSize:[34,34],iconAnchor:[17,30],popupAnchor:[0,-29]})}
+function hpointMap(id,key){if(!window.L){toast('Карта загружается. Повторите через секунду.');return null}let element=$(id);if(!element)return null;if(hpointMaps[key]){setTimeout(function(){hpointMaps[key].invalidateSize()},60);return hpointMaps[key]}let map=L.map(element,{zoomControl:true,attributionControl:true}).setView(HPOINT_MAP_CENTER,11);L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors'}).addTo(map);hpointMaps[key]=map;hpointMapLayers[key]=L.layerGroup().addTo(map);setTimeout(function(){map.invalidateSize()},100);return map}
+function hpointClearMap(key){let group=hpointMapLayers[key];if(group)group.clearLayers()}
+function hpointFit(map,points){if(!points.length)return;if(points.length===1){map.setView(points[0],14);return}map.fitBounds(points,{padding:[42,42],maxZoom:15})}
+function hpointAddMe(map,key,point){if(!point)return;L.marker([point.lat,point.lon],{icon:hpointPin('●','me'),zIndexOffset:500}).addTo(hpointMapLayers[key]).bindPopup('Вы здесь')}
+function hpointSetupMapPanel(){let panel=$('p-map');if(!panel||$('mapTools'))return;let intro=panel.querySelector('p');if(intro)intro.textContent='Ваша геопозиция видна только вам. Точка задачи и маршрут появляются после взаимного согласия на помощь.';let tools=document.createElement('div');tools.id='mapTools';tools.innerHTML='<div class="mapToolbar"><button class="btn light" onclick="mapLocateMe()">◎ Показать меня</button><span id="mapNotice" class="muted">Откройте геолокацию, чтобы увидеть себя на карте.</span></div><div id="mapTasks" class="mapTasks"></div>';let map=$('bigMap');map.parentNode.insertBefore(tools,map)}
+function hpointRenderMapTasks(tasks){let host=$('mapTasks');if(!host)return;host.innerHTML=tasks.length?'<p class="mapPrivacy">Точки активных заявок видны только участникам после того, как помощник подтвердил участие.</p>'+tasks.map(function(task){return '<div class="mapTask"><div class="mapTaskCopy"><b>'+esc(task.what)+'</b><span>Активная заявка · маршрут строится по вашему действию</span></div><button class="btn grad" onclick="buildRoute('+Number(task.id)+')">Построить маршрут</button></div>'}).join(''):'<p class="mapPrivacy">Сейчас нет активных заявок с подтверждённым помощником. На карте остаётся только ваша точка.</p>'}
+function hpointSetMapNotice(text){let node=$('mapNotice');if(node)node.textContent=text}
+async function mapLocateMe(){try{let point=await hpointGetBrowserLocation();hpointSetMapNotice('Ваше местоположение обновлено.');await loadBigMap()}catch(error){hpointSetMapNotice(hpointGeoMessage(error));toast(hpointGeoMessage(error))}}
+function helperGeoFallback(message,requestId){$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Поделитесь геопозицией</h2><p class="muted">Так автор заявки увидит только расстояние до вас, без вашей точки и адреса. '+esc(message)+'</p><div class="form"><button class="btn grad" onclick="helper('+(requestId?Number(requestId):'')+')">Разрешить геолокацию</button><button class="btn light" onclick="helperWithoutLocation('+(requestId?Number(requestId):'')+')">Продолжить без геолокации</button></div>'}
+async function joinHelper(position,requestId){let body=position?{lat:position.lat,lon:position.lon}:{};if(requestId)body.request_id=Number(requestId);let endpoint=requestId?'/api/requests/accept':'/api/helper/queue';let result=await api(endpoint,{method:'POST',body:JSON.stringify(body)});closeModal();toast(result.message);go('requests');await requests();return result}
+async function helper(requestId){try{toast('Запрашиваем геопозицию…');let point=await hpointGetBrowserLocation();return await joinHelper(point,requestId)}catch(error){helperGeoFallback(hpointGeoMessage(error),requestId)}}
+async function helperWithoutLocation(requestId){try{return await joinHelper(null,requestId)}catch(error){let target=$('err');if(target)target.textContent=error.message;else toast(error.message)}}
+async function acceptOpenRequest(id){return helper(Number(id))}
+function initMatchMap(){return hpointMap('mapMatch','match')}
+function hpointRenderCandidateMap(data){let map=initMatchMap();if(!map)return;hpointClearMap('match');let location=hpointCoordinates(data.request_location);if(!location){map.setView(HPOINT_MAP_CENTER,11);return}L.marker([location.lat,location.lon],{icon:hpointPin('⌂','match')}).addTo(hpointMapLayers.match).bindPopup('Ваша заявка');let distances=(data.matches||[]).map(function(candidate){return candidate.distance_km}).filter(function(distance){return distance!==null&&distance!==undefined}).sort(function(a,b){return a-b});if(distances.length){let closest=distances[0];L.circle([location.lat,location.lon],{radius:Math.max(100,closest*1000),color:'#7058e8',fillColor:'#7058e8',fillOpacity:.08,dashArray:'7 7',weight:2}).addTo(hpointMapLayers.match).bindPopup('Ближайший помощник: '+hpointDistanceText(closest)+'. Его точка скрыта до подтверждения помощи.')}hpointFit(map,[[location.lat,location.lon]]);let note=$('candidateMapNote');if(!note){note=document.createElement('p');note.id='candidateMapNote';note.className='candidateMapNote';$('mapMatch').after(note)}note.textContent=distances.length?'На карте показана ваша заявка и радиус ближайшего кандидата. Точные точки помощников не показываются до согласия.':'У кандидатов пока нет геолокации: расстояние появится, когда они разрешат доступ к ней.'}
+async function match(){if(!rid.value)return;try{let data=await api('/api/assistant/candidates',{method:'POST',body:JSON.stringify({request_id:Number(rid.value),question:$('matchQuestion').value})});if(data.offer){$('matches').innerHTML='<div class="empty">⏳ Ожидаем ответ от <b>'+esc(data.offer.name)+'</b>. После отказа можно выбрать другого кандидата.</div>';hpointRenderCandidateMap(data);return}let matches=data.matches||[];$('matches').innerHTML=matches.length?matches.map(function(candidate){return '<div class="match"><div class="avatar">'+esc((candidate.name||'?')[0])+'</div><div class="grow"><b>'+esc(candidate.name)+' '+(candidate.verified?'✓':'')+'</b><div class="muted">⭐ '+(candidate.rating||'—')+' · '+hpointDistanceText(candidate.distance_km)+' · '+candidate.reviews+' отзывов · match '+Math.round(candidate.score)+'%</div><div class="muted">'+esc((candidate.reasons||[]).join(' · '))+'</div></div><button class="btn grad" onclick="assign('+Number(rid.value)+','+Number(candidate.user_id)+')">Выбрать</button></div>'}).join(''):'<div class="empty">Сейчас в очереди нет подходящих добровольцев.</div>';hpointRenderCandidateMap(data)}catch(error){toast(error.message)}}
+async function loadBigMap(){hpointSetupMapPanel();let map=hpointMap('bigMap','big');if(!map)return;try{let data=await api('/api/map/active');hpointMapTasks=data.tasks||[];if(data.user_location)hpointLastLocation=hpointCoordinates(data.user_location)||hpointLastLocation;hpointClearMap('big');let points=[];let me=hpointSavedLocation();if(me){hpointAddMe(map,'big',me);points.push([me.lat,me.lon]);hpointSetMapNotice('Показана ваша текущая или последняя сохранённая геопозиция.')}for(let task of hpointMapTasks){let destination=hpointCoordinates(task.destination);if(!destination)continue;points.push([destination.lat,destination.lon]);L.marker([destination.lat,destination.lon],{icon:hpointPin('⌂','task')}).addTo(hpointMapLayers.big).bindPopup('Активная заявка: '+esc(task.what))}hpointFit(map,points);hpointRenderMapTasks(hpointMapTasks)}catch(error){hpointSetMapNotice('Не удалось загрузить карту: '+error.message)}}
+async function buildRoute(id){let task=hpointMapTasks.find(function(row){return Number(row.id)===Number(id)});let destination=task&&hpointCoordinates(task.destination);if(!destination){toast('У этой заявки нет геопозиции.');return}let start=null;try{start=await hpointGetBrowserLocation()}catch(error){start=hpointSavedLocation();if(!start){toast(hpointGeoMessage(error));return}}try{let url='https://router.project-osrm.org/route/v1/driving/'+start.lon+','+start.lat+';'+destination.lon+','+destination.lat+'?overview=full&geometries=geojson&steps=false';let response=await fetch(url);let data=await response.json();if(!response.ok||data.code!=='Ok'||!data.routes||!data.routes[0])throw new Error('маршрут пока недоступен');let route=data.routes[0];let map=hpointMap('bigMap','big');if(hpointMapLayers.route)hpointMapLayers.route.clearLayers();else hpointMapLayers.route=L.layerGroup().addTo(map);let routeLayer=L.geoJSON(route.geometry,{style:{color:'#087bff',weight:6,opacity:.86}}).addTo(hpointMapLayers.route);map.fitBounds(routeLayer.getBounds(),{padding:[42,42]});let km=(route.distance/1000).toLocaleString('ru-RU',{maximumFractionDigits:1});let minutes=Math.max(1,Math.round(route.duration/60));hpointSetMapNotice('Маршрут: '+km+' км · около '+minutes+' мин.')}catch(error){toast('Не удалось построить маршрут: '+error.message)}}
+'''
+
+# One account menu keeps identity-changing actions in a single, explicit place.
+# A full reload after a switch clears all rendered data and in-memory polling
+# state that belonged to the previous account.
+PROFILE_MENU_UI=r'''
+function openProfileMenu(){api('/api/me').then(function(data){let u=data.user,admin=u.role==='admin'?'<button class="btn grad" onclick="openAdminSupport()">Панель администратора</button>':'';$('modal').style.display='flex';$('modalbody').innerHTML='<h2>'+esc(u.name)+'</h2><p class="muted">'+esc(u.email||'Профиль Telegram')+'</p><div class="profileActions"><button class="btn grad" onclick="closeModal();go(\'profile\')">Мой профиль</button>'+admin+'<button class="btn light" onclick="openProfiles()">Сменить аккаунт</button><button class="btn light" onclick="closeModal();authForm(true)">Добавить аккаунт</button><button class="btn light" onclick="logout()">Выйти из аккаунта</button><button class="btn danger" onclick="deleteAccount()">Удалить аккаунт</button></div>'}).catch(function(e){toast(e.message)})}
+async function switchProfile(id){try{stopSync();await api('/api/profiles/switch',{method:'POST',body:JSON.stringify({user_id:id})});sessionStorage.removeItem('hpointLastLocation');sessionStorage.removeItem('hpointTelegramLoginTicket');location.replace('/')}catch(e){toast(e.message)}}
+const originalLoadForProfileMenu=window.load;
+window.load=async function(){await originalLoadForProfileMenu();let nav=$('nav');if(nav)nav.innerHTML='<button class="btn light" onclick="openSupport()">Поддержка</button><button class="btn light" onclick="openProfileMenu()">👤 Профиль</button><button class="btn dark" onclick="requestForm()">+ Заявка</button>'}
+'''
+
+SUPPORT_UI=r'''
+function openSupport(){$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Поддержка</h2><div class="form"><input id="supportSubject" class="input" maxlength="120" placeholder="Тема вопроса"><textarea id="supportMessage" class="input textarea" maxlength="2000" placeholder="Опишите проблему"></textarea><button class="btn grad" onclick="createSupportTicket()">Отправить</button></div><div id="supportTickets" style="margin-top:18px"></div>';loadSupportTickets()}
+async function createSupportTicket(){try{await api('/api/support',{method:'POST',body:JSON.stringify({subject:$('supportSubject').value,message:$('supportMessage').value})});toast('Обращение отправлено');await loadSupportTickets()}catch(e){toast(e.message)}}
+async function loadSupportTickets(){try{let data=await api('/api/support');let host=$('supportTickets');if(host)host.innerHTML=(data.tickets||[]).map(function(ticket){return '<div class="request"><div class="requestmain"><b>'+esc(ticket.subject)+'</b><div class="muted">'+esc(ticket.message)+'</div>'+ (ticket.admin_reply?'<p><b>Ответ поддержки:</b> '+esc(ticket.admin_reply)+'</p>':'<span class="badge warn">Ожидает ответа</span>')+'</div></div>'}).join('')||'<p class="muted">Обращений пока нет.</p>'}catch(e){toast(e.message)}}
+async function openAdminSupport(){try{let data=await api('/api/admin/support'),open=(data.summary.requests||{}).open||0;$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Панель поддержки</h2><p class="muted">Пользователей: '+Number(data.summary.users||0)+' · открытых заявок: '+Number(open)+'</p><div id="adminTickets">'+data.tickets.map(function(ticket){return '<div class="request"><div class="requestmain"><b>#'+ticket.id+' · '+esc(ticket.subject)+'</b><div class="muted">'+esc(ticket.user_name)+' · '+esc(ticket.user_email||'')+'</div><p>'+esc(ticket.message)+'</p><textarea id="reply'+ticket.id+'" class="input textarea" placeholder="Ответ пользователю">'+esc(ticket.admin_reply||'')+'</textarea><button class="btn grad" onclick="replySupport('+ticket.id+')">Ответить</button></div></div>'}).join('')+'</div>'}catch(e){toast(e.message)}}
+async function replySupport(id){try{await api('/api/admin/support/reply',{method:'POST',body:JSON.stringify({ticket_id:id,message:$('reply'+id).value})});toast('Ответ сохранён');openAdminSupport()}catch(e){toast(e.message)}}
+'''
+
+PASSWORD_RESET_UI=r'''
+function openPasswordReset(){ $('modal').style.display='flex';$('modalbody').innerHTML='<h2>Восстановить пароль</h2><p class="muted">Введите email. Если аккаунт существует, код придёт на эту почту.</p><div class="form"><input id="resetEmail" class="input" type="email" autocomplete="email" placeholder="Email"><button class="btn grad" onclick="requestPasswordReset()">Получить код</button><div id="err" class="muted"></div></div>' }
+async function requestPasswordReset(){try{await api('/api/auth/password/reset/request',{method:'POST',body:JSON.stringify({email:$('resetEmail').value})});$('modalbody').innerHTML='<h2>Новый пароль</h2><p class="muted">Введите код из письма и новый пароль.</p><div class="form"><input id="resetCode" class="input" inputmode="numeric" maxlength="6" placeholder="Код из письма"><input id="resetPassword" class="input" type="password" placeholder="Новый пароль"><input id="resetConfirm" class="input" type="password" placeholder="Повторите пароль"><button class="btn grad" onclick="confirmPasswordReset()">Сохранить пароль</button><div id="err" class="muted"></div></div>'}catch(e){$('err').textContent=e.message}}
+async function confirmPasswordReset(){let password=$('resetPassword').value,problem=passwordClientProblem(password);if(problem){$('err').textContent=problem;return}try{await api('/api/auth/password/reset/confirm',{method:'POST',body:JSON.stringify({email:$('resetEmail')?.value||window.__resetEmail,code:$('resetCode').value,password:password,password_confirm:$('resetConfirm').value})});closeModal();toast('Пароль изменён. Войдите с новым паролем.');authForm(false)}catch(e){$('err').textContent=e.message}}
+const originalRequestPasswordReset=requestPasswordReset;requestPasswordReset=async function(){window.__resetEmail=$('resetEmail').value;return originalRequestPasswordReset()}
+const originalAuthFormWithReset=window.authForm;window.authForm=function(reg){originalAuthFormWithReset(reg);if(!reg){let error=$('err');if(error)error.insertAdjacentHTML('beforebegin','<button class="btn light" type="button" onclick="openPasswordReset()">Забыли пароль?</button>')}}
+'''
+
+ADMIN_DASHBOARD_CSS=r'''
+/* Administrator workspace */
+.adminWorkspace{width:min(1180px,100%);max-width:1180px;padding:28px;background:#11140f;color:#edf0e7}
+.adminWorkspace .close{color:#edf0e7}.adminWorkspace h2{margin:0;font-size:30px}.adminTop{display:flex;gap:18px;align-items:flex-start;justify-content:space-between;padding-bottom:20px;border-bottom:1px solid #394035}.adminKicker{margin:0 0 6px;color:#b8f36b;font:700 10px 'Space Mono',monospace;letter-spacing:.14em}.adminSub{margin:8px 0 0;color:#a9afa1;font-size:13px}.adminRefresh{white-space:nowrap}.adminMetrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:19px 0}.adminMetric{padding:15px;border:1px solid #394035;background:#171a14}.adminMetric b{display:block;font-size:26px;letter-spacing:-.06em;color:#dfffb0}.adminMetric span{display:block;margin-top:6px;color:#a9afa1;font-size:11px}.adminGrid{display:grid;grid-template-columns:1.2fr .8fr;gap:12px}.adminCard{min-width:0;padding:18px;border:1px solid #394035;background:#171a14}.adminCard h3{margin:0 0 14px;font-size:16px}.adminChart{display:flex;align-items:flex-end;gap:5px;height:170px;padding-top:16px;border-bottom:1px solid #394035}.adminBar{flex:1;min-width:12px;position:relative;height:100%;display:flex;align-items:flex-end}.adminBar i{display:block;width:100%;min-height:4px;background:#b8f36b}.adminBar b{position:absolute;bottom:calc(100% + 5px);left:50%;transform:translateX(-50%);font-size:10px;color:#dfe5d9}.adminChartLabels{display:flex;justify-content:space-between;gap:5px;margin-top:8px;color:#899184;font:10px 'Space Mono',monospace}.adminTable{display:grid;gap:7px}.adminUser{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid #30362d}.adminUser:last-child{border-bottom:0}.adminUserCopy{min-width:0;flex:1}.adminUserCopy b,.adminUserCopy span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.adminUserCopy span{margin-top:3px;color:#a9afa1;font-size:11px}.adminState{display:flex;gap:5px;flex-wrap:wrap}.adminState .badge{font-size:9px}.adminUserActions{display:flex;gap:7px;flex-wrap:wrap}.adminUserActions .btn{padding:8px 11px;font-size:10px}.adminTickets{display:grid;gap:10px;max-height:470px;overflow:auto;padding-right:3px}.adminTicket{padding:14px;border:1px solid #394035;background:#11140f}.adminTicket h4{margin:0 0 5px;font-size:14px}.adminTicket p{margin:9px 0;color:#d6dcd1;font-size:12px;line-height:1.55;white-space:pre-wrap}.adminTicket small{color:#a9afa1}.adminTicket textarea{margin-top:8px;min-height:76px}.adminTicket .btn{margin-top:8px;padding:9px 13px;font-size:11px}.adminActivity{display:grid;gap:7px;max-height:430px;overflow:auto}.adminActivityItem{display:flex;gap:9px;align-items:flex-start;padding:9px 0;border-bottom:1px solid #30362d}.adminActivityItem:last-child{border-bottom:0}.adminActivityDot{width:8px;height:8px;flex:0 0 auto;margin-top:5px;background:#b8f36b}.adminActivityItem b{display:block;font-size:12px}.adminActivityItem span{display:block;margin-top:3px;color:#a9afa1;font-size:11px}.adminSearch{display:flex;gap:8px;margin:-1px 0 11px}.adminSearch .input{min-width:0}.adminEmpty{padding:20px 0;color:#a9afa1;font-size:12px}.adminWorkspace .danger{color:#ffc8bf;border-color:#8f4137}.adminWorkspace .input{background:#10120f;color:#edf0e7;border-color:#444b40}
+@media(max-width:900px){.adminMetrics{grid-template-columns:repeat(3,minmax(0,1fr))}.adminGrid{grid-template-columns:1fr}.adminWorkspace{max-height:94vh;padding:22px 16px}}
+@media(max-width:600px){.adminTop{align-items:flex-start;flex-direction:column;gap:12px}.adminMetrics{grid-template-columns:repeat(2,minmax(0,1fr))}.adminMetric b{font-size:23px}.adminWorkspace h2{font-size:25px}.adminUser{align-items:flex-start;flex-wrap:wrap}.adminUserActions{width:100%}.adminUserActions .btn{flex:1}.adminSearch{flex-direction:column}.adminSearch .btn{width:100%}.adminChart{height:135px}.adminCard{padding:14px}}
+'''
+
+CONTACT_VERIFICATION_CSS=r'''
+.contactVerification{grid-column:1/-1}.contactVerification h2{margin:0}.contactLead{margin:8px 0 18px;max-width:760px;line-height:1.6}.contactChecks{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:16px 0}.contactCheck{padding:12px;border:1px solid #394035;background:#11140f;color:#a9afa1;font-size:12px}.contactCheck.ok{border-color:#53723c;background:#1d2918;color:#d5ff8a}.contactCheck b{display:block;margin-bottom:4px;color:#edf0e7}.contactForm{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:12px}.contactForm .contactWide{grid-column:1/-1}.contactActions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.contactHint{margin:10px 0 0;font-size:12px;line-height:1.55}.phoneVerify{display:flex;gap:8px;align-items:center;margin-top:10px}.phoneVerify .input{max-width:190px;letter-spacing:.16em}@media(max-width:700px){.contactChecks,.contactForm{grid-template-columns:1fr}.contactForm .contactWide{grid-column:auto}.phoneVerify{align-items:stretch;flex-direction:column}.phoneVerify .input{max-width:none}.contactVerification{grid-column:auto}}.modal.adminModal{align-items:flex-start;overflow:auto;padding:30px 20px}.modal.adminModal>.box.adminShell{position:relative;width:min(1280px,100%);max-width:1280px;max-height:none;overflow:visible;margin:auto;padding:0;background:#11140f}.modal.adminModal>.box.adminShell>.close{position:absolute;z-index:4;right:18px;top:14px;float:none;padding:4px 10px;color:#edf0e7}.adminWorkspace{padding:32px;min-width:0}.adminWorkspace .adminCharts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.adminWorkspace .adminChart{overflow:hidden}.adminWorkspace .adminActivity{max-height:360px}.adminWorkspace .adminTickets{max-height:560px}@media(max-width:900px){.modal.adminModal{padding:12px}.modal.adminModal>.box.adminShell{width:100%}.adminWorkspace{padding:24px 18px}.adminWorkspace .adminCharts{grid-template-columns:1fr}}@media(max-width:600px){.adminWorkspace{padding:20px 14px}.modal.adminModal>.box.adminShell>.close{right:7px;top:8px}.adminWorkspace .adminTop{padding-right:42px}.adminWorkspace .adminCharts{grid-template-columns:1fr}.adminWorkspace .adminMetrics{grid-template-columns:repeat(2,minmax(0,1fr)}}
+'''
+
+EVENTS_CSS=r'''
+.activitiesHead{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}.activitiesHead h2{margin:0}.activitiesHead p{margin:7px 0 0;max-width:680px}.eventsList{display:grid;gap:14px}.eventCard{position:relative;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:16px;align-items:start;padding:20px;border:1px solid #3a4035;background:#171a14}.eventDate{width:74px;padding:10px 7px;text-align:center;border:1px solid #566050;background:#1e2919;color:#d5ff8a}.eventDate b{display:block;font:700 21px 'Space Mono',monospace}.eventDate span{display:block;margin-top:4px;font-size:10px;text-transform:uppercase}.eventCopy{min-width:0}.eventCopy h3{margin:0;font-size:20px}.eventMeta{display:flex;gap:8px;flex-wrap:wrap;margin:9px 0;color:#c7cec1;font-size:12px}.eventDescription{margin:0;color:#aeb6a8;line-height:1.62;white-space:pre-wrap}.eventActions{display:grid;gap:8px;justify-items:stretch;min-width:132px}.eventActions .btn{padding:10px 12px;font-size:11px}.eventCapacity{font:700 10px 'Space Mono',monospace;color:#b8f36b;text-align:center}.eventEmpty{padding:46px 22px;border:1px dashed #4b5447;text-align:center;color:#a9afa1}.eventFormNote{margin:0;font-size:12px;line-height:1.5}.eventFormError{min-height:20px;margin:0;color:#ff8477;font-size:13px;line-height:1.45}@media(max-width:680px){.activitiesHead{align-items:stretch;flex-direction:column}.activitiesHead .btn{width:100%}.eventCard{grid-template-columns:58px minmax(0,1fr);gap:12px;padding:15px}.eventDate{width:58px;padding:8px 4px}.eventDate b{font-size:18px}.eventCopy h3{font-size:17px}.eventActions{grid-column:1/-1;grid-template-columns:1fr 1fr;width:100%}.eventActions .eventCapacity{grid-column:1/-1}.eventActions .btn:only-child{grid-column:1/-1}}
+'''
+
+ADMIN_DASHBOARD_UI=r'''
+function adminDate(value,withTime=true){if(!value)return 'нет данных';let date=new Date(value);if(Number.isNaN(date.getTime()))return String(value);return date.toLocaleString('ru-RU',withTime?{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}:{day:'2-digit',month:'short'})}
+function adminMetric(value,label){return '<div class="adminMetric"><b>'+Number(value||0).toLocaleString('ru-RU')+'</b><span>'+esc(label)+'</span></div>'}
+function adminChart(series,key,label){let values=series.map(function(point){return Number(point[key]||0)}),max=Math.max(1,...values);return '<div class="adminCard"><h3>'+esc(label)+'</h3><div class="adminChart">'+series.map(function(point){let value=Number(point[key]||0),height=Math.max(4,Math.round(value/max*100));return '<div class="adminBar" title="'+esc(point.date)+': '+value+'"><i style="height:'+height+'%"></i><b>'+value+'</b></div>'}).join('')+'</div><div class="adminChartLabels"><span>'+esc(series[0]?.date?.slice(5)||'')+'</span><span>'+esc(series.at(-1)?.date?.slice(5)||'')+'</span></div></div>'}
+function adminUserRow(user){let states=(user.telegram_linked?'<span class="badge ok">Telegram</span>':'')+(user.email_verified?'<span class="badge ok">email</span>':'')+(user.blocked?'<span class="badge warn">заблокирован</span>':'')+(user.role==='admin'?'<span class="badge">админ</span>':'');let safety=user.role==='admin'?'':user.blocked?'<button class="btn light" onclick="adminSetBlock('+Number(user.id)+',false)">Разблокировать</button>':'<button class="btn danger" onclick="adminSetBlock('+Number(user.id)+',true)">Ограничить</button>';return '<div class="adminUser"><div class="avatar">'+esc((user.name||'?')[0])+'</div><div class="adminUserCopy"><b>'+esc(user.name)+'</b><span>'+esc(user.email||'Email не указан')+' · '+esc(user.city||'Город не указан')+'</span><span>Последняя активность: '+esc(adminDate(user.last_seen_at))+' · заявок: '+Number(user.request_count||0)+' · активных: '+Number(user.active_request_count||0)+'</span><div class="adminState">'+states+'</div></div><div class="adminUserActions">'+safety+'</div></div>'}
+function adminTicketRow(ticket){return '<article class="adminTicket"><h4>#'+Number(ticket.id)+' · '+esc(ticket.subject)+'</h4><small>'+esc(ticket.user_name)+' · '+esc(ticket.user_email||'без email')+' · '+esc(adminDate(ticket.created_at))+'</small><p>'+esc(ticket.message)+'</p>'+(ticket.admin_reply?'<p><b>Ваш ответ:</b> '+esc(ticket.admin_reply)+'</p>':'')+'<textarea id="adminReply'+Number(ticket.id)+'" class="input textarea" maxlength="2000" placeholder="Ответ пользователю">'+esc(ticket.admin_reply||'')+'</textarea><button class="btn grad" onclick="replySupport('+Number(ticket.id)+',true)">Сохранить ответ</button></article>'}
+function adminActivityRow(item){let action=item.kind==='request'&&['open','in_progress'].includes(item.status)?'<button class="btn light" onclick="adminCancelRequest('+Number(item.target_id)+')">Закрыть</button>':'';return '<div class="adminActivityItem"><i class="adminActivityDot"></i><div class="grow"><b>'+esc(item.title)+'</b><span>'+esc(item.meta)+' · '+esc(adminDate(item.at))+'</span></div>'+action+'</div>'}
+function renderAdminDashboard(data){let summary=data.summary||{},series=data.series||[],users=data.users||[],tickets=data.tickets||[],activities=data.activities||[];$('modal').style.display='flex';$('modalbody').className='box adminWorkspace';$('modalbody').innerHTML='<div class="adminTop"><div><p class="adminKicker">H·POINT · ADMIN</p><h2>Управление сообществом</h2><p class="adminSub">Статистика, обращения и доступ пользователей. Обновлено: '+esc(adminDate(new Date().toISOString()))+'</p></div><button class="btn light adminRefresh" onclick="openAdminSupport()">Обновить</button></div><div class="adminMetrics">'+adminMetric(summary.users,'Всего пользователей')+adminMetric(summary.active_24h,'Активны за 24 часа')+adminMetric(summary.active_7d,'Активны за 7 дней')+adminMetric((summary.requests||{}).open,'Открытые заявки')+adminMetric((summary.support||{}).open,'Ожидают ответа')+'</div><div class="adminGrid"><section class="adminCard"><h3>Динамика за 14 дней</h3><div class="adminGrid">'+adminChart(series,'users','Регистрации')+adminChart(series,'requests','Новые заявки')+'</div></section><section class="adminCard"><h3>Последняя активность</h3><div class="adminActivity">'+(activities.map(adminActivityRow).join('')||'<p class="adminEmpty">Событий пока нет.</p>')+'</div></section><section class="adminCard"><h3>Пользователи</h3><div class="adminSearch"><input id="adminUserSearch" class="input" maxlength="80" placeholder="Имя или email"><button class="btn light" onclick="adminSearchUsers()">Найти</button></div><div class="adminTable">'+(users.map(adminUserRow).join('')||'<p class="adminEmpty">Пользователи не найдены.</p>')+'</div></section><section class="adminCard"><h3>Обращения в поддержку</h3><div class="adminTickets">'+(tickets.map(adminTicketRow).join('')||'<p class="adminEmpty">Обращений пока нет.</p>')+'</div></section></div>';}
+function closeAdminPanel(){$('modalbody').className='box';closeModal()}
+async function openAdminSupport(query){try{let suffix=query?'?q='+encodeURIComponent(query):'';let data=await api('/api/admin/dashboard'+suffix);renderAdminDashboard(data)}catch(e){toast(e.message||'Не удалось открыть панель администратора')}}
+async function adminSearchUsers(){return openAdminSupport(($('adminUserSearch')?.value||'').trim())}
+async function replySupport(id,fromDashboard){try{let field=$('adminReply'+Number(id))||$('reply'+Number(id));await api('/api/admin/support/reply',{method:'POST',body:JSON.stringify({ticket_id:Number(id),message:field?.value||''})});toast('Ответ отправлен пользователю');if(fromDashboard)openAdminSupport();else openAdminSupport()}catch(e){toast(e.message)}}
+async function adminSetBlock(id,blocked){let reason='';if(blocked){reason=prompt('Укажите причину ограничения доступа:')||'';if(!reason.trim()){toast('Укажите причину ограничения.');return}}try{await api('/api/admin/users/block',{method:'POST',body:JSON.stringify({user_id:Number(id),blocked:Boolean(blocked),reason:reason})});toast(blocked?'Доступ ограничен':'Доступ восстановлен');openAdminSupport()}catch(e){toast(e.message)}}
+async function adminCancelRequest(id){let reason=prompt('Причина закрытия заявки:');if(reason===null)return;try{await api('/api/admin/requests/cancel',{method:'POST',body:JSON.stringify({request_id:Number(id),reason:reason})});toast('Заявка закрыта');openAdminSupport()}catch(e){toast(e.message)}}
+'''
+
+ADMIN_MODAL_FIXES=r'''
+const hpointBaseCloseModal=window.closeModal;
+window.closeModal=function(){let modal=$('modal'),shell=modal&&modal.firstElementChild;if(modal)modal.classList.remove('adminModal');if(shell)shell.className='box';let body=$('modalbody');if(body)body.className='';return hpointBaseCloseModal()}
+function closeAdminPanel(){closeModal()}
+function renderAdminDashboard(data){let summary=data.summary||{},series=data.series||[],users=data.users||[],tickets=data.tickets||[],activities=data.activities||[],modal=$('modal'),shell=modal.firstElementChild,body=$('modalbody');modal.classList.add('adminModal');shell.className='box adminShell';body.className='adminWorkspace';modal.style.display='flex';body.innerHTML='<div class="adminTop"><div><p class="adminKicker">H·POINT · ADMIN</p><h2>Управление сообществом</h2><p class="adminSub">Статистика, обращения и доступ пользователей. Обновлено: '+esc(adminDate(new Date().toISOString()))+'</p></div><button class="btn light adminRefresh" onclick="openAdminSupport()">Обновить</button></div><div class="adminMetrics">'+adminMetric(summary.users,'Всего пользователей')+adminMetric(summary.active_24h,'Активны за 24 часа')+adminMetric(summary.active_7d,'Активны за 7 дней')+adminMetric((summary.requests||{}).open,'Открытые заявки')+adminMetric((summary.support||{}).open,'Ожидают ответа')+'</div><div class="adminGrid"><section class="adminCard"><h3>Динамика за 14 дней</h3><div class="adminCharts">'+adminChart(series,'users','Регистрации')+adminChart(series,'requests','Новые заявки')+'</div></section><section class="adminCard"><h3>Последняя активность</h3><div class="adminActivity">'+(activities.map(adminActivityRow).join('')||'<p class="adminEmpty">Событий пока нет.</p>')+'</div></section><section class="adminCard"><h3>Пользователи</h3><div class="adminSearch"><input id="adminUserSearch" class="input" maxlength="80" placeholder="Имя или email"><button class="btn light" onclick="adminSearchUsers()">Найти</button></div><div class="adminTable">'+(users.map(adminUserRow).join('')||'<p class="adminEmpty">Пользователи не найдены.</p>')+'</div></section><section class="adminCard"><h3>Обращения в поддержку</h3><div class="adminTickets">'+(tickets.map(adminTicketRow).join('')||'<p class="adminEmpty">Обращений пока нет.</p>')+'</div></section></div>'}
+'''
+
+CONTACT_VERIFICATION_UI=r'''
+function contactStatus(ok,title,text){return '<div class="contactCheck '+(ok?'ok':'')+'"><b>'+(ok?'✓ ':'○ ')+esc(title)+'</b><span>'+esc(text)+'</span></div>'}
+function contactVerificationCard(u){let host=document.querySelector('#p-profile .profileGrid'),card=$('identityCard');if(!host)return;if(!card){card=document.createElement('section');card.id='identityCard';host.appendChild(card)}card.className='card identityCard contactVerification';let personal=Boolean((u.full_name||'').trim()&&u.birth_date),email=Boolean(u.email_verified),phone=Boolean(u.phone_verified),telegram=Boolean(u.tg_linked),ready=personal&&email&&phone&&telegram;let birth=u.birth_date||'',number=u.phone||'',sms=u.sms_delivery_configured;let phoneAction=phone?'<span class="badge ok">✓ Телефон подтверждён</span>':sms?'<button class="btn light" type="button" onclick="sendPhoneCode()">Получить SMS-код</button>':'<span class="badge warn">SMS ещё не подключены</span>';card.innerHTML='<h2>Проверка контактов</h2><p class="muted contactLead">Заполните данные и подтвердите контакты кодами. Проверка выполняется автоматически: ручное рассмотрение не требуется. Эти данные не показываются в заявках.</p><div class="contactChecks">'+contactStatus(personal,'Данные профиля',personal?'заполнены':'укажите имя и дату рождения')+contactStatus(email,'Email',email?'подтверждён':'подтвердите кодом из письма')+contactStatus(telegram,'Telegram',telegram?'привязан':'привяжите через бота')+contactStatus(phone,'Телефон',phone?'подтверждён':sms?'подтвердите SMS-кодом':'нужно подключить SMS')+'</div>'+(ready?'<span class="badge ok">✓ Контакты подтверждены</span>':'')+'<div class="contactForm"><label><span class="muted">Имя и фамилия</span><input id="contactFullName" class="input" maxlength="120" autocomplete="name" value="'+esc(u.full_name||'')+'" placeholder="Иван Петров"></label><label><span class="muted">Дата рождения</span><input id="contactBirthDate" class="input" type="date" value="'+esc(birth)+'"></label><label class="contactWide"><span class="muted">Телефон</span><input id="contactPhone" class="input" inputmode="tel" autocomplete="tel" maxlength="20" value="'+esc(number)+'" placeholder="+7 999 123-45-67"></label></div><div class="contactActions"><button class="btn grad" type="button" onclick="saveContactDetails()">Сохранить данные</button>'+(email?'<span class="badge ok">✓ Email подтверждён</span>':'<button class="btn light" type="button" onclick="showEmailVerification()">Подтвердить email</button>')+(telegram?'<span class="badge ok">✓ Telegram привязан</span>':'<button class="btn light" type="button" onclick="linkcode()">Получить код Telegram</button>')+phoneAction+'</div>'+(sms&&!phone?'<div id="phoneVerify" class="phoneVerify" style="display:none"><input id="phoneCode" class="input" inputmode="numeric" maxlength="6" placeholder="Код из SMS"><button class="btn grad" type="button" onclick="verifyPhoneCode()">Подтвердить телефон</button></div>':'')+'<p id="contactNotice" class="muted contactHint">'+(!sms&&!phone?'SMS-подтверждение станет доступно после подключения провайдера на сервере.':'')+'</p>'}
+async function saveContactDetails(){let note=$('contactNotice');try{await api('/api/profile/contacts',{method:'POST',body:JSON.stringify({full_name:$('contactFullName').value,birth_date:$('contactBirthDate').value,phone:$('contactPhone').value})});note.textContent='Данные сохранены. Подтвердите контакты кодами.';await profile()}catch(error){note.textContent=error.message}}
+async function sendPhoneCode(){let note=$('contactNotice');try{await api('/api/profile/phone/send-code',{method:'POST',body:'{}'});let field=$('phoneVerify');if(field)field.style.display='flex';note.textContent='Код отправлен в SMS. Он действует 10 минут.'}catch(error){note.textContent=error.message}}
+async function verifyPhoneCode(){let note=$('contactNotice');try{await api('/api/profile/phone/verify',{method:'POST',body:JSON.stringify({code:$('phoneCode').value.trim()})});toast('Телефон подтверждён');await profile()}catch(error){note.textContent=error.message}}
+// Replaces the older manual-review card.  It is intentionally defined last so
+// every profile refresh uses the automatic contact check above.
+function renderIdentityCard(u){contactVerificationCard(u)}
+'''
+
+EVENTS_UI=r'''
+function ensureActivitiesPanel(){let tabs=document.querySelector('.tabs'),app=$('app');if(!tabs||!app)return;if(!document.querySelector('[data-t="activities"]')){let tab=document.createElement('button');tab.className='tab';tab.dataset.t='activities';tab.textContent='Активности';tab.onclick=function(){go('activities')};let profile=document.querySelector('[data-t="profile"]');tabs.insertBefore(tab,profile||null)}if(!$('p-activities')){let panel=document.createElement('section');panel.id='p-activities';panel.className='panel';panel.innerHTML='<div class="activitiesHead"><div><span class="ey">СООБЩЕСТВО</span><h2>Активности рядом</h2><p class="muted">Создавайте турниры, встречи, мастер-классы и любые полезные события для района.</p></div><button class="btn grad" onclick="activityForm()">+ Новое мероприятие</button></div><div id="eventsList" class="eventsList"></div>';app.appendChild(panel)}}
+function eventDateParts(value){let date=new Date(value);if(Number.isNaN(date.getTime()))return {day:'—',month:'',full:'Дата уточняется'};return {day:String(date.getDate()).padStart(2,'0'),month:date.toLocaleDateString('ru-RU',{month:'short'}).replace('.',''),full:date.toLocaleString('ru-RU',{weekday:'short',day:'numeric',month:'long',hour:'2-digit',minute:'2-digit'})}}
+function eventTimeRange(event){let start=eventDateParts(event.starts_at).full;if(!event.ends_at)return start;let end=new Date(event.ends_at);if(Number.isNaN(end.getTime()))return start;return start+' — '+end.toLocaleString('ru-RU',{day:'numeric',month:'long',hour:'2-digit',minute:'2-digit'})}
+function eventCard(event){let date=eventDateParts(event.starts_at),full=Number(event.capacity||0)>0&&Number(event.participant_count)>=Number(event.capacity),capacity=Number(event.capacity||0)>0?Number(event.participant_count)+' / '+Number(event.capacity)+' мест':Number(event.participant_count)+' участников';let action=event.status!=='published'?'<span class="muted">Архив</span>':event.is_creator?'<button class="btn danger" onclick="cancelEvent('+Number(event.id)+')">Отменить</button>':event.joined?'<button class="btn light" onclick="leaveEvent('+Number(event.id)+')">Не участвовать</button>':full?'<button class="btn light" disabled>Мест нет</button>':'<button class="btn grad" onclick="joinEvent('+Number(event.id)+')">Участвовать</button>';let status=event.status!=='published'?'<span class="badge warn">Отменено</span>':'';return '<article class="eventCard"><div class="eventDate"><b>'+esc(date.day)+'</b><span>'+esc(date.month)+'</span></div><div class="eventCopy"><h3>'+esc(event.title)+' '+status+'</h3><div class="eventMeta"><span>◷ '+esc(eventTimeRange(event))+'</span><span>⌖ '+esc(event.place)+'</span><span>Организатор: '+esc(event.creator_name)+'</span></div>'+(event.description?'<p class="eventDescription">'+esc(event.description)+'</p>':'')+'</div><div class="eventActions"><span class="eventCapacity">'+esc(capacity)+'</span>'+action+'</div></article>'}
+async function loadActivities(mine){ensureActivitiesPanel();let host=$('eventsList');if(!host)return;host.innerHTML='<div class="eventEmpty">Загружаем мероприятия…</div>';try{let data=await api('/api/events'+(mine?'?mine=1':''));host.innerHTML=data.events.length?data.events.map(eventCard).join(''):'<div class="eventEmpty"><b>Пока нет ближайших мероприятий.</b><br>Создайте первое событие для своего района.</div>'}catch(error){host.innerHTML='<div class="eventEmpty">Не удалось загрузить мероприятия: '+esc(error.message)+'</div>'}}
+function activityForm(){$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Новое мероприятие</h2><p class="muted eventFormNote">Место и описание видны пользователям раздела «Активности». Контакты организатора не публикуются.</p><div class="form" style="margin-top:16px"><input id="eventTitle" class="input" maxlength="120" placeholder="Например: Турнир по настольному теннису"><input id="eventPlace" class="input" maxlength="180" placeholder="Место: парк, клуб, адрес или ориентир"><label class="muted">Начало<input id="eventStart" class="input" type="datetime-local" style="margin-top:5px"></label><label class="muted">Окончание, если известно<input id="eventEnd" class="input" type="datetime-local" style="margin-top:5px"></label><input id="eventCapacity" class="input" type="number" min="2" max="1000" inputmode="numeric" placeholder="Количество мест, если ограничено"><textarea id="eventDescription" class="input textarea" maxlength="2000" placeholder="Расскажите, что будет на мероприятии и что взять с собой"></textarea><button id="publishEventButton" class="btn grad" type="button" data-create-event>Опубликовать мероприятие</button><p id="eventError" class="eventFormError" role="alert"></p></div>'}
+function eventIso(id){let value=$(id).value;if(!value)return '';let date=new Date(value);return Number.isNaN(date.getTime())?'':date.toISOString()}
+async function createEvent(){let error=$('eventError'),title=$('eventTitle').value.trim(),place=$('eventPlace').value.trim(),starts=eventIso('eventStart');error.textContent='';if(title.length<3){error.textContent='Название должно содержать минимум 3 символа.';return}if(place.length<2){error.textContent='Укажите место проведения.';return}if(!starts){error.textContent='Укажите дату и время начала.';return}try{await api('/api/events',{method:'POST',body:JSON.stringify({title:title,place:place,starts_at:starts,ends_at:eventIso('eventEnd'),capacity:$('eventCapacity').value,description:$('eventDescription').value})});closeModal();toast('Мероприятие опубликовано');go('activities');await loadActivities()}catch(exception){error.textContent=exception.message;toast('Не удалось опубликовать мероприятие')}}
+async function joinEvent(id){try{let data=await api('/api/events/join',{method:'POST',body:JSON.stringify({event_id:Number(id)})});toast(data.message);await loadActivities()}catch(error){toast(error.message)}}
+async function leaveEvent(id){if(!confirm('Отменить участие в мероприятии?'))return;try{let data=await api('/api/events/leave',{method:'POST',body:JSON.stringify({event_id:Number(id)})});toast(data.message);await loadActivities()}catch(error){toast(error.message)}}
+async function cancelEvent(id){if(!confirm('Отменить мероприятие? Участники больше не смогут записаться.'))return;try{let data=await api('/api/events/cancel',{method:'POST',body:JSON.stringify({event_id:Number(id)})});toast(data.message);await loadActivities()}catch(error){toast(error.message)}}
+const hpointBaseGoForActivities=window.go;window.go=function(tab){ensureActivitiesPanel();hpointBaseGoForActivities(tab);if(tab==='activities')loadActivities()};ensureActivitiesPanel();
+'''
+
+PROGRESS_CSS=r'''
+.progressGrid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.progressMetric{padding:18px;border:1px solid #3a4035;background:#171a14}.progressMetric b{display:block;color:#cfff73;font-size:28px}.categoryBar{display:grid;grid-template-columns:minmax(110px,1fr) 3fr 45px;gap:10px;align-items:center;margin:12px 0}.categoryBar i{height:10px;background:#b8f36b;display:block}.eventPhoto{width:112px;height:84px;object-fit:cover;border:1px solid #4a5146}.donationCard{margin-top:30px;padding:18px;border:1px dashed #566050;color:#a9afa1;font-size:13px}.donationCard a{color:#cfff73}@media(max-width:650px){.progressGrid{grid-template-columns:repeat(2,1fr)}.eventPhoto{grid-column:1/-1;width:100%;height:180px}.categoryBar{grid-template-columns:105px 1fr 38px}}
+'''
+PROGRESS_UI=r'''
+function ensureProgressPanel(){let tabs=document.querySelector('.tabs'),app=$('app');if(!tabs||!app)return;if(!document.querySelector('[data-t="progress"]')){let tab=document.createElement('button');tab.className='tab';tab.dataset.t='progress';tab.textContent='Прогресс';tab.onclick=function(){go('progress')};let profile=document.querySelector('[data-t="profile"]');tabs.insertBefore(tab,profile||null)}if(!$('p-progress')){let panel=document.createElement('section');panel.id='p-progress';panel.className='panel';panel.innerHTML='<span class="ey">СООБЩЕСТВО</span><h2>Прогресс H-Point</h2><p class="muted">Общая открытая статистика по заявкам и категориям.</p><div id="progressData"></div>';app.appendChild(panel)}}
+async function loadProgress(){ensureProgressPanel();let host=$('progressData');host.innerHTML='<div class="eventEmpty">Собираем статистику…</div>';try{let d=await api('/api/progress');let max=Math.max(1,...d.categories.map(x=>x.count));host.innerHTML='<div class="progressGrid"><div class="progressMetric"><b>'+d.summary.total+'</b><span>всего заявок</span></div><div class="progressMetric"><b>'+d.summary.active+'</b><span>активных</span></div><div class="progressMetric"><b>'+d.summary.done+'</b><span>завершено</span></div><div class="progressMetric"><b>'+Number(d.summary.rewards).toLocaleString('ru-RU')+' ₽</b><span>обещано за помощь</span></div></div><div class="card" style="margin-top:16px"><h3>Категории заявок</h3>'+(d.categories.length?d.categories.map(x=>'<div class="categoryBar"><span>'+esc(x.title)+'</span><i style="width:'+Math.max(4,Math.round(x.count/max*100))+'%"></i><b>'+x.count+'</b></div>').join(''):'<p class="muted">Данных пока нет.</p>')+'</div>'}catch(e){host.innerHTML='<div class="eventEmpty">Не удалось загрузить статистику.</div>'}}
+function readEventPhoto(input){let file=input.files&&input.files[0],note=$('eventError');window.hpointEventPhoto='';if(!file)return;if(file.size>800000){note.textContent='Фото должно быть не больше 800 КБ.';input.value='';return}let reader=new FileReader();reader.onload=function(){window.hpointEventPhoto=String(reader.result);note.textContent='Фото добавлено.'};reader.readAsDataURL(file)}
+function activityForm(){$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Новое мероприятие</h2><p class="muted eventFormNote">Место и описание видны пользователям раздела «Активности». Контакты организатора не публикуются.</p><div class="form" style="margin-top:16px"><input id="eventTitle" class="input" maxlength="120" placeholder="Например: Турнир по настольному теннису"><input id="eventPlace" class="input" maxlength="180" placeholder="Место: парк, клуб, адрес или ориентир"><label class="muted">Фото мероприятия<input class="input" type="file" accept="image/png,image/jpeg,image/webp" onchange="readEventPhoto(this)"></label><label class="muted">Начало<input id="eventStart" class="input" type="datetime-local" style="margin-top:5px"></label><label class="muted">Окончание, если известно<input id="eventEnd" class="input" type="datetime-local" style="margin-top:5px"></label><input id="eventCapacity" class="input" type="number" min="2" max="1000" inputmode="numeric" placeholder="Количество мест, если ограничено"><textarea id="eventDescription" class="input textarea" maxlength="2000" placeholder="Расскажите, что будет на мероприятии и что взять с собой"></textarea><button id="publishEventButton" class="btn grad" type="button" data-create-event>Опубликовать мероприятие</button><p id="eventError" class="eventFormError" role="alert"></p></div>'}
+function eventCard(event){let date=eventDateParts(event.starts_at),full=Number(event.capacity||0)>0&&Number(event.participant_count)>=Number(event.capacity),capacity=Number(event.capacity||0)>0?Number(event.participant_count)+' / '+Number(event.capacity)+' мест':Number(event.participant_count)+' участников',action=event.status!=='published'?'<span class="muted">Архив</span>':event.is_creator?'<button class="btn danger" onclick="cancelEvent('+Number(event.id)+')">Отменить</button>':event.joined?'<button class="btn light" onclick="leaveEvent('+Number(event.id)+')">Не участвовать</button>':full?'<button class="btn light" disabled>Мест нет</button>':'<button class="btn grad" onclick="joinEvent('+Number(event.id)+')">Участвовать</button>';return '<article class="eventCard"><div class="eventDate"><b>'+esc(date.day)+'</b><span>'+esc(date.month)+'</span></div>'+(event.has_image?'<img class="eventPhoto" src="/api/events/image?id='+Number(event.id)+'" alt="Фото мероприятия">':'')+'<div class="eventCopy"><h3>'+esc(event.title)+'</h3><div class="eventMeta"><span>◷ '+esc(eventTimeRange(event))+'</span><span>⌖ '+esc(event.place)+'</span><span>Организатор: '+esc(event.creator_name)+'</span></div>'+(event.description?'<p class="eventDescription">'+esc(event.description)+'</p>':'')+'</div><div class="eventActions"><span class="eventCapacity">'+esc(capacity)+'</span>'+action+'</div></article>'}
+async function createEvent(){let error=$('eventError'),button=$('publishEventButton'),title=$('eventTitle').value.trim(),place=$('eventPlace').value.trim(),starts=eventIso('eventStart');error.textContent='';if(title.length<3){error.textContent='Название должно содержать минимум 3 символа.';toast(error.textContent);return}if(place.length<2){error.textContent='Укажите место проведения.';toast(error.textContent);return}if(!starts){error.textContent='Укажите дату и время начала.';toast(error.textContent);return}if(button){button.disabled=true;button.textContent='Публикуем…'}try{await api('/api/events',{method:'POST',body:JSON.stringify({title:title,place:place,starts_at:starts,ends_at:eventIso('eventEnd'),capacity:$('eventCapacity').value,description:$('eventDescription').value,image_data:window.hpointEventPhoto||''})});closeModal();toast('Мероприятие опубликовано');go('activities');await loadActivities()}catch(e){error.textContent=e.message||'Не удалось опубликовать мероприятие';toast(error.textContent);if(button){button.disabled=false;button.textContent='Опубликовать мероприятие'}}}
+document.addEventListener('click',function(event){if(event.target.closest('[data-create-event]')){event.preventDefault();createEvent()}});
+function requestForm(){$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Новая заявка</h2><p class="muted">Выберите вознаграждение: 0 ₽ означает бесплатную помощь.</p><div class="form"><input id="qw" class="input" placeholder="Что нужно сделать?"><input id="qp" class="input" placeholder="Город, улица, дом или ориентир"><input id="qt" class="input" placeholder="Когда нужна помощь?"><label class="muted">Вознаграждение: <b id="rewardValue">0 ₽</b><input id="rewardRub" type="range" min="0" max="10000" step="100" value="0" oninput="rewardValue.textContent=Number(this.value).toLocaleString(\'ru-RU\')+\' ₽\'"></label><select id="qc" class="input"><option value="other">Другое</option><option value="carry">Перенос / переезд</option><option value="shopping">Покупки</option><option value="snow">Снег / уборка</option><option value="tools">Инструменты</option><option value="transport">Транспорт</option><option value="tech">Техника</option><option value="study">Учёба</option></select><select id="qu" class="input"><option>🔥 Очень срочно</option><option>⏳ В течение дня</option><option>🕊 Не срочно</option></select><textarea id="qd" class="input textarea" placeholder="Детали"></textarea><button class="btn grad" onclick="createReq()">Создать заявку</button><div id="rqerr" class="eventFormError"></div></div>'}
+async function sendReq(lat,lon){try{let reward=Number($('rewardRub').value),d=await api('/api/requests',{method:'POST',body:JSON.stringify({what:qw.value,place:qp.value,time_needed:qt.value,urgency:qu.value,details:qd.value,category:qc.value,lat,lon,expires_in_hours:48,reward_rub:reward})});closeModal();if(reward>0){try{let payment=await api('/api/requests/reward/pay',{method:'POST',body:JSON.stringify({request_id:d.request_id})});location.href=payment.confirmation_url;return}catch(error){toast('Заявка создана. Оплату можно повторить позже: '+error.message)}}await requests();toast('Заявка #'+d.request_id+' создана');go('match')}catch(e){$('rqerr').textContent=e.message}}
+async function loadOpenRequests(){try{let d=await api('/api/requests?open=1'),host=openRequestHost();host.innerHTML='<h3>Открытые заявки</h3>'+(d.requests.length?d.requests.map(r=>'<div class="request"><div class="requestmain"><b>#'+r.id+' · '+esc(r.what)+'</b><div class="muted">'+esc(r.category_name)+' · '+esc(r.urgency)+(Number(r.reward_rub)>0?' · вознаграждение '+Number(r.reward_rub).toLocaleString('ru-RU')+' ₽':' · без оплаты')+'</div></div><button class="btn grad" onclick="acceptOpenRequest('+r.id+')">Помочь</button></div>').join(''):'<div class="empty">Сейчас нет открытых заявок от других пользователей.</div>')}catch(e){openRequestHost().innerHTML='<div class="empty">Не удалось загрузить заявки.</div>'}}
+async function loadDonation(){try{let d=await fetch('/api/public-config',{credentials:'same-origin'}).then(x=>x.json());if(!d.donation_url||document.getElementById('donationCard'))return;let card=document.createElement('aside');card.id='donationCard';card.className='donationCard';let text=document.createElement('span');text.textContent='H-Point развивается благодаря сообществу. ';let link=document.createElement('a');link.href=d.donation_url;link.target='_blank';link.rel='noopener';link.textContent=d.donation_title||'Поддержать проект';card.append(text,link);document.querySelector('#landing .wrap')?.append(card)}catch(e){}}
+const hpointBaseGoForProgress=window.go;window.go=function(tab){ensureActivitiesPanel();ensureProgressPanel();hpointBaseGoForProgress(tab);if(tab==='activities')loadActivities();if(tab==='progress')loadProgress()};ensureProgressPanel();loadDonation();
+'''
+LOCATION_PICKER_UI=r'''
+function locationPicker(id,onPick){if(!window.ymaps){toast('Яндекс Карты ещё загружаются.');return}ymaps.ready(function(){let host=$(id);if(!host)return;let map=new ymaps.Map(id,{center:[55.751244,37.618423],zoom:11,controls:['zoomControl','searchControl']},{suppressMapOpenBlock:true});let mark=null;map.events.add('click',function(event){let point=event.get('coords');if(mark)map.geoObjects.remove(mark);mark=new ymaps.Placemark(point,{balloonContent:'Выбранная точка'},{preset:'islands#blueDotIcon'});map.geoObjects.add(mark);onPick({lat:point[0],lon:point[1]})});let hint=document.createElement('p');hint.className='muted';hint.textContent='Нажмите на карте в нужном месте, чтобы поставить точку.';host.after(hint)})}
+function requestForm(){hpointRequestPoint=null;$('modal').style.display='flex';$('modalbody').innerHTML=`<h2>Новая заявка</h2><p class="muted">Укажите адрес или вручную поставьте точку на карте. Точный адрес виден только после назначения помощника.</p><div class="form"><input id="qw" class="input" placeholder="Что нужно сделать?"><input id="qp" class="input" placeholder="Город, улица, дом или ориентир"><div id="requestPicker" class="map" style="height:230px"></div><input id="qt" class="input" placeholder="Когда нужна помощь?"><label class="muted">Срок публикации: <b id="requestDuration">2 дня</b></label><input id="requestHours" type="range" min="1" max="168" value="48" step="1" oninput="$('requestDuration').textContent=this.value==24?'1 день':this.value==48?'2 дня':this.value+' ч.'"><select id="qc" class="input"><option value="other">Другое</option><option value="carry">Перенос / переезд</option><option value="shopping">Покупки</option><option value="snow">Снег / уборка</option><option value="tools">Инструменты</option><option value="transport">Транспорт</option><option value="tech">Техника</option><option value="study">Учёба</option></select><select id="qu" class="input"><option>🔥 Очень срочно</option><option>⏳ В течение дня</option><option>🕊 Не срочно</option></select><textarea id="qd" class="input textarea" placeholder="Детали"></textarea><button class="btn grad" onclick="createReq()">Создать заявку</button><div id="rqerr" class="muted"></div></div>`;setTimeout(function(){locationPicker('requestPicker',function(point){hpointRequestPoint=point;$('rqerr').textContent='Точка выбрана на карте.'})},20)}
+function createReq(){if(window.hpointRequestPoint){sendReq(hpointRequestPoint.lat,hpointRequestPoint.lon);return}let fallback=function(){sendReq(null,null)};let address=(qp&&qp.value||'').trim();if(!address||!window.ymaps){fallback();return}ymaps.ready(function(){ymaps.geocode(address,{results:1}).then(function(result){let first=result.geoObjects.get(0),coords=first&&first.geometry.getCoordinates();if(coords){sendReq(coords[0],coords[1])}else{fallback()}},fallback)})}
+function helperGeoFallback(message,requestId){window.hpointHelperPoint=null;$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Укажите местоположение</h2><p class="muted">'+esc(message)+' Поставьте точку на карте или введите адрес. Автор увидит только расстояние, без вашей точки.</p><div class="form"><input id="helperAddress" class="input" placeholder="Город, улица, дом или ориентир"><div id="helperPicker" class="map" style="height:230px"></div><button class="btn grad" onclick="helperUsePoint('+(requestId?Number(requestId):'')+')">Использовать выбранную точку</button><button class="btn light" onclick="helperByAddress('+(requestId?Number(requestId):'')+')">Найти по адресу</button><button class="btn light" onclick="helper('+(requestId?Number(requestId):'')+')">Повторить запрос GPS</button></div>';setTimeout(function(){locationPicker('helperPicker',function(point){hpointHelperPoint=point})},20)}
+function helperUsePoint(requestId){if(!window.hpointHelperPoint){toast('Нажмите на карте, чтобы выбрать точку.');return}joinHelper(hpointHelperPoint,requestId)}
+'''
+
+YANDEX_MAP_UI=r'''
+/* Russian Yandex Maps implementation.  Exact address lookup is used only for
+   the owner’s request; helpers receive distances until both sides agree. */
+const hpointYMaps={};
+function yMap(id,key,done){if(!window.ymaps){toast('Яндекс Карты загружаются…');return}ymaps.ready(function(){let item=hpointYMaps[key];if(!item){let element=$(id);if(!element)return;item={map:new ymaps.Map(id,{center:[55.751244,37.618423],zoom:11,controls:['zoomControl']}, {suppressMapOpenBlock:true}),objects:[]};hpointYMaps[key]=item}done(item)})}
+function yClear(item){item.objects.forEach(function(object){item.map.geoObjects.remove(object)});item.objects=[]}
+function yAdd(item,coords,label,color){let mark=new ymaps.Placemark(coords,{balloonContent:esc(label)},{preset:'islands#'+color+'Icon'});item.map.geoObjects.add(mark);item.objects.push(mark);return mark}
+function yFit(item,points){if(!points.length)return;if(points.length===1){item.map.setCenter(points[0],14);return}item.map.setBounds(ymaps.util.bounds.fromPoints(points),{checkZoomRange:true,zoomMargin:35})}
+function initMatchMap(){yMap('mapMatch','match',function(){});return null}
+function hpointRenderCandidateMap(data){yMap('mapMatch','match',function(item){yClear(item);let location=hpointCoordinates(data.request_location);if(!location)return;let point=[location.lat,location.lon];yAdd(item,point,'Ваша заявка','violet');yFit(item,[point]);let distances=(data.matches||[]).map(function(c){return c.distance_km}).filter(function(x){return x!==null&&x!==undefined}).sort(function(a,b){return a-b});let note=$('candidateMapNote');if(!note){note=document.createElement('p');note.id='candidateMapNote';note.className='candidateMapNote';$('mapMatch').after(note)}note.textContent=distances.length?'Показана ваша заявка. Точные точки помощников скрыты до взаимного согласия.':'У кандидатов пока нет геолокации.'})}
+async function loadBigMap(){hpointSetupMapPanel();let data;try{data=await api('/api/map/active')}catch(error){hpointSetMapNotice('Не удалось загрузить карту: '+error.message);return}hpointMapTasks=data.tasks||[];if(data.user_location)hpointLastLocation=hpointCoordinates(data.user_location)||hpointLastLocation;yMap('bigMap','big',function(item){yClear(item);let points=[],me=hpointSavedLocation();if(me){let point=[me.lat,me.lon];yAdd(item,point,'Вы здесь','blue');points.push(point);hpointSetMapNotice('Показана ваша текущая или последняя сохранённая геопозиция.')}hpointMapTasks.forEach(function(task){let dst=hpointCoordinates(task.destination);if(dst){let point=[dst.lat,dst.lon];yAdd(item,point,'Активная заявка: '+task.what,'green');points.push(point)}});yFit(item,points);hpointRenderMapTasks(hpointMapTasks)})}
+async function buildRoute(id){let task=hpointMapTasks.find(function(row){return Number(row.id)===Number(id)}),destination=task&&hpointCoordinates(task.destination);if(!destination){toast('У этой заявки нет геопозиции.');return}let start;try{start=await hpointGetBrowserLocation()}catch(error){start=hpointSavedLocation();if(!start){helperGeoFallback(hpointGeoMessage(error),null);return}}let url='https://yandex.ru/maps/?rtext='+encodeURIComponent(start.lat+','+start.lon+'~'+destination.lat+','+destination.lon)+'&rtt=auto';yMap('bigMap','big',function(item){if(!ymaps.route){window.open(url,'_blank','noopener');return}ymaps.route([[start.lat,start.lon],[destination.lat,destination.lon]],{mapStateAutoApply:true}).then(function(route){item.map.geoObjects.add(route);item.objects.push(route);hpointSetMapNotice('Маршрут построен. Открыть в Яндекс Картах: '+url)},function(){window.open(url,'_blank','noopener');toast('Открыли маршрут в Яндекс Картах.')})})}
+function requestForm(){ $('modal').style.display='flex';$('modalbody').innerHTML=`<h2>Новая заявка</h2><p class="muted">Укажите город и адрес или ориентир: Яндекс Карты поставят точку по этому адресу. Точный адрес виден только после назначения помощника.</p><div class="form"><input id="qw" class="input" placeholder="Что нужно сделать?"><input id="qp" class="input" placeholder="Город, улица, дом или ориентир"><input id="qt" class="input" placeholder="Когда нужна помощь?"><label class="muted">Срок публикации: <b id="requestDuration">2 дня</b></label><input id="requestHours" type="range" min="1" max="168" value="48" step="1" oninput="$('requestDuration').textContent=this.value==24?'1 день':this.value==48?'2 дня':this.value+' ч.'"><select id="qc" class="input"><option value="other">Другое</option><option value="carry">Перенос / переезд</option><option value="shopping">Покупки</option><option value="snow">Снег / уборка</option><option value="tools">Инструменты</option><option value="transport">Транспорт</option><option value="tech">Техника</option><option value="study">Учёба</option></select><select id="qu" class="input"><option>🔥 Очень срочно</option><option>⏳ В течение дня</option><option>🕊 Не срочно</option></select><textarea id="qd" class="input textarea" placeholder="Детали"></textarea><button class="btn grad" onclick="createReq()">Создать заявку</button><div id="rqerr" class="muted"></div></div>`}
+function createReq(){let fallback=function(){navigator.geolocation?navigator.geolocation.getCurrentPosition(function(p){sendReq(p.coords.latitude,p.coords.longitude)},function(){sendReq(null,null)},{timeout:5000,maximumAge:60000}):sendReq(null,null)};let address=(qp&&qp.value||'').trim();if(!address||!window.ymaps){fallback();return}ymaps.ready(function(){ymaps.geocode(address,{results:1}).then(function(result){let first=result.geoObjects.get(0),coords=first&&first.geometry.getCoordinates();if(coords){sendReq(coords[0],coords[1])}else{fallback()}},fallback)})}
+async function sendReq(lat,lon){try{let d=await api('/api/requests',{method:'POST',body:JSON.stringify({what:qw.value,place:qp.value,time_needed:qt.value,urgency:qu.value,details:qd.value,category:qc.value,lat,lon,expires_in_hours:Number($('requestHours').value)})});closeModal();await requests();toast('Заявка #'+d.request_id+' создана');go('match')}catch(e){$('rqerr').textContent=e.message}}
+function helperGeoFallback(message,requestId){$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Укажите местоположение</h2><p class="muted">'+esc(message)+' Адрес нужен только для расчёта расстояния: автор заявки не увидит вашу точку.</p><div class="form"><input id="helperAddress" class="input" placeholder="Город, улица, дом или ориентир"><button class="btn grad" onclick="helperByAddress('+(requestId?Number(requestId):'')+')">Указать адрес на карте</button><button class="btn light" onclick="helper('+(requestId?Number(requestId):'')+')">Повторить запрос геолокации</button><button class="btn light" onclick="helperWithoutLocation('+(requestId?Number(requestId):'')+')">Продолжить без геолокации</button></div>'}
+function helperByAddress(requestId){let address=($('helperAddress').value||'').trim();if(!address){toast('Введите адрес или ориентир.');return}if(!window.ymaps){toast('Яндекс Карты ещё загружаются.');return}ymaps.ready(function(){ymaps.geocode(address,{results:1}).then(function(result){let first=result.geoObjects.get(0),coords=first&&first.geometry.getCoordinates();if(!coords){toast('Адрес не найден. Добавьте город и номер дома.');return}joinHelper({lat:coords[0],lon:coords[1]},requestId)},function(){toast('Не удалось найти адрес. Попробуйте уточнить его.')})})}
+async function mapLocateMe(){try{let point=await hpointGetBrowserLocation();hpointSetMapNotice('Ваше местоположение обновлено.');await loadBigMap()}catch(error){helperGeoFallback(hpointGeoMessage(error),null)}}
+'''
+
+
+COMMUNITY_CSS=r'''
+.formRow{display:grid;grid-template-columns:1fr 1fr;gap:8px}.formRow .btn{padding:10px 9px;font-size:11px}@media(max-width:460px){.formRow{grid-template-columns:1fr}}
+.progressHero{display:grid;grid-template-columns:minmax(0,1fr) 180px;gap:18px;margin:20px 0}.progressMetrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.progressMetric{border-radius:16px;padding:16px;background:linear-gradient(145deg,#1c211a,#141712);border-color:#3e4939}.progressMetric b{font-size:25px}.progressRingCard{display:grid;place-items:center;align-content:center;min-height:170px;border:1px solid #43513d;border-radius:18px;background:#151a13}.progressRing{width:116px;height:116px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(#c7ff6d var(--progress),#2a3326 0)}.progressRing:after{content:'';width:92px;height:92px;border-radius:50%;background:#151a13;grid-area:1/1}.progressRing b{grid-area:1/1;z-index:1;font-size:25px;color:#d8ff99}.progressRing span{grid-area:1/1;z-index:1;margin-top:50px;color:#aeb6a8;font-size:10px}.progressLayout{display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,.8fr);gap:16px}.categoryList,.leaderboardList{display:grid;gap:10px}.categoryBar{grid-template-columns:minmax(105px,1fr) minmax(60px,3fr) 34px;margin:0}.categoryBar span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.categoryTrack{height:9px;border-radius:999px;overflow:hidden;background:#283025}.categoryBar i{height:100%;border-radius:inherit;background:linear-gradient(90deg,#8fdf56,#d5ff80)}.leaderRow{display:grid;grid-template-columns:30px 38px minmax(0,1fr) auto;align-items:center;gap:9px;padding:10px;border:1px solid #354032;border-radius:12px;background:#171b15;cursor:pointer}.leaderRow:hover{border-color:#b8f36b}.leaderPlace{font:700 12px 'Space Mono',monospace;color:#cfff73;text-align:center}.leaderAvatar,.eventVisual{display:grid;place-items:center;background:linear-gradient(140deg,#294336,#132720);color:#cfff73;font-weight:800}.leaderAvatar{width:34px;height:34px;border-radius:50%}.leaderName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700}.leaderMeta{margin-top:2px;color:#aeb6a8;font-size:11px}.leaderScore{text-align:right;color:#cfff73;font:700 11px 'Space Mono',monospace}.profileReviews{display:grid;gap:10px;max-height:390px;overflow:auto}.reviewCard{padding:13px;border:1px solid #354032;border-radius:12px;background:#171b15}.reviewHead{display:flex;justify-content:space-between;gap:12px;color:#cfd6c9;font-size:12px}.reviewStars{color:#d9ff8b;white-space:nowrap}.reviewText{margin:8px 0 0;color:#acb5a5;line-height:1.5}.eventCard{grid-template-columns:64px 118px minmax(0,1fr) minmax(126px,auto);gap:14px;border-radius:18px;padding:16px;overflow:hidden}.eventVisual{width:118px;height:100%;min-height:104px;border:1px solid #40503a;border-radius:12px;overflow:hidden}.eventVisual img{width:100%;height:100%;object-fit:cover}.eventVisual span{font:700 26px 'Space Mono',monospace}.eventCopy{padding-top:2px}.eventCopy h3{overflow-wrap:anywhere;line-height:1.25}.eventMeta span{overflow-wrap:anywhere}.eventDescription{overflow-wrap:anywhere}.eventActions{align-self:center}.donationCard{display:flex;justify-content:space-between;align-items:center;gap:14px;margin:30px auto 0;max-width:760px;padding:18px 20px;border:1px solid #4b5b44;border-radius:16px;background:linear-gradient(105deg,#151d13,#1d2718);color:#c7d0c0}.donationCard strong{display:block;color:#eff7e9;margin-bottom:4px}.donationCard p{margin:0;color:#aeb6a8;font-size:13px}.donationCard .btn{white-space:nowrap}.donationCard .btn[disabled]{opacity:.55}@media(max-width:760px){.progressHero,.progressLayout{grid-template-columns:1fr}.progressRingCard{min-height:145px}.progressMetrics{grid-template-columns:repeat(3,1fr)}.eventCard{grid-template-columns:54px minmax(0,1fr);gap:11px;padding:14px}.eventDate{width:54px}.eventVisual{grid-column:2;width:100%;height:150px;min-height:0}.eventCopy{grid-column:1/-1}.eventActions{grid-column:1/-1;grid-template-columns:1fr 1fr}.eventActions .eventCapacity{grid-column:1/-1}.donationCard{align-items:flex-start;flex-direction:column}.donationCard .btn{width:100%}}@media(max-width:450px){.progressMetrics{grid-template-columns:1fr}.leaderRow{grid-template-columns:26px 34px minmax(0,1fr)}.leaderScore{display:none}}
+'''
+COMMUNITY_UI=r'''
+function ensureProgressPanel(){let tabs=document.querySelector('.tabs'),app=$('app');if(!tabs||!app)return;if(!document.querySelector('[data-t="progress"]')){let tab=document.createElement('button');tab.className='tab';tab.dataset.t='progress';tab.textContent='Прогресс';tab.onclick=function(){go('progress')};let profile=document.querySelector('[data-t="profile"]');tabs.insertBefore(tab,profile||null)}if(!$('p-progress')){let panel=document.createElement('section');panel.id='p-progress';panel.className='panel';panel.innerHTML='<span class="ey">СООБЩЕСТВО</span><h2>Прогресс H-Point</h2><p class="muted">Открытая картина помощи: реальные заявки, категории и вклад участников.</p><div id="progressData"></div>';app.appendChild(panel)}}
+function progressMetric(value,label){return '<div class="progressMetric"><b>'+esc(String(value))+'</b><span>'+esc(label)+'</span></div>'}
+function leaderRow(person){let letter=esc((person.name||'?').slice(0,1).toUpperCase()),rating=person.rating===null?'нет оценок':'★ '+Number(person.rating).toFixed(1);return '<button type="button" class="leaderRow" onclick="openCommunityProfile('+Number(person.user_id)+')"><span class="leaderPlace">#'+Number(person.position)+'</span><span class="leaderAvatar">'+letter+'</span><span><span class="leaderName">'+esc(person.name)+'</span><span class="leaderMeta">'+Number(person.helped)+' заверш. · '+Number(person.reviews)+' отзывов</span></span><span class="leaderScore">'+rating+'<br>'+Number(person.score)+' баллов</span></button>'}
+async function loadProgress(){ensureProgressPanel();let host=$('progressData');if(!host)return;host.innerHTML='<div class="eventEmpty">Собираем статистику…</div>';try{let d=await api('/api/progress'),summary=d.summary||{},categories=d.categories||[],leaders=d.leaderboard||[],max=Math.max(1,...categories.map(x=>Number(x.count)||0)),percent=Math.max(0,Math.min(100,Number(d.completion_percent)||0));let categoryHtml=categories.map(x=>'<div class="categoryBar"><span title="'+esc(x.title)+'">'+esc(x.title)+'</span><span class="categoryTrack"><i style="width:'+Math.max(0,Math.round(Number(x.count)/max*100))+'%"></i></span><b>'+Number(x.count)+'</b></div>').join('');host.innerHTML='<div class="progressHero"><div class="progressMetrics">'+progressMetric(summary.total||0,'всего заявок')+progressMetric(summary.active||0,'сейчас активны')+progressMetric(summary.done||0,'успешно завершены')+'</div><div class="progressRingCard"><div class="progressRing" style="--progress:'+percent+'%"><b>'+percent+'%</b><span>выполнено</span></div></div></div><div class="progressLayout"><section class="card"><h3>Категории помощи</h3><p class="muted">Сколько раз пользователи выбирали каждое направление.</p><div class="categoryList">'+categoryHtml+'</div></section><section class="card"><h3>Рейтинг помощников</h3><p class="muted">Место зависит от завершённых заявок и оценок. Нажмите на участника, чтобы открыть отзывы.</p><div class="leaderboardList">'+(leaders.length?leaders.map(leaderRow).join(''):'<div class="eventEmpty">Как только кто-то завершит первую помощь, здесь появится рейтинг.</div>')+'</div></section></div>'}catch(error){host.innerHTML='<div class="eventEmpty"><b>Статистика временно недоступна.</b><br><span class="muted">Обновите страницу и попробуйте ещё раз.</span></div>';console.warn('progress',error)}}
+async function openCommunityProfile(id){try{let data=await api('/api/community/profile?id='+Number(id)),p=data.profile,stats=p.stats||{},reviews=p.reviews||[];$('modal').style.display='flex';$('modalbody').innerHTML='<h2>'+esc(p.name)+'</h2><p class="muted">'+(p.city?esc(p.city)+' · ':'')+'Публичный профиль сообщества</p><div class="progressMetrics" style="margin:18px 0">'+progressMetric(stats.helped||0,'раз помог')+progressMetric(stats.helped_avg===null?'—':'★ '+Number(stats.helped_avg).toFixed(1),'средняя оценка')+progressMetric(stats.received||0,'получил помощи')+'</div><h3>Оценки и отзывы</h3><div class="profileReviews">'+(reviews.length?reviews.map(r=>'<article class="reviewCard"><div class="reviewHead"><span>'+esc(r.reviewer_name)+' · '+esc(r.kind)+'</span><span class="reviewStars">'+'★'.repeat(Number(r.rating))+'</span></div><div class="muted">'+esc(r.title)+'</div>'+(r.review?'<p class="reviewText">'+esc(r.review)+'</p>':'')+'</article>').join(''):'<div class="eventEmpty">Оценок пока нет.</div>')+'</div>'}catch(error){toast(error.message||'Не удалось открыть профиль')}}
+function eventCard(event){let date=eventDateParts(event.starts_at),full=Number(event.capacity||0)>0&&Number(event.participant_count)>=Number(event.capacity),capacity=Number(event.capacity||0)>0?Number(event.participant_count)+' / '+Number(event.capacity)+' мест':Number(event.participant_count)+' участников',action=event.status!=='published'?'<span class="muted">Архив</span>':event.is_creator?'<button class="btn danger" onclick="cancelEvent('+Number(event.id)+')">Отменить</button>':event.joined?'<button class="btn light" onclick="leaveEvent('+Number(event.id)+')">Не участвовать</button>':full?'<button class="btn light" disabled>Мест нет</button>':'<button class="btn grad" onclick="joinEvent('+Number(event.id)+')">Участвовать</button>',visual=event.has_image?'<img src="/api/events/image?id='+Number(event.id)+'" alt="Фото мероприятия">':'<span>'+esc((event.title||'H').slice(0,1).toUpperCase())+'</span>';return '<article class="eventCard"><div class="eventDate"><b>'+esc(date.day)+'</b><span>'+esc(date.month)+'</span></div><div class="eventVisual">'+visual+'</div><div class="eventCopy"><h3>'+esc(event.title)+'</h3><div class="eventMeta"><span>◷ '+esc(eventTimeRange(event))+'</span><span>⌖ '+esc(event.place)+'</span><span>Организатор: '+esc(event.creator_name)+'</span></div>'+(event.description?'<p class="eventDescription">'+esc(event.description)+'</p>':'')+'</div><div class="eventActions"><span class="eventCapacity">'+esc(capacity)+'</span>'+action+'</div></article>'}
+async function loadDonation(){try{let response=await fetch('/api/public-config',{credentials:'same-origin'}),data=await response.json(),host=document.querySelector('#landing .wrap');if(!host||document.getElementById('donationCard'))return;let card=document.createElement('aside');card.id='donationCard';card.className='donationCard';let copy=document.createElement('div');copy.innerHTML='<strong>Поддержать H-Point</strong><p>Помогите развивать сервис взаимопомощи рядом с домом.</p>';let button=document.createElement(data.donation_url?'a':'button');button.className='btn grad';button.textContent=data.donation_title||'Поддержать';if(data.donation_url){button.href=data.donation_url;button.target='_blank';button.rel='noopener'}else{button.type='button';button.disabled=true;button.title='Реквизиты для пожертвований ещё не подключены'}card.append(copy,button);host.append(card)}catch(error){console.warn('donation',error)}}
+function hpointGetBrowserLocation(){return new Promise(function(resolve,reject){if(!navigator.geolocation){reject(new Error('Геолокация не поддерживается браузером.'));return}navigator.geolocation.getCurrentPosition(function(position){let point={lat:Number(position.coords.latitude),lon:Number(position.coords.longitude)};hpointLastLocation=point;try{sessionStorage.setItem('hpointLastLocation',JSON.stringify(point))}catch(e){}resolve(point)},reject,{enableHighAccuracy:true,timeout:15000,maximumAge:0})})}
+function hpointPickerPoint(id,point){window.hpointLocationPickers=window.hpointLocationPickers||{};let picker=window.hpointLocationPickers[id];if(!picker)return;if(picker.mark)picker.map.geoObjects.remove(picker.mark);picker.mark=new ymaps.Placemark([point.lat,point.lon],{balloonContent:'Выбранная точка'},{preset:'islands#blueCircleDotIcon'});picker.map.geoObjects.add(picker.mark);picker.map.setCenter([point.lat,point.lon],15,{duration:180})}
+function locationPicker(id,onPick){let host=$(id);if(!host)return;if(!window.ymaps){host.innerHTML='<div class="eventEmpty">Карта пока недоступна. Введите адрес или повторите запрос геолокации.</div>';return}ymaps.ready(function(){if(!$(id))return;window.hpointLocationPickers=window.hpointLocationPickers||{};let old=window.hpointLocationPickers[id];if(old){try{old.map.destroy()}catch(e){}}let map=new ymaps.Map(id,{center:[55.751244,37.618423],zoom:11,controls:['zoomControl','searchControl']},{suppressMapOpenBlock:true}),picker={map:map,mark:null};window.hpointLocationPickers[id]=picker;map.events.add('click',function(event){let coords=event.get('coords'),point={lat:Number(coords[0]),lon:Number(coords[1])};hpointPickerPoint(id,point);onPick(point)});let hint=document.createElement('p');hint.className='muted';hint.textContent='Нажмите на карте, чтобы выбрать точку.';host.after(hint);if(id==='requestPicker'&&window.hpointRequestPoint)hpointPickerPoint(id,window.hpointRequestPoint)})}
+async function hpointGeocodeAddress(address){if(window.ymaps){try{return await new Promise(function(resolve,reject){ymaps.ready(function(){ymaps.geocode(address,{results:1}).then(function(result){let first=result.geoObjects.get(0),coords=first&&first.geometry&&first.geometry.getCoordinates();if(!coords){reject(new Error('Адрес не найден.'));return}resolve({lat:Number(coords[0]),lon:Number(coords[1])})},function(){reject(new Error('Яндекс Карты временно не ответили.'))})})})}catch(error){console.warn('yandex geocoder',error)}}let response=await api('/api/geocode?q='+encodeURIComponent(address));return response.point}
+async function requestDeviceLocation(submitAfter){let note=$('rqerr');if(note)note.textContent='Запрашиваем геолокацию…';try{let point=await hpointGetBrowserLocation();window.hpointRequestPoint=point;hpointPickerPoint('requestPicker',point);if(note)note.textContent='Местоположение определено. Точка поставлена на карте.';if(submitAfter)await sendReq(point.lat,point.lon)}catch(error){if(note)note.textContent=(typeof hpointGeoMessage==='function'?hpointGeoMessage(error):'Не удалось определить геолокацию.')+' Разрешите доступ в браузере или выберите точку на карте.';if(submitAfter)toast('Укажите адрес или точку на карте, чтобы создать заявку.')}}
+async function requestFindAddress(submitAfter){let address=(($('qp')||{}).value||'').trim(),note=$('rqerr');if(!address){if(note)note.textContent='Введите адрес, затем нажмите «Найти по адресу». ';return}if(note)note.textContent='Ищем адрес…';try{let point=await hpointGeocodeAddress(address);window.hpointRequestPoint=point;hpointPickerPoint('requestPicker',point);if(note)note.textContent='Адрес найден. Точка поставлена на карте.';if(submitAfter)await sendReq(point.lat,point.lon)}catch(error){if(note)note.textContent=error.message||'Не удалось найти адрес.';toast(error.message||'Не удалось найти адрес.')}}
+function createReq(){if(window.hpointRequestPoint){sendReq(window.hpointRequestPoint.lat,window.hpointRequestPoint.lon);return}let address=(($('qp')||{}).value||'').trim();if(address){requestFindAddress(true);return}requestDeviceLocation(true)}
+async function helperByAddress(requestId){let field=$('helperAddress'),address=((field||{}).value||'').trim();if(!address){toast('Введите адрес или ориентир.');return}try{let point=await hpointGeocodeAddress(address);hpointPickerPoint('helperPicker',point);window.hpointHelperPoint=point;await joinHelper(point,requestId)}catch(error){toast(error.message||'Не удалось найти адрес.')}}
+function requestForm(){window.hpointRequestPoint=null;$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Новая заявка</h2><p class=\"muted\">Укажите адрес или поставьте точку на карте. Точный адрес увидит только назначенный помощник.</p><div class=\"form\"><input id=\"qw\" class=\"input\" maxlength=\"160\" placeholder=\"Что нужно сделать?\"><input id=\"qp\" class=\"input\" maxlength=\"180\" placeholder=\"Город, улица, дом или ориентир\"><div id=\"requestPicker\" class=\"map\" style=\"height:230px\"></div><div class=\"formRow\"><button type=\"button\" class=\"btn light\" onclick=\"requestDeviceLocation(false)\">◎ Использовать моё местоположение</button><button type=\"button\" class=\"btn light\" onclick=\"requestFindAddress(false)\">Найти по адресу</button></div><input id=\"qt\" class=\"input\" maxlength=\"120\" placeholder=\"Когда нужна помощь?\"><label class=\"muted\">Срок публикации: <b id=\"requestDuration\">2 дня</b><input id=\"requestHours\" type=\"range\" min=\"1\" max=\"168\" value=\"48\" step=\"1\" oninput=\"this.previousElementSibling.textContent=this.value==24?&quot;1 день&quot;:this.value==48?&quot;2 дня&quot;:this.value+&quot; ч.&quot;\"></label><label class=\"muted\">Вознаграждение: <b id=\"rewardValue\">0 ₽</b><input id=\"rewardRub\" type=\"range\" min=\"0\" max=\"10000\" step=\"100\" value=\"0\" oninput=\"this.previousElementSibling.textContent=Number(this.value).toLocaleString(&quot;ru-RU&quot;)+&quot; ₽&quot;\"></label><select id=\"qc\" class=\"input\"><option value=\"other\">Другое</option><option value=\"carry\">Перенос / переезд</option><option value=\"shopping\">Покупки</option><option value=\"snow\">Снег / уборка</option><option value=\"tools\">Инструменты</option><option value=\"transport\">Транспорт</option><option value=\"tech\">Техника</option><option value=\"study\">Учёба</option></select><select id=\"qu\" class=\"input\"><option>🔥 Очень срочно</option><option>⏳ В течение дня</option><option>🕊 Не срочно</option></select><textarea id=\"qd\" class=\"input textarea\" maxlength=\"1000\" placeholder=\"Детали\"></textarea><button class=\"btn grad\" type=\"button\" onclick=\"createReq()\">Создать заявку</button><div id=\"rqerr\" class=\"eventFormError\" role=\"alert\"></div></div>';setTimeout(function(){locationPicker('requestPicker',function(point){window.hpointRequestPoint=point;let note=$('rqerr');if(note)note.textContent='Точка выбрана на карте.'});requestDeviceLocation(false)},20)}
+async function sendReq(lat,lon){let error=$('rqerr');try{let reward=Number(($('rewardRub')||{}).value||0),hours=Number(($('requestHours')||{}).value||48),data=await api('/api/requests',{method:'POST',body:JSON.stringify({what:$('qw').value,place:$('qp').value,time_needed:$('qt').value,urgency:$('qu').value,details:$('qd').value,category:$('qc').value,lat:lat,lon:lon,expires_in_hours:hours,reward_rub:reward})});closeModal();if(reward>0){try{let payment=await api('/api/requests/reward/pay',{method:'POST',body:JSON.stringify({request_id:data.request_id})});location.href=payment.confirmation_url;return}catch(paymentError){toast('Заявка создана. Оплату можно повторить позже: '+paymentError.message)}}await requests();toast('Заявка #'+data.request_id+' создана');go('match')}catch(exception){if(error)error.textContent=exception.message||'Не удалось создать заявку'}}
+ensureProgressPanel();loadDonation();
+'''
+
+REQUEST_TRACKING_CSS=r'''
+.requestActions{display:flex;flex-wrap:wrap;gap:7px;align-items:center}.requestMeta{display:flex;flex-wrap:wrap;gap:5px}.requestTracking{display:grid;gap:12px;margin-top:16px}.trackingSummary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.trackingMetric{padding:12px;border:1px solid #3b4735;border-radius:12px;background:#171b15}.trackingMetric b,.trackingMetric span{display:block}.trackingMetric span{margin-top:4px;color:#aeb6a8;font-size:12px}.trackingList{display:grid;gap:9px}.trackingEvent{padding:11px 12px;border-left:3px solid #b8f36b;background:#171b15;border-radius:0 10px 10px 0}.trackingEvent small{display:block;margin-top:4px;color:#9ea79a}.trackingCandidate{display:flex;justify-content:space-between;gap:8px;padding:10px 0;border-bottom:1px solid #30382c}.trackingCandidate:last-child{border-bottom:0}@media(max-width:560px){.request{align-items:flex-start}.requestActions{width:100%}.requestActions .btn{flex:1}.trackingSummary{grid-template-columns:1fr}}
+'''
+
+REQUEST_TRACKING_UI=r'''
+function requestExpiresText(value){if(!value)return 'не указан';let delta=new Date(value).getTime()-Date.now();if(!Number.isFinite(delta))return 'указан';if(delta<=0)return 'срок истёк';let hours=Math.ceil(delta/3600000);return hours<24?'ещё '+hours+' ч.':'ещё '+Math.ceil(hours/24)+' дн.'}
+function requestCandidateStatus(status){return ({pending:'в очереди',offered:'ожидает ответ',accepted:'подтвердил участие',declined:'отказался',withdrawn:'предложение снято'})[status]||status}
+function requestActions(r,currentUserId){let mine=r.requester_id===currentUserId,actions='<button class="btn light" type="button" onclick="openRequestTracking('+Number(r.id)+')">Статус</button>';if(mine&&r.status==='open')actions+='<button class="btn danger" type="button" onclick="cancelOwnRequest('+Number(r.id)+')">Отменить</button>';if(r.status==='in_progress')actions+='<button class="btn light" type="button" onclick="openChat('+Number(r.id)+')">Чат</button>';if(r.status==='in_progress'&&r.helper_id===currentUserId)actions+='<button class="btn grad" type="button" onclick="finish('+Number(r.id)+')">Завершить</button>';if(r.status==='done'&&mine&&!r.requester_rating)actions+='<button class="btn light" type="button" onclick="review('+Number(r.id)+',\'requester\')">Оценить</button>';if(r.status==='done'&&r.helper_id===currentUserId&&!r.helper_rating)actions+='<button class="btn light" type="button" onclick="review('+Number(r.id)+',\'helper\')">Оценить</button>';return actions}
+function renderRequests(d){let current=Number(d.current_user_id);$('mine').innerHTML=d.requests.length?d.requests.map(function(r){let extra=r.status==='open'?' · '+requestExpiresText(r.expires_at):r.status==='cancelled'&&r.cancel_reason?' · '+esc(r.cancel_reason):'';return '<div class="request"><div class="avatar">'+esc((r.what||'?')[0].toUpperCase())+'</div><div class="requestmain"><b>#'+Number(r.id)+' · '+esc(r.what)+'</b><div class="muted requestMeta">'+esc(r.category_name)+' · '+esc(r.place)+' · '+esc(r.status_title)+' · 👁 '+Number(r.views||0)+extra+'</div></div><span class="badge '+(r.status==='done'?'ok':r.status==='in_progress'?'warn':'')+'">'+esc(r.urgency)+'</span><div class="requestActions">'+requestActions(r,current)+'</div></div>'}).join(''):'<div class="empty">Здесь появятся ваши заявки.</div>';$('rid').innerHTML=d.requests.filter(function(r){return r.status==='open'&&r.requester_id===current}).map(function(r){return '<option value="'+Number(r.id)+'">#'+Number(r.id)+' — '+esc(r.what)+'</option>'}).join('')||'<option value="">Нет открытых заявок</option>'}
+async function cancelOwnRequest(id){let reason=window.prompt('Почему отменяете заявку? Это увидите только вы и предложенные помощники.','Помощь больше не нужна');if(reason===null)return;try{await api('/api/requests/cancel',{method:'POST',body:JSON.stringify({request_id:id,reason:reason})});toast('Заявка отменена.');await requests()}catch(error){toast(error.message||'Не удалось отменить заявку.')}}
+function trackingDate(value){try{return new Date(value).toLocaleString('ru-RU',{dateStyle:'short',timeStyle:'short'})}catch(error){return value||''}}
+async function openRequestTracking(id){try{let data=await api('/api/requests/tracking?request_id='+Number(id)),r=data.request,events=data.events||[],candidates=data.candidates||[];$('modal').style.display='flex';let candidateHtml=candidates.length?'<section><h3>Помощники</h3><div class="trackingList">'+candidates.map(function(c){return '<div class="trackingCandidate"><b>'+esc(c.name)+'</b><span class="muted">'+esc(requestCandidateStatus(c.status))+'</span></div>'}).join('')+'</div></section>':'';let eventHtml=events.length?events.map(function(event){return '<article class="trackingEvent"><b>'+esc(event.message)+'</b><small>'+esc(event.actor_name||'H-Point')+' · '+esc(trackingDate(event.created_at))+'</small></article>'}).join(''):'<div class="empty">История пока пуста.</div>';$('modalbody').innerHTML='<h2>Заявка #'+Number(r.id)+'</h2><p class="muted">'+esc(r.what)+'</p><div class="trackingSummary"><div class="trackingMetric"><b>'+esc(r.status_title)+'</b><span>текущий статус</span></div><div class="trackingMetric"><b>👁 '+Number(r.views||0)+'</b><span>уникальных просмотров</span></div><div class="trackingMetric"><b>'+esc(requestExpiresText(r.expires_at))+'</b><span>срок публикации</span></div><div class="trackingMetric"><b>'+((Number(r.reward_rub)||0)>0?Number(r.reward_rub).toLocaleString('ru-RU')+' ₽':'без вознаграждения')+'</b><span>условия помощи</span></div></div>'+candidateHtml+'<section><h3>Что происходит с заявкой</h3><div class="trackingList">'+eventHtml+'</div></section>'}catch(error){toast(error.message||'Не удалось загрузить статус заявки.')}}
+'''
+
+WALLET_UI=r'''
+function ensureWalletPanel(){let tabs=document.querySelector('.tabs'),app=$('app');if(!tabs||!app)return;if(!document.querySelector('[data-t="wallet"]')){let tab=document.createElement('button');tab.className='tab';tab.dataset.t='wallet';tab.textContent='Кошелёк';tab.onclick=function(){go('wallet')};let billing=document.querySelector('[data-t="billing"]');tabs.insertBefore(tab,billing||null)}if(!$('p-wallet')){let panel=document.createElement('section');panel.id='p-wallet';panel.className='panel';panel.innerHTML='<span class="ey">МОИ ФИНАНСЫ</span><h2>Кошелёк</h2><p class="muted">Внутренний рублёвый учёт вознаграждений. H-Points находятся отдельно.</p><div id="walletContent"></div>';app.appendChild(panel)}}
+function walletAmount(value){return Number(value||0).toLocaleString('ru-RU')+' ₽'}
+function walletDate(value){try{return new Date(value).toLocaleString('ru-RU',{dateStyle:'short',timeStyle:'short'})}catch(error){return value||''}}
+function walletKind(kind){return ({payment:'Пополнение для вознаграждения',reward_reserve:'Средства зарезервированы',reward_earned:'Вознаграждение за помощь',reward_refund:'Возврат вознаграждения',hpoint_purchase:'Оплата H-Point+'})[kind]||'Операция'}
+async function loadWallet(){ensureWalletPanel();let host=$('walletContent');if(!host)return;host.innerHTML='<div class="eventEmpty">Загружаем кошелёк…</div>';try{let data=await api('/api/wallet'),w=data.wallet||{},rows=w.transactions||[],operations=rows.length?rows.map(function(row){let amount=Number(row.amount_rub||0),sign=amount>0?'+':'−';return '<div class="request"><div class="requestmain"><b>'+esc(walletKind(row.kind))+'</b><div class="muted">'+esc(row.description||'')+' · '+esc(walletDate(row.created_at))+'</div></div><b class="'+(amount>=0?'walletPlus':'walletMinus')+'">'+sign+walletAmount(Math.abs(amount))+'</b></div>'}).join(''):'<div class="empty">Операций пока нет. Подтверждённые вознаграждения будут отражаться здесь.</div>';host.innerHTML='<div class="progressMetrics walletMetrics"><div class="progressMetric"><b>'+walletAmount(w.balance_rub)+'</b><span>доступно в кошельке</span></div><div class="progressMetric"><b>'+walletAmount(w.reserved_rub)+'</b><span>зарезервировано по заявкам</span></div><div class="progressMetric"><b>'+walletAmount(w.incoming_rub)+'</b><span>ожидается за помощь</span></div></div><section class="card walletNotice"><h3>Как работает кошелёк</h3><p class="muted">После подтверждённой оплаты вознаграждение резервируется. Когда помощник завершает заявку, сумма зачисляется ему в кошелёк. При отмене открытой заявки сумма возвращается автору в кошелёк.</p><p class="muted">Пополнение и вывод появятся после подключения платёжного провайдера и реквизитов.</p></section><section class="card"><h3>Операции</h3>'+operations+'</section>'}catch(error){host.innerHTML='<div class="eventEmpty">Не удалось загрузить кошелёк.</div>';console.warn('wallet',error)}}
+ensureWalletPanel();
+'''
+
+DONATION_MENU_UI=r'''
+function ensureDonationPanel(){let tabs=document.querySelector('.tabs'),app=$('app');if(!tabs||!app)return;if(!document.querySelector('[data-t="donate"]')){let tab=document.createElement('button');tab.className='tab';tab.dataset.t='donate';tab.textContent='Поддержать';tab.onclick=function(){go('donate')};let profile=document.querySelector('[data-t="profile"]');tabs.insertBefore(tab,profile||null)}if(!$('p-donate')){let panel=document.createElement('section');panel.id='p-donate';panel.className='panel';panel.innerHTML='<span class="ey">ПОДДЕРЖКА ПРОЕКТА</span><h2>Поддержать H-Point</h2><p class="muted">Добровольное пожертвование помогает развивать сервис помощи рядом.</p><div id="donateContent" class="card"></div>';app.appendChild(panel)}}
+async function loadDonationMenu(){ensureDonationPanel();let host=$('donateContent');if(!host)return;host.innerHTML='<p class="muted">Загружаем способ поддержки…</p>';try{let response=await fetch('/api/public-config',{credentials:'same-origin'}),data=await response.json(),title=esc(data.donation_title||'Поддержать H-Point');host.innerHTML='<h3>'+title+'</h3><p class="muted">Пожертвование добровольное. Сумму и способ оплаты вы выбираете на странице платёжного сервиса.</p>'+(data.donation_url?'<a class="btn grad" href="'+esc(data.donation_url)+'" target="_blank" rel="noopener">Перейти к пожертвованию</a>':'<div class="eventEmpty"><b>Способ пожертвования ещё настраивается.</b><br><span class="muted">Кнопка станет активной после добавления платёжной ссылки.</span></div>')}catch(error){host.innerHTML='<div class="eventEmpty">Не удалось загрузить данные о пожертвовании.</div>'}}
+function go(t){document.querySelectorAll('.tab').forEach(function(x){x.classList.toggle('active',x.dataset.t===t)});document.querySelectorAll('.panel').forEach(function(x){x.classList.toggle('active',x.id==='p-'+t)});if(t!=='chat')stopChatPolling();if(t==='requests')requests();if(t==='match'){requests();setTimeout(initMatchMap,50)}if(t==='chat'){loadChats();if(currentChat)startChatPolling()}if(t==='map')setTimeout(loadBigMap,50);if(t==='history')history();if(t==='profile')profile();if(t==='billing'){prices('appprices',true);billing()}if(t==='progress')loadProgress();if(t==='events')loadEvents();if(t==='donate')loadDonationMenu();if(t==='wallet')loadWallet()}
+ensureDonationPanel();
+'''
+
+# Final presentation layer for the community screens.  It intentionally uses
+# the already privacy-filtered /api/progress and authenticated event endpoints.
+SHOWCASE_CSS=r'''
+.showcasePanel{position:relative}.showcaseIntro{display:flex;align-items:end;justify-content:space-between;gap:22px;margin-bottom:20px}.showcaseIntro h2{margin:9px 0 7px;font-size:clamp(28px,4vw,42px);letter-spacing:-1.8px}.showcaseIntro p{max-width:650px;margin:0;line-height:1.6}.showcaseKicker{display:inline-flex;align-items:center;gap:7px;color:#d8ff99;font:700 11px 'Space Mono',monospace;letter-spacing:.08em}.showcaseKicker:before{content:'';width:8px;height:8px;border-radius:50%;background:#b8f36b;box-shadow:0 0 0 6px rgba(184,243,107,.12)}.progressHero{position:relative;overflow:hidden;padding:22px;border:1px solid rgba(191,255,124,.26);border-radius:24px;background:radial-gradient(circle at 90% 0,rgba(184,243,107,.16),transparent 34%),linear-gradient(135deg,#171d15,#10140f)}.progressHero:after{content:'';position:absolute;width:300px;height:300px;right:-145px;bottom:-210px;border-radius:50%;border:1px solid rgba(184,243,107,.18);box-shadow:0 0 0 30px rgba(184,243,107,.035),0 0 0 60px rgba(184,243,107,.025);pointer-events:none}.progressMetrics{position:relative;z-index:1}.progressMetric{position:relative;overflow:hidden;min-height:124px;padding:20px;border-color:rgba(196,255,137,.14);background:rgba(255,255,255,.055);box-shadow:none}.progressMetric:before{content:'';position:absolute;inset:0 auto 0 0;width:3px;background:linear-gradient(#d9ff8c,#7bca50)}.progressMetric b{font-size:clamp(25px,3vw,34px);letter-spacing:-1.5px;color:#f0ffe0}.progressMetric span{display:block;margin-top:7px;color:#aebba5;font-size:12px}.progressRingCard{position:relative;z-index:1;background:rgba(8,12,7,.38);border-color:rgba(196,255,137,.22)}.progressRing{box-shadow:0 0 0 11px rgba(184,243,107,.06),0 16px 35px rgba(0,0,0,.25);transition:background 1s ease}.progressRing b{font-size:27px}.progressLayout{margin-top:16px}.showcaseSection{border-radius:22px;overflow:hidden}.sectionTitle{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}.sectionTitle h3{margin:0;font-size:17px}.sectionTitle p{margin:5px 0 0;font-size:12px;line-height:1.5}.sectionCount{padding:6px 9px;border:1px solid rgba(184,243,107,.23);border-radius:999px;color:#d8ff99;font:700 10px 'Space Mono',monospace;white-space:nowrap}.categoryList{gap:13px}.categoryBar{gap:11px;padding:10px 0;border-bottom:1px solid rgba(207,222,198,.08)}.categoryBar:last-child{border-bottom:0}.categoryBar b{color:#e7f3df;font:700 12px 'Space Mono',monospace;text-align:right}.categoryTrack{height:11px;background:#273125;box-shadow:inset 0 1px 2px rgba(0,0,0,.28)}.categoryBar i{width:0!important;transition:width .85s cubic-bezier(.2,.8,.2,1);box-shadow:0 0 18px rgba(184,243,107,.36)}.categoryBar.is-visible i{width:var(--bar)!important}.ratingPodium{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:end;gap:9px;margin:2px 0 16px}.podiumCard{position:relative;min-height:144px;padding:16px 10px 13px;border:1px solid rgba(184,243,107,.16);border-radius:16px;background:linear-gradient(145deg,#1b2417,#121712);color:#eef7e9;text-align:center;cursor:pointer;transition:transform .22s ease,border-color .22s ease,box-shadow .22s ease}.podiumCard:hover{transform:translateY(-5px);border-color:rgba(216,255,153,.65);box-shadow:0 18px 36px rgba(0,0,0,.24)}.podiumCard:first-child{order:2;min-height:180px;border-color:rgba(225,255,149,.48);background:radial-gradient(circle at 50% 0,rgba(205,255,112,.17),transparent 56%),linear-gradient(145deg,#25321d,#121712)}.podiumCard:nth-child(2){order:1}.podiumCard:nth-child(3){order:3}.podiumMedal{display:grid;place-items:center;width:34px;height:34px;margin:0 auto 8px;border-radius:50%;background:#2f4227;color:#ddff9c;font:700 12px 'Space Mono',monospace}.podiumCard:first-child .podiumMedal{background:linear-gradient(135deg,#e5ff9d,#92d957);color:#1c2716;box-shadow:0 0 0 6px rgba(211,255,130,.1)}.podiumAvatar{display:grid;place-items:center;width:42px;height:42px;margin:0 auto 9px;border-radius:15px;background:linear-gradient(135deg,#4f7d47,#1e3e2e);color:#e9ffd3;font-weight:800}.podiumName{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:800;font-size:12px}.podiumMeta{display:block;margin-top:5px;color:#aebba5;font-size:10px}.podiumRating{display:block;margin-top:9px;color:#d8ff99;font:700 11px 'Space Mono',monospace}.leaderboardList{gap:8px}.leaderRow{width:100%;text-align:left;transition:transform .2s ease,border-color .2s ease,background .2s ease}.leaderRow:hover{transform:translateX(3px);background:#1d2519}.leaderRow:focus-visible,.podiumCard:focus-visible{outline:3px solid #d8ff99;outline-offset:3px}.activityStats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:0 0 16px}.activityStat{padding:13px 15px;border:1px solid rgba(184,243,107,.13);border-radius:16px;background:linear-gradient(145deg,#182016,#121711)}.activityStat b{display:block;color:#e9ffd1;font-size:20px;letter-spacing:-.8px}.activityStat span{display:block;margin-top:4px;color:#aebba5;font-size:11px}.eventsList{display:grid;gap:12px}.eventCard{position:relative;border-color:rgba(184,243,107,.16);background:linear-gradient(115deg,#161c14,#121611);box-shadow:none;animation:showcase-rise .42s both}.eventCard:hover{transform:translateY(-3px);border-color:rgba(216,255,153,.52);box-shadow:0 20px 42px rgba(0,0,0,.22)}.eventCard:nth-child(2){animation-delay:.06s}.eventCard:nth-child(3){animation-delay:.12s}.eventCard:nth-child(4){animation-delay:.18s}.eventCard:nth-child(5){animation-delay:.24s}.eventDate{background:rgba(184,243,107,.1);border:1px solid rgba(184,243,107,.2);border-radius:14px}.eventCapacity{position:relative;overflow:hidden;display:grid;gap:7px;padding:9px 10px;border:1px solid rgba(184,243,107,.16);border-radius:12px;background:#10150f;color:#dcebd5;font-size:11px}.eventCapacity i{height:4px;border-radius:999px;background:#2f3e2c;overflow:hidden}.eventCapacity i:after{content:'';display:block;width:var(--fill);height:100%;border-radius:inherit;background:linear-gradient(90deg,#8fde58,#ddff98);transition:width .8s ease}.eventStatus{display:inline-flex;margin-left:7px;padding:4px 7px;border:1px solid rgba(184,243,107,.2);border-radius:999px;color:#d8ff99;font:700 9px 'Space Mono',monospace;vertical-align:middle}.eventStatus.joined{color:#abdcff;border-color:rgba(126,199,255,.28)}.eventStatus.full{color:#ffd48d;border-color:rgba(255,190,102,.28)}.eventEmpty{border-radius:18px;background:linear-gradient(145deg,#182016,#121711)}.showcaseReveal{animation:showcase-rise .45s both}@keyframes showcase-rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}@media(max-width:760px){.showcaseIntro{align-items:flex-start;flex-direction:column}.showcaseIntro .btn{width:100%}.progressHero{padding:15px}.ratingPodium{gap:6px}.podiumCard{padding:13px 7px 10px}.podiumCard:first-child{min-height:166px}.activityStats{grid-template-columns:1fr}.eventCard{animation-duration:.32s}}@media(prefers-reduced-motion:reduce){.eventCard,.showcaseReveal{animation:none}.categoryBar i,.progressRing,.podiumCard,.leaderRow{transition:none}}
+'''
+
+SHOWCASE_UI=r'''
+function ensureProgressPanel(){let tabs=document.querySelector('.tabs'),app=$('app');if(!tabs||!app)return;if(!document.querySelector('[data-t="progress"]')){let tab=document.createElement('button');tab.className='tab';tab.dataset.t='progress';tab.textContent='Прогресс';tab.onclick=function(){go('progress')};let profile=document.querySelector('[data-t="profile"]');tabs.insertBefore(tab,profile||null)}let panel=$('p-progress');if(!panel){panel=document.createElement('section');panel.id='p-progress';panel.className='panel';app.appendChild(panel)}if(!panel.querySelector('.showcaseIntro')){panel.classList.add('showcasePanel');panel.innerHTML='<div class="showcaseIntro"><div><span class="showcaseKicker">ОБЩЕЕ ДЕЛО</span><h2>Прогресс H-Point</h2><p class="muted">Реальный вклад сообщества: помощь, завершённые заявки и репутация участников.</p></div></div><div id="progressData"></div>'}}
+function ensureActivitiesPanel(){let tabs=document.querySelector('.tabs'),app=$('app');if(!tabs||!app)return;if(!document.querySelector('[data-t="activities"]')){let tab=document.createElement('button');tab.className='tab';tab.dataset.t='activities';tab.textContent='Активности';tab.onclick=function(){go('activities')};let profile=document.querySelector('[data-t="profile"]');tabs.insertBefore(tab,profile||null)}let panel=$('p-activities');if(!panel){panel=document.createElement('section');panel.id='p-activities';panel.className='panel';app.appendChild(panel)}if(!panel.querySelector('.showcaseIntro')){panel.classList.add('showcasePanel');panel.innerHTML='<div class="showcaseIntro"><div><span class="showcaseKicker">СООБЩЕСТВО РЯДОМ</span><h2>Активности</h2><p class="muted">Встречи, турниры и полезные события, которые собирают людей рядом.</p></div><button class="btn grad" type="button" onclick="activityForm()">+ Создать событие</button></div><div id="activityStats" class="activityStats"></div><div id="eventsList" class="eventsList"></div>'}}
+function progressMetric(value,label){return '<div class="progressMetric showcaseReveal"><b data-count="'+Number(value||0)+'">0</b><span>'+esc(label)+'</span></div>'}
+function animateCommunityNumbers(root){if(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches){root.querySelectorAll('[data-count]').forEach(function(node){node.textContent=Number(node.dataset.count||0).toLocaleString('ru-RU')});return}root.querySelectorAll('[data-count]').forEach(function(node){let target=Math.max(0,Number(node.dataset.count)||0),started=performance.now(),duration=Math.min(1000,450+target*15);function frame(now){let p=Math.min(1,(now-started)/duration),value=Math.round(target*(1-Math.pow(1-p,3)));node.textContent=value.toLocaleString('ru-RU');if(p<1)requestAnimationFrame(frame)}requestAnimationFrame(frame)})}
+function podiumCard(person){let name=esc(person.name||'Участник'),letter=esc((person.name||'?').slice(0,1).toUpperCase()),rating=person.rating===null?'нет оценок':'★ '+Number(person.rating).toFixed(1);return '<button type="button" class="podiumCard showcaseReveal" onclick="openCommunityProfile('+Number(person.user_id)+')"><span class="podiumMedal">#'+Number(person.position)+'</span><span class="podiumAvatar">'+letter+'</span><span class="podiumName">'+name+'</span><span class="podiumMeta">'+Number(person.helped)+' заверш. · '+Number(person.reviews)+' отзывов</span><span class="podiumRating">'+rating+'</span></button>'}
+function leaderRow(person){let letter=esc((person.name||'?').slice(0,1).toUpperCase()),rating=person.rating===null?'нет оценок':'★ '+Number(person.rating).toFixed(1);return '<button type="button" class="leaderRow showcaseReveal" onclick="openCommunityProfile('+Number(person.user_id)+')"><span class="leaderPlace">#'+Number(person.position)+'</span><span class="leaderAvatar">'+letter+'</span><span><span class="leaderName">'+esc(person.name)+'</span><span class="leaderMeta">'+Number(person.helped)+' заверш. · '+Number(person.reviews)+' отзывов</span></span><span class="leaderScore">'+rating+'<br>'+Number(person.score)+' баллов</span></button>'}
+async function loadProgress(){ensureProgressPanel();let host=$('progressData');if(!host)return;host.innerHTML='<div class="eventEmpty">Обновляем картину сообщества…</div>';try{let d=await api('/api/progress'),summary=d.summary||{},categories=d.categories||[],leaders=d.leaderboard||[],max=Math.max(1,...categories.map(function(x){return Number(x.count)||0})),percent=Math.max(0,Math.min(100,Number(d.completion_percent)||0));let categoryHtml=categories.map(function(x){let width=Math.max(0,Math.round(Number(x.count)/max*100));return '<div class="categoryBar showcaseReveal"><span title="'+esc(x.title)+'">'+esc(x.title)+'</span><span class="categoryTrack"><i style="--bar:'+width+'%"></i></span><b>'+Number(x.count)+'</b></div>'}).join('');let podium=leaders.slice(0,3).map(podiumCard).join('');let list=leaders.slice(3).map(leaderRow).join('');host.innerHTML='<div class="progressHero"><div class="progressMetrics">'+progressMetric(summary.total,'всего заявок')+progressMetric(summary.active,'сейчас в работе')+progressMetric(summary.done,'успешно завершены')+'</div><div class="progressRingCard"><div class="progressRing" style="--progress:'+percent+'%"><b>'+percent+'%</b><span>доведено до конца</span></div></div></div><div class="progressLayout"><section class="card showcaseSection"><div class="sectionTitle"><div><h3>Направления помощи</h3><p class="muted">Что чаще всего требуется сообществу.</p></div><span class="sectionCount">'+Number(summary.total||0)+' заявок</span></div><div class="categoryList">'+(categoryHtml||'<div class="eventEmpty">Заявок пока нет.</div>')+'</div></section><section class="card showcaseSection"><div class="sectionTitle"><div><h3>Рейтинг помощников</h3><p class="muted">За завершённые заявки и оценки от участников.</p></div><span class="sectionCount">топ '+Number(leaders.length)+'</span></div>'+(podium?'<div class="ratingPodium">'+podium+'</div>':'<div class="eventEmpty">Первое завершённое дело откроет рейтинг.</div>')+(list?'<div class="leaderboardList">'+list+'</div>':'')+'</section></div>';animateCommunityNumbers(host);requestAnimationFrame(function(){host.querySelectorAll('.categoryBar').forEach(function(row,index){setTimeout(function(){row.classList.add('is-visible')},index*55)})})}catch(error){host.innerHTML='<div class="eventEmpty"><b>Статистика временно недоступна.</b><br><span class="muted">Обновите страницу и попробуйте ещё раз.</span></div>';console.warn('progress',error)}}
+function eventCard(event){let date=eventDateParts(event.starts_at),count=Number(event.participant_count||0),capacity=Number(event.capacity||0),full=capacity>0&&count>=capacity,fill=capacity?Math.min(100,Math.round(count/capacity*100)):Math.min(100,count*12),status=event.is_creator?'<span class="eventStatus">ваше событие</span>':event.joined?'<span class="eventStatus joined">вы участвуете</span>':full?'<span class="eventStatus full">мест нет</span>':'',capacityText=capacity?count+' из '+capacity+' мест':count+' участников',action=event.status!=='published'?'<span class="muted">Архив</span>':event.is_creator?'<button class="btn danger" type="button" onclick="cancelEvent('+Number(event.id)+')">Отменить</button>':event.joined?'<button class="btn light" type="button" onclick="leaveEvent('+Number(event.id)+')">Не участвовать</button>':full?'<button class="btn light" type="button" disabled>Мест нет</button>':'<button class="btn grad" type="button" onclick="joinEvent('+Number(event.id)+')">Участвовать</button>',visual=event.has_image?'<img src="/api/events/image?id='+Number(event.id)+'" alt="Фото мероприятия">':'<span>'+esc((event.title||'H').slice(0,1).toUpperCase())+'</span>';return '<article class="eventCard"><div class="eventDate"><b>'+esc(date.day)+'</b><span>'+esc(date.month)+'</span></div><div class="eventVisual">'+visual+'</div><div class="eventCopy"><h3>'+esc(event.title)+status+'</h3><div class="eventMeta"><span>◷ '+esc(eventTimeRange(event))+'</span><span>⌖ '+esc(event.place)+'</span><span>Организатор: '+esc(event.creator_name)+'</span></div>'+(event.description?'<p class="eventDescription">'+esc(event.description)+'</p>':'')+'</div><div class="eventActions"><span class="eventCapacity">'+esc(capacityText)+'<i style="--fill:'+fill+'%"></i></span>'+action+'</div></article>'}
+async function loadActivities(mine){ensureActivitiesPanel();let host=$('eventsList'),stats=$('activityStats');if(!host)return;host.innerHTML='<div class="eventEmpty">Ищем ближайшие события…</div>';try{let data=await api('/api/events'+(mine?'?mine=1':'')),events=data.events||[],joined=events.filter(function(x){return x.joined}).length,seats=events.reduce(function(sum,x){return sum+Number(x.participant_count||0)},0);if(stats)stats.innerHTML='<div class="activityStat showcaseReveal"><b data-count="'+events.length+'">0</b><span>ближайших событий</span></div><div class="activityStat showcaseReveal"><b data-count="'+seats+'">0</b><span>участников уже записались</span></div><div class="activityStat showcaseReveal"><b data-count="'+joined+'">0</b><span>событий в вашем плане</span></div>';host.innerHTML=events.length?events.map(eventCard).join(''):'<div class="eventEmpty"><b>Пока нет ближайших мероприятий.</b><br><span class="muted">Создайте первое событие для своего района.</span></div>';if(stats)animateCommunityNumbers(stats)}catch(error){host.innerHTML='<div class="eventEmpty">Не удалось загрузить мероприятия: '+esc(error.message)+'</div>'}}
+const hpointShowcaseGo=window.go;window.go=function(tab){ensureActivitiesPanel();ensureProgressPanel();hpointShowcaseGo(tab);if(tab==='activities')loadActivities();if(tab==='progress')loadProgress()};ensureActivitiesPanel();ensureProgressPanel();
+'''
+
+# The final progress presentation deliberately has no dependency on the older
+# community styles.  The screen stays readable even when it contains only one
+# ranked helper, which is the normal state for a young community.
+LEAGUE_CSS=r'''
+.showcasePanel{max-width:1120px;margin:0 auto;padding:28px 0 52px}.showcasePanel .showcaseIntro{margin:0 0 18px}.leagueHeading{display:flex;align-items:center;gap:13px}.leagueHeadingMark{display:grid;place-items:center;flex:0 0 48px;width:48px;height:48px;border-radius:17px;background:linear-gradient(145deg,#65e6ff,#268bff);box-shadow:0 8px 0 #1763cf,0 15px 28px rgba(23,99,207,.32);font-size:25px}.leagueHeading h2{margin:0;color:#f7fbff;font-size:clamp(28px,4vw,42px);letter-spacing:-1.7px}.leagueHeading p{margin:4px 0 0;color:#aeb9b0}.leagueHero{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(180px,.55fr);gap:18px;position:relative;overflow:hidden;padding:24px;border:2px solid #354436;border-radius:26px;background:linear-gradient(135deg,#1f6df0,#2855db 60%,#5037bd);box-shadow:0 10px 0 #182b83,0 22px 40px rgba(21,39,130,.28)}.leagueHero:before,.leagueHero:after{content:'';position:absolute;border:22px solid rgba(255,255,255,.08);border-radius:50%;pointer-events:none}.leagueHero:before{width:260px;height:260px;right:-130px;top:-155px}.leagueHero:after{width:170px;height:170px;right:26px;bottom:-125px}.leagueEyebrow{position:relative;z-index:1;display:inline-flex;align-items:center;gap:7px;margin-bottom:9px;color:#dceeff;font:800 11px 'Space Mono',monospace;letter-spacing:.09em}.leagueEyebrow:before{content:'';width:9px;height:9px;border:3px solid #c6f74a;border-radius:50%;background:#fff}.leagueHero h3{position:relative;z-index:1;max-width:560px;margin:0;color:#fff;font-size:clamp(23px,3vw,31px);letter-spacing:-1px}.leagueHero p{position:relative;z-index:1;max-width:560px;margin:8px 0 0;color:#e7efff;line-height:1.55}.leagueProgress{position:relative;z-index:1;display:grid;gap:7px;margin-top:20px;max-width:460px}.leagueProgressTop{display:flex;justify-content:space-between;gap:12px;color:#e8f1ff;font-size:12px;font-weight:800}.leagueProgressTrack{height:13px;overflow:hidden;border:2px solid rgba(14,37,112,.24);border-radius:999px;background:#1742ae;box-shadow:inset 0 2px 0 rgba(0,0,0,.16)}.leagueProgressTrack i{display:block;width:var(--league-progress);height:100%;border-radius:inherit;background:linear-gradient(90deg,#c4f848,#f1ff9e);box-shadow:0 0 17px rgba(215,255,88,.75);animation:league-fill .9s cubic-bezier(.22,1,.36,1)}.leagueTrophy{position:relative;z-index:1;display:grid;place-items:center;align-self:center;justify-self:center;width:148px;height:148px;border:8px solid rgba(255,255,255,.24);border-radius:50%;background:radial-gradient(circle at 35% 28%,#f6ffbf,#bdf042 48%,#71b72d 49%,#4f952c);box-shadow:0 9px 0 rgba(20,65,170,.55),0 20px 35px rgba(9,25,99,.3);font-size:69px;transform:rotate(-6deg);animation:league-bob 3s ease-in-out infinite}.leagueStats{display:grid!important;grid-template-columns:repeat(3,minmax(0,1fr))!important;gap:12px;margin:18px 0}.leagueStat{position:relative;min-height:116px;overflow:hidden;padding:17px 18px 15px;border:2px solid #354336;border-radius:20px;background:#182018;box-shadow:0 5px 0 #101510}.leagueStat:nth-child(1){border-color:#326fce;background:linear-gradient(145deg,#19325a,#17241d)}.leagueStat:nth-child(2){border-color:#5a8d37;background:linear-gradient(145deg,#263c20,#17241d)}.leagueStat:nth-child(3){border-color:#9b7937;background:linear-gradient(145deg,#3a311d,#17241d)}.leagueStatEmoji{display:block;margin-bottom:7px;font-size:20px}.leagueStat b{display:block;color:#fff;font-size:28px;letter-spacing:-1px}.leagueStat span{display:block;margin-top:4px;color:#b9c4b7;font-size:12px}.leagueGrid{display:grid!important;grid-template-columns:minmax(0,1.25fr) minmax(280px,.75fr)!important;gap:18px;margin-top:18px}.leagueBoard,.leagueCategories{border:2px solid #354336;border-radius:24px;background:#171d16;box-shadow:0 7px 0 #101510}.leagueBoard{padding:20px}.leagueCategories{padding:20px}.leagueSectionHead{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:17px}.leagueSectionHead h3{margin:0;color:#f6faf3;font-size:20px;letter-spacing:-.5px}.leagueSectionHead p{margin:4px 0 0;color:#a9b4a8;font-size:12px;line-height:1.45}.leaguePill{padding:7px 10px;border-radius:999px;background:#273728;color:#d7fa8a;font:800 10px 'Space Mono',monospace;white-space:nowrap}.duoPodium{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:end;gap:10px;margin:4px 0 19px}.duoChampion{appearance:none;width:100%;border:0;color:inherit;font:inherit;text-align:center;cursor:pointer}.duoChampionCard{position:relative;overflow:hidden;min-height:176px;padding:14px 8px 13px;border:2px solid #546348;border-radius:19px;background:linear-gradient(160deg,#273523,#182018);box-shadow:0 6px 0 #101510;transition:transform .18s ease,filter .18s ease}.duoChampion:hover .duoChampionCard{transform:translateY(-4px);filter:brightness(1.12)}.duoChampion.first .duoChampionCard{min-height:210px;border-color:#d0e95d;background:radial-gradient(circle at 50% 0,rgba(238,255,151,.3),transparent 45%),linear-gradient(160deg,#405225,#1d291b);box-shadow:0 7px 0 #252f14}.duoChampion.solo{max-width:310px;margin:4px auto 18px}.duoChampion.solo .duoChampionCard{min-height:245px}.duoRankBadge{display:grid;place-items:center;width:34px;height:34px;margin:0 auto 8px;border-radius:50%;background:#394837;color:#e9f8d7;font:800 13px 'Space Mono',monospace}.duoChampion.first .duoRankBadge{background:linear-gradient(135deg,#fff9bb,#d6f34b);color:#43551b;box-shadow:0 0 0 5px rgba(227,255,132,.14)}.duoAvatar{display:grid;place-items:center;width:51px;height:51px;margin:0 auto 8px;border:3px solid rgba(238,255,218,.34);border-radius:20px;background:linear-gradient(135deg,#5bd6ff,#366bdc);color:#fff;font-size:20px;font-weight:900;box-shadow:0 5px 0 rgba(10,29,88,.35)}.duoChampionName{display:block;overflow:hidden;color:#fff;text-overflow:ellipsis;white-space:nowrap;font-weight:900;font-size:13px}.duoChampionMeta{display:block;margin-top:5px;color:#bfccb9;font-size:10px}.duoChampionScore{display:inline-block;margin-top:10px;padding:5px 8px;border-radius:999px;background:rgba(5,13,5,.34);color:#ebffae;font:800 10px 'Space Mono',monospace}.leagueRows{display:grid;gap:9px}.leagueRow{appearance:none;display:grid;width:100%;grid-template-columns:36px 42px minmax(0,1fr) auto;align-items:center;gap:11px;padding:10px 11px;border:2px solid #303c2f;border-radius:16px;background:#1d261b;color:inherit;font:inherit;text-align:left;cursor:pointer;transition:transform .16s ease,border-color .16s ease,background .16s ease}.leagueRow:hover{transform:translateX(4px);border-color:#a8d94b;background:#243020}.leagueRow:focus-visible,.duoChampion:focus-visible{outline:3px solid #d6fa67;outline-offset:3px}.leaguePosition{display:grid;place-items:center;width:30px;height:30px;border-radius:10px;background:#2e3a2b;color:#d7fa8a;font:800 11px 'Space Mono',monospace}.leagueAvatar{display:grid;place-items:center;width:39px;height:39px;border-radius:15px;background:linear-gradient(135deg,#315d4c,#193845);color:#dcffe7;font-weight:900}.leagueMemberName{display:block;overflow:hidden;color:#f3f8f0;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:900}.leagueMemberMeta{display:block;margin-top:3px;color:#aeb9ab;font-size:11px}.leagueRating{text-align:right;color:#efffae;font:800 11px 'Space Mono',monospace;line-height:1.55}.leagueCategoryList{display:grid;gap:11px}.leagueCategory{display:grid;grid-template-columns:minmax(0,1fr) 43px;gap:10px;align-items:center}.leagueCategoryTop{display:flex;justify-content:space-between;gap:8px;margin-bottom:5px;color:#e5ede1;font-size:12px;font-weight:700}.leagueCategoryTop span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.leagueCategoryCount{text-align:right;color:#cbfa7a;font:800 11px 'Space Mono',monospace}.leagueCategoryTrack{height:11px;overflow:hidden;border-radius:999px;background:#2b3629;box-shadow:inset 0 2px 2px rgba(0,0,0,.22)}.leagueCategoryTrack i{display:block;width:var(--width);height:100%;border-radius:inherit;background:linear-gradient(90deg,#4dc9ff,#9cf252);box-shadow:0 0 14px rgba(103,224,119,.38);animation:league-fill .85s cubic-bezier(.22,1,.36,1)}.leagueEmpty{padding:25px;border:2px dashed #3d4b3a;border-radius:18px;background:#141a13;color:#b7c2b4;text-align:center;line-height:1.55}@keyframes league-fill{from{width:0}}@keyframes league-bob{0%,100%{transform:rotate(-6deg) translateY(0)}50%{transform:rotate(-3deg) translateY(-7px)}}@media(max-width:760px){.showcasePanel{padding:18px 0 38px}.leagueHero,.leagueGrid{grid-template-columns:1fr!important}.leagueHero{padding:19px}.leagueTrophy{display:none}.leagueStats{grid-template-columns:1fr!important}.duoPodium{gap:6px}.duoChampionCard{min-height:158px;padding:12px 5px 10px}.duoChampion.first .duoChampionCard{min-height:184px}.duoAvatar{width:43px;height:43px;border-radius:16px}.duoChampionMeta{font-size:9px}.leagueRow{grid-template-columns:30px 38px minmax(0,1fr);gap:8px}.leagueRating{display:none}}@media(prefers-reduced-motion:reduce){.leagueTrophy{animation:none}.leagueProgressTrack i,.leagueCategoryTrack i,.duoChampionCard,.leagueRow{animation:none;transition:none}}
+'''
+
+# This is intentionally late and specific: the original page still contains
+# generic button styling that could paint a native white button behind the
+# leaderboard card in some browsers.
+LEAGUE_REPAIR_CSS=r'''
+.leagueBoard .duoChampion{display:block!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;border-radius:0!important;background:transparent!important;box-shadow:none!important;outline:0!important}.leagueBoard .duoChampionCard{display:block!important;width:100%!important;box-sizing:border-box!important}.leagueBoard .duoChampionCard>*{box-sizing:border-box}.leagueBoard .duoChampion.solo{width:100%!important;max-width:310px!important}.leagueBoard .duoChampion:focus-visible{outline:3px solid #d6fa67!important;outline-offset:4px!important}
+'''
+
+HPOINT_WALLET_PAYMENT_UI=r'''
+function prices(id,paid){$(id).innerHTML=products.map(function(p){return '<div class="card"><span class="ey">H·POINT+</span><h3>'+p[1]+'</h3><p class="muted">'+p[2]+'</p><div class="productPrices"><div class="price">'+p[3]+' ₽</div><div class="hp">или '+p[4]+' HP</div></div>'+(!paid?'':'<div class="purchaseActions"><button class="btn grad" type="button" onclick="buy(\''+p[0]+'\',\'wallet\')">Оплатить кошельком</button><button class="btn light" type="button" onclick="buy(\''+p[0]+'\',\'hp\')">Оплатить HP</button></div>')+'</div>'}).join('')}
+async function buy(item,method){let meta=purchaseMeta(item);if(meta===null)return;try{let key=crypto.randomUUID(),path=method==='hp'?'/api/payments/hp':'/api/payments/wallet',d=await api(path,{method:'POST',body:JSON.stringify({item_type:item,metadata:meta,request_id:meta.request_id,ad_text:meta.ad_text,purchase_key:key})});if(method==='hp')toast(d.created?'Функция подключена · баланс '+d.balance+' HP':'Покупка уже выполнена');else toast(d.created?'Функция подключена · списано из кошелька':'Покупка уже выполнена');await billing();await loadWallet();await syncTick()}catch(e){toast(e.message)}}
+async function billing(){let both=await Promise.all([api('/api/billing'),api('/api/wallet')]),d=both[0],wallet=both[1].wallet||{};$('subs').innerHTML='<p>Кошелёк: <b>'+walletAmount(wallet.balance_rub)+'</b> · <button class="link" type="button" onclick="go(\'wallet\')">открыть</button></p><p>Баланс: <b>'+Number(d.user.balance||0)+' HP</b></p><p>PRO: <b>'+(d.user.pro_until?new Date(d.user.pro_until).toLocaleDateString('ru-RU'):'нет')+'</b></p><p>Проверка личности: <b>'+(d.user.identity_verified?'подтверждена':d.user.identity_verification?.status==='pending'?'на проверке':'нет')+'</b></p><p>Business: <b>'+(d.user.business_until?new Date(d.user.business_until).toLocaleDateString('ru-RU'):'нет')+'</b></p>';$('payments').innerHTML=d.history.length?d.history.map(function(x){return '<div class="request"><div class="requestmain"><b>'+esc(x.item_type)+'</b><div class="muted">'+x.amount_rub+' '+(x.currency==='HP'?'HP':'₽')+' · '+esc(x.status)+'</div></div></div>'}).join(''):'<div class="muted">Покупок пока нет.</div>'}
+'''
+
+MVP_CSS=r'''
+.globalBalance{display:flex;align-items:center;gap:2px;margin-right:2px;border:1px solid #3d463c;background:#171a14;color:#edf0e7;padding:5px 8px;min-height:42px;cursor:pointer}.globalBalance:hover{border-color:#b8f36b;background:#1e231c}.globalBalanceItem{display:flex;flex-direction:column;min-width:68px;padding:0 8px;text-align:left}.globalBalanceItem+.globalBalanceItem{border-left:1px solid #3d463c}.globalBalanceItem small{font:9px 'Space Mono',monospace;letter-spacing:.08em;color:#a9afa1}.globalBalanceItem b{font-size:13px;white-space:nowrap;color:#edf0e7}.globalBalanceItem:first-child b{color:#d5ff8a}.globalBalance[aria-busy="true"]{opacity:.68}.homePulse{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;padding:0!important;background:#3a4035!important}.homePulseItem{padding:20px;background:#171a14}.homePulseItem b{display:block;color:#d5ff8a;font-size:27px;line-height:1.1}.homePulseItem span{display:block;margin-top:7px;color:#a9afa1;font-size:11px}.homePulseEmpty{grid-column:1/-1;padding:23px;background:#171a14;color:#a9afa1}.telegramSummary{display:flex;align-items:center;gap:13px;padding:16px;border:1px solid #3a4035;background:#10120f}.telegramAvatar{width:42px;height:42px;display:grid;place-items:center;background:#b8f36b;color:#10120f;font-weight:800;font-size:16px}.telegramCopy{min-width:0;flex:1}.telegramCopy b,.telegramCopy span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.telegramCopy span{margin-top:3px;color:#a9afa1;font-size:12px}.telegramActions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}.subscriptionStatus{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:#3a4035;margin-bottom:14px}.subscriptionStatus>div{background:#171a14;padding:14px}.subscriptionStatus b{display:block;color:#d5ff8a}.subscriptionStatus span{display:block;margin-top:4px;color:#a9afa1;font-size:11px}.subscriptionCard{position:relative;overflow:hidden;min-height:252px}.subscriptionCard .productPrices{margin-top:auto}.subscriptionCard .purchaseActions{width:100%;display:grid;gap:8px}.subscriptionCard .purchaseActions .btn{width:100%}.subscriptionCard .hp{color:#d5ff8a;font-size:12px}.btn[disabled]{cursor:wait;opacity:.62;transform:none!important}.profileButton{margin-left:8px}.matchActions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.matchActions .btn{min-width:105px}@media(max-width:760px){.globalBalance{order:2;margin-left:auto}.globalBalanceItem{min-width:55px;padding:0 5px}.globalBalanceItem small{font-size:8px}.globalBalanceItem b{font-size:11px}.homePulse,.subscriptionStatus{grid-template-columns:1fr}.telegramSummary{align-items:flex-start}.telegramActions{flex-direction:column}.telegramActions .btn{width:100%}.matchActions{width:100%;justify-content:stretch}.matchActions .btn{flex:1}.profileButton{margin-left:0}.nav .in{gap:7px}.nav #nav{display:flex;gap:7px;align-items:center}.nav #nav>.btn{padding:10px 11px;font-size:11px}}
+@media(prefers-reduced-motion:no-preference){.globalBalance,.homePulseItem,.subscriptionCard{transition:background .16s,border-color .16s,transform .16s}.subscriptionCard:hover{transform:translateY(-2px)}}
+'''
+
+MVP_UI=r'''
+const mvpHpPrices={boost:25,more_responses:40,pro:180,verification:70,favorites:90,business:600,business_pro:900,ad:120};
+let mvpSyncBusy=false,mvpVisibilityBound=false;const mvpBusyActions=new Set();
+function mvpRoubles(value){return Number(value||0).toLocaleString('ru-RU')+' ₽'}
+function renderGlobalBalance(user,wallet){let nav=$('nav');if(!nav||!user)return;let node=$('globalBalance');if(!node){node=document.createElement('button');node.id='globalBalance';node.type='button';node.className='globalBalance';node.title='Открыть кошелёк';node.onclick=function(){go('wallet')};nav.prepend(node)}let rub=wallet&&wallet.balance_rub||0;node.innerHTML='<span class="globalBalanceItem"><small>BALANCE</small><b>'+mvpRoubles(rub)+'</b></span><span class="globalBalanceItem"><small>H-POINTS</small><b>'+Number(user.balance||0).toLocaleString('ru-RU')+' HP</b></span>'}
+function renderInteractiveHome(data){let panel=$('p-home');if(!panel)return;let verification=panel.querySelector('.verify');if(verification)verification.remove();let notice=$('verifyNotice');if(notice)notice.innerHTML='';let layout=panel.querySelector('.layout');if(!layout)return;let host=$('homePulse');if(!host){host=document.createElement('section');host.id='homePulse';host.className='card homePulse';layout.appendChild(host)}let requests=(data&&data.requests)||[],open=requests.filter(function(r){return r.status==='open'}).length,active=requests.filter(function(r){return r.status==='in_progress'}).length,done=requests.filter(function(r){return r.status==='done'}).length;host.innerHTML='<div class="homePulseItem"><b>'+open+'</b><span>ожидают помощника</span></div><div class="homePulseItem"><b>'+active+'</b><span>в работе сейчас</span></div><div class="homePulseItem"><b>'+done+'</b><span>завершено вами</span></div>'+(requests.length?'':'<div class="homePulseEmpty">Создайте первую заявку или присоединитесь к помощи рядом.</div>')}
+const mvpBaseUpdateDashboard=window.updateDashboard;
+window.updateDashboard=function(user){mvpBaseUpdateDashboard(user);renderGlobalBalance(user,window.hpointWallet||{});};
+const mvpBaseApplySync=window.applySync;
+window.applySync=function(data){window.hpointWallet=data.wallet||{};mvpBaseApplySync(data);renderGlobalBalance(data.user,window.hpointWallet);renderInteractiveHome(data);};
+const mvpBaseProfile=window.profile;
+window.profile=async function(providedUser){let user=providedUser||(await api('/api/me')).user;await mvpBaseProfile(user);let state=$('tgState'),card=state&&state.closest('.card');if(!state||!card)return;let old=card.querySelector('#tgLinkedSummary');if(old)old.remove();let title=card.querySelector('h2'),intro=card.querySelector('p.muted'),linkButton=$('tgLinkButton'),code=$('code'),guide=$('tgGuide');if(title)title.textContent='Telegram';if(user.tg_linked){if(intro)intro.style.display='none';if(linkButton)linkButton.style.display='none';if(code)code.style.display='none';if(guide)guide.style.display='none';state.innerHTML='';let telegram=user.telegram||{},name=telegram.name||user.name||'Telegram',username=telegram.username?'@'+telegram.username:'Профиль подключён',initial=esc(name.slice(0,1).toUpperCase());let summary=document.createElement('div');summary.id='tgLinkedSummary';summary.innerHTML='<div class="telegramSummary"><span class="telegramAvatar">'+initial+'</span><div class="telegramCopy"><b>'+esc(name)+'</b><span>'+esc(username)+'</span><span>✓ Сайт и бот синхронизированы</span></div></div><div class="telegramActions">'+(user.telegram_url?'<a class="btn light" href="'+esc(user.telegram_url)+'" target="_blank" rel="noopener">Открыть Telegram</a>':'')+'<button class="btn danger" type="button" onclick="unlinkTelegram()">Изменить аккаунт</button></div>';card.appendChild(summary)}else{if(intro){intro.style.display='';intro.textContent='Подключите Telegram, чтобы объединить заявки, сообщения и уведомления сайта с ботом.'}if(linkButton)linkButton.style.display='';if(code)code.style.display='';if(guide)guide.style.display='';state.innerHTML='<span class="badge warn">Telegram не привязан</span>'}};
+window.prices=function(id,paid){let host=$(id);if(!host)return;host.innerHTML=products.map(function(product){let hp=mvpHpPrices[product[0]],actions=!paid?'':'<div class="purchaseActions"><button class="btn grad" type="button" onclick="buy(\''+product[0]+'\',\'wallet\')">Оплатить ₽</button><button class="btn light" type="button" onclick="buy(\''+product[0]+'\',\'hp\')">Оплатить '+hp+' HP</button></div>';return '<article class="card subscriptionCard"><span class="ey">H·POINT+</span><h3>'+esc(product[1])+'</h3><p class="muted">'+esc(product[2])+'</p><div class="productPrices"><div class="price">'+Number(product[3]).toLocaleString('ru-RU')+' ₽</div><div class="hp">или '+hp+' HP</div></div>'+actions+'</article>'}).join('')};
+window.billing=async function(){let both=await Promise.all([api('/api/billing'),api('/api/wallet')]),billing=both[0],wallet=both[1].wallet||{};window.hpointWallet=wallet;renderGlobalBalance(billing.user,wallet);let pro=billing.user.pro_until?new Date(billing.user.pro_until).toLocaleDateString('ru-RU'):'не подключён',business=billing.user.business_until?new Date(billing.user.business_until).toLocaleDateString('ru-RU'):'не подключён';$('subs').innerHTML='<div class="subscriptionStatus"><div><b>'+mvpRoubles(wallet.balance_rub)+'</b><span>доступно в кошельке</span></div><div><b>'+Number(billing.user.balance||0)+' HP</b><span>баланс H-Points</span></div><div><b>'+esc(pro)+'</b><span>H·Point PRO</span></div></div><p class="muted">Business: '+esc(business)+'. Оплата выполняется только доступным способом; фиктивных списаний нет.</p>';$('payments').innerHTML=billing.history.length?billing.history.map(function(item){return '<div class="request"><div class="requestmain"><b>'+esc(item.item_type)+'</b><div class="muted">'+Number(item.amount_rub||0).toLocaleString('ru-RU')+' '+(item.currency==='HP'?'HP':'₽')+' · '+esc(item.status)+'</div></div></div>'}).join(''):'<div class="empty">Операций пока нет.</div>'};
+async function mvpOnce(key,action){if(mvpBusyActions.has(key))return;mvpBusyActions.add(key);try{return await action()}finally{mvpBusyActions.delete(key)}}
+const mvpBaseBuy=window.buy,mvpBaseFinish=window.finish,mvpBaseAssign=window.assign,mvpBaseSendReq=window.sendReq;
+window.buy=function(item,method){return mvpOnce('buy:'+item,function(){return mvpBaseBuy(item,method)})};
+window.finish=function(id){return mvpOnce('finish:'+Number(id),function(){return mvpBaseFinish(id)})};
+window.assign=function(requestId,helperId){return mvpOnce('assign:'+Number(requestId),function(){return mvpBaseAssign(requestId,helperId)})};
+window.sendReq=function(lat,lon){return mvpOnce('request:create',function(){return mvpBaseSendReq(lat,lon)})};
+const mvpBaseMatch=window.match;
+window.match=async function(){await mvpBaseMatch();let host=$('matches');if(!host)return;host.querySelectorAll('.match').forEach(function(row){let select=row.querySelector('.btn.grad');if(!select||row.querySelector('.profileButton'))return;let handler=select.getAttribute('onclick')||'',ids=handler.match(/assign\(\s*\d+\s*,\s*(\d+)/);if(!ids)return;let button=document.createElement('button');button.type='button';button.className='btn light profileButton';button.textContent='Профиль';button.onclick=function(){openCommunityProfile(Number(ids[1]))};select.parentElement.classList.add('matchActions');select.parentElement.appendChild(button)})};
+window.loadOpenRequests=async function(){try{let data=await api('/api/requests?open=1');window.hpointOpenRequests=data.requests||[];let host=openRequestHost();host.innerHTML='<h3>Открытые заявки</h3>'+((data.requests||[]).length?data.requests.map(function(request){return '<div class="request"><div class="requestmain"><b>#'+Number(request.id)+' · '+esc(request.what)+'</b><div class="muted">'+esc(request.category_name)+' · '+esc(request.urgency)+(Number(request.reward_rub)>0?' · вознаграждение '+mvpRoubles(request.reward_rub):' · без оплаты')+'</div></div><div class="matchActions"><button class="btn light profileButton" type="button" onclick="openCommunityProfile('+Number(request.author_profile_id)+')">Профиль автора</button><button class="btn grad" type="button" onclick="acceptOpenRequest('+Number(request.id)+')">Помочь</button></div></div>'}).join(''):'<div class="empty">Сейчас нет открытых заявок от других пользователей.</div>')}catch(error){openRequestHost().innerHTML='<div class="empty">Не удалось загрузить открытые заявки.</div>'}};
+window.syncTick=async function(){if(mvpSyncBusy)return;mvpSyncBusy=true;try{let data=await api('/api/sync');window.applySync(data);let active=document.querySelector('.tab.active')?.dataset.t;if(active==='profile')await window.profile(data.user);if(active==='billing')await window.billing();if(active==='requests'){await window.loadOpenRequests();if(window.loadHelperOffers)await window.loadHelperOffers()}}catch(error){if(error.message==='auth_required'){stopSync();stopChatPolling()}}finally{mvpSyncBusy=false}};
+window.startSync=function(){if(syncTimer)return;syncTimer=setInterval(function(){if(document.visibilityState==='visible')window.syncTick()},20000);if(!mvpVisibilityBound){mvpVisibilityBound=true;document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible')window.syncTick()})}};
+'''
+
+# Final presentation layer.  Earlier iterations of the single-file interface
+# accumulated feature-specific rules.  This layer defines the shared component
+# contract once, keeps the existing markup/API hooks intact and is deliberately
+# loaded last so a screen does not depend on CSS source order by accident.
+UX_AUDIT_CSS=r'''
+:root{--hp-green:#0e9f6e;--hp-green-strong:#087a54;--hp-green-soft:#e7f7ef;--hp-blue:#087bff;--hp-ink:#17231d;--hp-muted:#607168;--hp-canvas:#f5f8f6;--hp-surface:#fff;--hp-surface-alt:#f8fbf9;--hp-line:#dce7e1;--hp-danger:#c73a3a;--hp-radius-sm:10px;--hp-radius:16px;--hp-radius-lg:24px;--hp-space-1:4px;--hp-space-2:8px;--hp-space-3:12px;--hp-space-4:16px;--hp-space-5:20px;--hp-space-6:24px;--hp-space-8:32px;--hp-shadow:0 12px 30px rgba(23,35,29,.08);--hp-shadow-soft:0 5px 18px rgba(23,35,29,.06);--bg:var(--hp-canvas);--surface:var(--hp-surface);--ink:var(--hp-ink);--muted:var(--hp-muted);--line:var(--hp-line);--brand:var(--hp-green);--brand2:#23b47e;--ok:var(--hp-green);--warn:#b7791f;--shadow:var(--hp-shadow)}
+*,*::before,*::after{box-sizing:border-box}html{background:var(--hp-canvas)}body{min-width:0;background:linear-gradient(180deg,#f8fcfa 0,#f5f8f6 380px);color:var(--hp-ink);font-family:Manrope,Arial,sans-serif;letter-spacing:0}button,input,textarea,select{font:inherit}img,svg,canvas{max-width:100%}.wrap{width:min(1240px,100%);padding-left:clamp(16px,4vw,48px);padding-right:clamp(16px,4vw,48px)}
+.nav{background:rgba(255,255,255,.92);border-bottom:1px solid var(--hp-line);box-shadow:0 1px 0 rgba(23,35,29,.02);backdrop-filter:blur(16px)}.nav .in{width:min(1240px,100%);min-height:76px;height:auto;margin:auto;padding:var(--hp-space-2) clamp(16px,4vw,48px);display:grid;grid-template-columns:minmax(150px,1fr) minmax(0,1fr) minmax(170px,auto) auto;grid-template-areas:"brand spacer wallet actions";gap:var(--hp-space-3);align-items:center}.brandLogo{grid-area:brand;min-width:0}.brandLogo img{width:134px;height:42px;object-fit:contain;object-position:left center;filter:none}.nav .sp{grid-area:spacer;min-width:0}.nav #nav{display:contents}.appHeaderActions{grid-area:actions;display:flex;align-items:center;justify-content:flex-end;gap:var(--hp-space-2);min-width:0}.appHeaderActions .btn{min-height:42px;padding:10px 14px;white-space:nowrap}
+#globalBalance{grid-area:wallet;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:stretch;width:176px;min-height:48px;margin:0;padding:0;border:1px solid var(--hp-line);border-radius:var(--hp-radius-sm);background:var(--hp-surface-alt);color:var(--hp-ink);box-shadow:none;cursor:pointer;overflow:hidden;transition:border-color .16s ease,box-shadow .16s ease,background .16s ease}#globalBalance:hover{border-color:#a9cdbb;background:#fff;box-shadow:var(--hp-shadow-soft);transform:none}#globalBalance:focus-visible{outline:3px solid rgba(14,159,110,.24);outline-offset:3px}#globalBalance[aria-busy="true"]{pointer-events:none}.globalBalanceItem,.balanceSkeletonItem{display:flex;min-width:0;flex-direction:column;justify-content:center;gap:2px;padding:7px 9px;text-align:left}.globalBalanceItem+.globalBalanceItem,.balanceSkeletonItem+.balanceSkeletonItem{border-left:1px solid var(--hp-line)}.globalBalanceItem small{overflow:hidden;color:var(--hp-muted);font-size:9px;font-weight:800;letter-spacing:.06em;text-overflow:ellipsis;white-space:nowrap}.globalBalanceItem b{overflow:hidden;color:var(--hp-ink);font-size:12px;font-variant-numeric:tabular-nums;line-height:1.2;text-overflow:ellipsis;white-space:nowrap}.globalBalanceItem:first-child b{color:var(--hp-green-strong)}.balanceSkeleton{display:block;width:68%;height:10px;border-radius:99px;background:linear-gradient(90deg,#e7eee9 25%,#f6faf7 50%,#e7eee9 75%);background-size:200% 100%;animation:balance-sheen 1.1s linear infinite}@keyframes balance-sheen{to{background-position:-200% 0}}
+.app{min-height:100vh;background:transparent}.appHead{padding-top:var(--hp-space-8)}.welcome h1{color:var(--hp-ink);font-size:clamp(28px,3.5vw,44px);font-weight:800;letter-spacing:-.045em}.tabs{top:76px;display:flex;gap:4px;max-width:100%;padding:6px;background:rgba(255,255,255,.94);border:1px solid var(--hp-line);border-radius:var(--hp-radius);box-shadow:0 6px 20px rgba(23,35,29,.05);backdrop-filter:blur(12px)}.tab{min-height:38px;padding:9px 12px;border-radius:9px;color:var(--hp-muted);font-family:Manrope,Arial,sans-serif;font-size:12px;font-weight:700;letter-spacing:0}.tab.active{background:var(--hp-green-soft);border-color:transparent;color:var(--hp-green-strong);box-shadow:none}.tab:hover:not(.active){background:#f3f7f4;color:var(--hp-ink)}.panel{min-width:0;padding-top:var(--hp-space-6);padding-bottom:56px}.panel>h2,.panel .layout h2{color:var(--hp-ink);font-size:clamp(24px,3vw,32px);letter-spacing:-.035em}.card,.request,.match,.stat,.profileGrid>.card{min-width:0;border:1px solid var(--hp-line);border-radius:var(--hp-radius);background:var(--hp-surface);box-shadow:var(--hp-shadow-soft)}.card{padding:var(--hp-space-5)}.stats,.profileGrid,.layout{gap:var(--hp-space-4);background:transparent;border:0}.stat{min-height:112px;padding:var(--hp-space-5)}.stat .big{color:var(--hp-ink);font-variant-numeric:tabular-nums}.layout>.card,.layout>div>.card{border:1px solid var(--hp-line)}.request{gap:var(--hp-space-3);padding:var(--hp-space-4);align-items:center}.request:hover{border-color:#b6d9c5;box-shadow:var(--hp-shadow);transform:none}.requestmain,.grow,.taskCopy,.telegramCopy{min-width:0}.requestmain b,.requestmain .muted,.match b,.match .muted,.leagueMemberName,.leagueMemberMeta,.duoChampionName,.duoChampionMeta{overflow-wrap:anywhere}.requestmain .muted{line-height:1.5}.match{min-width:0;border-color:var(--hp-line);background:var(--hp-surface)}.btn{min-height:42px;max-width:100%;border-radius:var(--hp-radius-sm);font-size:13px;font-weight:800;line-height:1.2;transition:background .16s ease,border-color .16s ease,box-shadow .16s ease,transform .16s ease}.btn:hover{transform:translateY(-1px)}.btn:active{transform:translateY(0)}.btn:focus-visible,.tab:focus-visible,.input:focus-visible,.close:focus-visible{outline:3px solid rgba(14,159,110,.28);outline-offset:2px}.dark,.grad{background:var(--hp-green);color:#fff;box-shadow:0 7px 16px rgba(14,159,110,.18)}.dark:hover,.grad:hover{background:var(--hp-green-strong);box-shadow:0 9px 20px rgba(14,159,110,.22)}.light{border-color:var(--hp-line);background:#fff;color:var(--hp-ink)}.light:hover{border-color:#a9cdbb;background:var(--hp-surface-alt)}.danger{border-color:#f1c9c9;background:#fff;color:var(--hp-danger)}.input{min-width:0;max-width:100%;border-color:#cfded6;border-radius:var(--hp-radius-sm);background:#fff;color:var(--hp-ink)}.input:focus{border-color:var(--hp-green);box-shadow:0 0 0 4px rgba(14,159,110,.12)}.badge{max-width:100%;overflow:hidden;border-radius:999px;font-family:Manrope,Arial,sans-serif;font-variant-numeric:tabular-nums;text-overflow:ellipsis}.badge.ok{background:var(--hp-green-soft);color:var(--hp-green-strong)}.badge.warn{background:#fff7e8;color:#9a6516}.avatar{flex:0 0 auto;border-radius:12px;background:var(--hp-green-soft);color:var(--hp-green-strong)}.map{height:clamp(310px,48vw,520px);border-radius:var(--hp-radius);border-color:var(--hp-line);background:#eef5f1}.modal{padding:clamp(12px,3vw,28px);background:rgba(10,25,17,.46);backdrop-filter:blur(5px)}.box{width:min(620px,100%);max-height:min(88dvh,760px);padding:clamp(20px,4vw,32px);border:1px solid var(--hp-line);border-radius:var(--hp-radius-lg);background:#fff;box-shadow:0 28px 70px rgba(10,25,17,.22)}.box h2{overflow-wrap:anywhere;color:var(--hp-ink);letter-spacing:-.03em}.close{color:var(--hp-muted)}.messages{min-width:0;background:#f4f8f6;border:1px solid var(--hp-line)}.msg{overflow-wrap:anywhere;border-radius:14px;border-color:var(--hp-line);background:#fff;color:var(--hp-ink)}.msg.mine{border-color:#c4e7d2;background:var(--hp-green-soft)}.chatbar{min-width:0}.chatbar textarea{min-width:0}.empty{border:1px dashed #cbdcd2;border-radius:var(--hp-radius);background:#fafcfb;color:var(--hp-muted)}.toast{max-width:min(420px,calc(100vw - 32px));border-radius:var(--hp-radius-sm);background:var(--hp-ink);color:#fff;box-shadow:var(--hp-shadow)}
+.homePulse{gap:var(--hp-space-2);padding:0!important;background:transparent!important;border:0!important;box-shadow:none!important}.homePulseItem,.homePulseEmpty{border:1px solid var(--hp-line);border-radius:var(--hp-radius);background:#fff;box-shadow:var(--hp-shadow-soft)}.homePulseItem{padding:var(--hp-space-5)}.homePulseItem b{color:var(--hp-green-strong);font-variant-numeric:tabular-nums}.telegramSummary{border-color:var(--hp-line);border-radius:var(--hp-radius);background:var(--hp-surface-alt)}.telegramAvatar{border-radius:12px;background:var(--hp-green);color:#fff}.subscriptionStatus{gap:var(--hp-space-2);background:transparent}.subscriptionStatus>div{border:1px solid var(--hp-line);border-radius:var(--hp-radius-sm);background:#fff}.subscriptionStatus b{color:var(--hp-green-strong);font-variant-numeric:tabular-nums}.subscriptionCard{min-height:0;border-color:var(--hp-line)}.subscriptionCard:hover{transform:translateY(-2px);border-color:#b6d9c5;box-shadow:var(--hp-shadow)}
+/* Progress uses the same compact surface system as every other screen. */
+.showcasePanel{max-width:1240px}.leagueHeading{gap:var(--hp-space-3)}.leagueHeadingMark{border-radius:15px;background:var(--hp-green);box-shadow:0 6px 0 var(--hp-green-strong),0 12px 22px rgba(14,159,110,.2)}.leagueHeading h2,.leagueSectionHead h3{color:var(--hp-ink)}.leagueHeading p,.leagueSectionHead p{color:var(--hp-muted)}.leagueHero{border:1px solid #b8dfc8;border-radius:var(--hp-radius-lg);background:linear-gradient(135deg,#e7f7ef,#f8fffb 58%,#e5f4ee);box-shadow:var(--hp-shadow)}.leagueHero:before,.leagueHero:after{border-color:rgba(14,159,110,.09)}.leagueHero h3{color:var(--hp-ink)}.leagueHero p,.leagueProgressTop{color:#496256}.leagueProgressTrack{border-color:#c8e4d3;background:#dcefe4}.leagueProgressTrack i{background:linear-gradient(90deg,var(--hp-green),#58c895);box-shadow:none}.leagueTrophy{border-color:#d5eadc;background:radial-gradient(circle at 35% 28%,#fff,#d7f3e3 47%,#91d7ae 48%,#55ad79);box-shadow:0 9px 0 #9acdaf,0 20px 32px rgba(14,159,110,.15)}.leagueStats{gap:var(--hp-space-3);background:transparent;border:0}.leagueStat,.leagueStat:nth-child(n){border:1px solid var(--hp-line);border-radius:var(--hp-radius);background:#fff;box-shadow:var(--hp-shadow-soft)}.leagueStat b{color:var(--hp-ink)}.leagueStat span{color:var(--hp-muted)}.leagueGrid{gap:var(--hp-space-4);background:transparent}.leagueBoard,.leagueCategories{border:1px solid var(--hp-line);border-radius:var(--hp-radius-lg);background:#fff;box-shadow:var(--hp-shadow-soft)}.leaguePill{background:var(--hp-green-soft);color:var(--hp-green-strong)}.duoChampionCard{border-color:var(--hp-line);border-radius:var(--hp-radius);background:#fbfdfc;box-shadow:0 5px 0 #dfe9e3}.duoChampion.first .duoChampionCard{border-color:#a7d9ba;background:linear-gradient(160deg,#ecfaf2,#fff);box-shadow:0 6px 0 #a8d3b8}.duoRankBadge{background:#eaf4ee;color:var(--hp-green-strong)}.duoChampion.first .duoRankBadge{background:var(--hp-green);color:#fff;box-shadow:0 0 0 5px rgba(14,159,110,.11)}.duoAvatar,.leagueAvatar{background:linear-gradient(135deg,#0e9f6e,#53c191);color:#fff}.duoChampionName,.leagueMemberName{color:var(--hp-ink)}.duoChampionMeta,.leagueMemberMeta{color:var(--hp-muted)}.duoChampionScore{background:var(--hp-green-soft);color:var(--hp-green-strong)}.leagueRow{border-color:var(--hp-line);background:#fff;box-shadow:none}.leagueRow:hover{border-color:#a7d9ba;background:#f7fcf8}.leaguePosition{background:var(--hp-green-soft);color:var(--hp-green-strong)}.leagueRating{color:var(--hp-green-strong)}.leagueCategoryTop{color:var(--hp-ink)}.leagueCategoryCount{color:var(--hp-green-strong)}.leagueCategoryTrack{background:#e2eee7}.leagueCategoryTrack i{background:linear-gradient(90deg,var(--hp-green),#73d2a2);box-shadow:none}.leagueEmpty{border-color:#c9ded1;border-radius:var(--hp-radius);background:#f9fcfa;color:var(--hp-muted)}
+@media(max-width:760px){.nav .in{min-height:68px;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"brand wallet" "actions actions";gap:var(--hp-space-2)}.brandLogo img{width:112px;height:36px}.nav .sp{display:none}.appHeaderActions{justify-content:stretch}.appHeaderActions .btn{flex:1;min-width:0;padding:10px 9px}.appHeaderActions .btn:first-child{display:none}#globalBalance{width:152px;min-height:42px}.globalBalanceItem,.balanceSkeletonItem{padding:6px 7px}.globalBalanceItem small{font-size:8px}.globalBalanceItem b{font-size:11px}.appHead{padding-top:var(--hp-space-6)}.tabs{top:112px;border-radius:12px}.panel{padding-top:var(--hp-space-5)}.stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--hp-space-2)}.profileGrid,.layout{gap:var(--hp-space-3)}.request{align-items:flex-start;flex-wrap:wrap}.requestmain{flex:1 1 180px}.request>.btn,.match .btn{min-height:40px}.match{align-items:flex-start;flex-wrap:wrap}.matchActions{width:100%;justify-content:stretch}.matchActions .btn{flex:1;min-width:0}.map{height:360px}.subscriptionStatus,.homePulse{grid-template-columns:1fr}.leagueHero{padding:20px}.leagueGrid{grid-template-columns:1fr!important}.leagueStats{grid-template-columns:1fr!important}.leagueBoard,.leagueCategories{padding:16px}.leagueRow{grid-template-columns:30px 38px minmax(0,1fr);gap:8px}.leagueRating{display:none}}
+@media(max-width:360px){.nav .in{padding-left:12px;padding-right:12px}.brandLogo img{width:98px;height:32px}#globalBalance{width:142px}.appHeaderActions .btn{font-size:12px}.tabs{top:110px}.wrap{padding-left:12px;padding-right:12px}.box{padding:18px 16px}.stat{padding:14px}.request{padding:12px}}
+@media(prefers-reduced-motion:reduce){.balanceSkeleton{animation:none}.subscriptionCard,.btn,.leagueRow{transition:none}}
+'''
+
+# Keep the robust layout introduced above, but preserve H-Point's established
+# black-and-lime visual identity.  This must stay after UX_AUDIT_CSS: it only
+# changes presentation tokens and component colors, never the DOM or API flow.
+DARK_UI_RESTORE_CSS=r'''
+:root{--hp-green:#b8f36b;--hp-green-strong:#d3ff74;--hp-green-soft:#27391c;--hp-blue:#12cfd0;--hp-ink:#edf0e7;--hp-muted:#a9afa1;--hp-canvas:#10120f;--hp-surface:#171a14;--hp-surface-alt:#1b2019;--hp-line:#3a4035;--hp-danger:#ffc8bf;--hp-shadow:0 18px 44px rgba(0,0,0,.28);--hp-shadow-soft:0 8px 22px rgba(0,0,0,.18);--bg:var(--hp-canvas);--surface:var(--hp-surface);--ink:var(--hp-ink);--muted:var(--hp-muted);--line:var(--hp-line);--brand:var(--hp-green);--brand2:var(--hp-green-strong);--ok:var(--hp-green);--warn:#f5d96b;--shadow:var(--hp-shadow)}
+html{background:var(--hp-canvas)}body{background:radial-gradient(ellipse at 76% 13%,#1d322d 0,transparent 38%),var(--hp-canvas);color:var(--hp-ink)}.nav{background:rgba(16,18,15,.92);border-color:#30352d;box-shadow:0 1px 0 rgba(255,255,255,.025)}.brandLogo img{filter:brightness(1.08) saturate(1.08) drop-shadow(0 7px 18px rgba(18,207,208,.14))}.nav .in{background:transparent}#globalBalance{border-color:#465040;background:#151813;color:var(--hp-ink)}#globalBalance:hover{border-color:var(--hp-green);background:#1b2118;box-shadow:0 8px 20px rgba(0,0,0,.24)}.globalBalanceItem+.globalBalanceItem,.balanceSkeletonItem+.balanceSkeletonItem{border-color:#3a4035}.globalBalanceItem small{color:#a9afa1}.globalBalanceItem b,.globalBalanceItem:first-child b{color:var(--hp-green)}.balanceSkeleton{background:linear-gradient(90deg,#293126 25%,#465040 50%,#293126 75%);background-size:200% 100%}.tabs{background:rgba(23,26,20,.94);border-color:#3a4035;box-shadow:0 8px 22px rgba(0,0,0,.2)}.tab{color:#a9afa1}.tab.active{background:var(--hp-green);color:#10120f}.tab:hover:not(.active){background:#1f251d;color:#edf0e7}.welcome h1,.panel>h2,.panel .layout h2{color:#edf0e7}.card,.request,.match,.stat,.profileGrid>.card{border-color:#3a4035;background:#171a14;box-shadow:var(--hp-shadow-soft)}.layout>.card,.layout>div>.card{border-color:#3a4035}.stat .big{color:#edf0e7}.request:hover{border-color:rgba(184,243,107,.62);box-shadow:var(--hp-shadow)}.match{border-color:#3a4035;background:#171a14}.dark,.grad{background:var(--hp-green);color:#10120f;box-shadow:0 8px 20px rgba(184,243,107,.13)}.dark:hover,.grad:hover{background:var(--hp-green-strong);box-shadow:0 12px 26px rgba(184,243,107,.2)}.light{border-color:#4a5146;background:transparent;color:#edf0e7}.light:hover{border-color:var(--hp-green);background:#1a1d17}.danger{border-color:#8f4137;background:transparent;color:#ffc8bf}.input{border-color:#444b40;background:#10120f;color:#edf0e7}.input:focus{border-color:var(--hp-green);box-shadow:0 0 0 4px rgba(184,243,107,.13)}.badge{background:#252a22;color:#d4d9d0}.badge.ok{background:#27391c;color:#d5ff8a}.badge.warn{background:#443d1c;color:#fff1a8}.avatar{background:#182f30;color:#70f5e9}.map{border-color:#3a4035;background:#151813}.modal{background:rgba(7,8,6,.84)}.box{border-color:#4a5146;background:#171a14;box-shadow:0 28px 80px #0009}.box h2{color:#edf0e7}.close{color:#edf0e7}.messages{border-color:#3a4035;background:#11140f}.msg{border-color:#3a4035;background:#1c211a;color:#edf0e7}.msg.mine{border-color:#2c716b;background:#173c3a}.empty{border-color:#465040;background:#151813;color:#a9afa1}.toast{background:var(--hp-green);color:#10120f;box-shadow:none}.homePulseItem,.homePulseEmpty{border-color:#3a4035;background:#171a14;box-shadow:var(--hp-shadow-soft)}.homePulseItem b,.subscriptionStatus b{color:var(--hp-green)}.telegramSummary{border-color:#3a4035;background:#1b2019}.telegramAvatar{background:var(--hp-green);color:#10120f}.subscriptionStatus>div{border-color:#3a4035;background:#171a14}.subscriptionCard{border-color:#3a4035}.subscriptionCard:hover{border-color:rgba(184,243,107,.62);box-shadow:var(--hp-shadow)}
+.leagueHeadingMark{background:var(--hp-green);box-shadow:0 6px 0 #718e36,0 12px 22px rgba(184,243,107,.16)}.leagueHeading h2,.leagueSectionHead h3{color:#edf0e7}.leagueHeading p,.leagueSectionHead p{color:#a9afa1}.leagueHero{border-color:#43523c;background:linear-gradient(135deg,#1e3023,#171a14 60%,#2b331d);box-shadow:var(--hp-shadow)}.leagueHero:before,.leagueHero:after{border-color:rgba(184,243,107,.1)}.leagueHero h3{color:#edf0e7}.leagueHero p,.leagueProgressTop{color:#c3c9bf}.leagueProgressTrack{border-color:#44533e;background:#263225}.leagueProgressTrack i{background:linear-gradient(90deg,#b8f36b,#70dca2)}.leagueTrophy{border-color:#75934a;background:radial-gradient(circle at 35% 28%,#efffd2,#b8f36b 47%,#759c45 48%,#3c5a31);box-shadow:0 9px 0 #55733d,0 20px 32px rgba(0,0,0,.3)}.leagueStat,.leagueStat:nth-child(n),.leagueBoard,.leagueCategories{border-color:#3a4035;background:#171a14;box-shadow:var(--hp-shadow-soft)}.leagueStat b{color:#edf0e7}.leagueStat span{color:#a9afa1}.leaguePill,.duoChampionScore,.leaguePosition{background:#27391c;color:#d5ff8a}.duoChampionCard{border-color:#3a4035;background:#1b2019;box-shadow:0 5px 0 #303b2c}.duoChampion.first .duoChampionCard{border-color:#66874b;background:linear-gradient(160deg,#253a26,#171a14);box-shadow:0 6px 0 #4d693d}.duoRankBadge{background:#27391c;color:#d5ff8a}.duoChampion.first .duoRankBadge{background:var(--hp-green);color:#10120f;box-shadow:0 0 0 5px rgba(184,243,107,.1)}.duoAvatar,.leagueAvatar{background:linear-gradient(135deg,#12cfd0,#087bff);color:#10120f}.duoChampionName,.leagueMemberName,.leagueCategoryTop{color:#edf0e7}.duoChampionMeta,.leagueMemberMeta{color:#a9afa1}.leagueRow{border-color:#3a4035;background:#171a14}.leagueRow:hover{border-color:rgba(184,243,107,.62);background:#1d241a}.leagueRating,.leagueCategoryCount{color:#d5ff8a}.leagueCategoryTrack{background:#263225}.leagueCategoryTrack i{background:linear-gradient(90deg,#b8f36b,#70dca2)}.leagueEmpty{border-color:#465040;background:#151813;color:#a9afa1}
+/* Technical mono accent: compact navigation and data keep the earlier pixel-like character without making copy hard to read. */
+.tab,.globalBalanceItem small,.globalBalanceItem b,.badge,.ey,.leagueEyebrow,.leaguePill,.leaguePosition,.leagueRating,.leagueCategoryCount,.duoChampionScore,.duoRankBadge{font-family:'Space Mono',monospace}.tab{font-size:10px;letter-spacing:.045em}.globalBalanceItem b{font-size:11px;letter-spacing:-.035em}.globalBalanceItem small{letter-spacing:.08em}.badge{letter-spacing:.03em}
+.duoPodium.soloBoard{grid-template-columns:minmax(0,360px);justify-content:center}.duoChampion.solo{max-width:360px}.duoChampion.solo .duoChampionCard{min-height:248px;padding:18px 16px}.duoLaunchLabel{display:block;margin:0 0 13px;color:#d5ff8a;font:700 10px 'Space Mono',monospace;letter-spacing:.1em}.leagueLaunchNote{display:grid;gap:6px;max-width:520px;margin:2px auto 4px;padding:13px 15px;border:1px solid #566d42;border-radius:14px;background:linear-gradient(90deg,rgba(184,243,107,.11),rgba(184,243,107,.025));text-align:center}.leagueLaunchNote b{color:#d5ff8a;font:700 11px 'Space Mono',monospace;letter-spacing:.07em}.leagueLaunchNote span{color:#c3c9bf;font-size:12px;line-height:1.5}
+'''
+
+UX_AUDIT_UI=r'''
+let hpointAuditUser=null,hpointAuditWallet=null;
+function auditMoney(value){return Number(value||0).toLocaleString('ru-RU')+' ₽'}
+function auditPoints(value){return Number(value||0).toLocaleString('ru-RU')+' HP'}
+function auditBalanceMarkup(user,wallet,loading){if(loading)return '<span class="balanceSkeletonItem"><i class="balanceSkeleton"></i></span><span class="balanceSkeletonItem"><i class="balanceSkeleton"></i></span>';let rub=wallet&&wallet.balance_rub||0,points=user&&user.balance||0;return '<span class="globalBalanceItem"><small>BALANCE</small><b>'+auditMoney(rub)+'</b></span><span class="globalBalanceItem"><small>H-POINTS</small><b>'+auditPoints(points)+'</b></span>'}
+function renderAuditHeader(user,wallet,loading){let nav=$("nav");if(!nav)return;nav.innerHTML='<button id="globalBalance" class="balanceWidget" type="button" '+(loading?'aria-busy="true"':'')+' aria-label="Открыть кошелёк" title="Открыть кошелёк" onclick="go(\'wallet\')">'+auditBalanceMarkup(user,wallet,loading)+'</button><div class="appHeaderActions"><button class="btn light" type="button" onclick="openSupport()">Поддержка</button><button class="btn light" type="button" onclick="openProfileMenu()">Профиль</button><button class="btn grad" type="button" onclick="requestForm()">+ Заявка</button></div>'}const auditBaseApplySync=window.applySync;
+window.applySync=function(data){auditBaseApplySync(data);hpointAuditUser=data.user||null;hpointAuditWallet=data.wallet||window.hpointWallet||null;renderAuditHeader(hpointAuditUser,hpointAuditWallet,false)};
+const auditBaseLanding=window.landing;
+window.landing=function(){auditBaseLanding();let nav=$('nav');if(nav)nav.innerHTML=''};
+window.load=async function(){renderAuditHeader(null,null,true);try{let data=await api('/api/sync');$('landing').style.display='none';$('app').style.display='block';window.applySync(data);await window.profile(data.user);window.prices('appprices',true);await window.billing();window.startSync()}catch(error){window.landing()}};
+const auditBaseBilling=window.billing;
+window.billing=async function(){let result=await auditBaseBilling();if(hpointAuditUser){hpointAuditWallet=window.hpointWallet||hpointAuditWallet;renderAuditHeader(hpointAuditUser,hpointAuditWallet,false)}return result};
+'''
+
+LEAGUE_UI=r'''
+function ensureProgressPanel(){let tabs=document.querySelector('.tabs'),app=$('app');if(!tabs||!app)return;if(!document.querySelector('[data-t="progress"]')){let tab=document.createElement('button');tab.className='tab';tab.dataset.t='progress';tab.textContent='Прогресс';tab.onclick=function(){go('progress')};let profile=document.querySelector('[data-t="profile"]');tabs.insertBefore(tab,profile||null)}let panel=$('p-progress');if(!panel){panel=document.createElement('section');panel.id='p-progress';panel.className='panel';app.appendChild(panel)}if(!panel.querySelector('.leagueHeading')){panel.className='panel showcasePanel';panel.innerHTML='<div class="leagueHeading"><span class="leagueHeadingMark">🏆</span><div><h2>Лига H-Point</h2><p>Ваше сообщество делает район добрее — одно дело за другим.</p></div></div><div id="progressData"></div>'}}
+function leagueStat(icon,value,label){return '<article class="leagueStat"><span class="leagueStatEmoji">'+icon+'</span><b>'+Number(value||0).toLocaleString('ru-RU')+'</b><span>'+esc(label)+'</span></article>'}
+function leagueChampion(person,solo){let rank=Number(person.position)||1,name=esc(person.name||'Участник'),initial=esc((person.name||'?').slice(0,1).toUpperCase()),rating=person.rating===null?'Новый участник':'★ '+Number(person.rating).toFixed(1),kind=(rank===1?'first ':'')+(solo?'solo':'');return '<button type="button" class="duoChampion '+kind+'" onclick="openCommunityProfile('+Number(person.user_id)+')"><span class="duoChampionCard">'+(solo?'<span class="duoLaunchLabel">ПЕРВОПРОХОДЕЦ СЕЗОНА</span>':'')+'<span class="duoRankBadge">'+(rank===1?'♛':'#'+rank)+'</span><span class="duoAvatar">'+initial+'</span><span class="duoChampionName">'+name+'</span><span class="duoChampionMeta">'+Number(person.helped)+' добрых дел · '+Number(person.reviews)+' отзывов</span><span class="duoChampionScore">'+rating+'</span></span></button>'}
+function leagueRow(person){let name=esc(person.name||'Участник'),initial=esc((person.name||'?').slice(0,1).toUpperCase()),rating=person.rating===null?'Без оценок':'★ '+Number(person.rating).toFixed(1);return '<button type="button" class="leagueRow" onclick="openCommunityProfile('+Number(person.user_id)+')"><span class="leaguePosition">#'+Number(person.position)+'</span><span class="leagueAvatar">'+initial+'</span><span><span class="leagueMemberName">'+name+'</span><span class="leagueMemberMeta">'+Number(person.helped)+' завершённых дел · '+Number(person.reviews)+' отзывов</span></span><span class="leagueRating">'+rating+'<br>'+Number(person.score)+' XP</span></button>'}
+async function loadProgress(){ensureProgressPanel();let host=$('progressData');if(!host)return;host.innerHTML='<div class="leagueEmpty">Собираем статистику сообщества…</div>';try{let d=await api('/api/progress'),summary=d.summary||{},categories=d.categories||[],leaders=d.leaderboard||[],topLeaders=leaders.slice(0,3),solo=topLeaders.length===1,max=Math.max(1,...categories.map(function(item){return Number(item.count)||0})),percent=Math.max(0,Math.min(100,Number(d.completion_percent)||0)),champions=topLeaders.map(function(person){return leagueChampion(person,solo)}).join(''),rows=leaders.slice(3).map(leagueRow).join(''),launchNote=solo?'<div class="leagueLaunchNote"><b>Сезон открыт</b><span>Первое место занимает текущий лидер. Следующие места откроются после завершённых заявок.</span></div>':'',categoryHtml=categories.map(function(item){let width=Math.max(0,Math.round(Number(item.count||0)/max*100));return '<div class="leagueCategory"><div><div class="leagueCategoryTop"><span>'+esc(item.title)+'</span></div><div class="leagueCategoryTrack"><i style="--width:'+width+'%"></i></div></div><span class="leagueCategoryCount">'+Number(item.count||0)+'</span></div>'}).join('');host.innerHTML='<section class="leagueHero"><div><span class="leagueEyebrow">СЕЗОН ПОМОЩИ</span><h3>Каждое завершённое дело двигает сообщество вперёд.</h3><p>Рейтинг растёт за реальную помощь и отзывы. Победителей определяют дела, а не клики.</p><div class="leagueProgress"><span class="leagueProgressTop"><span>Выполнено заявок</span><b>'+percent+'%</b></span><span class="leagueProgressTrack"><i style="--league-progress:'+percent+'%"></i></span></div></div><div class="leagueTrophy" aria-hidden="true">🏆</div></section><section class="leagueStats">'+leagueStat('📬',summary.total,'всего заявок')+leagueStat('⚡',summary.active,'сейчас в работе')+leagueStat('💚',summary.done,'добрых дел завершено')+'</section><div class="leagueGrid"><section class="leagueBoard"><div class="leagueSectionHead"><div><h3>Таблица лидеров</h3><p>Помощники с подтверждёнными завершёнными делами.</p></div><span class="leaguePill">ТОП '+Number(leaders.length)+'</span></div>'+(champions?'<div class="duoPodium '+(solo?'soloBoard':'')+'">'+champions+'</div>'+launchNote:'<div class="leagueEmpty">Первое завершённое дело откроет таблицу лидеров.</div>')+(rows?'<div class="leagueRows">'+rows+'</div>':'')+'</section><aside class="leagueCategories"><div class="leagueSectionHead"><div><h3>Направления</h3><p>Где помощь сейчас нужна чаще.</p></div><span class="leaguePill">'+Number(summary.total||0)+' заявок</span></div><div class="leagueCategoryList">'+(categoryHtml||'<div class="leagueEmpty">Данных пока нет.</div>')+'</div></aside></div>'}catch(error){host.innerHTML='<div class="leagueEmpty"><b>Статистика временно недоступна.</b><br>Обновите страницу и попробуйте ещё раз.</div>';console.warn('progress',error)}}
+ensureProgressPanel();
+'''
+
+GAMES_NAV_CSS=r'''
+#gamesNavLink{display:inline-flex;align-items:center;gap:7px;min-height:40px;padding:10px 12px;border:1px solid #4a5146;border-radius:10px;color:#edf0e7;text-decoration:none;font:800 12px Manrope,Arial,sans-serif;white-space:nowrap;transition:border-color .18s,background .18s,color .18s}#gamesNavLink svg{width:16px;height:16px}#gamesNavLink:hover{border-color:#b8f36b;background:#1a2118;color:#b8f36b}.gamesProfileSummary{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:16px;background:linear-gradient(135deg,#172417,#263721);border:1px solid #466240;padding:18px}.gamesProfileSummary h2{margin:0 0 6px}.gamesProfileStats{display:flex;gap:12px;flex-wrap:wrap}.gamesProfileStats span{padding:6px 9px;border-radius:999px;background:#101810;color:#d9f6bc;font-size:12px;font-weight:700}@media(max-width:500px){#gamesNavLink{padding:9px 10px;font-size:10px}#gamesNavLink span{display:none}.gamesProfileSummary{align-items:flex-start;flex-direction:column}}
+'''
+
+GAMES_NAV_UI=r'''
+(function(){
+  function addGamesLink(){var nav=document.getElementById('nav');if(!nav||document.getElementById('gamesNavLink'))return;var link=document.createElement('a');link.id='gamesNavLink';link.href='/games';link.setAttribute('aria-label','Открыть H-Point Games');link.innerHTML='<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 8h10c2.5 0 4.3 2.4 3.5 4.8l-1 3.1a2.6 2.6 0 0 1-4.6.8l-.6-.9h-4.6l-.6.9a2.6 2.6 0 0 1-4.6-.8l-1-3.1C2.7 10.4 4.5 8 7 8Z" stroke="currentColor" stroke-width="1.8"/><path d="M8 11v3m-1.5-1.5h3M16 12h.01M18 14h.01" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><span>Игры</span>';nav.prepend(link)}
+  var previousLoad=window.load;window.load=async function(){var result=await previousLoad.apply(this,arguments);addGamesLink();return result};
+  var previousLanding=window.landing;window.landing=function(){var result=previousLanding.apply(this,arguments);addGamesLink();return result};
+  var previousSync=window.applySync;window.applySync=function(){var result=previousSync.apply(this,arguments);addGamesLink();return result};
+  async function renderGamesProfile(){var host=document.querySelector('#p-profile .profileGrid');if(!host)return;var old=document.getElementById('gamesProfileSummary');if(old)old.remove();try{var data=await api('/api/games/state');if(!data.authenticated)return;var profile=data.profile||{},card=document.createElement('section');card.id='gamesProfileSummary';card.className='card gamesProfileSummary';card.innerHTML='<div><h2>H-Point Games</h2><p class="muted">Ваши игровые достижения и H-Points синхронизированы с ботом.</p><div class="gamesProfileStats"><span>Начато: '+Number(profile.games_played||0)+'</span><span>Завершено: '+Number(profile.games_completed||0)+'</span><span>Заработано: '+Number(profile.games_hp_earned||0)+' HP</span></div></div><a class="btn grad" href="/games">Открыть игры</a>';host.appendChild(card)}catch(error){console.warn('games profile',error)}}
+  var previousProfile=window.profile;window.profile=async function(){var result=await previousProfile.apply(this,arguments);await renderGamesProfile();return result};
+  setTimeout(addGamesLink,0);
+})();
+'''
+
 def _page_replace(needle, replacement):
     global PAGE
     if needle not in PAGE:
         raise RuntimeError("H-Point page template changed; UI override target is missing")
     PAGE=PAGE.replace(needle, replacement, 1)
 
-_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+"</style></head>")
-_page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
+_page_replace("</style></head>", BRAND_CSS+REFERENCE_CSS+SOFT_CSS+SECURITY_CSS+PASSWORD_CSS+MAP_CSS+ADMIN_DASHBOARD_CSS+CONTACT_VERIFICATION_CSS+EVENTS_CSS+PROGRESS_CSS+COMMUNITY_CSS+REQUEST_TRACKING_CSS+SHOWCASE_CSS+"</style></head>")
+_page_replace("<title>H·Point — помощь рядом</title>", '<title>H·Point — помощь рядом</title><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg"><link rel="apple-touch-icon" href="/assets/hpoint-logo.png"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">')
+if YANDEX_MAPS_API_KEY:
+    PAGE=PAGE.replace('<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>', f'<script src="https://api-maps.yandex.ru/2.1/?apikey={escape(YANDEX_MAPS_API_KEY, quote=True)}&lang=ru_RU"></script>')
 _page_replace('<div class="logo">H·Point<b>.</b></div>', '<a class="logo brandLogo" href="/" aria-label="H-Point"><img src="/assets/hpoint-logo-dark.png" alt="H-Point"></a>')
 _page_replace("<h1>Хорошие дела<br>начинаются рядом.</h1>", "<h1>Хорошие дела<br><span>начинаются рядом.</span></h1>")
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+"\nresumeTelegramLogin();\nload();\n</script></body></html>")
+_page_replace('<p class="audiencePortrait">H·Point создан для Ильи: он недавно переехал в новый район, работает до вечера и хочет быстро найти надёжного человека рядом, чтобы настроить роутер, донести коробки или решить другую небольшую, но срочную задачу.</p>', '')
+_page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')
+# The historic shared stylesheet contains legacy rules with inconsistent
+# nesting.  Isolate the league stylesheet so these rules cannot suppress it.
+_page_replace("</head>", "<style>"+LEAGUE_CSS+LEAGUE_REPAIR_CSS+MVP_CSS+UX_AUDIT_CSS+DARK_UI_RESTORE_CSS+GAMES_NAV_CSS+"</style></head>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+SUPPORT_UI+ADMIN_DASHBOARD_UI+ADMIN_MODAL_FIXES+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+LOCATION_PICKER_UI+CONTACT_VERIFICATION_UI+EVENTS_UI+PROGRESS_UI+COMMUNITY_UI+REQUEST_TRACKING_UI+WALLET_UI+DONATION_MENU_UI+SHOWCASE_UI+LEAGUE_UI+HPOINT_WALLET_PAYMENT_UI+MVP_UI+UX_AUDIT_UI+GAMES_NAV_UI+"\nresumeTelegramLogin();\nwindow.load();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
@@ -384,7 +987,9 @@ class Handler(BaseHTTPRequestHandler):
         body=item[0].read_bytes()
         self.send_response(200);self.send_header("Content-Type",item[1]);self.send_header("X-Content-Type-Options","nosniff");self.send_header("Cache-Control","public, max-age=604800, immutable");self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
     def html(self):
-        b=PAGE.replace("__YANDEX_MAPS_API_KEY__", YANDEX_MAPS_API_KEY).encode();self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
+        b=PAGE.encode();self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
+    def games_html(self):
+        b=GAMES_PAGE.encode();self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
     def do_HEAD(self):
         """Serve metadata for public resources without a response body."""
         p = urlparse(self.path)
@@ -396,8 +1001,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200);self.send_header("Content-Type",item[1]);self.send_header("X-Content-Type-Options","nosniff");self.send_header("Cache-Control","public, max-age=604800, immutable");self.send_header("Content-Length",str(item[0].stat().st_size));self.end_headers()
             return
         if p.path in ("/", "/index.html", "/payment/result"):
-            size = len(PAGE.replace("__YANDEX_MAPS_API_KEY__", YANDEX_MAPS_API_KEY).encode())
-            self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(size));self.end_headers()
+            size = len(PAGE.encode())
+            self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(size));self.end_headers()
+            return
+        if p.path in ("/games", "/games/"):
+            size = len(GAMES_PAGE.encode())
+            self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(size));self.end_headers()
             return
         if p.path == "/api/health":
             b = json.dumps({"ok":True,"database":True}).encode()
@@ -419,7 +1028,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control","no-store");self.end_headers()
                 return
             if p.path in ("/","/index.html","/payment/result"): return self.html()
+            if p.path in ("/games","/games/"): return self.games_html()
             if p.path=="/api/health": return reply(self,{"ok":True,"database":True})
+            if p.path=="/api/games/state":
+                u=get_sess(self)
+                if u and u["is_blocked"]:
+                    return reply(self,{"ok":False,"error":"account_blocked"},403)
+                return reply(self,games.game_state(u["user_id"] if u else None))
+            if p.path=="/api/public-config": return reply(self,{"ok":True,"donation_url":DONATION_URL,"donation_title":DONATION_TITLE})
             if p.path=="/api/auth/telegram/complete":
                 ticket=parse_qs(p.query).get("ticket",[""])[0]
                 uid=database.consume_telegram_auth_ticket(ticket)
@@ -428,6 +1044,14 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/admin/summary":
                 if not admin_auth(self): return
                 return reply(self,{"ok":True,"summary":admin_summary()})
+            if p.path=="/api/admin/dashboard":
+                if not admin_auth(self): return
+                query=parse_qs(p.query)
+                try: days=int(query.get("days",[14])[0])
+                except (TypeError,ValueError): days=14
+                try: limit=int(query.get("limit",[100])[0])
+                except (TypeError,ValueError): limit=100
+                return reply(self,{"ok":True,**database.admin_dashboard(days,limit,query.get("q",[""])[0])})
             if p.path=="/api/me":
                 u=auth(self)
                 if not u:return
@@ -435,17 +1059,108 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/dashboard":
                 u=auth(self)
                 if not u:return
-                return reply(self,{"ok":True,"user":user_payload(u)})
+                return reply(self,{"ok":True,"user":user_payload(u),"wallet":database.wallet_summary(u["user_id"], limit=5)})
+            if p.path=="/api/progress":
+                # Aggregate-only data is intentionally public: no account data,
+                # contacts or precise locations leave the server here.
+                try: days=int(parse_qs(p.query).get("days",[30])[0])
+                except (TypeError,ValueError): days=30
+                return reply(self,{"ok":True,**database.community_progress(days)})
+            if p.path=="/api/geocode":
+                u=auth(self)
+                if not u:return
+                query=" ".join(parse_qs(p.query).get("q",[""])[0].split())
+                if not 4 <= len(query) <= 180:return reply(self,{"ok":False,"error":"Укажите адрес от 4 до 180 символов."},400)
+                if database.auth_is_rate_limited("geocode",str(u["user_id"]),10):
+                    return reply(self,{"ok":False,"error":"Слишком много поисков адреса. Повторите позже."},429)
+                database.record_auth_failure("geocode",str(u["user_id"]))
+                try: point=geocode_address(query)
+                except ValueError as exc:return reply(self,{"ok":False,"error":str(exc)},400)
+                except RuntimeError as exc:return reply(self,{"ok":False,"error":str(exc)},503)
+                return reply(self,{"ok":True,"point":point})
+            if p.path=="/api/community/profile":
+                u=auth(self)
+                if not u:return
+                try: target_id=int(parse_qs(p.query).get("id",[0])[0])
+                except (TypeError,ValueError): return reply(self,{"ok":False,"error":"Некорректный профиль."},400)
+                if target_id<=0:return reply(self,{"ok":False,"error":"Некорректный профиль."},400)
+                profile=database.community_profile(target_id)
+                if not profile:return reply(self,{"ok":False,"error":"Профиль не найден."},404)
+                return reply(self,{"ok":True,"profile":profile})
             if p.path=="/api/sync":
                 u=auth(self)
                 if not u:return
                 rs=get_history(u["user_id"],HISTORY_LIMIT)
-                return reply(self,{"ok":True,"user":user_payload(u),"current_user_id":u["user_id"],"requests":[request_payload(r) for r in rs]})
+                return reply(self,{"ok":True,"user":user_payload(u),"wallet":database.wallet_summary(u["user_id"], limit=5),"current_user_id":u["user_id"],"requests":[request_payload(r) for r in rs]})
             if p.path=="/api/requests/mine":
                 u=auth(self)
                 if not u:return
+                expire_open_requests()
                 rs=get_history(u["user_id"],HISTORY_LIMIT)
                 return reply(self,{"ok":True,"current_user_id":u["user_id"],"requests":[request_payload(r) for r in rs]})
+            if p.path=="/api/requests/tracking":
+                u=auth(self)
+                if not u:return
+                try: request_id=int(parse_qs(p.query).get("request_id",[""])[0])
+                except (TypeError,ValueError): return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
+                expire_open_requests()
+                request_row=get_request(request_id)
+                if not request_row or u["user_id"] not in (request_row["requester_id"],request_row["helper_id"]):
+                    return reply(self,{"ok":False,"error":"Нет доступа к этой заявке."},403)
+                events=db.execute(
+                    """SELECT e.event_type,e.message,e.created_at,u.name actor_name
+                       FROM request_events e LEFT JOIN users u ON u.user_id=e.actor_id
+                       WHERE e.request_id=? ORDER BY e.id DESC LIMIT 50""",
+                    (request_id,),
+                ).fetchall()
+                candidates=[]
+                if request_row["requester_id"]==u["user_id"]:
+                    candidate_rows=db.execute(
+                        """SELECT rc.status,rc.updated_at,u.name
+                           FROM request_candidates rc JOIN users u ON u.user_id=rc.candidate_id
+                           WHERE rc.request_id=? ORDER BY rc.updated_at DESC LIMIT 30""",
+                        (request_id,),
+                    ).fetchall()
+                    candidates=[dict(row) for row in candidate_rows]
+                return reply(self,{"ok":True,"request":request_payload(request_row),"events":[dict(row) for row in events],"candidates":candidates})
+            if p.path=="/api/events/image":
+                u=auth(self)
+                if not u:return
+                try:event_id=int(parse_qs(p.query).get("id",[0])[0])
+                except (TypeError,ValueError):return self.send_error(404)
+                row=db.execute("SELECT image_data FROM community_events WHERE id=? AND status='published'",(event_id,)).fetchone()
+                if not row or not row["image_data"]:return self.send_error(404)
+                try: mime,payload=row["image_data"].split(",",1); mime=mime[5:].split(";",1)[0]; body=base64.b64decode(payload,validate=True)
+                except (ValueError,binascii.Error):return self.send_error(404)
+                self.send_response(200);self.send_header("Content-Type",mime);self.send_header("Cache-Control","private, max-age=3600");self.send_header("X-Content-Type-Options","nosniff");self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body);return
+            if p.path=="/api/map/active":
+                u=auth(self)
+                if not u:return
+                rows=db.execute(
+                    "SELECT * FROM requests WHERE status=? AND (requester_id=? OR helper_id=?) ORDER BY id DESC",
+                    (STATUS_IN_PROGRESS,u["user_id"],u["user_id"]),
+                ).fetchall()
+                tasks=[]
+                for row in rows:
+                    if row["lat"] is None or row["lon"] is None:
+                        continue
+                    tasks.append({"id":row["id"],"what":row["what"],"destination":{"lat":row["lat"],"lon":row["lon"]}})
+                location={"lat":u["lat"],"lon":u["lon"]} if u["lat"] is not None and u["lon"] is not None else None
+                return reply(self,{"ok":True,"user_location":location,"tasks":tasks})
+            if p.path=="/api/helper/offers":
+                u=auth(self)
+                if not u:return
+                return reply(self,{"ok":True,"offers":[dict(row) for row in get_helper_offers(u["user_id"])]})
+            if p.path=="/api/support":
+                u=auth(self)
+                if not u:return
+                rows=db.execute("SELECT * FROM support_tickets WHERE user_id=? ORDER BY id DESC LIMIT 50",(u["user_id"],)).fetchall()
+                return reply(self,{"ok":True,"tickets":[dict(row) for row in rows]})
+            if p.path=="/api/admin/support":
+                admin=admin_auth(self)
+                if not admin:return
+                rows=db.execute("SELECT t.*,u.name user_name,u.email user_email FROM support_tickets t JOIN users u ON u.user_id=t.user_id ORDER BY CASE t.status WHEN 'open' THEN 0 ELSE 1 END,t.id DESC LIMIT 100").fetchall()
+                return reply(self,{"ok":True,"tickets":[dict(row) for row in rows],"summary":admin_summary()})
             if p.path=="/api/history":
                 u=auth(self)
                 if not u:return
@@ -454,9 +1169,23 @@ class Handler(BaseHTTPRequestHandler):
                     role="Вы просили помощь" if r["requester_id"]==u["user_id"] else "Вы помогали";rating=r["requester_rating"] if r["requester_id"]==u["user_id"] else r["helper_rating"]
                     x=request_payload(r);x["role"]=role;x["rating"]=rating;out.append(x)
                 return reply(self,{"ok":True,"requests":out})
+            if p.path=="/api/events":
+                u=auth(self)
+                if not u:return
+                mine=parse_qs(p.query).get("mine",["0"])[0] in {"1","true","yes"}
+                rows=database.community_events_for_user(u["user_id"],mine=mine)
+                events=[]
+                for row in rows:
+                    item=dict(row)
+                    item["has_image"]=bool(item.pop("image_data", ""))
+                    item["joined"]=bool(item["joined"])
+                    item["is_creator"]=item["creator_id"]==u["user_id"]
+                    events.append(item)
+                return reply(self,{"ok":True,"events":events,"mine":mine})
             if p.path=="/api/search":
                 u=auth(self)
                 if not u:return
+                expire_open_requests()
                 q=parse_qs(p.query).get("q",[""])[0].strip().lower();cat=parse_qs(p.query).get("category",[""])[0]
                 rows=db.execute("SELECT * FROM requests WHERE status=? ORDER BY priority_boost DESC,created_at DESC LIMIT 100",(STATUS_OPEN,)).fetchall();out=[]
                 for r in rows:
@@ -464,13 +1193,15 @@ class Handler(BaseHTTPRequestHandler):
                     if cat and r["category"]!=cat: continue
                     hay=(r["what"]+" "+r["details"]+" "+r["place"]).lower()
                     if q and q not in hay: continue
-                    out.append(request_payload(r))
+                    record_request_view(r["id"],u["user_id"]); out.append(request_payload(r))
                 return reply(self,{"ok":True,"requests":[public_request_payload(r) for r in out[:30]]})
             if p.path=="/api/requests":
                 u=auth(self)
                 if not u:return
+                expire_open_requests()
                 if parse_qs(p.query).get("open",[""])[0]:
                     rs=db.execute("SELECT * FROM requests WHERE status=? AND requester_id!=? ORDER BY priority_boost DESC,created_at DESC LIMIT 100",(STATUS_OPEN,u["user_id"])).fetchall()
+                    for row in rs: record_request_view(row["id"],u["user_id"])
                     return reply(self,{"ok":True,"requests":[public_request_payload(r) for r in rs]})
                 return reply(self,{"ok":True,"requests":[request_payload(r) for r in get_history(u["user_id"],HISTORY_LIMIT)]})
             if p.path=="/api/smart-match":
@@ -499,6 +1230,10 @@ class Handler(BaseHTTPRequestHandler):
                 u=auth(self)
                 if not u:return
                 return reply(self,{"ok":True,"user":user_payload(u),"history":[dict(x) for x in database.get_billing_history(u["user_id"]) ]})
+            if p.path=="/api/wallet":
+                u=auth(self)
+                if not u:return
+                return reply(self,{"ok":True,"wallet":database.wallet_summary(u["user_id"])})
             if p.path=="/api/profiles":
                 u=auth(self)
                 if not u:return
@@ -530,43 +1265,145 @@ class Handler(BaseHTTPRequestHandler):
                 logging.exception("Payment callback failed")
                 return self._text("payment callback failed",500)
         if not valid_origin(self): return reply(self,{"ok":False,"error":"invalid_origin"},403)
-        try:d=read(self)
+        try:d=read(self, EVENT_JSON_BODY if p.path=="/api/events" else MAX_JSON_BODY)
         except:return reply(self,{"ok":False,"error":"Некорректный JSON"},400)
         try:
+            if p.path=="/api/games/start":
+                u=auth(self)
+                if not u:return
+                try:
+                    game_code=str(d.get("game", ""))
+                    return reply(self,games.start_game(u["user_id"],game_code))
+                except ValueError as exc:
+                    return reply(self,{"ok":False,"error":str(exc)},409)
+            if p.path=="/api/games/action":
+                u=auth(self)
+                if not u:return
+                try:
+                    return reply(self,games.action_game(u["user_id"],d.get("session_id"),d.get("action")))
+                except ValueError as exc:
+                    return reply(self,{"ok":False,"error":str(exc)},409)
+            if p.path=="/api/games/abandon":
+                u=auth(self)
+                if not u:return
+                try:
+                    return reply(self,games.abandon_game(u["user_id"],d.get("session_id")))
+                except ValueError as exc:
+                    return reply(self,{"ok":False,"error":str(exc)},409)
+            if p.path=="/api/games/shop/purchase":
+                u=auth(self)
+                if not u:return
+                try:
+                    return reply(self,{"ok":True,**games.purchase_item(u["user_id"],str(d.get("item_id", "")),d.get("purchase_key"))})
+                except ValueError as exc:
+                    return reply(self,{"ok":False,"error":str(exc)},409)
+            if p.path=="/api/games/shop/equip":
+                u=auth(self)
+                if not u:return
+                try:
+                    return reply(self,{"ok":True,**games.equip_item(u["user_id"],str(d.get("item_id", "")),bool(d.get("equipped", True)))})
+                except ValueError as exc:
+                    return reply(self,{"ok":False,"error":str(exc)},409)
             if p.path=="/api/auth/telegram/start":
                 if not _telegram_username:return reply(self,{"ok":False,"error":"telegram_login_unavailable"},503)
                 subject=client_key(self)
-                if database.auth_is_rate_limited("telegram_start",subject,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"too_many_attempts"},429)
+                if database.auth_is_rate_limited("telegram_start",subject,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"Слишком много попыток. Повторите через 15 минут."},429)
                 ticket=secrets.token_urlsafe(32)
                 database.create_telegram_auth_ticket(ticket)
                 database.record_auth_failure("telegram_start",subject)
                 return reply(self,{"ok":True,"ticket":ticket,"bot_url":f"https://t.me/{_telegram_username}?start=login_{ticket}"})
             if p.path=="/api/auth/register":
-                n=str(d.get("name","")).strip();e=str(d.get("email","")).strip().lower();pw=str(d.get("password",""))
-                if database.auth_is_rate_limited("register",e,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"too_many_attempts"},429)
+                n=str(d.get("name","")).strip();e=str(d.get("email","")).strip().lower();pw=str(d.get("password",""));confirm=str(d.get("password_confirm",""))
+                subject=client_key(self)
+                if database.auth_is_rate_limited("register",e,AUTH_ATTEMPT_LIMIT) or database.auth_is_rate_limited("register_ip",subject,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"Слишком много попыток. Повторите через 15 минут."},429)
                 if not 2<=len(n)<=MAX_NAME_LEN:return reply(self,{"ok":False,"error":"Имя должно быть от 2 до 50 символов."},400)
                 if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",e):return reply(self,{"ok":False,"error":"Введите корректный email."},400)
-                if not 12<=len(pw)<=256:return reply(self,{"ok":False,"error":"Пароль должен быть от 12 до 256 символов."},400)
+                if pw!=confirm:return reply(self,{"ok":False,"error":"Пароли не совпадают."},400)
+                problem=password_error(pw)
+                if problem:return reply(self,{"ok":False,"error":problem},400)
                 if get_user_by_email(e):
-                    database.record_auth_failure("register",e)
-                    return reply(self,{"ok":False,"error":"Этот email уже зарегистрирован."},409)
-                uid=create_web_user(n,e,ph(pw));c=database.create_link_code(uid)
-                database.clear_auth_failures("register",e)
-                return reply(self,{"ok":True,"link_code":c},headers=session_headers(self,uid))
+                    database.record_auth_failure("register",e);database.record_auth_failure("register_ip",subject)
+                    return reply(self,{"ok":False,"error":"Не удалось создать аккаунт с этим email."},409)
+                try:
+                    uid=create_web_user(n,e,ph(pw));c=database.create_link_code(uid)
+                except Exception:
+                    logging.exception("Registration could not be completed")
+                    database.record_auth_failure("register",e);database.record_auth_failure("register_ip",subject)
+                    return reply(self,{"ok":False,"error":"Не удалось создать аккаунт с этим email."},409)
+                sent=False
+                if email_delivery_configured():
+                    code=database.create_email_verification_code(uid)
+                    sent=send_email_verification_code(e,code)
+                database.clear_auth_failures("register",e);database.clear_auth_failures("register_ip",subject)
+                return reply(self,{"ok":True,"link_code":c,"email_verification_sent":sent,"email_delivery_configured":email_delivery_configured()},headers=session_headers(self,uid))
             if p.path=="/api/auth/login":
                 email=str(d.get("email","")).strip().lower()
-                if database.auth_is_rate_limited("login",email,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"too_many_attempts"},429)
+                subject=client_key(self)
+                if database.auth_is_rate_limited("login",email,AUTH_ATTEMPT_LIMIT) or database.auth_is_rate_limited("login_ip",subject,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"Слишком много попыток. Повторите через 15 минут."},429)
                 u=get_user_by_email(email)
                 if not u or not u["password_hash"] or not pv(str(d.get("password","")),u["password_hash"]):
-                    database.record_auth_failure("login",email)
+                    database.record_auth_failure("login",email);database.record_auth_failure("login_ip",subject)
                     return reply(self,{"ok":False,"error":"Неверный email или пароль."},401)
                 if u["is_blocked"]:return reply(self,{"ok":False,"error":"Аккаунт заблокирован."},403)
-                database.clear_auth_failures("login",email)
+                database.clear_auth_failures("login",email);database.clear_auth_failures("login_ip",subject)
                 if password_needs_upgrade(u["password_hash"]):db.execute("UPDATE users SET password_hash=? WHERE user_id=?",(ph(str(d.get("password",""))),u["user_id"]))
                 return reply(self,{"ok":True},headers=session_headers(self,u["user_id"]))
+            if p.path=="/api/auth/password/reset/request":
+                email=str(d.get("email","")).strip().lower(); subject=client_key(self)
+                if database.auth_is_rate_limited("password_reset",email,3) or database.auth_is_rate_limited("password_reset_ip",subject,5): return reply(self,{"ok":True})
+                if not email_delivery_configured():
+                    return reply(self,{"ok":False,"error":"Отправка писем временно не настроена. Обратитесь в поддержку."},503)
+                user=get_user_by_email(email)
+                if user:
+                    code=database.create_email_verification_code(user["user_id"])
+                    if not send_password_reset_code(email,code):
+                        db.execute("DELETE FROM email_verification_codes WHERE user_id=?",(user["user_id"],))
+                        return reply(self,{"ok":False,"error":"Не удалось отправить письмо. Повторите позже."},503)
+                database.record_auth_failure("password_reset",email); database.record_auth_failure("password_reset_ip",subject)
+                return reply(self,{"ok":True})
+            if p.path=="/api/auth/password/reset/confirm":
+                email=str(d.get("email","")).strip().lower(); password=str(d.get("password", "")); confirmation=str(d.get("password_confirm", ""))
+                user=get_user_by_email(email)
+                if not user:return reply(self,{"ok":False,"error":"Код недействителен или истёк."},400)
+                if password!=confirmation:return reply(self,{"ok":False,"error":"Пароли не совпадают."},400)
+                problem=password_error(password)
+                if problem:return reply(self,{"ok":False,"error":problem},400)
+                ok,_=database.verify_email_code(user["user_id"],str(d.get("code","")).strip())
+                if not ok:return reply(self,{"ok":False,"error":"Код недействителен или истёк."},400)
+                db.execute("UPDATE users SET password_hash=? WHERE user_id=?",(ph(password),user["user_id"])); db.execute("DELETE FROM sessions WHERE user_id=?",(user["user_id"],))
+                return reply(self,{"ok":True})
+            if p.path=="/api/auth/email/resend":
+                u=auth(self)
+                if not u:return
+                if u["email_verified"]:return reply(self,{"ok":True,"already_verified":True})
+                if not u["email"]:return reply(self,{"ok":False,"error":"В профиле нет email для подтверждения."},409)
+                if not email_delivery_configured():return reply(self,{"ok":False,"error":"Отправка кодов временно не настроена."},503)
+                if database.auth_is_rate_limited("email_resend",str(u["user_id"]),3):return reply(self,{"ok":False,"error":"Слишком много кодов. Повторите позже."},429)
+                code=database.create_email_verification_code(u["user_id"])
+                if not send_email_verification_code(u["email"],code):return reply(self,{"ok":False,"error":"Не удалось отправить код. Повторите позже."},503)
+                database.record_auth_failure("email_resend",str(u["user_id"]))
+                return reply(self,{"ok":True,"sent":True})
+            if p.path=="/api/auth/email/verify":
+                u=auth(self)
+                if not u:return
+                subject=str(u["user_id"])+":"+client_key(self)
+                if database.auth_is_rate_limited("email_verify",subject,5):return reply(self,{"ok":False,"error":"Слишком много попыток. Запросите новый код."},429)
+                ok,status=database.verify_email_code(u["user_id"],str(d.get("code","")).strip())
+                if not ok:
+                    database.record_auth_failure("email_verify",subject)
+                    messages={"expired":"Код истёк. Запросите новый.","too_many_attempts":"Слишком много попыток. Запросите новый код.","invalid":"Неверный код."}
+                    return reply(self,{"ok":False,"error":messages.get(status,"Не удалось подтвердить email.")},400)
+                database.clear_auth_failures("email_verify",subject)
+                return reply(self,{"ok":True,"verified":True})
             if p.path=="/api/auth/logout":
                 c=self.headers.get("Cookie","");t=next((x.strip().split("=",1)[1] for x in c.split(";") if x.strip().startswith("hpoint_session=")),None)
                 if t:db.execute("DELETE FROM sessions WHERE token=?",(t,))
+                return reply(self,{"ok":True},headers={"Set-Cookie":session_cookie("", 0)})
+            if p.path=="/api/auth/account/delete":
+                u=auth(self)
+                if not u:return
+                if str(d.get("confirmation","")).strip()!="УДАЛИТЬ":return reply(self,{"ok":False,"error":"Введите УДАЛИТЬ для подтверждения."},400)
+                database.delete_user_account(u["user_id"])
                 return reply(self,{"ok":True},headers={"Set-Cookie":session_cookie("", 0)})
             if p.path=="/api/profiles/switch":
                 u=auth(self)
@@ -576,6 +1413,11 @@ class Handler(BaseHTTPRequestHandler):
                 device=cookie_value(self,"hpoint_device")
                 row=db.execute("SELECT 1 FROM sessions WHERE user_id=? AND device_id=? AND expires_at>? LIMIT 1",(target,device,now().isoformat())).fetchone() if device else None
                 if not row:return reply(self,{"ok":False,"error":"Этот профиль недоступен на устройстве."},403)
+                # Rotate the browser session on every switch.  This prevents a
+                # stale session token from being reused after the UI changes
+                # identity and makes all subsequent requests unambiguous.
+                current=cookie_value(self,"hpoint_session")
+                if current: db.execute("DELETE FROM sessions WHERE token=?",(current,))
                 return reply(self,{"ok":True},headers=session_headers(self,target))
             if p.path=="/api/profile/telegram/unlink":
                 u=auth(self)
@@ -587,12 +1429,100 @@ class Handler(BaseHTTPRequestHandler):
                 u=auth(self)
                 if not u:return
                 c=database.create_link_code(u["user_id"]);return reply(self,{"ok":True,"code":c})
+            if p.path=="/api/profile/contacts":
+                u=auth(self)
+                if not u:return
+                ok,message=database.update_contact_details(u["user_id"],d.get("full_name"),d.get("birth_date"),d.get("phone"))
+                if not ok:return reply(self,{"ok":False,"error":message},400)
+                return reply(self,{"ok":True})
+            if p.path=="/api/profile/phone/send-code":
+                u=auth(self)
+                if not u:return
+                if not u["phone"]:return reply(self,{"ok":False,"error":"Сначала сохраните номер телефона."},409)
+                if u["phone_verified"]:return reply(self,{"ok":True,"already_verified":True})
+                if not sms_delivery_configured():return reply(self,{"ok":False,"error":"SMS-подтверждение ещё не подключено администратором."},503)
+                subject=str(u["user_id"])
+                if database.auth_is_rate_limited("phone_resend",subject,3):return reply(self,{"ok":False,"error":"Слишком много кодов. Повторите позже."},429)
+                code=database.create_phone_verification_code(u["user_id"])
+                if not code or not send_phone_verification_code(u["phone"],code):
+                    db.execute("DELETE FROM phone_verification_codes WHERE user_id=?",(u["user_id"],))
+                    return reply(self,{"ok":False,"error":"Не удалось отправить SMS. Повторите позже."},503)
+                database.record_auth_failure("phone_resend",subject)
+                return reply(self,{"ok":True,"sent":True})
+            if p.path=="/api/profile/phone/verify":
+                u=auth(self)
+                if not u:return
+                subject=str(u["user_id"])+":"+client_key(self)
+                if database.auth_is_rate_limited("phone_verify",subject,5):return reply(self,{"ok":False,"error":"Слишком много попыток. Запросите новый код."},429)
+                ok,status=database.verify_phone_code(u["user_id"],str(d.get("code","")).strip())
+                if not ok:
+                    database.record_auth_failure("phone_verify",subject)
+                    messages={"expired":"Код истёк. Запросите новый.","too_many_attempts":"Слишком много попыток. Запросите новый код.","invalid":"Неверный код."}
+                    return reply(self,{"ok":False,"error":messages.get(status,"Не удалось подтвердить номер.")},400)
+                database.clear_auth_failures("phone_verify",subject)
+                return reply(self,{"ok":True,"verified":True})
             if p.path=="/api/profile":
                 u=auth(self)
                 if not u:return
                 n=str(d.get("name",u["name"])).strip()[:MAX_NAME_LEN];city=str(d.get("city","")).strip()[:80];bio=str(d.get("bio","")).strip()[:500]
                 if len(n)<2:return reply(self,{"ok":False,"error":"Имя слишком короткое."},400)
                 db.execute("UPDATE users SET name=?,city=?,bio=? WHERE user_id=?",(n,city,bio,u["user_id"]));return reply(self,{"ok":True})
+            if p.path=="/api/events":
+                u=auth(self)
+                if not u:return
+                try:
+                    image=event_image_data(d.get("image_data"))
+                    event_id=database.create_community_event(u["user_id"],d.get("title"),d.get("description"),d.get("place"),d.get("starts_at"),d.get("ends_at"),d.get("capacity"),image)
+                except ValueError as exc:
+                    return reply(self,{"ok":False,"error":str(exc)},400)
+                if u["tg_user_id"]:
+                    notify_telegram_user(u["tg_user_id"],f"📅 На сайте создано мероприятие «{escape(str(d.get('title',''))[:120])}»." )
+                return reply(self,{"ok":True,"event_id":event_id})
+            if p.path=="/api/events/join":
+                u=auth(self)
+                if not u:return
+                try:event_id=int(d.get("event_id"))
+                except (TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректное мероприятие."},400)
+                ok,message=database.join_community_event(event_id,u["user_id"])
+                if not ok:return reply(self,{"ok":False,"error":message},409)
+                event=db.execute("SELECT creator_id,title FROM community_events WHERE id=?",(event_id,)).fetchone()
+                creator=get_user(event["creator_id"]) if event else None
+                if creator and creator["tg_user_id"] and creator["user_id"]!=u["user_id"]:
+                    notify_telegram_user(creator["tg_user_id"],f"📅 Пользователь записался на ваше мероприятие «{escape(event['title'])}».")
+                return reply(self,{"ok":True,"message":message})
+            if p.path=="/api/events/leave":
+                u=auth(self)
+                if not u:return
+                try:event_id=int(d.get("event_id"))
+                except (TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректное мероприятие."},400)
+                ok,message=database.leave_community_event(event_id,u["user_id"])
+                return reply(self,{"ok":ok,"error":None if ok else message,"message":message},200 if ok else 409)
+            if p.path=="/api/events/cancel":
+                u=auth(self)
+                if not u:return
+                try:event_id=int(d.get("event_id"))
+                except (TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректное мероприятие."},400)
+                ok,message=database.cancel_community_event(event_id,u["user_id"],allow_admin=u["role"]=="admin")
+                if not ok:return reply(self,{"ok":False,"error":message},403)
+                return reply(self,{"ok":True,"message":message})
+            if p.path=="/api/support":
+                u=auth(self)
+                if not u:return
+                subject=str(d.get("subject","")).strip()[:120]; message=str(d.get("message","")).strip()[:2000]
+                if not subject or not message:return reply(self,{"ok":False,"error":"Заполните тему и сообщение."},400)
+                ticket=database.insert_id("INSERT INTO support_tickets(user_id,subject,message) VALUES(?,?,?)",(u["user_id"],subject,message))
+                return reply(self,{"ok":True,"ticket_id":ticket})
+            if p.path=="/api/admin/support/reply":
+                admin=admin_auth(self)
+                if not admin:return
+                try: ticket_id=int(d.get("ticket_id"))
+                except (TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректное обращение."},400)
+                message=str(d.get("message","")).strip()[:2000]
+                if not message:return reply(self,{"ok":False,"error":"Введите ответ."},400)
+                changed=db.execute("UPDATE support_tickets SET admin_reply=?,replied_by=?,replied_at=CURRENT_TIMESTAMP,status='answered' WHERE id=?",(message,admin["user_id"],ticket_id)).rowcount
+                if not changed:return reply(self,{"ok":False,"error":"Обращение не найдено."},404)
+                database.record_admin_action(admin["user_id"],"support_replied",None,{"ticket_id":ticket_id})
+                return reply(self,{"ok":True})
             if p.path=="/api/identity-verification":
                 u=auth(self)
                 if not u:return
@@ -609,103 +1539,166 @@ class Handler(BaseHTTPRequestHandler):
                 if target_id==admin["user_id"]:return reply(self,{"ok":False,"error":"Нельзя изменить свой доступ."},400)
                 if not set_user_blocked(admin["user_id"],target_id,blocked,str(d.get("reason", ""))):return reply(self,{"ok":False,"error":"Пользователь не найден."},404)
                 return reply(self,{"ok":True})
+            if p.path=="/api/admin/requests/cancel":
+                admin=admin_auth(self)
+                if not admin:return
+                try: request_id=int(d["request_id"])
+                except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
+                reason=str(d.get("reason","")).strip()[:300]
+                cancelled,request=database.admin_cancel_request(admin["user_id"],request_id,reason)
+                if not cancelled:return reply(self,{"ok":False,"error":"Заявка не найдена или уже завершена."},409)
+                requester=get_user(request["requester_id"])
+                if requester and requester["tg_user_id"]:
+                    message=f"ℹ️ Заявка №{request_id} закрыта поддержкой."
+                    if reason: message+=f" Причина: {reason}"
+                    notify_telegram_user(requester["tg_user_id"],message)
+                return reply(self,{"ok":True})
             if p.path=="/api/requests":
                 u=auth(self)
                 if not u:return
-                if get_active_own_request(u["user_id"]):return reply(self,{"ok":False,"error":"У вас уже есть активная заявка."},409)
-                if u["balance"]<REQUEST_COST:return reply(self,{"ok":False,"error":f"Нужно {REQUEST_COST} HP."},400)
+                if not verified_community_account(self,u):return
+                open_count=db.execute("SELECT COUNT(*) n FROM requests WHERE requester_id=? AND status=?",(u["user_id"],STATUS_OPEN)).fetchone()["n"]
+                if int(open_count or 0)>=10:return reply(self,{"ok":False,"error":"Одновременно можно опубликовать до 10 открытых заявок."},409)
                 f={k:str(d.get(k,"" )).strip() for k in ("what","place","time_needed","urgency","details")}
                 if not all(f.values()):return reply(self,{"ok":False,"error":"Заполните все поля."},400)
                 if any(len(value)>MAX_TEXT_LEN for value in f.values()):return reply(self,{"ok":False,"error":f"Каждое поле должно быть не длиннее {MAX_TEXT_LEN} символов."},400)
-                try:lat=float(d["lat"]) if d.get("lat") is not None else None;lon=float(d["lon"]) if d.get("lon") is not None else None
-                except:lat=lon=None
+                try:lat,lon=coordinates_from_payload(d)
+                except ValueError:return reply(self,{"ok":False,"error":"Некорректные координаты."},400)
+                try: expires_in_hours=int(d.get("expires_in_hours",48)); reward_rub=int(d.get("reward_rub",0) or 0)
+                except (TypeError,ValueError): return reply(self,{"ok":False,"error":"Некорректный срок заявки."},400)
+                if not 1 <= expires_in_hours <= 168:return reply(self,{"ok":False,"error":"Срок заявки — от 1 часа до 7 дней."},400)
+                if not 0 <= reward_rub <= 100_000:return reply(self,{"ok":False,"error":"Вознаграждение — от 0 до 100 000 ₽."},400)
+                if reward_rub == 0 and u["balance"]<REQUEST_COST:return reply(self,{"ok":False,"error":f"Нужно {REQUEST_COST} HP."},400)
                 f["category"]=str(d.get("category","other"))
                 if f["category"] not in CATEGORIES:return reply(self,{"ok":False,"error":"Некорректная категория."},400)
-                if (lat is None) != (lon is None) or (lat is not None and not (-90<=lat<=90 and -180<=lon<=180)):return reply(self,{"ok":False,"error":"Некорректные координаты."},400)
-                rid=create_request(u["user_id"],{**f,"lat":lat,"lon":lon})
+                rid=create_request(u["user_id"],{**f,"lat":lat,"lon":lon,"expires_in_hours":expires_in_hours,"reward_rub":reward_rub})
+                if lat is not None:
+                    db.execute("UPDATE users SET lat=?,lon=? WHERE user_id=?",(lat,lon,u["user_id"]))
                 req=get_request(rid)
-                helper_id=find_best_queued_helper(req)
-                matched=False
-                if helper_id is not None:
-                    matched=try_assign_helper(rid,helper_id)
-                    if matched:
-                        chat_for_request(rid)
                 if u["tg_user_id"]:
-                    status = "Помощник уже найден." if matched else "Заявка ожидает помощника."
                     notify_telegram_user(
                         u["tg_user_id"],
-                        f"🆕 На сайте создана заявка №{rid}: {escape(req['what'])}\n{status}\n"
-                        "Она доступна в общей истории. Откройте /history в H-Point.",
+                        f"🆕 На сайте создана заявка №{rid}: {escape(req['what'])}\n"
+                        "Откройте в H-Point «⚡ Подобрать кандидатов», выберите человека из очереди — он сам подтвердит согласие.",
                     )
-                return reply(self,{"ok":True,"request_id":rid,"matched":matched})
+                return reply(self,{"ok":True,"request_id":rid,"matched":False})
             if p.path=="/api/helper/queue":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
+                try:lat,lon=coordinates_from_payload(d)
+                except ValueError:return reply(self,{"ok":False,"error":"Некорректные координаты."},400)
                 if get_active_own_request(u["user_id"]):
                     return reply(self,{"ok":False,"error":"Сначала завершите или отмените свою активную заявку."},409)
                 if get_active_help(u["user_id"]):
                     return reply(self,{"ok":False,"error":"Сначала завершите текущую помощь."},409)
-                while True:
-                    request=find_best_open_request_for(u["user_id"])
-                    if request is None:
-                        add_to_queue(u["user_id"])
-                        return reply(self,{"ok":True,"matched":False,"message":"Подходящих заявок пока нет. Вы добавлены в очередь помощников."})
-                    if try_assign_helper(request["id"],u["user_id"]):
-                        chat_for_request(request["id"])
-                        requester=get_user(request["requester_id"])
-                        if requester and requester["tg_user_id"]:
-                            notify_telegram_user(requester["tg_user_id"],f"🤝 По заявке №{request['id']} найден помощник. Откройте сайт H-Point или бот, чтобы продолжить общение.")
-                        if u["tg_user_id"]:
-                            notify_telegram_user(u["tg_user_id"],f"🤝 Вы приняли заявку №{request['id']}: {escape(request['what'])}. Чат уже создан.")
-                        return reply(self,{"ok":True,"matched":True,"request_id":request["id"],"message":"Вы приняли подходящую заявку. Чат создан."})
+                if lat is not None:
+                    db.execute("UPDATE users SET lat=?,lon=? WHERE user_id=?",(lat,lon,u["user_id"]))
+                add_to_queue(u["user_id"])
+                suffix=" Расстояние видно автору заявки, ваша точка скрыта." if lat is not None else " Геопозиция не указана, поэтому расстояние не будет показано."
+                return reply(self,{"ok":True,"matched":False,"message":"Вы в общей очереди помощников. Когда вас выберут, вы сами подтвердите или отклоните предложение."+suffix})
             if p.path=="/api/requests/accept":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
                 try: rid=int(d.get("request_id"))
                 except (TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
+                try:lat,lon=coordinates_from_payload(d)
+                except ValueError:return reply(self,{"ok":False,"error":"Некорректные координаты."},400)
                 request=get_request(rid)
                 if not request or request["status"]!=STATUS_OPEN or request["requester_id"]==u["user_id"]:
                     return reply(self,{"ok":False,"error":"Эта заявка недоступна."},409)
                 if get_active_own_request(u["user_id"]):
                     return reply(self,{"ok":False,"error":"Сначала завершите или отмените свою активную заявку."},409)
-                if not try_assign_helper(rid,u["user_id"]):
-                    return reply(self,{"ok":False,"error":"Заявку уже принял другой помощник или у вас есть активная помощь."},409)
-                chat_for_request(rid)
-                requester=get_user(request["requester_id"])
-                if requester and requester["tg_user_id"]:
-                    notify_telegram_user(requester["tg_user_id"],f"🤝 По заявке №{rid} найден помощник. Откройте сайт H-Point или бот, чтобы продолжить общение.")
-                if u["tg_user_id"]:
-                    notify_telegram_user(u["tg_user_id"],f"🤝 Вы приняли заявку №{rid}: {escape(request['what'])}. Чат уже создан.")
-                return reply(self,{"ok":True,"request_id":rid})
+                if get_active_help(u["user_id"]):
+                    return reply(self,{"ok":False,"error":"Сначала завершите текущую помощь."},409)
+                if lat is not None:
+                    db.execute("UPDATE users SET lat=?,lon=? WHERE user_id=?",(lat,lon,u["user_id"]))
+                add_to_queue(u["user_id"])
+                suffix=" Расстояние видно автору заявки, ваша точка скрыта." if lat is not None else " Геопозиция не указана, поэтому расстояние не будет показано."
+                return reply(self,{"ok":True,"request_id":rid,"queued":True,"message":"Вы в очереди помощников. Автор заявки сам выберет кандидата."+suffix})
             if p.path=="/api/assistant/candidates":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
                 try: rid=int(d["request_id"])
                 except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
                 request=get_request(rid)
                 if not request or request["requester_id"]!=u["user_id"] or request["status"]!=STATUS_OPEN:
                     return reply(self,{"ok":False,"error":"Подбор доступен только для вашей открытой заявки."},403)
                 question=str(d.get("question", "")).strip()[:MAX_TEXT_LEN]
-                return reply(self,{"ok":True,"matches":smart_match(rid,query=question)})
+                offer=get_current_helper_offer(rid)
+                request_location={"lat":request["lat"],"lon":request["lon"]} if request["lat"] is not None and request["lon"] is not None else None
+                return reply(self,{"ok":True,"matches":smart_match(rid,query=question),"offer":dict(offer) if offer else None,"request_location":request_location})
             if p.path=="/api/smart-match/assign":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
                 try:rid=int(d["request_id"]);hid=int(d["helper_id"])
                 except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректные данные."},400)
                 r=get_request(rid)
                 if not r or r["requester_id"]!=u["user_id"] or r["status"]!=STATUS_OPEN:return reply(self,{"ok":False,"error":"Недоступно."},403)
-                if not try_assign_helper(rid,hid):return reply(self,{"ok":False,"error":"Кандидат уже занят или заявка изменилась."},409)
-                chat_for_request(rid);return reply(self,{"ok":True})
+                if not offer_helper(rid,hid):return reply(self,{"ok":False,"error":"Кандидат уже занят, вышел из очереди или заявка изменилась."},409)
+                candidate=get_user(hid)
+                if candidate and candidate["tg_user_id"]:
+                    notify_telegram_user(
+                        candidate["tg_user_id"],
+                        f"🤝 <b>Вас выбрали как помощника</b>\n\n"
+                        f"Заявка №{rid}: {escape(r['what'])}\n"
+                        f"Где: {escape(r['place'])}\nКогда: {escape(r['time_needed'])}\n\n"
+                        "Подтвердите, что готовы помочь. До вашего согласия заявка никому не назначена.",
+                        reply_markup=helper_offer_kb(rid),
+                    )
+                return reply(self,{"ok":True,"offered":True})
+            if p.path=="/api/helper/offers/respond":
+                u=auth(self)
+                if not u:return
+                if not verified_community_account(self,u):return
+                try:rid=int(d["request_id"])
+                except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
+                accept=d.get("accept")
+                if not isinstance(accept,bool):return reply(self,{"ok":False,"error":"Некорректный ответ."},400)
+                if not respond_to_helper_offer(rid,u["user_id"],accept):
+                    return reply(self,{"ok":False,"error":"Предложение уже неактуально."},409)
+                request=get_request(rid)
+                if accept:
+                    chat_for_request(rid)
+                    requester=get_user(request["requester_id"])
+                    if requester and requester["tg_user_id"]:
+                        notify_telegram_user(requester["tg_user_id"],f"🎉 Помощник подтвердил заявку №{rid}. Чат уже создан.")
+                else:
+                    requester=get_user(request["requester_id"])
+                    if requester and requester["tg_user_id"]:
+                        notify_telegram_user(requester["tg_user_id"],f"ℹ️ Помощник отклонил предложение по заявке №{rid}. Выберите другого кандидата.")
+                return reply(self,{"ok":True,"accepted":accept,"request_id":rid})
+            if p.path=="/api/requests/cancel":
+                u=auth(self)
+                if not u:return
+                try: rid=int(d["request_id"])
+                except (KeyError,TypeError,ValueError): return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
+                reason=str(d.get("reason","")).strip()[:300]
+                if not cancel_request(rid,u["user_id"],reason):
+                    return reply(self,{"ok":False,"error":"Отменить можно только свою заявку, пока она ожидает помощника."},409)
+                return reply(self,{"ok":True,"request_id":rid})
             if p.path=="/api/requests/finish":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
                 try:rid=int(d["request_id"])
                 except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
                 if not complete_request(rid,u["user_id"]):return reply(self,{"ok":False,"error":"Завершить может только назначенный помощник."},409)
                 return reply(self,{"ok":True})
+            if p.path=="/api/requests/reward/pay":
+                u=auth(self)
+                if not u:return
+                try:rid=int(d.get("request_id")); invoice,_,_=create_request_reward_invoice(u["user_id"],rid); url,pid=create_payment(invoice)
+                except ValueError:return reply(self,{"ok":False,"error":"Оплата для этой заявки недоступна."},409)
+                except Exception:return reply(self,{"ok":False,"error":"Платёжный сервис временно недоступен."},503)
+                return reply(self,{"ok":True,"invoice_id":invoice,"confirmation_url":url,"payment_id":pid})
             if p.path=="/api/reviews":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
                 try:rid=int(d["request_id"]);rating=int(d["rating"])
                 except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная оценка."},400)
                 side=str(d.get("side", ""))
@@ -717,6 +1710,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/chats/send":
                 u=auth(self)
                 if not u:return
+                if not verified_community_account(self,u):return
                 try:rid=int(d["request_id"])
                 except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректный request_id."},400)
                 text=str(d.get("text","")).strip()[:1000]
@@ -761,6 +1755,20 @@ class Handler(BaseHTTPRequestHandler):
                     errors={"insufficient_points":"Недостаточно H-Points.","request_id required":"Для этой функции нужна открытая заявка.","request is unavailable":"Заявка недоступна для продвижения.","telegram link required":"Сначала привяжите Telegram.","ad_text required":"Введите текст объявления."}
                     return reply(self,{"ok":False,"error":errors.get(str(exc),"Не удалось выполнить покупку.")},409)
                 return reply(self,{"ok":True,"invoice_id":invoice_id,"created":created,"balance":get_user(u["user_id"])["balance"]})
+            if p.path=="/api/payments/wallet":
+                u=auth(self)
+                if not u:return
+                item=str(d.get("item_type", ""));meta=d.get("metadata") or {}
+                if item in ("boost","more_responses"):
+                    try: meta["request_id"]=int(d.get("request_id") or meta.get("request_id") or 0)
+                    except (TypeError,ValueError): meta["request_id"]=0
+                if item=="ad" and d.get("ad_text"): meta["ad_text"]=str(d["ad_text"])[:MAX_TEXT_LEN]
+                try:
+                    invoice_id,created=purchase_with_wallet(u["user_id"],item,meta,d.get("purchase_key"))
+                except ValueError as exc:
+                    errors={"insufficient_wallet":"Недостаточно средств в кошельке.","request_id required":"Для этой функции нужна открытая заявка.","request is unavailable":"Заявка недоступна для продвижения.","telegram link required":"Сначала привяжите Telegram.","ad_text required":"Введите текст объявления."}
+                    return reply(self,{"ok":False,"error":errors.get(str(exc),"Не удалось выполнить покупку.")},409)
+                return reply(self,{"ok":True,"invoice_id":invoice_id,"created":created,"wallet":database.wallet_summary(u["user_id"])})
             self.send_error(404)
         except Exception:
             logging.exception("Web request failed: %s", p.path)

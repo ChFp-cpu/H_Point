@@ -14,18 +14,38 @@ class Web(unittest.TestCase):
   self.assertEqual(database.get_request(rid)["category"],"tech")
  def test_page_contains_platform(self):
   self.assertIn("Smart Match",web.PAGE);self.assertIn("Telegram",web.PAGE);self.assertIn("руб",web.PAGE)
+  self.assertIn('rel="icon" type="image/svg+xml" href="/assets/favicon.svg"',web.PAGE)
   self.assertIn("timeout:2500",web.PAGE)
-  self.assertIn("&csp=true",web.PAGE)
+  if web.YANDEX_MAPS_API_KEY:self.assertIn("api-maps.yandex.ru",web.PAGE)
+  else:self.assertIn("leaflet@1.9.4",web.PAGE)
   self.assertIn("Создать профиль",web.PAGE)
   self.assertIn("resumeTelegramLogin",web.PAGE)
-  self.assertIn("/api/requests/accept",web.PAGE)
-  self.assertIn("https://*.maps.yandex.net",web.CSP)
-  self.assertIn("https://api-maps.yandex.ru",web.CSP)
+  self.assertIn("/api/helper/offers",web.PAGE)
+  self.assertIn("Предложения помощи",web.PAGE)
+  self.assertIn("ratingPodium",web.PAGE)
+  self.assertIn("activityStats",web.PAGE)
+  self.assertIn("globalBalance",web.PAGE)
+  self.assertIn("homePulse",web.PAGE)
+  self.assertIn("telegramSummary",web.PAGE)
+  self.assertIn("renderAuditHeader",web.PAGE)
+  self.assertIn("onclick=\"openProfileMenu()\"",web.PAGE)
+  self.assertIn("Панель администратора",web.PAGE)
+  self.assertIn("Сменить аккаунт",web.PAGE)
+  self.assertIn("Выйти из аккаунта",web.PAGE)
+  self.assertIn("balanceSkeleton",web.PAGE)
+  self.assertIn("grid-template-areas",web.PAGE)
+  self.assertIn("hpointAuditWallet",web.PAGE)
+  self.assertIn("window.load();",web.PAGE)
+  self.assertIn("soloBoard",web.PAGE)
+  self.assertIn("ПЕРВОПРОХОДЕЦ СЕЗОНА",web.PAGE)
+  self.assertIn("hpointShowcaseGo",web.PAGE)
+  self.assertIn("https://*.yandex.ru",web.CSP)
+  self.assertIn("https://*.yandex.net",web.CSP)
  def test_head_for_public_page_and_health(self):
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
   try:
    base=f"http://127.0.0.1:{server.server_address[1]}"
-   for path,content_type in (("/","text/html"),("/api/health","application/json")):
+   for path,content_type in (("/","text/html"),("/api/health","application/json"),("/assets/favicon.svg","image/svg+xml")):
     req=urllib.request.Request(base+path,method="HEAD")
     with urllib.request.urlopen(req,timeout=3) as response:
      self.assertEqual(response.status,200);self.assertEqual(response.headers.get_content_type(),content_type);self.assertEqual(response.read(),b"")
@@ -41,12 +61,13 @@ class Web(unittest.TestCase):
    req=urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers=headers,method="POST")
    return urllib.request.urlopen(req,timeout=3)
   try:
-   with post("/api/auth/register",{"name":"New User","email":"new@example.com","password":"correct horse"}) as response:
+   password="Aa1234"
+   with post("/api/auth/register",{"name":"New User","email":"new@example.com","password":password,"password_confirm":password}) as response:
     created=json.load(response);cookie=response.headers["Set-Cookie"].split(";",1)[0]
    self.assertTrue(created["ok"])
    with urllib.request.urlopen(urllib.request.Request(base+"/api/me",headers={"Cookie":cookie}),timeout=3) as response:
     self.assertEqual(json.load(response)["user"]["email"],"new@example.com")
-   with post("/api/auth/login",{"email":"new@example.com","password":"correct horse"}) as response:
+   with post("/api/auth/login",{"email":"new@example.com","password":password}) as response:
     self.assertTrue(json.load(response)["ok"])
    with self.assertRaises(urllib.error.HTTPError) as denied:
     urllib.request.urlopen(base+"/api/me",timeout=3)
@@ -57,6 +78,70 @@ class Web(unittest.TestCase):
     urllib.request.urlopen(urllib.request.Request(base+"/api/admin/summary",headers={"Cookie":cookie}),timeout=3)
    self.assertEqual(forbidden.exception.code,403)
    forbidden.exception.close()
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_paid_request_does_not_require_hpoints_and_sync_has_wallet(self):
+  database.create_user(1,"Requester")
+  self.db.execute("UPDATE users SET balance=0,email_verified=1 WHERE user_id=1")
+  token=web.new_sess(1)
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Content-Type":"application/json","Cookie":f"hpoint_session={token}"}
+  try:
+   payload={"what":"Оплатить работу","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test","reward_rub":500}
+   with urllib.request.urlopen(urllib.request.Request(base+"/api/requests",data=json.dumps(payload).encode(),headers=headers,method="POST"),timeout=3) as response:
+    created=json.load(response);self.assertTrue(created["ok"])
+   self.assertEqual(database.get_user(1)["balance"],0)
+   with urllib.request.urlopen(urllib.request.Request(base+"/api/sync",headers={"Cookie":f"hpoint_session={token}"}),timeout=3) as response:
+    synced=json.load(response)
+   self.assertIn("wallet",synced);self.assertEqual(synced["wallet"]["balance_rub"],0)
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_user_payload_includes_safe_telegram_summary(self):
+  database.create_user(7,"Telegram Person","tgperson")
+  self.db.execute("UPDATE users SET tg_user_id=7 WHERE user_id=7")
+  payload=web.user_payload(database.get_user(7))
+  self.assertTrue(payload["tg_linked"])
+  self.assertEqual(payload["telegram"],{"name":"Telegram Person","username":"tgperson","avatar_url":None})
+ def test_email_code_is_one_time_and_required_for_email_actions(self):
+  old_configured,old_send=web.email_delivery_configured,web.send_email_verification_code
+  delivered=[];web.email_delivery_configured=lambda:True;web.send_email_verification_code=lambda address,code:delivered.append((address,code)) or True
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  base=f"http://127.0.0.1:{server.server_address[1]}"
+  def post(path,payload,cookie=None):
+   headers={"Content-Type":"application/json"}
+   if cookie:headers["Cookie"]=cookie
+   return urllib.request.urlopen(urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers=headers,method="POST"),timeout=3)
+  try:
+   password="SecurePass123A"
+   with post("/api/auth/register",{"name":"Verified User","email":"verified@example.com","password":password,"password_confirm":password}) as response:
+    created=json.load(response);cookie=response.headers["Set-Cookie"].split(";",1)[0]
+   self.assertTrue(created["email_verification_sent"]);self.assertEqual(delivered[0][0],"verified@example.com")
+   request={"what":"Нужна помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"}
+   with self.assertRaises(urllib.error.HTTPError) as blocked:
+    post("/api/requests",request,cookie)
+   self.assertEqual(blocked.exception.code,403);blocked.exception.close()
+   with self.assertRaises(urllib.error.HTTPError) as wrong:
+    post("/api/auth/email/verify",{"code":"000000"},cookie)
+   self.assertEqual(wrong.exception.code,400);wrong.exception.close()
+   with post("/api/auth/email/verify",{"code":delivered[0][1]},cookie) as response:self.assertTrue(json.load(response)["verified"])
+   with post("/api/requests",request,cookie) as response:self.assertTrue(json.load(response)["ok"])
+   with self.assertRaises(urllib.error.HTTPError) as reused:
+    post("/api/auth/email/verify",{"code":delivered[0][1]},cookie)
+   self.assertEqual(reused.exception.code,400);reused.exception.close()
+  finally:
+   web.email_delivery_configured,web.send_email_verification_code=old_configured,old_send
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_registration_requires_matching_strong_password(self):
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  base=f"http://127.0.0.1:{server.server_address[1]}"
+  try:
+   def register(payload):return urllib.request.urlopen(urllib.request.Request(base+"/api/auth/register",data=json.dumps(payload).encode(),headers={"Content-Type":"application/json"},method="POST"),timeout=3)
+   with self.assertRaises(urllib.error.HTTPError) as weak:
+    register({"name":"Weak User","email":"weak@example.com","password":"weakpassword12","password_confirm":"weakpassword12"})
+   self.assertEqual(weak.exception.code,400);weak.exception.close()
+   with self.assertRaises(urllib.error.HTTPError) as mismatch:
+    register({"name":"Mismatch User","email":"mismatch@example.com","password":"SecurePass123A","password_confirm":"SecurePass123B"})
+   self.assertEqual(mismatch.exception.code,400);mismatch.exception.close()
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_telegram_login_creates_one_shared_profile(self):
@@ -88,6 +173,28 @@ class Web(unittest.TestCase):
    base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Cookie":f"hpoint_session={token}"}
    with urllib.request.urlopen(urllib.request.Request(base+"/api/requests?open=1",headers=headers),timeout=3) as response: row=json.load(response)["requests"][0]
    self.assertEqual(row["id"],rid);self.assertIsNone(row["lat"]);self.assertIsNone(row["lon"]);self.assertNotIn("details",row);self.assertNotEqual(row["place"],"район")
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_helper_location_updates_distance_and_active_map_stays_private(self):
+  database.create_user(1,"Requester");database.create_user(2,"Helper")
+  rid=services.create_request(1,{"what":"Нужна дрель","place":"район","time_needed":"сегодня","urgency":"обычная","details":"Точный адрес","lat":55.75123,"lon":37.61987})
+  requester_token=web.new_sess(1);helper_token=web.new_sess(2)
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   base=f"http://127.0.0.1:{server.server_address[1]}"
+   def post(path,payload,cookie):
+    return urllib.request.urlopen(urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers={"Content-Type":"application/json","Cookie":cookie},method="POST"),timeout=3)
+   with post("/api/helper/queue",{"lat":55.752,"lon":37.62},f"hpoint_session={helper_token}") as response:
+    self.assertTrue(json.load(response)["ok"])
+   with urllib.request.urlopen(urllib.request.Request(base+f"/api/smart-match?request_id={rid}",headers={"Cookie":f"hpoint_session={requester_token}"}),timeout=3) as response:
+    candidate=json.load(response)["matches"][0]
+   self.assertIsNotNone(candidate["distance_km"]);self.assertIsNone(candidate["lat"]);self.assertIsNone(candidate["lon"])
+   with urllib.request.urlopen(urllib.request.Request(base+"/api/map/active",headers={"Cookie":f"hpoint_session={helper_token}"}),timeout=3) as response:
+    self.assertEqual(json.load(response)["tasks"],[])
+   self.assertTrue(services.try_assign_helper(rid,2))
+   with urllib.request.urlopen(urllib.request.Request(base+"/api/map/active",headers={"Cookie":f"hpoint_session={helper_token}"}),timeout=3) as response:
+    task=json.load(response)["tasks"][0]
+   self.assertEqual(task["id"],rid);self.assertEqual(task["destination"]["lat"],55.75123)
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_production_requires_same_origin_for_state_changes(self):
@@ -175,6 +282,19 @@ class Web(unittest.TestCase):
    with get(second) as response:self.assertEqual(json.load(response)["user"]["id"],uid)
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_account_deletion_requires_confirmation_and_revokes_session(self):
+  uid=database.create_web_user("Erase Me","erase@example.com","hash");token=web.new_sess(uid)
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Content-Type":"application/json","Cookie":f"hpoint_session={token}"}
+   bad=urllib.request.Request(base+"/api/auth/account/delete",data=json.dumps({"confirmation":"нет"}).encode(),headers=headers,method="POST")
+   with self.assertRaises(urllib.error.HTTPError) as denied:urllib.request.urlopen(bad,timeout=3)
+   self.assertEqual(denied.exception.code,400);denied.exception.close();self.assertIsNotNone(database.get_user(uid))
+   good=urllib.request.Request(base+"/api/auth/account/delete",data=json.dumps({"confirmation":"УДАЛИТЬ"}).encode(),headers=headers,method="POST")
+   with urllib.request.urlopen(good,timeout=3) as response:self.assertTrue(json.load(response)["ok"])
+   self.assertIsNone(database.get_user(uid))
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
  def test_chat_is_private_live_and_input_is_validated(self):
   for uid,name in ((1,"Requester"),(2,"Helper"),(3,"Outsider")):database.create_user(uid,name)
   rid=services.create_request(1,{"what":"Нужна помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
@@ -221,23 +341,27 @@ class Web(unittest.TestCase):
      self.assertEqual(response.headers.get_content_type(),"image/png");self.assertGreater(len(response.read()),1000)
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
- def test_helper_claims_existing_request_and_open_feed_hides_own_request(self):
+ def test_helper_is_offered_request_and_must_confirm(self):
   database.create_user(1,"Requester");database.create_user(2,"Helper")
   rid=services.create_request(1,{"what":"Нужна помощь с техникой","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
-  token=web.new_sess(2)
+  requester_token=web.new_sess(1);token=web.new_sess(2)
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
   try:
    base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Cookie":f"hpoint_session={token}","Content-Type":"application/json"}
    with urllib.request.urlopen(urllib.request.Request(base+"/api/requests?open=1",headers=headers),timeout=3) as response:feed=json.load(response)["requests"]
    self.assertEqual([row["id"] for row in feed],[rid]);self.assertNotIn("details",feed[0])
    with urllib.request.urlopen(urllib.request.Request(base+"/api/helper/queue",data=b"{}",headers=headers,method="POST"),timeout=3) as response:claimed=json.load(response)
-   self.assertTrue(claimed["matched"]);self.assertEqual(claimed["request_id"],rid)
+   self.assertFalse(claimed["matched"])
+   request=database.get_request(rid);self.assertIsNone(request["helper_id"]);self.assertEqual(request["status"],"open")
+   requester_headers={"Cookie":f"hpoint_session={requester_token}","Content-Type":"application/json"}
+   offer=urllib.request.Request(base+"/api/smart-match/assign",data=json.dumps({"request_id":rid,"helper_id":2}).encode(),headers=requester_headers,method="POST")
+   with urllib.request.urlopen(offer,timeout=3) as response:self.assertTrue(json.load(response)["offered"])
+   self.assertEqual(database.get_request(rid)["status"],"open")
+   with urllib.request.urlopen(urllib.request.Request(base+"/api/helper/offers",headers=headers),timeout=3) as response:self.assertEqual(json.load(response)["offers"][0]["request_id"],rid)
+   response_request=urllib.request.Request(base+"/api/helper/offers/respond",data=json.dumps({"request_id":rid,"accept":True}).encode(),headers=headers,method="POST")
+   with urllib.request.urlopen(response_request,timeout=3) as response:self.assertTrue(json.load(response)["accepted"])
    request=database.get_request(rid);self.assertEqual(request["helper_id"],2);self.assertEqual(request["status"],"in_progress")
    self.assertIsNotNone(web.chat_for_request(rid))
-   with self.assertRaises(urllib.error.HTTPError) as busy:
-    urllib.request.urlopen(urllib.request.Request(base+"/api/helper/queue",data=b"{}",headers=headers,method="POST"),timeout=3)
-   self.assertEqual(busy.exception.code,409);busy.exception.close()
-   with urllib.request.urlopen(urllib.request.Request(base+"/api/requests?open=1",headers=headers),timeout=3) as response:self.assertEqual(json.load(response)["requests"],[])
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_helper_with_active_request_cannot_accept_another_request(self):
@@ -280,6 +404,25 @@ class Web(unittest.TestCase):
    with urllib.request.urlopen(urllib.request.Request(base+"/api/me",headers={"Cookie":new_cookie+"; hpoint_device=unlink-device"}),timeout=3) as response:site_user=json.load(response)["user"]
    self.assertLess(site_user["id"],0);self.assertEqual(site_user["balance"],333);self.assertFalse(site_user["tg_linked"])
    self.assertEqual(database.get_user(77)["tg_user_id"],77);self.assertEqual(database.get_user(77)["balance"],100)
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_admin_dashboard_is_private_and_can_close_active_request(self):
+  database.create_user(1,"Member");database.create_user(99,"Admin")
+  self.db.execute("UPDATE users SET role='admin' WHERE user_id=99")
+  rid=services.create_request(1,{"what":"Need help","place":"centre","time_needed":"today","urgency":"normal","details":"test"})
+  member_token,admin_token=web.new_sess(1),web.new_sess(99)
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   base=f"http://127.0.0.1:{server.server_address[1]}"
+   denied=urllib.request.Request(base+"/api/admin/dashboard",headers={"Cookie":f"hpoint_session={member_token}"})
+   with self.assertRaises(urllib.error.HTTPError) as error:urllib.request.urlopen(denied,timeout=3)
+   self.assertEqual(error.exception.code,403);error.exception.close()
+   allowed=urllib.request.Request(base+"/api/admin/dashboard",headers={"Cookie":f"hpoint_session={admin_token}"})
+   with urllib.request.urlopen(allowed,timeout=3) as response:dashboard=json.load(response)
+   self.assertEqual(dashboard["summary"]["requests"]["open"],1)
+   close=urllib.request.Request(base+"/api/admin/requests/cancel",data=json.dumps({"request_id":rid,"reason":"duplicate"}).encode(),headers={"Cookie":f"hpoint_session={admin_token}","Content-Type":"application/json"},method="POST")
+   with urllib.request.urlopen(close,timeout=3) as response:self.assertTrue(json.load(response)["ok"])
+   self.assertEqual(database.get_request(rid)["status"],"cancelled")
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
 if __name__=="__main__":unittest.main()

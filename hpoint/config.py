@@ -14,7 +14,6 @@ SESSION_COOKIE_SECURE = (
     if _cookie_secure_value
     else WEB_PUBLIC_URL.startswith("https://")
 )
-YANDEX_MAPS_API_KEY = os.getenv("YANDEX_MAPS_API_KEY", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 RUN_TELEGRAM_BOT = os.getenv("RUN_TELEGRAM_BOT", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -33,7 +32,44 @@ AUTH_ATTEMPT_LIMIT = int(os.getenv("AUTH_ATTEMPT_LIMIT", "5"))
 AUTH_ATTEMPT_WINDOW_SECONDS = int(os.getenv("AUTH_ATTEMPT_WINDOW_SECONDS", str(15 * 60)))
 TELEGRAM_AUTH_TTL_SECONDS = int(os.getenv("TELEGRAM_AUTH_TTL_SECONDS", "300"))
 TELEGRAM_LINK_TTL_SECONDS = int(os.getenv("TELEGRAM_LINK_TTL_SECONDS", "600"))
+EMAIL_VERIFICATION_TTL_SECONDS = int(os.getenv("EMAIL_VERIFICATION_TTL_SECONDS", "600"))
+PHONE_VERIFICATION_TTL_SECONDS = int(os.getenv("PHONE_VERIFICATION_TTL_SECONDS", "600"))
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "2525"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", "").strip()
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "1").strip().lower() not in ("0", "false", "no", "off")
+SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "0").strip().lower() in ("1", "true", "yes", "on")
+SMTP_TIMEOUT_SECONDS = int(os.getenv("SMTP_TIMEOUT_SECONDS", "10"))
+# A transactional SMS provider is optional.  The UI never claims that a phone
+# is verified until a code was actually sent and checked.
+BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
+SMS_SENDER = os.getenv("SMS_SENDER", "HPoint").strip()
+YANDEX_MAPS_API_KEY = os.getenv("YANDEX_MAPS_API_KEY", "").strip()
+DONATION_URL = os.getenv("DONATION_URL", "").strip()
+DONATION_TITLE = os.getenv("DONATION_TITLE", "Поддержать H-Point").strip()[:80]
+EVENT_IMAGE_MAX_BYTES = int(os.getenv("EVENT_IMAGE_MAX_BYTES", "800000"))
 MAX_PAYMENT_BODY = int(os.getenv("MAX_PAYMENT_BODY", "10000"))
+
+# H-Point Games economy.  These are deliberately server-side values: the
+# browser only receives the resulting balance and can never choose a reward.
+GAME_REWARD_TIMEZONE = os.getenv("GAME_REWARD_TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow"
+GAME_DAILY_REWARD_CAP = int(os.getenv("GAME_DAILY_REWARD_CAP", "15"))
+GAME_PER_TITLE_REWARD_CAP = int(os.getenv("GAME_PER_TITLE_REWARD_CAP", "3"))
+GAME_SESSION_TTL_SECONDS = int(os.getenv("GAME_SESSION_TTL_SECONDS", str(60 * 45)))
+GAME_ACTION_MIN_INTERVAL_MS = int(os.getenv("GAME_ACTION_MIN_INTERVAL_MS", "110"))
+
+# Scores are evaluated by the server against these thresholds.  The values
+# express the *daily total* for a title, so improving a result only grants the
+# difference that has not already been issued on that day.
+GAME_REWARD_THRESHOLDS = {
+    "crossing": ((90, 1), (180, 2), (290, 3)),
+    "dispatch": ((180, 1), (420, 2), (650, 3)),
+    "match": ((180, 1), (420, 2), (720, 3)),
+    "safety": ((3, 1), (5, 2), (6, 3)),
+    "mission": ((3, 1), (5, 2), (7, 3)),
+}
 
 BTN_NEED_HELP = "🆘 Мне нужна помощь"
 BTN_WANT_HELP = "🤝 Хочу помочь"
@@ -43,6 +79,7 @@ BTN_PROFILE = "👤 Мой профиль"
 BTN_HISTORY = "📜 История"
 BTN_SETTINGS = "⚙️ Настройки помощи"
 BTN_WEBSITE = "🌐 Перейти на сайт"
+BTN_GAMES = "🎮 Игры H-Point"
 BTN_CANCEL = "❌ Отмена"
 BTN_NO_DETAILS = "Нет"
 

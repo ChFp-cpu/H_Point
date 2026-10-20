@@ -37,6 +37,7 @@ __pycache__/
 *.log
 logs/
 .hpoint*.lock
+.hpoint-deploy*.tar.gz
 
 # ================================
 # Testing
@@ -82,4 +83,5 @@ dist/
 # Local project files
 # ================================
 *.local
+.runtime/
 
