@@ -13,6 +13,7 @@ from .services import *
 from .states import Registration, HelpRequest, Review, Billing
 from .keyboards import *
 from .billing import create_pending_invoice
+from . import games as game_service
 
 router = Router()
 
@@ -179,7 +180,7 @@ async def cmd_help(message: Message) -> None:
         "<b>Как подключить сайт:</b> на сайте откройте «Профиль» → «Получить код привязки», "
         "затем отправьте боту <b>/link КОД</b>. После этого заявки и история будут общими.\n\n"
         "Основные действия находятся в меню. Команды: /start, /profile, /website, "
-        "/history, /settings, /billing, /verifyme, /chat, /cancel, /ask.\n\n"
+        "/history, /settings, /billing, /games, /verifyme, /chat, /cancel, /ask.\n\n"
         "Команда /ask уточняет подбор для вашей активной заявки. В группах бот отвечает только на команды и не публикует заявки или профили."
     )
 
@@ -392,7 +393,7 @@ async def website(message: Message, state: FSMContext) -> None:
 @router.message(Registration.name, F.text)
 async def reg_name(message: Message, state: FSMContext) -> None:
     name = message.text.strip()
-    if name.startswith("/") or name in (BTN_NEED_HELP, BTN_WANT_HELP, BTN_FIND_CANDIDATES, BTN_MY_CANDIDATES, BTN_PROFILE, BTN_HISTORY, BTN_SETTINGS, BTN_WEBSITE, BTN_CANCEL):
+    if name.startswith("/") or name in (BTN_NEED_HELP, BTN_WANT_HELP, BTN_FIND_CANDIDATES, BTN_MY_CANDIDATES, BTN_PROFILE, BTN_HISTORY, BTN_SETTINGS, BTN_WEBSITE, BTN_GAMES, BTN_CANCEL):
         await message.answer("Пожалуйста, напишите своё имя обычным текстом.")
         return
     if not name or len(name) > MAX_NAME_LEN:
@@ -422,6 +423,326 @@ async def ensure_registered(message: Message, state: FSMContext) -> bool:
         await message.answer("Доступ к аккаунту ограничен. Обратитесь в поддержку.")
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# H-Point Games.  Telegram is a second client of the exact same game service
+# as the website: it sends actions to server-owned sessions and never carries a
+# score or a reward in callback data.
+
+_GAME_TILE_LABELS = {
+    "food": "●", "book": "▰", "tool": "◆", "cloth": "✦", "kit": "✚", "box": "■",
+}
+
+
+def _games_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚶 H-Crossing", callback_data="g:start:crossing"), InlineKeyboardButton(text="📍 H-Dispatch", callback_data="g:start:dispatch")],
+        [InlineKeyboardButton(text="🧩 H-Match", callback_data="g:start:match"), InlineKeyboardButton(text="🛡 H-Safety", callback_data="g:start:safety")],
+        [InlineKeyboardButton(text="💚 H-Mission", callback_data="g:start:mission")],
+        [InlineKeyboardButton(text="🏆 Прогресс и достижения", callback_data="g:progress"), InlineKeyboardButton(text="🛍 Магазин", callback_data="g:shop")],
+    ])
+
+
+def _game_nav_kb(session: dict) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="↻ Начать заново", callback_data=f"g:restart:{session['id']}"),
+        InlineKeyboardButton(text="🎮 К играм", callback_data="g:menu"),
+    ]])
+
+
+def _game_text(session: dict) -> str:
+    code = session["game"]
+    state = session["game_state"]
+    title = game_service.GAME_CATALOG[code]["title"]
+    score = session.get("score", 0)
+    if code == "crossing":
+        score = state["distance"] * 10 + state["coins"] * 5 + state["deliveries"] * 20
+        body = (
+            f"📍 Расстояние: <b>{state['distance']}</b> · ресурсы: <b>{state['coins']}</b> · доставки: <b>{state['deliveries']}</b>\n"
+            f"🛡 Щит: <b>{'активен' if state['shield'] else 'нет'}</b>\n\n{escape(state['notice'])}"
+        )
+    elif code == "dispatch":
+        body = (
+            f"✅ Выполнено: <b>{state['completed']}</b> · назначено: <b>{state['assigned']}/8</b>\n"
+            f"📈 Эффективность: <b>{state['efficiency']}%</b>\n\n{escape(state['notice'])}"
+        )
+    elif code == "match":
+        body = (
+            f"📚 Книги: <b>{state['target_count']}/{state['target_goal']}</b> · ходы: <b>{state['moves']}</b>\n"
+            f"✨ Лучший каскад: <b>×{state['max_combo']}</b>\n\n{escape(state['notice'])}"
+        )
+    elif code == "safety":
+        body = f"🧠 Верных ответов: <b>{state['correct']}</b> · ситуация {min(state['index'] + 1, state['total'])}/{state['total']}"
+    else:
+        body = f"💚 Репутация помощника: <b>{state['reputation']}</b> · история {min(state['index'] + 1, state['total'])}/{state['total']}"
+    return f"🎮 <b>{escape(title)}</b>\n\n🏅 Счёт: <b>{score}</b>\n{body}"
+
+
+def _game_result_text(session: dict) -> str:
+    result = session.get("result") or {}
+    rewards = result.get("reward_events") or []
+    achievements = result.get("achievements") or []
+    reward_text = "\n".join(f"• {escape(item['label'])}: <b>+{item['hp']} HP</b>" for item in rewards)
+    achievement_text = "\n".join(f"• 🏆 {escape(item['title'])}" for item in achievements)
+    return (
+        f"🏁 <b>{escape(result.get('outcome', 'Игра завершена'))}</b>\n\n"
+        f"Результат: <b>{result.get('score', session.get('score', 0))}</b>\n"
+        f"Получено сейчас: <b>+{result.get('reward_hp', 0)} HP</b>"
+        + (f"\n\n<b>Награды</b>\n{reward_text}" if reward_text else "\n\nСегодняшняя награда за этот результат уже учтена или достигнут дневной лимит.")
+        + (f"\n\n<b>Новые достижения</b>\n{achievement_text}" if achievement_text else "")
+    )
+
+
+def _crossing_kb(session: dict) -> InlineKeyboardMarkup:
+    sid = session["id"]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬆️", callback_data=f"g:move:{sid}:up")],
+        [InlineKeyboardButton(text="⬅️", callback_data=f"g:move:{sid}:left"), InlineKeyboardButton(text="⬇️", callback_data=f"g:move:{sid}:down"), InlineKeyboardButton(text="➡️", callback_data=f"g:move:{sid}:right")],
+        _game_nav_kb(session).inline_keyboard[0],
+    ])
+
+
+def _dispatch_kb(session: dict, volunteer_id: str | None = None) -> InlineKeyboardMarkup:
+    sid, state = session["id"], session["game_state"]
+    if volunteer_id:
+        buttons = []
+        for job in state["jobs"]:
+            if job.get("assigned"):
+                continue
+            buttons.append([InlineKeyboardButton(text=f"{job['title']} · {job['distance']} км", callback_data=f"g:assign:{sid}:{volunteer_id}:{job['id']}")])
+        buttons.append([InlineKeyboardButton(text="← К команде", callback_data=f"g:view:{sid}")])
+        buttons.append(_game_nav_kb(session).inline_keyboard[0])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+    rows = []
+    for person in state["volunteers"]:
+        rows.append([InlineKeyboardButton(text=f"{person['name']} · {'/'.join(person['skills'])} · скорость {person['speed']}", callback_data=f"g:vol:{sid}:{person['id']}")])
+    rows.append(_game_nav_kb(session).inline_keyboard[0])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _match_kb(session: dict) -> InlineKeyboardMarkup:
+    sid, board = session["id"], session["game_state"]["board"]
+    rows = []
+    for row_index, row in enumerate(board):
+        rows.append([InlineKeyboardButton(text=_GAME_TILE_LABELS.get(tile, "●"), callback_data=f"g:pick:{sid}:{row_index}:{col_index}") for col_index, tile in enumerate(row)])
+    hint = session["game_state"].get("hints", 0)
+    rows.append([InlineKeyboardButton(text=f"💡 Подсказка ({hint})" if hint else "Подсказок нет", callback_data=f"g:hint:{sid}")])
+    rows.append(_game_nav_kb(session).inline_keyboard[0])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _scenario_kb(session: dict) -> InlineKeyboardMarkup:
+    sid, code, scenario = session["id"], session["game"], session["game_state"].get("scenario", {})
+    action = "answer" if code == "safety" else "choose"
+    rows = [[InlineKeyboardButton(text=choice[:60], callback_data=f"g:{action}:{sid}:{index}")] for index, choice in enumerate(scenario.get("choices", []))]
+    rows.append(_game_nav_kb(session).inline_keyboard[0])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _game_keyboard(session: dict) -> InlineKeyboardMarkup:
+    if session.get("status") != "active":
+        code = session["game"]
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="↻ Играть ещё", callback_data=f"g:start:{code}"), InlineKeyboardButton(text="🎮 К играм", callback_data="g:menu")]
+        ])
+    if session["game"] == "crossing":
+        return _crossing_kb(session)
+    if session["game"] == "dispatch":
+        return _dispatch_kb(session)
+    if session["game"] == "match":
+        return _match_kb(session)
+    return _scenario_kb(session)
+
+
+def _games_summary(user_id: int) -> str:
+    payload = game_service.game_state(user_id)
+    profile, economy = payload["profile"], payload["economy"]
+    return (
+        "🎮 <b>H-Point Games</b>\n\n"
+        "Пять мини-игр, общий H-Points-баланс, достижения и безопасные обучающие сценарии.\n\n"
+        f"💰 Баланс: <b>{payload['balance']} HP</b>\n"
+        f"📈 Сыграно: <b>{profile['games_played']}</b> · завершено: <b>{profile['games_completed']}</b>\n"
+        f"✨ Получено сегодня: <b>{economy['earned_today']}/{economy['daily_cap']} HP</b>\n\n"
+        "Выберите игру. Лучший подтверждённый сервером результат увеличивает награду только до дневного лимита."
+    )
+
+
+async def _send_or_edit_game(message: Message, session: dict, *, edit: bool = False, feedback: dict | None = None) -> None:
+    if session.get("status") == "completed":
+        text = _game_result_text(session)
+    else:
+        text = _game_text(session)
+        if feedback:
+            if session["game"] == "safety":
+                title = "✅ Безопасный выбор" if feedback.get("correct") else "ℹ️ Разберём ситуацию"
+                detail = feedback.get("principle") or feedback.get("explanation")
+            elif session["game"] == "mission":
+                title = "💚 Репутация выросла" if int(feedback.get("reputation", 0)) > 0 else "ℹ️ Другой вариант был бы бережнее"
+                detail = feedback.get("explanation")
+            else:
+                title, detail = "💡 Подсказка", "Ход подсвечен в веб-версии."
+            text += f"\n\n<b>{title}</b>\n{escape(detail or '')}"
+    markup = _game_keyboard(session)
+    if edit:
+        try:
+            await message.edit_text(text, reply_markup=markup)
+            return
+        except Exception:
+            pass
+    await message.answer(text, reply_markup=markup)
+
+
+@router.message(Command("games"))
+@router.message(StateFilter(None), F.text == BTN_GAMES)
+async def games_menu(message: Message, state: FSMContext) -> None:
+    if message.chat.type != "private":
+        await message.answer("Игры и личный прогресс доступны в личном диалоге с H-Point.")
+        return
+    if not await ensure_registered(message, state):
+        return
+    # Entering the games intentionally leaves any unfinished text form, so a
+    # later answer cannot be misinterpreted as a request or review field.
+    await state.clear()
+    await message.answer(_games_summary(message.from_user.id), reply_markup=_games_menu_kb())
+
+
+@router.callback_query(F.data.startswith("g:"))
+async def game_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message.chat.type != "private":
+        await callback.answer("Игры доступны только в личном чате.", show_alert=True)
+        return
+    user = get_user(callback.from_user.id)
+    if not user or user["is_blocked"]:
+        await callback.answer("Сначала откройте личный диалог с H-Point.", show_alert=True)
+        return
+    await state.clear()
+    parts = (callback.data or "").split(":")
+    try:
+        command = parts[1]
+        if command == "menu":
+            await callback.answer()
+            await callback.message.edit_text(_games_summary(callback.from_user.id), reply_markup=_games_menu_kb())
+            return
+        if command == "progress":
+            payload = game_service.game_state(callback.from_user.id)
+            records = payload.get("records", {})
+            lines = ["🏆 <b>Игровой прогресс</b>"]
+            for code, details in game_service.GAME_CATALOG.items():
+                record = records.get(code, {})
+                lines.append(f"\n<b>{escape(details['short_title'])}</b> — рекорд {record.get('best_score', 0)}, завершено {record.get('completions', 0)}")
+            if payload.get("achievements"):
+                lines.append("\n<b>Достижения</b>")
+                lines.extend(f"• {escape(item['title'])}" for item in payload["achievements"])
+            await callback.answer()
+            await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="← К играм", callback_data="g:menu")]]))
+            return
+        if command == "shop":
+            payload = game_service.game_state(callback.from_user.id)
+            rows = []
+            for item in payload.get("store", []):
+                status = "✓ " if item["owned"] else ""
+                label = f"{status}{item['title']} — {item['price']} HP"
+                rows.append([InlineKeyboardButton(text=label[:64], callback_data=f"g:item:{item['id']}")])
+            rows.append([InlineKeyboardButton(text="← К играм", callback_data="g:menu")])
+            await callback.answer()
+            await callback.message.edit_text("🛍 <b>Магазин игр</b>\n\nВыберите предмет. Покупка списывает реальные H-Points в общей истории операций.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+            return
+        if command == "item":
+            item_id = parts[2]
+            item = game_service.STORE_ITEMS.get(item_id)
+            if not item:
+                raise ValueError("Предмет не найден.")
+            payload = game_service.game_state(callback.from_user.id)
+            owned = next((entry for entry in payload["store"] if entry["id"] == item_id), None)
+            action = f"g:use:{item_id}" if owned and owned["owned"] else f"g:buy:{item_id}"
+            label = "Использовать" if owned and owned["owned"] else f"Купить за {item['price']} HP"
+            await callback.answer()
+            await callback.message.edit_text(
+                f"<b>{escape(item['title'])}</b>\n\n{escape(item['description'])}\n\nСтоимость: <b>{item['price']} HP</b>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=label, callback_data=action)],
+                    [InlineKeyboardButton(text="← В магазин", callback_data="g:shop")],
+                ]),
+            )
+            return
+        if command == "buy":
+            item_id = parts[2]
+            result = game_service.purchase_item(callback.from_user.id, item_id, secrets.token_urlsafe(18))
+            await callback.answer("Покупка выполнена")
+            await callback.message.edit_text(
+                f"✅ Предмет приобретён. Баланс: <b>{result['balance']} HP</b>\n\nТеперь включите его перед следующей игрой.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Использовать", callback_data=f"g:use:{item_id}"), InlineKeyboardButton(text="К играм", callback_data="g:menu")]]),
+            )
+            return
+        if command == "use":
+            item_id = parts[2]
+            payload = game_service.game_state(callback.from_user.id)
+            item = next((entry for entry in payload["store"] if entry["id"] == item_id), None)
+            if not item or not item["owned"]:
+                raise ValueError("Сначала приобретите предмет.")
+            result = game_service.equip_item(callback.from_user.id, item_id, not item["equipped"])
+            await callback.answer("Предмет включён" if result["equipped"] else "Предмет выключен")
+            await callback.message.edit_text(
+                "✅ Предмет будет применён в следующем запуске этой игры." if result["equipped"] else "Предмет выключен.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="← В магазин", callback_data="g:shop"), InlineKeyboardButton(text="К играм", callback_data="g:menu")]]),
+            )
+            return
+        if command == "start":
+            session = game_service.start_game(callback.from_user.id, parts[2])
+            await callback.answer("Игра началась")
+            await _send_or_edit_game(callback.message, session, edit=True)
+            return
+        if command == "restart":
+            previous = parts[2]
+            active = game_service.game_session(callback.from_user.id, previous)
+            game_service.abandon_game(callback.from_user.id, previous)
+            session = game_service.start_game(callback.from_user.id, active["game"])
+            await callback.answer("Новая игра")
+            await _send_or_edit_game(callback.message, session, edit=True)
+            return
+        if command == "view":
+            session = game_service.game_session(callback.from_user.id, parts[2])
+            await callback.answer()
+            await _send_or_edit_game(callback.message, session, edit=True)
+            return
+        if command == "move":
+            session = game_service.action_game(callback.from_user.id, parts[2], {"direction": parts[3]})
+        elif command == "vol":
+            session = game_service.game_session(callback.from_user.id, parts[2])
+            await callback.answer("Выберите подходящую заявку")
+            await callback.message.edit_text(_game_text(session) + "\n\n<b>Выберите заявку для волонтёра:</b>", reply_markup=_dispatch_kb(session, parts[3]))
+            return
+        elif command == "assign":
+            session = game_service.action_game(callback.from_user.id, parts[2], {"type": "assign", "volunteer_id": parts[3], "job_id": parts[4]})
+        elif command == "pick":
+            session = game_service.game_session(callback.from_user.id, parts[2])
+            row, col = int(parts[3]), int(parts[4])
+            options = []
+            for dr, dc, label in ((-1, 0, "⬆️"), (1, 0, "⬇️"), (0, -1, "⬅️"), (0, 1, "➡️")):
+                rr, cc = row + dr, col + dc
+                if 0 <= rr < 7 and 0 <= cc < 7:
+                    options.append(InlineKeyboardButton(text=label, callback_data=f"g:swap:{parts[2]}:{row}:{col}:{rr}:{cc}"))
+            await callback.answer("Выберите соседнюю клетку")
+            await callback.message.edit_text(_game_text(session) + "\n\n<b>Куда переместить выбранный предмет?</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[options, [InlineKeyboardButton(text="← К полю", callback_data=f"g:view:{parts[2]}")]]))
+            return
+        elif command == "swap":
+            session = game_service.action_game(callback.from_user.id, parts[2], {"type": "swap", "a": [int(parts[3]), int(parts[4])], "b": [int(parts[5]), int(parts[6])]})
+        elif command == "hint":
+            session = game_service.action_game(callback.from_user.id, parts[2], {"type": "hint"})
+        elif command == "answer":
+            session = game_service.action_game(callback.from_user.id, parts[2], {"type": "answer", "choice": int(parts[3])})
+        elif command == "choose":
+            session = game_service.action_game(callback.from_user.id, parts[2], {"type": "choose", "choice": int(parts[3])})
+        else:
+            raise ValueError("Неизвестное игровое действие.")
+        await callback.answer()
+        await _send_or_edit_game(callback.message, session, edit=True, feedback=session.get("feedback"))
+    except (ValueError, IndexError) as exc:
+        await callback.answer(str(exc) or "Действие сейчас недоступно.", show_alert=True)
+    except Exception:
+        logging.exception("Telegram game action failed")
+        await callback.answer("Не удалось выполнить игровое действие. Попробуйте ещё раз.", show_alert=True)
 
 
 @router.message(Command("cancel"))

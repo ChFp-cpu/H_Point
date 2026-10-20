@@ -253,6 +253,73 @@ def init_db():
       action TEXT NOT NULL, target_user_id INTEGER REFERENCES users(user_id), details TEXT NOT NULL DEFAULT '{}',
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS game_profiles(
+      user_id INTEGER PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+      games_played INTEGER NOT NULL DEFAULT 0,
+      games_completed INTEGER NOT NULL DEFAULT 0,
+      games_hp_earned INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS game_sessions(
+      id TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      game_code TEXT NOT NULL,
+      state TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      score INTEGER NOT NULL DEFAULT 0,
+      started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_action_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      completed_at TEXT,
+      expires_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS game_records(
+      user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      game_code TEXT NOT NULL,
+      best_score INTEGER NOT NULL DEFAULT 0,
+      best_meta TEXT NOT NULL DEFAULT '{}',
+      plays INTEGER NOT NULL DEFAULT 0,
+      completions INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(user_id,game_code)
+    );
+    CREATE TABLE IF NOT EXISTS game_daily_rewards(
+      user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      game_code TEXT NOT NULL,
+      reward_date TEXT NOT NULL,
+      best_score INTEGER NOT NULL DEFAULT 0,
+      awarded_hp INTEGER NOT NULL DEFAULT 0,
+      result_hp INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(user_id,game_code,reward_date)
+    );
+    CREATE TABLE IF NOT EXISTS game_transactions(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      amount_hp INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      description TEXT NOT NULL,
+      reference TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS game_item_ownership(
+      user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      item_id TEXT NOT NULL,
+      equipped INTEGER NOT NULL DEFAULT 0,
+      purchased_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(user_id,item_id)
+    );
+    CREATE TABLE IF NOT EXISTS game_achievements(
+      user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      achievement_id TEXT NOT NULL,
+      unlocked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(user_id,achievement_id)
+    );
+    CREATE TABLE IF NOT EXISTS game_daily_challenge_claims(
+      user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      challenge_id TEXT NOT NULL,
+      reward_date TEXT NOT NULL,
+      claimed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(user_id,challenge_id,reward_date)
+    );
     CREATE INDEX IF NOT EXISTS idx_request_candidates_request ON request_candidates(request_id,status,score);
     CREATE INDEX IF NOT EXISTS idx_request_candidates_candidate ON request_candidates(candidate_id,status);
     CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status,created_at);
@@ -265,12 +332,17 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_telegram_auth_tickets_expires ON telegram_auth_tickets(expires_at);
     CREATE INDEX IF NOT EXISTS idx_email_verification_codes_expires ON email_verification_codes(expires_at);
     CREATE INDEX IF NOT EXISTS idx_phone_verification_codes_expires ON phone_verification_codes(expires_at);
+    CREATE INDEX IF NOT EXISTS idx_game_sessions_user_status ON game_sessions(user_id,status,started_at);
+    CREATE INDEX IF NOT EXISTS idx_game_transactions_user ON game_transactions(user_id,id DESC);
+    CREATE INDEX IF NOT EXISTS idx_game_daily_rewards_date ON game_daily_rewards(user_id,reward_date);
     """
     if getattr(db, "is_postgres", False):
         schema = schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY").replace("INTEGER", "BIGINT")
     db.executescript(schema)
     db.execute("CREATE TABLE IF NOT EXISTS schema_migrations(version TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
     db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", ("001_initial",))
+    db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", ("002_hpoint_games",))
+    db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", ("003_hpoint_games_rewards",))
     # Safe migration of the old project.
     for t,n,d in [
       ("users","email","TEXT"),("users","password_hash","TEXT"),("users","tg_user_id","INTEGER"),
@@ -280,7 +352,8 @@ def init_db():
       ("users","role","TEXT NOT NULL DEFAULT 'user'"),("users","is_blocked","INTEGER NOT NULL DEFAULT 0"),("users","blocked_reason","TEXT"),
       ("users","last_seen_at","TEXT"),
       ("requests","lat","REAL"),("requests","lon","REAL"),("requests","expires_at","TEXT"),("requests","views","INTEGER NOT NULL DEFAULT 0"),("requests","reward_rub","INTEGER NOT NULL DEFAULT 0"),("requests","reward_payment_status","TEXT NOT NULL DEFAULT 'none'"),("requests","cancel_reason","TEXT"),("requests","cancelled_at","TEXT"),("community_events","image_data","TEXT NOT NULL DEFAULT ''"),("billing_invoices","amount_rub","INTEGER NOT NULL DEFAULT 0"),
-      ("billing_invoices","currency","TEXT NOT NULL DEFAULT 'RUB'"),("billing_invoices","provider_payment_id","TEXT")
+      ("billing_invoices","currency","TEXT NOT NULL DEFAULT 'RUB'"),("billing_invoices","provider_payment_id","TEXT"),
+      ("game_daily_rewards","result_hp","INTEGER NOT NULL DEFAULT 0")
       ,("sessions","device_id","TEXT")
     ]: _add_column(t,n,d)
     # Legacy payment columns remain for backwards-compatible data, but new code never uses them.

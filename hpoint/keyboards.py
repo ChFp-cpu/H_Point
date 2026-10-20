@@ -7,6 +7,7 @@ def main_menu_kb():
         [KeyboardButton(text=BTN_FIND_CANDIDATES), KeyboardButton(text=BTN_MY_CANDIDATES)],
         [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_HISTORY)],
         [KeyboardButton(text=BTN_SETTINGS)],
+        [KeyboardButton(text=BTN_GAMES)],
         [KeyboardButton(text=BTN_WEBSITE)],
         [KeyboardButton(text="💳 H-Point+" )],
     ], resize_keyboard=True)

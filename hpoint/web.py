@@ -7,8 +7,10 @@ import asyncio, json, logging, os, secrets, hashlib, hmac, datetime as dt, re, s
 from pathlib import Path
 from html import escape
 from . import database
+from . import games
 from .database import db, get_user, get_user_by_email, create_web_user, get_request, get_user_stats, get_active_own_request, get_history, get_billing_history, is_user_blocked, admin_summary, set_user_blocked
 from .config import *
+from .games_page import GAMES_PAGE
 from .services import *
 from .billing import create_pending_invoice, create_request_reward_invoice, create_payment, fulfill_invoice, purchase_with_points, purchase_with_wallet, verify_robokassa_result
 from .keyboards import helper_offer_kb
@@ -914,7 +916,7 @@ let hpointAuditUser=null,hpointAuditWallet=null;
 function auditMoney(value){return Number(value||0).toLocaleString('ru-RU')+' ₽'}
 function auditPoints(value){return Number(value||0).toLocaleString('ru-RU')+' HP'}
 function auditBalanceMarkup(user,wallet,loading){if(loading)return '<span class="balanceSkeletonItem"><i class="balanceSkeleton"></i></span><span class="balanceSkeletonItem"><i class="balanceSkeleton"></i></span>';let rub=wallet&&wallet.balance_rub||0,points=user&&user.balance||0;return '<span class="globalBalanceItem"><small>BALANCE</small><b>'+auditMoney(rub)+'</b></span><span class="globalBalanceItem"><small>H-POINTS</small><b>'+auditPoints(points)+'</b></span>'}
-function renderAuditHeader(user,wallet,loading){let nav=$('nav');if(!nav)return;nav.innerHTML='<button id="globalBalance" class="balanceWidget" type="button" '+(loading?'aria-busy="true"':'')+' aria-label="Открыть кошелёк" title="Открыть кошелёк" onclick="go(\'wallet\')">'+auditBalanceMarkup(user,wallet,loading)+'</button><div class="appHeaderActions"><button class="btn light" type="button" onclick="go(\'profile\')">Профиль</button><button class="btn grad" type="button" onclick="requestForm()">+ Заявка</button></div>'}
+function renderAuditHeader(user,wallet,loading){let nav=$('nav');if(!nav)return;nav.innerHTML='<button id="globalBalance" class="balanceWidget" type="button" '+(loading?'aria-busy="true"':'')+' aria-label="Открыть кошелёк" title="Открыть кошелёк" onclick="go(\'wallet\')">'+auditBalanceMarkup(user,wallet,loading)+'</button><div class="appHeaderActions"><button class="btn light" type="button" onclick="openSupport()">Поддержка</button><button class="btn light" type="button" onclick="openProfileMenu()">👤 Профиль</button><button class="btn grad" type="button" onclick="requestForm()">+ Заявка</button></div>'}
 const auditBaseApplySync=window.applySync;
 window.applySync=function(data){auditBaseApplySync(data);hpointAuditUser=data.user||null;hpointAuditWallet=data.wallet||window.hpointWallet||null;renderAuditHeader(hpointAuditUser,hpointAuditWallet,false)};
 const auditBaseLanding=window.landing;
@@ -933,6 +935,22 @@ async function loadProgress(){ensureProgressPanel();let host=$('progressData');i
 ensureProgressPanel();
 '''
 
+GAMES_NAV_CSS=r'''
+#gamesNavLink{display:inline-flex;align-items:center;gap:7px;min-height:40px;padding:10px 12px;border:1px solid #4a5146;border-radius:10px;color:#edf0e7;text-decoration:none;font:800 12px Manrope,Arial,sans-serif;white-space:nowrap;transition:border-color .18s,background .18s,color .18s}#gamesNavLink svg{width:16px;height:16px}#gamesNavLink:hover{border-color:#b8f36b;background:#1a2118;color:#b8f36b}.gamesProfileSummary{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:16px;background:linear-gradient(135deg,#172417,#263721);border:1px solid #466240;padding:18px}.gamesProfileSummary h2{margin:0 0 6px}.gamesProfileStats{display:flex;gap:12px;flex-wrap:wrap}.gamesProfileStats span{padding:6px 9px;border-radius:999px;background:#101810;color:#d9f6bc;font-size:12px;font-weight:700}@media(max-width:500px){#gamesNavLink{padding:9px 10px;font-size:10px}#gamesNavLink span{display:none}.gamesProfileSummary{align-items:flex-start;flex-direction:column}}
+'''
+
+GAMES_NAV_UI=r'''
+(function(){
+  function addGamesLink(){var nav=document.getElementById('nav');if(!nav||document.getElementById('gamesNavLink'))return;var link=document.createElement('a');link.id='gamesNavLink';link.href='/games';link.setAttribute('aria-label','Открыть H-Point Games');link.innerHTML='<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 8h10c2.5 0 4.3 2.4 3.5 4.8l-1 3.1a2.6 2.6 0 0 1-4.6.8l-.6-.9h-4.6l-.6.9a2.6 2.6 0 0 1-4.6-.8l-1-3.1C2.7 10.4 4.5 8 7 8Z" stroke="currentColor" stroke-width="1.8"/><path d="M8 11v3m-1.5-1.5h3M16 12h.01M18 14h.01" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><span>Игры</span>';nav.prepend(link)}
+  var previousLoad=window.load;window.load=async function(){var result=await previousLoad.apply(this,arguments);addGamesLink();return result};
+  var previousLanding=window.landing;window.landing=function(){var result=previousLanding.apply(this,arguments);addGamesLink();return result};
+  var previousSync=window.applySync;window.applySync=function(){var result=previousSync.apply(this,arguments);addGamesLink();return result};
+  async function renderGamesProfile(){var host=document.querySelector('#p-profile .profileGrid');if(!host)return;var old=document.getElementById('gamesProfileSummary');if(old)old.remove();try{var data=await api('/api/games/state');if(!data.authenticated)return;var profile=data.profile||{},card=document.createElement('section');card.id='gamesProfileSummary';card.className='card gamesProfileSummary';card.innerHTML='<div><h2>H-Point Games</h2><p class="muted">Ваши игровые достижения и H-Points синхронизированы с ботом.</p><div class="gamesProfileStats"><span>Начато: '+Number(profile.games_played||0)+'</span><span>Завершено: '+Number(profile.games_completed||0)+'</span><span>Заработано: '+Number(profile.games_hp_earned||0)+' HP</span></div></div><a class="btn grad" href="/games">Открыть игры</a>';host.appendChild(card)}catch(error){console.warn('games profile',error)}}
+  var previousProfile=window.profile;window.profile=async function(){var result=await previousProfile.apply(this,arguments);await renderGamesProfile();return result};
+  setTimeout(addGamesLink,0);
+})();
+'''
+
 def _page_replace(needle, replacement):
     global PAGE
     if needle not in PAGE:
@@ -949,8 +967,8 @@ _page_replace('<p class="audiencePortrait">H·Point создан для Ильи
 _page_replace('</section></main>\n<main id="app"', '</section>'+LANDING_ENHANCEMENTS+'</main>\n<main id="app"')
 # The historic shared stylesheet contains legacy rules with inconsistent
 # nesting.  Isolate the league stylesheet so these rules cannot suppress it.
-_page_replace("</head>", "<style>"+LEAGUE_CSS+LEAGUE_REPAIR_CSS+MVP_CSS+UX_AUDIT_CSS+DARK_UI_RESTORE_CSS+"</style></head>")
-_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+SUPPORT_UI+ADMIN_DASHBOARD_UI+ADMIN_MODAL_FIXES+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+LOCATION_PICKER_UI+CONTACT_VERIFICATION_UI+EVENTS_UI+PROGRESS_UI+COMMUNITY_UI+REQUEST_TRACKING_UI+WALLET_UI+DONATION_MENU_UI+SHOWCASE_UI+LEAGUE_UI+HPOINT_WALLET_PAYMENT_UI+MVP_UI+UX_AUDIT_UI+"\nresumeTelegramLogin();\nwindow.load();\n</script></body></html>")
+_page_replace("</head>", "<style>"+LEAGUE_CSS+LEAGUE_REPAIR_CSS+MVP_CSS+UX_AUDIT_CSS+DARK_UI_RESTORE_CSS+GAMES_NAV_CSS+"</style></head>")
+_page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRIDES+FUNCTIONAL_FIXES+CONSENT_MATCH_UI+ACCOUNT_SECURITY_UI+PASSWORD_UI_ENHANCEMENTS+ACCOUNT_ACTIONS_UI+MAP_UI+PROFILE_MENU_UI+PASSWORD_RESET_UI+SUPPORT_UI+ADMIN_DASHBOARD_UI+ADMIN_MODAL_FIXES+(YANDEX_MAP_UI if YANDEX_MAPS_API_KEY else '')+LOCATION_PICKER_UI+CONTACT_VERIFICATION_UI+EVENTS_UI+PROGRESS_UI+COMMUNITY_UI+REQUEST_TRACKING_UI+WALLET_UI+DONATION_MENU_UI+SHOWCASE_UI+LEAGUE_UI+HPOINT_WALLET_PAYMENT_UI+MVP_UI+UX_AUDIT_UI+GAMES_NAV_UI+"\nresumeTelegramLogin();\nwindow.load();\n</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     server_version="HPointWeb/3.0"
@@ -971,6 +989,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200);self.send_header("Content-Type",item[1]);self.send_header("X-Content-Type-Options","nosniff");self.send_header("Cache-Control","public, max-age=604800, immutable");self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
     def html(self):
         b=PAGE.encode();self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
+    def games_html(self):
+        b=GAMES_PAGE.encode();self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
     def do_HEAD(self):
         """Serve metadata for public resources without a response body."""
         p = urlparse(self.path)
@@ -983,6 +1003,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if p.path in ("/", "/index.html", "/payment/result"):
             size = len(PAGE.encode())
+            self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(size));self.end_headers()
+            return
+        if p.path in ("/games", "/games/"):
+            size = len(GAMES_PAGE.encode())
             self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(size));self.end_headers()
             return
         if p.path == "/api/health":
@@ -1005,7 +1029,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control","no-store");self.end_headers()
                 return
             if p.path in ("/","/index.html","/payment/result"): return self.html()
+            if p.path in ("/games","/games/"): return self.games_html()
             if p.path=="/api/health": return reply(self,{"ok":True,"database":True})
+            if p.path=="/api/games/state":
+                u=get_sess(self)
+                if u and u["is_blocked"]:
+                    return reply(self,{"ok":False,"error":"account_blocked"},403)
+                return reply(self,games.game_state(u["user_id"] if u else None))
             if p.path=="/api/public-config": return reply(self,{"ok":True,"donation_url":DONATION_URL,"donation_title":DONATION_TITLE})
             if p.path=="/api/auth/telegram/complete":
                 ticket=parse_qs(p.query).get("ticket",[""])[0]
@@ -1239,6 +1269,42 @@ class Handler(BaseHTTPRequestHandler):
         try:d=read(self, EVENT_JSON_BODY if p.path=="/api/events" else MAX_JSON_BODY)
         except:return reply(self,{"ok":False,"error":"Некорректный JSON"},400)
         try:
+            if p.path=="/api/games/start":
+                u=auth(self)
+                if not u:return
+                try:
+                    game_code=str(d.get("game", ""))
+                    return reply(self,games.start_game(u["user_id"],game_code))
+                except ValueError as exc:
+                    return reply(self,{"ok":False,"error":str(exc)},409)
+            if p.path=="/api/games/action":
+                u=auth(self)
+                if not u:return
+                try:
+                    return reply(self,games.action_game(u["user_id"],d.get("session_id"),d.get("action")))
+                except ValueError as exc:
+                    return reply(self,{"ok":False,"error":str(exc)},409)
+            if p.path=="/api/games/abandon":
+                u=auth(self)
+                if not u:return
+                try:
+                    return reply(self,games.abandon_game(u["user_id"],d.get("session_id")))
+                except ValueError as exc:
+                    return reply(self,{"ok":False,"error":str(exc)},409)
+            if p.path=="/api/games/shop/purchase":
+                u=auth(self)
+                if not u:return
+                try:
+                    return reply(self,{"ok":True,**games.purchase_item(u["user_id"],str(d.get("item_id", "")),d.get("purchase_key"))})
+                except ValueError as exc:
+                    return reply(self,{"ok":False,"error":str(exc)},409)
+            if p.path=="/api/games/shop/equip":
+                u=auth(self)
+                if not u:return
+                try:
+                    return reply(self,{"ok":True,**games.equip_item(u["user_id"],str(d.get("item_id", "")),bool(d.get("equipped", True)))})
+                except ValueError as exc:
+                    return reply(self,{"ok":False,"error":str(exc)},409)
             if p.path=="/api/auth/telegram/start":
                 if not _telegram_username:return reply(self,{"ok":False,"error":"telegram_login_unavailable"},503)
                 subject=client_key(self)

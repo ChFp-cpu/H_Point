@@ -52,6 +52,25 @@ DONATION_TITLE = os.getenv("DONATION_TITLE", "Поддержать H-Point").str
 EVENT_IMAGE_MAX_BYTES = int(os.getenv("EVENT_IMAGE_MAX_BYTES", "800000"))
 MAX_PAYMENT_BODY = int(os.getenv("MAX_PAYMENT_BODY", "10000"))
 
+# H-Point Games economy.  These are deliberately server-side values: the
+# browser only receives the resulting balance and can never choose a reward.
+GAME_REWARD_TIMEZONE = os.getenv("GAME_REWARD_TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow"
+GAME_DAILY_REWARD_CAP = int(os.getenv("GAME_DAILY_REWARD_CAP", "15"))
+GAME_PER_TITLE_REWARD_CAP = int(os.getenv("GAME_PER_TITLE_REWARD_CAP", "3"))
+GAME_SESSION_TTL_SECONDS = int(os.getenv("GAME_SESSION_TTL_SECONDS", str(60 * 45)))
+GAME_ACTION_MIN_INTERVAL_MS = int(os.getenv("GAME_ACTION_MIN_INTERVAL_MS", "110"))
+
+# Scores are evaluated by the server against these thresholds.  The values
+# express the *daily total* for a title, so improving a result only grants the
+# difference that has not already been issued on that day.
+GAME_REWARD_THRESHOLDS = {
+    "crossing": ((90, 1), (180, 2), (290, 3)),
+    "dispatch": ((180, 1), (420, 2), (650, 3)),
+    "match": ((180, 1), (420, 2), (720, 3)),
+    "safety": ((3, 1), (5, 2), (6, 3)),
+    "mission": ((3, 1), (5, 2), (7, 3)),
+}
+
 BTN_NEED_HELP = "🆘 Мне нужна помощь"
 BTN_WANT_HELP = "🤝 Хочу помочь"
 BTN_FIND_CANDIDATES = "⚡ Подобрать кандидатов"
@@ -60,6 +79,7 @@ BTN_PROFILE = "👤 Мой профиль"
 BTN_HISTORY = "📜 История"
 BTN_SETTINGS = "⚙️ Настройки помощи"
 BTN_WEBSITE = "🌐 Перейти на сайт"
+BTN_GAMES = "🎮 Игры H-Point"
 BTN_CANCEL = "❌ Отмена"
 BTN_NO_DETAILS = "Нет"
 
