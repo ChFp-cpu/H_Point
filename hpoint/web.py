@@ -28,7 +28,7 @@ ASSETS = {
     "hpoint-route-network.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-route-network.png", "image/png"),
     "hpoint-match-field.png": (Path(__file__).resolve().parent.parent / "assets" / "hpoint-match-field.png", "image/png"),
 }
-CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://*.yandex.ru https://yastatic.net; "
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' https://*.yandex.ru https://yastatic.net; "
        "style-src 'self' 'unsafe-inline' blob: https://fonts.googleapis.com https://yastatic.net; "
        "font-src 'self' data: https://fonts.gstatic.com; "
        "img-src 'self' data: https://*.yandex.net https://*.yandex.ru https://yastatic.net; "
@@ -80,11 +80,16 @@ def pv(password, stored):
         actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 180000).hex()
         return hmac.compare_digest(actual, digest)
     except Exception: return False
-def password_needs_upgrade(stored): return not stored.startswith("scrypt$")
+def password_needs_upgrade(stored):
+    try:
+        scheme, n, r, p, _salt, _digest = stored.split("$")
+        return scheme != "scrypt" or int(n) < 2**14 or int(r) < 8 or int(p) < 1
+    except (AttributeError, TypeError, ValueError):
+        return True
 
 def password_error(password):
-    if not 6 <= len(password) <= 256:
-        return "Пароль должен быть от 6 до 256 символов."
+    if not 12 <= len(password) <= 256:
+        return "Пароль должен быть от 12 до 256 символов."
     if not re.search(r"[a-z]", password) or not re.search(r"[A-Z]", password) or not re.search(r"\d", password):
         return "В пароле нужны строчная и заглавная латинские буквы, а также цифра."
     return None
@@ -163,17 +168,32 @@ def cookie_value(h, name):
     c=h.headers.get("Cookie","")
     return next((x.strip().split("=",1)[1] for x in c.split(";") if x.strip().startswith(name+"=")),None)
 
+def session_token_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def revoke_session(token):
+    """Remove a current hashed token and a short-lived legacy raw token."""
+    if token:
+        db.execute("DELETE FROM sessions WHERE token IN (?,?)", (session_token_hash(token), token))
+
 def get_sess(h):
     t=cookie_value(h,"hpoint_session")
     if not t: return None
-    r=db.execute("SELECT * FROM sessions WHERE token=? AND expires_at>?",(t,now().isoformat())).fetchone()
+    token_hash=session_token_hash(t)
+    r=db.execute("SELECT * FROM sessions WHERE token=? AND expires_at>?",(token_hash,now().isoformat())).fetchone()
+    if not r:
+        # Sessions created before token-at-rest hardening keep working until
+        # expiry, then are upgraded on first legitimate use.
+        r=db.execute("SELECT * FROM sessions WHERE token=? AND expires_at>?",(t,now().isoformat())).fetchone()
+        if r:
+            db.execute("UPDATE sessions SET token=? WHERE token=?",(token_hash,t))
     return get_user(r["user_id"]) if r else None
 
 def new_sess(uid, device_id=None):
     t=secrets.token_urlsafe(32)
     e=(now()+dt.timedelta(seconds=SESSION_TTL)).isoformat()
     db.execute("DELETE FROM sessions WHERE expires_at<=?", (now().isoformat(),))
-    db.execute("INSERT INTO sessions(token,user_id,expires_at,device_id) VALUES(?,?,?,?)",(t,uid,e,device_id))
+    db.execute("INSERT INTO sessions(token,user_id,expires_at,device_id) VALUES(?,?,?,?)",(session_token_hash(t),uid,e,device_id))
     database.touch_user_activity(uid)
     return t
 
@@ -307,14 +327,14 @@ def client_key(h):
 
 def user_payload(u):
     stats=get_user_stats(u["user_id"])
-    code_valid=bool(u["verification_code"] and u["verification_code_expires_at"] and u["verification_code_expires_at"]>now().isoformat())
+    code_valid=bool((u["verification_code_hash"] or u["verification_code"]) and u["verification_code_expires_at"] and u["verification_code_expires_at"]>now().isoformat())
     identity=database.get_identity_verification(u["user_id"])
     identity_payload={"status":identity["status"],"submitted_at":identity["submitted_at"],"reviewed_at":identity["reviewed_at"],"note":identity["note"]} if identity else {"status":"not_requested"}
     contacts_ready=bool((u["full_name"] or "").strip() and u["birth_date"] and u["email_verified"] and u["phone_verified"] and u["tg_user_id"])
     telegram = None
     if u["tg_user_id"]:
         telegram = {"name": u["name"], "username": u["username"] or "", "avatar_url": None}
-    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"role":u["role"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"email_verified":bool(u["email_verified"]),"account_verified":account_is_verified(u),"email_delivery_configured":email_delivery_configured(),"sms_delivery_configured":sms_delivery_configured(),"full_name":u["full_name"] or "","birth_date":u["birth_date"] or "","phone":u["phone"] or "","phone_verified":bool(u["phone_verified"]),"contacts_verified":contacts_ready,"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram":telegram,"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code":u["verification_code"] if code_valid else None,"pro_until":u["pro_until"],"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats}
+    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"role":u["role"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"email_verified":bool(u["email_verified"]),"account_verified":account_is_verified(u),"email_delivery_configured":email_delivery_configured(),"sms_delivery_configured":sms_delivery_configured(),"full_name":u["full_name"] or "","birth_date":u["birth_date"] or "","phone":u["phone"] or "","phone_verified":bool(u["phone_verified"]),"contacts_verified":contacts_ready,"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram":telegram,"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code_available":code_valid,"pro_until":u["pro_until"],"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats}
 
 def request_payload(r):
     d=dict(r); d["category_name"]=CATEGORIES.get(r["category"],"Другое"); d["status_title"]=STATUS_TITLES.get(r["status"],r["status"]); return d
@@ -403,7 +423,7 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>go(b.dataset.t));
 function prices(id,paid){$(id).innerHTML=products.map(p=>`<div class="card"><span class="ey">H·POINT+</span><h3>${p[1]}</h3><p class="muted">${p[2]}</p><div class="price">${p[3]} ₽</div>${paid?`<button class="btn grad" onclick="buy('${p[0]}')">Оплатить</button>`:''}</div>`).join('')}
 function authForm(reg){$('modal').style.display='flex';$('modalbody').innerHTML=reg?`<h2>Создать аккаунт</h2><p class="muted">Войдите через Telegram или используйте email. Telegram подтверждает аккаунт и синхронизирует сайт с ботом.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Продолжить с Telegram</button><div class="muted" style="text-align:center">или</div><input id="an" class="input" placeholder="Имя"><input id="ae" class="input" placeholder="Email"><input id="ap" class="input" type="password" autocomplete="new-password" placeholder="Пароль от 12 символов"><button class="btn light" onclick="register()">Зарегистрироваться по email</button><div id="err" class="muted"></div></div>`:`<h2>Войти</h2><p class="muted">Telegram откроет тот же профиль и историю заявок.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Войти через Telegram</button><div class="muted" style="text-align:center">или</div><input id="ae" class="input" placeholder="Email" autocomplete="email"><input id="ap" class="input" type="password" autocomplete="current-password" placeholder="Пароль"><button class="btn light" onclick="login()">Войти по email</button><div id="err" class="muted"></div></div>`}
 function closeModal(){$('modal').style.display='none'}
-async function register(){try{let d=await api('/api/auth/register',{method:'POST',body:JSON.stringify({name:an.value,email:ae.value,password:ap.value})});closeModal();toast('Аккаунт создан');await load();if(d.link_code)go('profile')}catch(e){$('err').textContent=e.message}}
+async function register(){try{let d=await api('/api/auth/register',{method:'POST',body:JSON.stringify({name:an.value,email:ae.value,password:ap.value,password_confirm:ap.value})});closeModal();toast('Аккаунт создан');await load();if(d.link_code)go('profile')}catch(e){$('err').textContent=e.message}}
 async function login(){try{await api('/api/auth/login',{method:'POST',body:JSON.stringify({email:ae.value,password:ap.value})});closeModal();await load();toast('С возвращением')}catch(e){$('err').textContent=e.message}}
 async function telegramLogin(){try{let d=await api('/api/auth/telegram/start',{method:'POST',body:'{}'});window.open(d.bot_url,'hpointTelegramLogin','noopener');$('modalbody').innerHTML=`<h2>Подтвердите вход в Telegram</h2><p class="muted">Открылся бот H·Point. Нажмите «Start» в Telegram — сайт войдёт автоматически.</p><div id="tgLoginStatus" class="ey">Ожидаем подтверждение…</div>`;let tries=0;let poll=setInterval(async()=>{tries++;try{let r=await fetch('/api/auth/telegram/complete?ticket='+encodeURIComponent(d.ticket),{credentials:'same-origin'});if(r.status===202){if(tries>150){clearInterval(poll);$('tgLoginStatus').textContent='Ссылка истекла. Начните вход заново.'}return}let done=await r.json();if(done.ok){clearInterval(poll);closeModal();await load();toast('Вход через Telegram выполнен')}}catch(e){clearInterval(poll);$('tgLoginStatus').textContent='Не удалось подтвердить вход.'}},2000)}catch(e){$('err').textContent=e.message==='telegram_login_unavailable'?'Вход через Telegram пока настраивается.':'Не удалось начать вход через Telegram.'}}
 async function logout(){await fetch('/api/auth/logout',{method:'POST'});location.reload()}
@@ -423,7 +443,7 @@ async function assign(r,h){try{await api('/api/smart-match/assign',{method:'POST
 async function finish(id){try{await api('/api/requests/finish',{method:'POST',body:JSON.stringify({request_id:id})});toast('Помощь завершена');await requests()}catch(e){toast(e.message)}}
 function review(id,side){$('modal').style.display='flex';$('modalbody').innerHTML=`<h2>Оценить взаимодействие</h2><div class="form"><select id="rv" class="input"><option value="5">5 ⭐</option><option value="4">4 ⭐</option><option value="3">3 ⭐</option><option value="2">2 ⭐</option><option value="1">1 ⭐</option></select><textarea id="rt" class="input textarea" placeholder="Отзыв"></textarea><button class="btn grad" onclick="sendReview(${id},'${side}')">Сохранить</button></div>`}
 async function sendReview(id,side){try{await api('/api/reviews',{method:'POST',body:JSON.stringify({request_id:id,side,rating:Number(rv.value),review:rt.value})});closeModal();toast('Спасибо за отзыв');await requests();await load()}catch(e){toast(e.message)}}
-async function profile(){let d=await api('/api/me'),u=d.user,linked=Boolean(u.tg_linked);$('pn').value=u.name||'';$('pc').value=u.city||'';$('pb').value=u.bio||'';$('profInfo').innerHTML=`<p><b>${esc(u.name)}</b></p><p class="muted">${esc(u.email||'')}<br>Рейтинг: ${u.stats.helped_avg?u.stats.helped_avg.toFixed(1):'—'} · ${u.stats.helped} помощей</p>`;$('tgState').innerHTML=(linked?'<span class="badge ok">✓ Telegram привязан</span>':'<span class="badge warn">Telegram не привязан</span>')+(u.telegram_url?` <a class="btn light" href="${esc(u.telegram_url)}" target="_blank" rel="noopener">Перейти в Telegram</a>`:'');$('tgLinkButton').style.display=linked?'none':'';$('code').textContent=linked?'Подключено':u.link_code||'Код не создан';$('tgGuide').innerHTML=linked?'Сайт и бот используют один профиль.':'Получите код и отправьте в боте: <b>/link КОД</b>.'}
+async function profile(){let d=await api('/api/me'),u=d.user,linked=Boolean(u.tg_linked);$('pn').value=u.name||'';$('pc').value=u.city||'';$('pb').value=u.bio||'';$('profInfo').innerHTML=`<p><b>${esc(u.name)}</b></p><p class="muted">${esc(u.email||'')}<br>Рейтинг: ${u.stats.helped_avg?u.stats.helped_avg.toFixed(1):'—'} · ${u.stats.helped} помощей</p>`;$('tgState').innerHTML=(linked?'<span class="badge ok">✓ Telegram привязан</span>':'<span class="badge warn">Telegram не привязан</span>')+(u.telegram_url?` <a class="btn light" href="${esc(u.telegram_url)}" target="_blank" rel="noopener">Перейти в Telegram</a>`:'');$('tgLinkButton').style.display=linked?'none':'';$('code').textContent=linked?'Подключено':u.link_code_available?'Код уже создан — получите новый при необходимости':'Нажмите «Получить код»';$('tgGuide').innerHTML=linked?'Сайт и бот используют один профиль.':'Получите код и отправьте в боте: <b>/link КОД</b>.'}
 async function saveProfile(){try{await api('/api/profile',{method:'POST',body:JSON.stringify({name:pn.value,city:pc.value,bio:pb.value})});toast('Профиль сохранён');await load()}catch(e){toast(e.message)}}
 async function linkcode(){try{let d=await api('/api/auth/link-code',{method:'POST'});$('code').textContent=d.code;toast('Код создан')}catch(e){toast(e.message)}}
 async function history(){let d=await api('/api/history');$('historyList').innerHTML=d.requests.length?d.requests.map(r=>`<div class="request"><div class="requestmain"><b>#${r.id} · ${esc(r.what)}</b><div class="muted">${r.role} · ${esc(r.status_title)} · ${new Date(r.created_at).toLocaleString('ru-RU')}</div></div><span class="badge">${r.rating?'⭐ '+r.rating:'без оценки'}</span></div>`).join(''):'<div class="empty">История пока пуста.</div>'}
@@ -477,7 +497,7 @@ async function buy(item,method){let meta=purchaseMeta(item);if(meta===null)retur
 async function openProfiles(){try{let d=await api('/api/profiles');$('modal').style.display='flex';$('modalbody').innerHTML=`<div class="authBrand"><img src="/assets/hpoint-logo-dark.png" alt="H-Point"></div><h2>Профили на этом устройстве</h2><p class="muted">Каждый профиль хранит свои заявки, баланс и подписки.</p><div class="profileSwitch">${d.profiles.map(p=>`<button class="request" onclick="switchProfile(${p.id})"><div class="avatar">${esc((p.name||'?')[0])}</div><div class="requestmain"><b>${esc(p.name)}</b><div class="muted">${esc(p.email||'Telegram')}</div></div><span class="badge ${p.active?'ok':''}">${p.active?'Активен':'Перейти'}</span></button>`).join('')}</div><div class="profileActions"><button class="btn grad" onclick="authForm(false)">+ Добавить профиль</button></div>`}catch(e){toast(e.message)}}
 async function switchProfile(id){try{await api('/api/profiles/switch',{method:'POST',body:JSON.stringify({user_id:id})});closeModal();await load();toast('Профиль переключён')}catch(e){toast(e.message)}}
 async function unlinkTelegram(){if(!confirm('Отвязать Telegram? Данные останутся на сайте, а у бота начнётся отдельный чистый профиль.'))return;try{await api('/api/profile/telegram/unlink',{method:'POST',body:'{}'});toast('Telegram отвязан');await load();go('profile')}catch(e){toast(e.message)}}
-async function profile(providedUser){let u=providedUser||(await api('/api/me')).user,linked=Boolean(u.tg_linked);$('pn').value=u.name||'';$('pc').value=u.city||'';$('pb').value=u.bio||'';$('profInfo').innerHTML=`<p><b>${esc(u.name)}</b></p><p class="muted">${esc(u.email||'')}<br>Рейтинг: ${u.stats.helped_avg?u.stats.helped_avg.toFixed(1):'—'} · ${u.stats.helped} помощей</p>`;$('tgState').innerHTML=linked?'<span class="badge ok">✓ Telegram привязан</span>':'<span class="badge warn">Telegram не привязан</span>';$('tgLinkButton').style.display=linked?'none':'';$('code').textContent=linked?'Подключено':u.link_code||'Код не создан';$('tgGuide').innerHTML=linked?'Сайт и бот используют один профиль. При отвязке данные сайта сохранятся, а бот начнёт отдельный профиль.':'Получите код и отправьте в боте: <b>/link КОД</b>.';let host=$('tgState').parentElement;let actions=$('tgUnlinkButton');if(!actions){actions=document.createElement('div');actions.id='tgUnlinkButton';actions.className='profileActions';host.appendChild(actions)}actions.innerHTML=linked?'<button class="btn danger" onclick="unlinkTelegram()">Отвязать Telegram</button>':'';renderIdentityCard(u)}
+async function profile(providedUser){let u=providedUser||(await api('/api/me')).user,linked=Boolean(u.tg_linked);$('pn').value=u.name||'';$('pc').value=u.city||'';$('pb').value=u.bio||'';$('profInfo').innerHTML=`<p><b>${esc(u.name)}</b></p><p class="muted">${esc(u.email||'')}<br>Рейтинг: ${u.stats.helped_avg?u.stats.helped_avg.toFixed(1):'—'} · ${u.stats.helped} помощей</p>`;$('tgState').innerHTML=linked?'<span class="badge ok">✓ Telegram привязан</span>':'<span class="badge warn">Telegram не привязан</span>';$('tgLinkButton').style.display=linked?'none':'';$('code').textContent=linked?'Подключено':u.link_code_available?'Код уже создан — получите новый при необходимости':'Нажмите «Получить код»';$('tgGuide').innerHTML=linked?'Сайт и бот используют один профиль. При отвязке данные сайта сохранятся, а бот начнёт отдельный профиль.':'Получите код и отправьте в боте: <b>/link КОД</b>.';let host=$('tgState').parentElement;let actions=$('tgUnlinkButton');if(!actions){actions=document.createElement('div');actions.id='tgUnlinkButton';actions.className='profileActions';host.appendChild(actions)}actions.innerHTML=linked?'<button class="btn danger" onclick="unlinkTelegram()">Отвязать Telegram</button>':'';renderIdentityCard(u)}
 async function load(){try{let d=await api('/api/sync');$('landing').style.display='none';$('app').style.display='block';$('nav').innerHTML='<button class="btn light" onclick="openProfiles()">Профили</button><button class="btn light" onclick="go(\'profile\')">Профиль</button><button class="btn dark" onclick="requestForm()">+ Заявка</button>';applySync(d);await profile(d.user);prices('appprices',true);await billing();startSync()}catch(e){landing()}}
 async function billing(){let d=await api('/api/billing');$('subs').innerHTML=`<p>Баланс: <b>${d.user.balance} HP</b></p><p>PRO: <b>${d.user.pro_until?new Date(d.user.pro_until).toLocaleDateString('ru-RU'):'нет'}</b></p><p>Проверка личности: <b>${d.user.identity_verified?'подтверждена':d.user.identity_verification?.status==='pending'?'на проверке':'нет'}</b></p><p>Business: <b>${d.user.business_until?new Date(d.user.business_until).toLocaleDateString('ru-RU'):'нет'}</b></p>`;$('payments').innerHTML=d.history.length?d.history.map(x=>`<div class="request"><div class="requestmain"><b>${esc(x.item_type)}</b><div class="muted">${x.amount_rub} ${x.currency==='HP'?'HP':'₽'} · ${x.status}</div></div></div>`).join(''):'<div class="muted">Покупок пока нет.</div>'}
 '''
@@ -513,7 +533,7 @@ async function syncTick(){try{let d=await api('/api/sync');applySync(d);let tab=
 function startSync(){if(syncTimer)return;syncTimer=setInterval(()=>{if(document.visibilityState==='visible')syncTick()},10000);document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'){syncTick();if(currentChat&&document.querySelector('.tab.active')?.dataset.t==='chat')refreshChat()}})}
 function stopSync(){if(syncTimer){clearInterval(syncTimer);syncTimer=null}}
 function renderIdentityCard(u){let host=document.querySelector('#p-profile .profileGrid'),card=$('identityCard');if(!host)return;if(!card){card=document.createElement('div');card.id='identityCard';card.className='card identityCard';host.appendChild(card)}let state=u.identity_verification?.status||'not_requested',note=u.identity_verification?.note||'',body,action='';if(!u.tg_linked){body='Сначала подключите Telegram. Это подтверждает, что вы управляете аккаунтом, и объединяет сайт с ботом.';action='<button class="btn light" onclick="linkcode()">Подключить Telegram</button>'}else if(state==='approved'){body='Личность подтверждена вручную. Статус действует 365 дней.';action='<span class="badge ok">✓ Личность подтверждена</span>'}else if(state==='pending'){body='Заявка принята и ожидает ручной проверки администратора.';action='<span class="badge warn">На проверке</span>'}else{body=state==='rejected'?(note?'Заявка отклонена: '+esc(note):'Заявка отклонена. Можно отправить новую после уточнения данных.'):'Telegram уже подключён. Отправьте заявку на ручное подтверждение личности.';action='<button class="btn grad" onclick="requestIdentityVerification()">Отправить заявку</button>'}card.innerHTML='<img class="identityArt" src="/assets/hpoint-logo.png" alt=""><h2>Подтверждение личности</h2><p class="muted">'+body+'</p><div>'+action+'</div>'}
-async function profile(providedUser){let u=providedUser||(await api('/api/me')).user,linked=Boolean(u.tg_linked);$('pn').value=u.name||'';$('pc').value=u.city||'';$('pb').value=u.bio||'';$('profInfo').innerHTML=`<p><b>${esc(u.name)}</b></p><p class="muted">${esc(u.email||'')}<br>Рейтинг: ${u.stats.helped_avg?u.stats.helped_avg.toFixed(1):'—'} · ${u.stats.helped} помощей</p>`;$('tgState').innerHTML=(linked?'<span class="badge ok">✓ Telegram привязан</span>':'<span class="badge warn">Telegram не привязан</span>')+(u.telegram_url?` <a class="btn light" href="${esc(u.telegram_url)}" target="_blank" rel="noopener">Перейти в Telegram</a>`:'');$('tgLinkButton').style.display=linked?'none':'';$('code').textContent=linked?'Подключено':u.link_code||'Код не создан';$('tgGuide').innerHTML=linked?'Сайт и бот используют один профиль. Входить можно одновременно с нескольких устройств; выход завершает только текущий сеанс.':'Получите код и отправьте в боте: <b>/link КОД</b>.';renderIdentityCard(u)}
+async function profile(providedUser){let u=providedUser||(await api('/api/me')).user,linked=Boolean(u.tg_linked);$('pn').value=u.name||'';$('pc').value=u.city||'';$('pb').value=u.bio||'';$('profInfo').innerHTML=`<p><b>${esc(u.name)}</b></p><p class="muted">${esc(u.email||'')}<br>Рейтинг: ${u.stats.helped_avg?u.stats.helped_avg.toFixed(1):'—'} · ${u.stats.helped} помощей</p>`;$('tgState').innerHTML=(linked?'<span class="badge ok">✓ Telegram привязан</span>':'<span class="badge warn">Telegram не привязан</span>')+(u.telegram_url?` <a class="btn light" href="${esc(u.telegram_url)}" target="_blank" rel="noopener">Перейти в Telegram</a>`:'');$('tgLinkButton').style.display=linked?'none':'';$('code').textContent=linked?'Подключено':u.link_code_available?'Код уже создан — получите новый при необходимости':'Нажмите «Получить код»';$('tgGuide').innerHTML=linked?'Сайт и бот используют один профиль. Входить можно одновременно с нескольких устройств; выход завершает только текущий сеанс.':'Получите код и отправьте в боте: <b>/link КОД</b>.';renderIdentityCard(u)}
 async function requestIdentityVerification(){try{let d=await api('/api/identity-verification',{method:'POST',body:'{}'});toast(d.status==='approved'?'Личность уже подтверждена':'Заявка отправлена на проверку');await profile()}catch(e){toast(e.message)}}
 async function loadChats(){let d=await api('/api/chats');$('chatList').innerHTML=d.chats.length?d.chats.map(c=>`<button class="request" style="width:100%;text-align:left;border:1px solid var(--line);cursor:pointer" onclick="openChat(${c.request_id})"><div class="avatar">${esc((c.other_name||'?')[0])}</div><div class="requestmain"><b>${esc(c.other_name)}</b><div class="muted">Заявка #${c.request_id} · ${esc(c.last_message||'Новый чат')}</div></div></button>`).join(''):'<div class="empty">Чатов пока нет. Они появятся после назначения помощника.</div>'}
 async function openChat(rid){currentChat=Number(rid);go('chat');await refreshChat(true);startChatPolling()}
@@ -559,7 +579,7 @@ async function register(){let password=$('ap').value,confirm=$('ap2').value,prob
 async function verifyEmailCode(){try{await api('/api/auth/email/verify',{method:'POST',body:JSON.stringify({code:$('emailCode').value.trim()})});closeModal();toast('Email подтверждён');await syncTick();if(document.querySelector('.tab.active')?.dataset.t==='profile')await profile()}catch(e){$('err').textContent=e.message}}
 async function resendEmailCode(){try{await api('/api/auth/email/resend',{method:'POST',body:'{}'});toast('Новый код отправлен')}catch(e){$('err').textContent=e.message}}
 function emailVerificationCard(u){let card=$('emailState');if(!card){card=document.createElement('div');card.id='emailState';let anchor=$('profInfo');anchor.parentElement.insertBefore(card,anchor.nextSibling)}if(u.email_verified){card.className='emailVerificationCard';card.innerHTML='<span class="badge ok">✓ Email подтверждён</span><p class="muted">Почта подтверждена одноразовым кодом и может использоваться для входа.</p>';return}card.className='emailVerificationCard warn';let configured=u.email_delivery_configured;card.innerHTML='<span class="badge warn">Требуется подтверждение email</span><p class="muted">'+(configured?'Подтвердите код из письма, чтобы публиковать заявки и отвечать на них.':'Отправка кодов ещё не настроена. Можно сразу подтвердить профиль через Telegram.')+'</p><div class="profileActions">'+(configured?'<button class="btn grad" onclick="showEmailVerification()">Ввести код</button><button class="btn light" onclick="resendEmailCode()">Новый код</button>':'')+'</div>'}
-async function profile(providedUser){let u=providedUser||(await api('/api/me')).user,linked=Boolean(u.tg_linked);$('pn').value=u.name||'';$('pc').value=u.city||'';$('pb').value=u.bio||'';$('profInfo').innerHTML=`<p><b>${esc(u.name)}</b></p><p class="muted">${esc(u.email||'')}<br>Рейтинг: ${u.stats.helped_avg?u.stats.helped_avg.toFixed(1):'—'} · ${u.stats.helped} помощей</p>`;emailVerificationCard(u);$('tgState').innerHTML=(linked?'<span class="badge ok">✓ Telegram привязан</span>':'<span class="badge warn">Telegram не привязан</span>')+(u.telegram_url?` <a class="btn light" href="${esc(u.telegram_url)}" target="_blank" rel="noopener">Перейти в Telegram</a>`:'');$('tgLinkButton').style.display=linked?'none':'';$('code').textContent=linked?'Подключено':u.link_code||'Код не создан';$('tgGuide').innerHTML=linked?'Сайт и бот используют один профиль. Входить можно одновременно с нескольких устройств; выход завершает только текущий сеанс.':'Получите код и отправьте в боте: <b>/link КОД</b>.';renderIdentityCard(u)}
+async function profile(providedUser){let u=providedUser||(await api('/api/me')).user,linked=Boolean(u.tg_linked);$('pn').value=u.name||'';$('pc').value=u.city||'';$('pb').value=u.bio||'';$('profInfo').innerHTML=`<p><b>${esc(u.name)}</b></p><p class="muted">${esc(u.email||'')}<br>Рейтинг: ${u.stats.helped_avg?u.stats.helped_avg.toFixed(1):'—'} · ${u.stats.helped} помощей</p>`;emailVerificationCard(u);$('tgState').innerHTML=(linked?'<span class="badge ok">✓ Telegram привязан</span>':'<span class="badge warn">Telegram не привязан</span>')+(u.telegram_url?` <a class="btn light" href="${esc(u.telegram_url)}" target="_blank" rel="noopener">Перейти в Telegram</a>`:'');$('tgLinkButton').style.display=linked?'none':'';$('code').textContent=linked?'Подключено':u.link_code_available?'Код уже создан — получите новый при необходимости':'Нажмите «Получить код»';$('tgGuide').innerHTML=linked?'Сайт и бот используют один профиль. Входить можно одновременно с нескольких устройств; выход завершает только текущий сеанс.':'Получите код и отправьте в боте: <b>/link КОД</b>.';renderIdentityCard(u)}
 '''
 
 PASSWORD_CSS=r'''
@@ -1308,28 +1328,25 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/auth/telegram/start":
                 if not _telegram_username:return reply(self,{"ok":False,"error":"telegram_login_unavailable"},503)
                 subject=client_key(self)
-                if database.auth_is_rate_limited("telegram_start",subject,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"Слишком много попыток. Повторите через 15 минут."},429)
+                if not database.reserve_auth_attempts(("telegram_start",subject,AUTH_ATTEMPT_LIMIT)):return reply(self,{"ok":False,"error":"Слишком много попыток. Повторите через 15 минут."},429)
                 ticket=secrets.token_urlsafe(32)
                 database.create_telegram_auth_ticket(ticket)
-                database.record_auth_failure("telegram_start",subject)
                 return reply(self,{"ok":True,"ticket":ticket,"bot_url":f"https://t.me/{_telegram_username}?start=login_{ticket}"})
             if p.path=="/api/auth/register":
                 n=str(d.get("name","")).strip();e=str(d.get("email","")).strip().lower();pw=str(d.get("password",""));confirm=str(d.get("password_confirm",""))
                 subject=client_key(self)
-                if database.auth_is_rate_limited("register",e,AUTH_ATTEMPT_LIMIT) or database.auth_is_rate_limited("register_ip",subject,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"Слишком много попыток. Повторите через 15 минут."},429)
                 if not 2<=len(n)<=MAX_NAME_LEN:return reply(self,{"ok":False,"error":"Имя должно быть от 2 до 50 символов."},400)
                 if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",e):return reply(self,{"ok":False,"error":"Введите корректный email."},400)
                 if pw!=confirm:return reply(self,{"ok":False,"error":"Пароли не совпадают."},400)
                 problem=password_error(pw)
                 if problem:return reply(self,{"ok":False,"error":problem},400)
+                if not database.reserve_auth_attempts(("register",e,AUTH_ATTEMPT_LIMIT),("register_ip",subject,AUTH_ATTEMPT_LIMIT)):return reply(self,{"ok":False,"error":"Слишком много попыток. Повторите через 15 минут."},429)
                 if get_user_by_email(e):
-                    database.record_auth_failure("register",e);database.record_auth_failure("register_ip",subject)
                     return reply(self,{"ok":False,"error":"Не удалось создать аккаунт с этим email."},409)
                 try:
                     uid=create_web_user(n,e,ph(pw));c=database.create_link_code(uid)
                 except Exception:
                     logging.exception("Registration could not be completed")
-                    database.record_auth_failure("register",e);database.record_auth_failure("register_ip",subject)
                     return reply(self,{"ok":False,"error":"Не удалось создать аккаунт с этим email."},409)
                 sent=False
                 if email_delivery_configured():
@@ -1340,10 +1357,9 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/auth/login":
                 email=str(d.get("email","")).strip().lower()
                 subject=client_key(self)
-                if database.auth_is_rate_limited("login",email,AUTH_ATTEMPT_LIMIT) or database.auth_is_rate_limited("login_ip",subject,AUTH_ATTEMPT_LIMIT):return reply(self,{"ok":False,"error":"Слишком много попыток. Повторите через 15 минут."},429)
+                if not database.reserve_auth_attempts(("login",email,AUTH_ATTEMPT_LIMIT),("login_ip",subject,AUTH_ATTEMPT_LIMIT)):return reply(self,{"ok":False,"error":"Слишком много попыток. Повторите через 15 минут."},429)
                 u=get_user_by_email(email)
                 if not u or not u["password_hash"] or not pv(str(d.get("password","")),u["password_hash"]):
-                    database.record_auth_failure("login",email);database.record_auth_failure("login_ip",subject)
                     return reply(self,{"ok":False,"error":"Неверный email или пароль."},401)
                 if u["is_blocked"]:return reply(self,{"ok":False,"error":"Аккаунт заблокирован."},403)
                 database.clear_auth_failures("login",email);database.clear_auth_failures("login_ip",subject)
@@ -1351,7 +1367,7 @@ class Handler(BaseHTTPRequestHandler):
                 return reply(self,{"ok":True},headers=session_headers(self,u["user_id"]))
             if p.path=="/api/auth/password/reset/request":
                 email=str(d.get("email","")).strip().lower(); subject=client_key(self)
-                if database.auth_is_rate_limited("password_reset",email,3) or database.auth_is_rate_limited("password_reset_ip",subject,5): return reply(self,{"ok":True})
+                if not database.reserve_auth_attempts(("password_reset",email,3),("password_reset_ip",subject,5)): return reply(self,{"ok":True})
                 if not email_delivery_configured():
                     return reply(self,{"ok":False,"error":"Отправка писем временно не настроена. Обратитесь в поддержку."},503)
                 user=get_user_by_email(email)
@@ -1360,7 +1376,6 @@ class Handler(BaseHTTPRequestHandler):
                     if not send_password_reset_code(email,code):
                         db.execute("DELETE FROM email_verification_codes WHERE user_id=?",(user["user_id"],))
                         return reply(self,{"ok":False,"error":"Не удалось отправить письмо. Повторите позже."},503)
-                database.record_auth_failure("password_reset",email); database.record_auth_failure("password_reset_ip",subject)
                 return reply(self,{"ok":True})
             if p.path=="/api/auth/password/reset/confirm":
                 email=str(d.get("email","")).strip().lower(); password=str(d.get("password", "")); confirmation=str(d.get("password_confirm", ""))
@@ -1379,26 +1394,24 @@ class Handler(BaseHTTPRequestHandler):
                 if u["email_verified"]:return reply(self,{"ok":True,"already_verified":True})
                 if not u["email"]:return reply(self,{"ok":False,"error":"В профиле нет email для подтверждения."},409)
                 if not email_delivery_configured():return reply(self,{"ok":False,"error":"Отправка кодов временно не настроена."},503)
-                if database.auth_is_rate_limited("email_resend",str(u["user_id"]),3):return reply(self,{"ok":False,"error":"Слишком много кодов. Повторите позже."},429)
+                if not database.reserve_auth_attempts(("email_resend",str(u["user_id"]),3)):return reply(self,{"ok":False,"error":"Слишком много кодов. Повторите позже."},429)
                 code=database.create_email_verification_code(u["user_id"])
                 if not send_email_verification_code(u["email"],code):return reply(self,{"ok":False,"error":"Не удалось отправить код. Повторите позже."},503)
-                database.record_auth_failure("email_resend",str(u["user_id"]))
                 return reply(self,{"ok":True,"sent":True})
             if p.path=="/api/auth/email/verify":
                 u=auth(self)
                 if not u:return
                 subject=str(u["user_id"])+":"+client_key(self)
-                if database.auth_is_rate_limited("email_verify",subject,5):return reply(self,{"ok":False,"error":"Слишком много попыток. Запросите новый код."},429)
+                if not database.reserve_auth_attempts(("email_verify",subject,5)):return reply(self,{"ok":False,"error":"Слишком много попыток. Запросите новый код."},429)
                 ok,status=database.verify_email_code(u["user_id"],str(d.get("code","")).strip())
                 if not ok:
-                    database.record_auth_failure("email_verify",subject)
                     messages={"expired":"Код истёк. Запросите новый.","too_many_attempts":"Слишком много попыток. Запросите новый код.","invalid":"Неверный код."}
                     return reply(self,{"ok":False,"error":messages.get(status,"Не удалось подтвердить email.")},400)
                 database.clear_auth_failures("email_verify",subject)
                 return reply(self,{"ok":True,"verified":True})
             if p.path=="/api/auth/logout":
                 c=self.headers.get("Cookie","");t=next((x.strip().split("=",1)[1] for x in c.split(";") if x.strip().startswith("hpoint_session=")),None)
-                if t:db.execute("DELETE FROM sessions WHERE token=?",(t,))
+                revoke_session(t)
                 return reply(self,{"ok":True},headers={"Set-Cookie":session_cookie("", 0)})
             if p.path=="/api/auth/account/delete":
                 u=auth(self)
@@ -1418,7 +1431,7 @@ class Handler(BaseHTTPRequestHandler):
                 # stale session token from being reused after the UI changes
                 # identity and makes all subsequent requests unambiguous.
                 current=cookie_value(self,"hpoint_session")
-                if current: db.execute("DELETE FROM sessions WHERE token=?",(current,))
+                revoke_session(current)
                 return reply(self,{"ok":True},headers=session_headers(self,target))
             if p.path=="/api/profile/telegram/unlink":
                 u=auth(self)
@@ -1443,21 +1456,19 @@ class Handler(BaseHTTPRequestHandler):
                 if u["phone_verified"]:return reply(self,{"ok":True,"already_verified":True})
                 if not sms_delivery_configured():return reply(self,{"ok":False,"error":"SMS-подтверждение ещё не подключено администратором."},503)
                 subject=str(u["user_id"])
-                if database.auth_is_rate_limited("phone_resend",subject,3):return reply(self,{"ok":False,"error":"Слишком много кодов. Повторите позже."},429)
+                if not database.reserve_auth_attempts(("phone_resend",subject,3)):return reply(self,{"ok":False,"error":"Слишком много кодов. Повторите позже."},429)
                 code=database.create_phone_verification_code(u["user_id"])
                 if not code or not send_phone_verification_code(u["phone"],code):
                     db.execute("DELETE FROM phone_verification_codes WHERE user_id=?",(u["user_id"],))
                     return reply(self,{"ok":False,"error":"Не удалось отправить SMS. Повторите позже."},503)
-                database.record_auth_failure("phone_resend",subject)
                 return reply(self,{"ok":True,"sent":True})
             if p.path=="/api/profile/phone/verify":
                 u=auth(self)
                 if not u:return
                 subject=str(u["user_id"])+":"+client_key(self)
-                if database.auth_is_rate_limited("phone_verify",subject,5):return reply(self,{"ok":False,"error":"Слишком много попыток. Запросите новый код."},429)
+                if not database.reserve_auth_attempts(("phone_verify",subject,5)):return reply(self,{"ok":False,"error":"Слишком много попыток. Запросите новый код."},429)
                 ok,status=database.verify_phone_code(u["user_id"],str(d.get("code","")).strip())
                 if not ok:
-                    database.record_auth_failure("phone_verify",subject)
                     messages={"expired":"Код истёк. Запросите новый.","too_many_attempts":"Слишком много попыток. Запросите новый код.","invalid":"Неверный код."}
                     return reply(self,{"ok":False,"error":messages.get(status,"Не удалось подтвердить номер.")},400)
                 database.clear_auth_failures("phone_verify",subject)

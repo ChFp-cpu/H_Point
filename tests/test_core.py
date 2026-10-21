@@ -54,6 +54,22 @@ class Core(unittest.TestCase):
         self.assertTrue(database.auth_is_rate_limited("login","person@example.com",3))
         database.clear_auth_failures("login","person@example.com")
         self.assertFalse(database.auth_is_rate_limited("login","person@example.com",3))
+    def test_auth_attempt_reservations_enforce_a_shared_limit(self):
+        for _ in range(3):
+            self.assertTrue(database.reserve_auth_attempts(("login","person@example.com",3),("login_ip","127.0.0.1",3)))
+        self.assertFalse(database.reserve_auth_attempts(("login","person@example.com",3),("login_ip","127.0.0.1",3)))
+        # A rejected multi-subject reservation must not consume the other key.
+        self.assertFalse(database.auth_is_rate_limited("login_ip","127.0.0.2",3))
+    def test_telegram_link_code_is_hashed_and_single_use(self):
+        uid=database.create_web_user("Web","secure-link@example.com","hash")
+        code=database.create_link_code(uid)
+        row=database.get_user(uid)
+        self.assertEqual(len(code),32)
+        self.assertIsNone(row["verification_code"])
+        self.assertNotEqual(row["verification_code_hash"],code)
+        ok,_=database.link_by_code(code,556,"user556")
+        self.assertTrue(ok)
+        self.assertFalse(database.link_by_code(code,557,"user557")[0])
     def test_expired_telegram_link_code_cannot_link_account(self):
         uid=database.create_web_user("Web","expired@example.com","hash")
         self.db.execute("UPDATE users SET verification_code='EXPIRED',verification_code_expires_at=? WHERE user_id=?",((datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat(),uid))

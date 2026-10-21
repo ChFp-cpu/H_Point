@@ -41,6 +41,7 @@ class Web(unittest.TestCase):
   self.assertIn("hpointShowcaseGo",web.PAGE)
   self.assertIn("https://*.yandex.ru",web.CSP)
   self.assertIn("https://*.yandex.net",web.CSP)
+  self.assertNotIn("unsafe-eval",web.CSP)
  def test_head_for_public_page_and_health(self):
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
   try:
@@ -61,7 +62,7 @@ class Web(unittest.TestCase):
    req=urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers=headers,method="POST")
    return urllib.request.urlopen(req,timeout=3)
   try:
-   password="Aa1234"
+   password="ValidPassword123"
    with post("/api/auth/register",{"name":"New User","email":"new@example.com","password":password,"password_confirm":password}) as response:
     created=json.load(response);cookie=response.headers["Set-Cookie"].split(";",1)[0]
    self.assertTrue(created["ok"])
@@ -139,6 +140,9 @@ class Web(unittest.TestCase):
    with self.assertRaises(urllib.error.HTTPError) as weak:
     register({"name":"Weak User","email":"weak@example.com","password":"weakpassword12","password_confirm":"weakpassword12"})
    self.assertEqual(weak.exception.code,400);weak.exception.close()
+   with self.assertRaises(urllib.error.HTTPError) as short:
+    register({"name":"Short User","email":"short@example.com","password":"Aa1234","password_confirm":"Aa1234"})
+   self.assertEqual(short.exception.code,400);short.exception.close()
    with self.assertRaises(urllib.error.HTTPError) as mismatch:
     register({"name":"Mismatch User","email":"mismatch@example.com","password":"SecurePass123A","password_confirm":"SecurePass123B"})
    self.assertEqual(mismatch.exception.code,400);mismatch.exception.close()
@@ -239,9 +243,9 @@ class Web(unittest.TestCase):
   telegram_request=services.create_request(42,{"what":"Заявка из Telegram","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"bot"})
   web_uid=database.create_web_user("Site","site@example.com","hash")
   site_old_request=services.create_request(web_uid,{"what":"Заявка до привязки","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"site"})
-  self.db.execute("UPDATE users SET verification_code='LINK1234',verification_code_expires_at=? WHERE user_id=?",((datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat(),web_uid))
+  self.db.execute("UPDATE users SET verification_code='A1B2C3D4',verification_code_expires_at=? WHERE user_id=?",((datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat(),web_uid))
   token=web.new_sess(web_uid)
-  ok,_=database.link_by_code("LINK1234",42,"telegram_user")
+  ok,_=database.link_by_code("A1B2C3D4",42,"telegram_user")
   self.assertTrue(ok)
 
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler)
@@ -280,6 +284,24 @@ class Web(unittest.TestCase):
    request=urllib.request.Request(base+"/api/auth/logout",data=b"{}",headers={"Content-Type":"application/json","Cookie":f"hpoint_session={first}"},method="POST")
    with urllib.request.urlopen(request,timeout=3) as response:self.assertTrue(json.load(response)["ok"])
    with get(second) as response:self.assertEqual(json.load(response)["user"]["id"],uid)
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_session_tokens_are_hashed_and_legacy_tokens_upgrade(self):
+  uid=database.create_web_user("Session User","session@example.com","hash")
+  token=web.new_sess(uid)
+  stored=self.db.execute("SELECT token FROM sessions WHERE user_id=?",(uid,)).fetchone()["token"]
+  self.assertNotEqual(stored,token)
+  self.assertEqual(len(stored),64)
+  legacy="legacy-session-token"
+  expiry=(datetime.now(timezone.utc)+timedelta(days=1)).isoformat()
+  self.db.execute("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)",(legacy,uid,expiry))
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   base=f"http://127.0.0.1:{server.server_address[1]}"
+   with urllib.request.urlopen(urllib.request.Request(base+"/api/me",headers={"Cookie":f"hpoint_session={legacy}"}),timeout=3) as response:self.assertTrue(json.load(response)["ok"])
+   upgraded=self.db.execute("SELECT token FROM sessions WHERE user_id=? AND token!=?",(uid,stored)).fetchone()["token"]
+   self.assertNotEqual(upgraded,legacy)
+   self.assertEqual(len(upgraded),64)
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_account_deletion_requires_confirmation_and_revokes_session(self):
