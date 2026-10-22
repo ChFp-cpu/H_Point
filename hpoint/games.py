@@ -17,6 +17,13 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from . import database
+from .game_content import (
+    CONTENT_VERSION,
+    LEARNING_SESSION_LENGTH,
+    MISSION_SCENARIOS as CONTENT_MISSION_SCENARIOS,
+    SAFETY_SCENARIOS as CONTENT_SAFETY_SCENARIOS,
+    published_scenarios,
+)
 from .config import (
     GAME_ACTION_MIN_INTERVAL_MS,
     GAME_DAILY_REWARD_CAP,
@@ -257,6 +264,12 @@ MISSION_SCENARIOS = (
     },
 )
 
+# The historical inline lists above are kept only so an interrupted upgrade
+# can still read an already-persisted legacy session.  New sessions use the
+# versioned content source below, which has stable IDs and editorial metadata.
+SAFETY_SCENARIOS = CONTENT_SAFETY_SCENARIOS
+MISSION_SCENARIOS = CONTENT_MISSION_SCENARIOS
+
 _PURCHASE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
 _TILES = ("food", "book", "tool", "cloth", "kit", "box")
 
@@ -351,9 +364,69 @@ def _score_target(game_code: str, score: int) -> int:
     return min(GAME_PER_TITLE_REWARD_CAP, earned)
 
 
+# Crossing advances from server time, not from browser-provided frames.  The
+# client receives enough data to draw it smoothly, but score and collisions
+# are always calculated against this server clock.
+_CROSSING_TICK_MS = 750
+_LEGACY_LEARNING_LENGTHS = {"safety": 6, "mission": 5}
+
+
+def _timestamp_ms(value: str | None) -> int:
+    try:
+        stamp = datetime.fromisoformat(value or "")
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return int(stamp.timestamp() * 1000)
+    except (TypeError, ValueError):
+        return int(_now().timestamp() * 1000)
+
+
+def _select_learning_scenarios(user_id: int, game_code: str) -> list[dict]:
+    """Select a frozen, non-repeating learning set for a new session.
+
+    A participant sees each published scenario once before the rotation can
+    reuse it.  The final partial batch carries remaining unseen prompts into
+    the next cycle without repeating a prompt inside one session.
+    """
+    catalog_items = list(published_scenarios(game_code))
+    if len(catalog_items) < LEARNING_SESSION_LENGTH:
+        raise RuntimeError("Недостаточно опубликованных учебных сценариев.")
+    seen = {
+        row["scenario_id"]
+        for row in _db().execute(
+            "SELECT scenario_id FROM game_scenario_history WHERE user_id=? AND game_code=?",
+            (user_id, game_code),
+        ).fetchall()
+    }
+    unseen = [item for item in catalog_items if item["id"] not in seen]
+    rng = secrets.SystemRandom()
+    selected = rng.sample(unseen, min(len(unseen), LEARNING_SESSION_LENGTH))
+    if len(selected) < LEARNING_SESSION_LENGTH:
+        remaining = [item for item in catalog_items if item["id"] not in {scene["id"] for scene in selected}]
+        selected.extend(rng.sample(remaining, LEARNING_SESSION_LENGTH - len(selected)))
+    for scene in selected:
+        _db().execute(
+            "INSERT OR IGNORE INTO game_scenario_history(user_id,game_code,scenario_id,content_version) VALUES(?,?,?,?)",
+            (user_id, game_code, scene["id"], scene["version"]),
+        )
+    return copy.deepcopy(selected)
+
+
+def _learning_scenes(state: dict, game_code: str) -> list[dict]:
+    """Return server-side snapshots, retaining sessions begun before 2026.10."""
+    snapshots = state.get("scenarios")
+    if isinstance(snapshots, list) and snapshots:
+        return snapshots
+    # Old sessions were ordered against the small original bank.  Keep that
+    # order and length so deployment never changes an in-progress lesson.
+    return list(published_scenarios(game_code))[:_LEGACY_LEARNING_LENGTHS[game_code]]
+
+
 def _make_crossing_state(user_id: int, equipped: set[str]) -> dict:
+    clock_anchor = _now_text()
     return {
         "seed": secrets.randbelow(2**31 - 1), "player": {"x": 3, "y": 0}, "ticks": 0,
+        "elapsed_ms": 0, "clock_anchor_at": clock_anchor, "paused": False,
         "distance": 0, "coins": 0, "deliveries": 0, "collected": [],
         "shield": 1 if "crossing_wayfinder" in equipped else 0,
         "last_notice": "Двигайтесь вперёд: соберите ресурсы и доберитесь до точки помощи.",
@@ -424,11 +497,21 @@ def _make_match_state(user_id: int, equipped: set[str]) -> dict:
 
 
 def _make_safety_state(user_id: int, equipped: set[str]) -> dict:
-    return {"index": 0, "correct": 0, "answers": [], "equipped": sorted(equipped), "last_notice": "Выберите самый безопасный вариант."}
+    scenarios = _select_learning_scenarios(user_id, "safety")
+    return {
+        "content_version": CONTENT_VERSION, "scenario_ids": [item["id"] for item in scenarios], "scenarios": scenarios,
+        "index": 0, "correct": 0, "answers": [], "equipped": sorted(equipped),
+        "last_notice": "Выберите самый безопасный вариант.",
+    }
 
 
 def _make_mission_state(user_id: int, equipped: set[str]) -> dict:
-    return {"index": 0, "reputation": 0, "answers": [], "equipped": sorted(equipped), "last_notice": "Помогайте бережно, с уважением к границам и согласию."}
+    scenarios = _select_learning_scenarios(user_id, "mission")
+    return {
+        "content_version": CONTENT_VERSION, "scenario_ids": [item["id"] for item in scenarios], "scenarios": scenarios,
+        "index": 0, "reputation": 0, "answers": [], "equipped": sorted(equipped),
+        "last_notice": "Помогайте бережно, с уважением к границам и согласию.",
+    }
 
 
 _NEW_SESSION = {
@@ -451,20 +534,47 @@ def _crossing_lane(seed: int, row: int, tick: int) -> list[int]:
     return cars
 
 
+def _crossing_elapsed_ms(state: dict) -> int:
+    elapsed = max(0, int(state.get("elapsed_ms", int(state.get("ticks", 0)) * _CROSSING_TICK_MS)))
+    if state.get("paused"):
+        return elapsed
+    anchor = state.get("clock_anchor_at")
+    if not anchor:
+        return elapsed
+    return max(elapsed, elapsed + int(_now().timestamp() * 1000) - _timestamp_ms(anchor))
+
+
+def _crossing_tick(state: dict) -> int:
+    return max(0, _crossing_elapsed_ms(state) // _CROSSING_TICK_MS)
+
+
+def _set_crossing_paused(state: dict, paused: bool) -> None:
+    if bool(state.get("paused")) == paused:
+        return
+    state["elapsed_ms"] = _crossing_elapsed_ms(state)
+    state["clock_anchor_at"] = _now_text()
+    state["paused"] = paused
+    state["ticks"] = state["elapsed_ms"] // _CROSSING_TICK_MS
+
+
 def _crossing_view(state: dict) -> dict:
     player = state["player"]
+    tick = _crossing_tick(state)
     low = max(0, int(player["y"]) - 3)
     rows = []
     for row in range(low, low + 10):
         lane = row % 4 in (1, 2)
         rows.append({
-            "y": row, "lane": lane, "cars": _crossing_lane(state["seed"], row, state["ticks"]),
+            "y": row, "lane": lane, "cars": _crossing_lane(state["seed"], row, tick),
             "coin": bool(row and (state["seed"] + row * 7) % 5 == 0 and row not in state["collected"]),
             "delivery": bool(row and row % 10 == 0),
         })
     return {
         "player": player, "rows": rows, "distance": state["distance"], "coins": state["coins"],
         "deliveries": state["deliveries"], "shield": state["shield"], "notice": state["last_notice"],
+        "seed": state["seed"], "elapsed_ms": _crossing_elapsed_ms(state),
+        "server_time_ms": int(_now().timestamp() * 1000), "tick_ms": _CROSSING_TICK_MS,
+        "paused": bool(state.get("paused")),
     }
 
 
@@ -494,26 +604,30 @@ def _public_session(row: dict, state: dict | None = None) -> dict:
         }
     elif game_code == "safety":
         index = state["index"]
-        if index < len(SAFETY_SCENARIOS):
-            scene = SAFETY_SCENARIOS[index]
+        scenes = _learning_scenes(state, "safety")
+        if index < len(scenes):
+            scene = scenes[index]
             data["game_state"] = {
-                "index": index, "total": len(SAFETY_SCENARIOS), "correct": state["correct"],
-                "scenario": {key: scene[key] for key in ("level", "title", "scene", "question", "choices")},
+                "index": index, "total": len(scenes), "correct": state["correct"],
+                "content_version": state.get("content_version", "legacy"),
+                "scenario": {"id": scene.get("id"), "difficulty": scene.get("difficulty", scene.get("level", "")), "tags": scene.get("tags", ()), "title": scene["title"], "scene": scene["scene"], "question": scene["question"], "choices": scene["choices"]},
                 "notice": state["last_notice"],
             }
         else:
-            data["game_state"] = {"index": index, "total": len(SAFETY_SCENARIOS), "correct": state["correct"], "finished": True}
+            data["game_state"] = {"index": index, "total": len(scenes), "correct": state["correct"], "finished": True}
     elif game_code == "mission":
         index = state["index"]
-        if index < len(MISSION_SCENARIOS):
-            scene = MISSION_SCENARIOS[index]
+        scenes = _learning_scenes(state, "mission")
+        if index < len(scenes):
+            scene = scenes[index]
             data["game_state"] = {
-                "index": index, "total": len(MISSION_SCENARIOS), "reputation": state["reputation"],
-                "scenario": {"title": scene["title"], "person": scene["person"], "place": scene["place"], "scene": scene["scene"], "choices": [choice[0] for choice in scene["choices"]]},
+                "index": index, "total": len(scenes), "reputation": state["reputation"],
+                "content_version": state.get("content_version", "legacy"),
+                "scenario": {"id": scene.get("id"), "difficulty": scene.get("difficulty"), "tags": scene.get("tags", ()), "title": scene["title"], "person": scene["person"], "place": scene["place"], "scene": scene["scene"], "choices": [choice[0] for choice in scene["choices"]]},
                 "notice": state["last_notice"],
             }
         else:
-            data["game_state"] = {"index": index, "total": len(MISSION_SCENARIOS), "reputation": state["reputation"], "finished": True}
+            data["game_state"] = {"index": index, "total": len(scenes), "reputation": state["reputation"], "finished": True}
     if state.get("result"):
         data["result"] = state["result"]
     return data
@@ -583,15 +697,26 @@ def _check_action_timing(row: dict) -> None:
 
 
 def _crossing_action(state: dict, action: dict) -> tuple[dict, bool, dict | None]:
+    control = action.get("type")
+    if control == "pause":
+        _set_crossing_paused(state, True)
+        state["last_notice"] = "Маршрут поставлен на паузу. Машины остановлены на сервере."
+        return state, False, None
+    if control == "resume":
+        _set_crossing_paused(state, False)
+        state["last_notice"] = "Маршрут продолжен. Следите за движением машин."
+        return state, False, None
     direction = action.get("direction")
     if direction not in {"up", "down", "left", "right"}:
         raise ValueError("Выберите направление движения.")
+    if state.get("paused"):
+        raise ValueError("Сначала продолжите маршрут.")
     player = state["player"]
     shifts = {"up": (0, 1), "down": (0, -1), "left": (-1, 0), "right": (1, 0)}
     dx, dy = shifts[direction]
     next_x = max(0, min(6, int(player["x"]) + dx))
     next_y = max(0, int(player["y"]) + dy)
-    state["ticks"] += 1
+    state["ticks"] = _crossing_tick(state)
     if next_x == player["x"] and next_y == player["y"]:
         state["last_notice"] = "Здесь край маршрута — выберите другое направление."
         return state, False, None
@@ -765,13 +890,14 @@ def _safety_action(state: dict, action: dict) -> tuple[dict, bool, dict | None, 
     if action.get("type") != "answer":
         raise ValueError("Выберите вариант ответа.")
     index = state["index"]
-    if index >= len(SAFETY_SCENARIOS):
+    scenes = _learning_scenes(state, "safety")
+    if index >= len(scenes):
         raise ValueError("Игра уже завершена.")
     try:
         selected = int(action.get("choice"))
     except (TypeError, ValueError):
         raise ValueError("Некорректный вариант ответа.")
-    scene = SAFETY_SCENARIOS[index]
+    scene = scenes[index]
     if not 0 <= selected < len(scene["choices"]):
         raise ValueError("Некорректный вариант ответа.")
     correct = selected == scene["correct"]
@@ -782,7 +908,7 @@ def _safety_action(state: dict, action: dict) -> tuple[dict, bool, dict | None, 
     state["index"] += 1
     state["last_notice"] = scene["principle"]
     feedback = {"correct": correct, "explanation": scene["explanation"], "principle": scene["principle"]}
-    finished = state["index"] >= len(SAFETY_SCENARIOS)
+    finished = state["index"] >= len(scenes)
     final = {"score": state["correct"], "outcome": "Курс завершён", "metric": state["correct"]} if finished else None
     return state, finished, final, feedback
 
@@ -791,13 +917,14 @@ def _mission_action(state: dict, action: dict) -> tuple[dict, bool, dict | None,
     if action.get("type") != "choose":
         raise ValueError("Выберите вариант действия.")
     index = state["index"]
-    if index >= len(MISSION_SCENARIOS):
+    scenes = _learning_scenes(state, "mission")
+    if index >= len(scenes):
         raise ValueError("История уже завершена.")
     try:
         selected = int(action.get("choice"))
     except (TypeError, ValueError):
         raise ValueError("Некорректный вариант действия.")
-    scene = MISSION_SCENARIOS[index]
+    scene = scenes[index]
     if not 0 <= selected < len(scene["choices"]):
         raise ValueError("Некорректный вариант действия.")
     choice, reputation, explanation = scene["choices"][selected]
@@ -807,7 +934,7 @@ def _mission_action(state: dict, action: dict) -> tuple[dict, bool, dict | None,
     state["index"] += 1
     state["last_notice"] = explanation
     feedback = {"reputation": reputation, "explanation": explanation, "choice": choice}
-    finished = state["index"] >= len(MISSION_SCENARIOS)
+    finished = state["index"] >= len(scenes)
     final = {"score": state["reputation"], "outcome": "История завершена", "metric": state["reputation"]} if finished else None
     return state, finished, final, feedback
 
@@ -947,9 +1074,10 @@ def action_game(user_id: int, session_id: str, action: dict) -> dict:
         if row["status"] != "active":
             _db().execute("COMMIT")
             return _public_session(row, state)
-        _check_action_timing(row)
         feedback: dict | None = None
         game_code = row["game_code"]
+        if not (game_code == "crossing" and action.get("type") in {"pause", "resume"}):
+            _check_action_timing(row)
         if game_code == "crossing":
             state, finished, final = _crossing_action(state, action)
         elif game_code == "dispatch":

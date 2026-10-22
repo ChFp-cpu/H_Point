@@ -8,9 +8,10 @@ def main_menu_kb():
         [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_HISTORY)],
         [KeyboardButton(text=BTN_SETTINGS)],
         [KeyboardButton(text=BTN_GAMES)],
+        [KeyboardButton(text="💳 H-Point+"), KeyboardButton(text=BTN_NAVIGATOR)],
         [KeyboardButton(text=BTN_WEBSITE)],
-        [KeyboardButton(text="💳 H-Point+" )],
     ], resize_keyboard=True)
+
 
 def cancel_kb(*extra_rows):
     rows = [[KeyboardButton(text=t) for t in row] for row in extra_rows]

@@ -18,6 +18,55 @@ from . import games as game_service
 router = Router()
 
 
+# The bot deliberately stays focused on the help flow.  This guide makes every
+# available control discoverable without turning the reply keyboard into a
+# second, crowded version of the website.
+BOT_GUIDE = (
+    "ℹ️ <b>Как пользоваться H-Point</b>\n\n"
+    "<b>Основное меню</b>\n"
+    "🆘 <b>Мне нужна помощь</b> — ответьте на 5 коротких вопросов, чтобы создать заявку.\n"
+    "🤝 <b>Хочу помочь</b> — встать в общую очередь помощников сайта и бота.\n"
+    "⚡ <b>Подобрать кандидатов</b> / 👥 <b>Мои кандидаты</b> — выбрать человека для своей открытой заявки; он подтвердит участие сам.\n"
+    "👤 <b>Мой профиль</b> — баланс HP, рейтинг, статистика и статус проверки.\n"
+    "📜 <b>История</b> — завершённые и текущие заявки.\n"
+    "⚙️ <b>Настройки помощи</b> — указать категории, в которых вы готовы помогать.\n"
+    "🎮 <b>Игры H-Point</b> — мини-игры, достижения и общий HP-баланс.\n"
+    "💳 <b>H-Point+</b> — платные возможности и безопасный переход к оплате.\n"
+    "🌐 <b>Перейти на сайт</b> — одноразовый вход в тот же профиль без пароля.\n\n"
+    "<b>Как проходит помощь</b>\n"
+    "1. Создайте заявку или встаньте в очередь.\n"
+    "2. Автор выбирает кандидата; помощник подтверждает согласие.\n"
+    "3. Общайтесь через /chat ТЕКСТ, завершите помощь и поставьте оценки.\n\n"
+    "<b>Синхронизация и безопасность</b>\n"
+    "Бот и сайт используют общие профиль, заявки, историю, HP и игровые достижения. "
+    "Чтобы подключить существующий сайт: сайт → «Профиль» → «Получить код привязки», затем в боте <b>/link КОД</b>. "
+    "Код вводите только в этом боте. Для отмены незавершённого действия используйте /cancel.\n\n"
+    "Сайт остаётся основным местом для карты, расширенного профиля, контактов, подтверждения email/телефона и платежей — бот открывает его безопасной одноразовой ссылкой."
+)
+
+# The first reply for a returning participant remains short enough for a
+# messenger, but names every visible main-menu group.  The separate guide
+# keeps the explanations discoverable without adding secondary controls to the
+# reply keyboard.
+BOT_START_OVERVIEW = (
+    "<b>Что открывает меню</b>\n"
+    "🆘 Нужна помощь — новая заявка; 🤝 хочу помочь — очередь помощников.\n"
+    "⚡ Подобрать кандидатов и 👥 Мои кандидаты — выбор и статус помощника.\n"
+    "👤 профиль, 📜 история и ⚙️ настройки — ваш аккаунт и готовность помогать.\n"
+    "🎮 Игры, 💳 H-Point+ и 🌐 сайт — достижения, доступы и полный веб-интерфейс.\n"
+    "ℹ️ «Как пользоваться» показывает подробный порядок действий и команды чата."
+)
+
+
+def onboarding_text() -> str:
+    return (
+        "👋 <b>H-Point — помощь рядом.</b>\n\n"
+        "Сначала создадим ваш профиль, а затем откроется понятное главное меню.\n\n"
+        + BOT_GUIDE
+        + "\n\n<b>Как вас зовут?</b>"
+    )
+
+
 def user_link(user) -> str:
     name = escape(user["name"])
     if user["username"]:
@@ -156,33 +205,28 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     user = get_user(message.from_user.id)
     if user is None:
         await state.set_state(Registration.name)
-        await message.answer(
-            "👋 <b>H-Point — помощь рядом.</b>\n\n"
-            "1. Напишите имя — создадим профиль.\n"
-            "2. В меню можно попросить о помощи или предложить её.\n"
-            "3. Для сайта нажмите «🌐 Перейти на сайт».\n\n"
-            "Уже есть профиль на сайте? Откройте там «Профиль», получите код и отправьте сюда <b>/link КОД</b>.\n\n"
-            "Как вас зовут?"
-        )
+        await message.answer(onboarding_text())
         return
-    await show_main_menu(message, f"С возвращением, {escape(user['name'])}! Выберите действие:")
+    await show_main_menu(
+        message,
+        f"С возвращением, {escape(user['name'])}!\n\n" + BOT_START_OVERVIEW,
+    )
     if payload == "profile":
         await profile(message, state)
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    await message.answer(
-        "<b>H-Point — помощь рядом</b>\n\n"
-        "Создайте заявку, чтобы попросить о помощи, или встаньте в очередь, "
-        "чтобы помочь кому-то. После подбора вы получите уведомление; "
-        "завершение заявки и оценки доступны в боте.\n\n"
-        "<b>Как подключить сайт:</b> на сайте откройте «Профиль» → «Получить код привязки», "
-        "затем отправьте боту <b>/link КОД</b>. После этого заявки и история будут общими.\n\n"
-        "Основные действия находятся в меню. Команды: /start, /profile, /website, "
-        "/history, /settings, /billing, /games, /verifyme, /chat, /cancel, /ask.\n\n"
-        "Команда /ask уточняет подбор для вашей активной заявки. В группах бот отвечает только на команды и не публикует заявки или профили."
-    )
+    await message.answer(BOT_GUIDE, reply_markup=main_menu_kb())
+
+
+@router.message(Command("menu"))
+@router.message(StateFilter(None), F.text == BTN_NAVIGATOR)
+async def cmd_menu_guide(message: Message, state: FSMContext) -> None:
+    if not await ensure_registered(message, state):
+        return
+    await state.clear()
+    await message.answer(BOT_GUIDE, reply_markup=main_menu_kb())
 
 
 @router.message(Command("ask"))
@@ -393,7 +437,7 @@ async def website(message: Message, state: FSMContext) -> None:
 @router.message(Registration.name, F.text)
 async def reg_name(message: Message, state: FSMContext) -> None:
     name = message.text.strip()
-    if name.startswith("/") or name in (BTN_NEED_HELP, BTN_WANT_HELP, BTN_FIND_CANDIDATES, BTN_MY_CANDIDATES, BTN_PROFILE, BTN_HISTORY, BTN_SETTINGS, BTN_WEBSITE, BTN_GAMES, BTN_CANCEL):
+    if name.startswith("/") or name in (BTN_NEED_HELP, BTN_WANT_HELP, BTN_FIND_CANDIDATES, BTN_MY_CANDIDATES, BTN_PROFILE, BTN_HISTORY, BTN_SETTINGS, BTN_WEBSITE, BTN_GAMES, BTN_NAVIGATOR, BTN_CANCEL, "💳 H-Point+"):
         await message.answer("Пожалуйста, напишите своё имя обычным текстом.")
         return
     if not name or len(name) > MAX_NAME_LEN:
@@ -404,7 +448,8 @@ async def reg_name(message: Message, state: FSMContext) -> None:
     await show_main_menu(
         message,
         f"✅ Регистрация завершена, {escape(name)}! Вам начислено <b>{START_BALANCE} HP</b>.\n\n"
-        "Нажмите «🌐 Перейти на сайт», чтобы открыть этот же профиль в браузере.",
+        "Нажмите «🌐 Перейти на сайт», чтобы открыть этот же профиль в браузере, "
+        "или «ℹ️ Как пользоваться», чтобы увидеть назначение всех кнопок.",
     )
 
 

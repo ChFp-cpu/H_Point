@@ -80,6 +80,7 @@ BTN_HISTORY = "📜 История"
 BTN_SETTINGS = "⚙️ Настройки помощи"
 BTN_WEBSITE = "🌐 Перейти на сайт"
 BTN_GAMES = "🎮 Игры H-Point"
+BTN_NAVIGATOR = "ℹ️ Как пользоваться"
 BTN_CANCEL = "❌ Отмена"
 BTN_NO_DETAILS = "Нет"
 

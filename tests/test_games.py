@@ -44,10 +44,53 @@ class Games(unittest.TestCase):
 
     def _complete_safety(self):
         session = games.start_game(1, "safety")
-        for choice in (1, 0, 1, 1, 0, 1):
+        while session["status"] == "active":
+            state = json.loads(self.db.execute("SELECT state FROM game_sessions WHERE id=?", (session["id"],)).fetchone()["state"])
+            choice = state["scenarios"][state["index"]]["correct"]
             self._allow_next_action(session["id"])
             session = games.action_game(1, session["id"], {"type": "answer", "choice": choice})
         return session
+
+    def test_learning_content_is_versioned_frozen_and_keeps_answers_server_side(self):
+        from hpoint.game_content import MISSION_SCENARIOS, SAFETY_SCENARIOS
+
+        self.assertGreaterEqual(len(SAFETY_SCENARIOS), 20)
+        self.assertGreaterEqual(len(MISSION_SCENARIOS), 20)
+        self.assertTrue(all(item["id"] and item["version"] and item["published"] for item in SAFETY_SCENARIOS + MISSION_SCENARIOS))
+
+        first = games.start_game(1, "safety")
+        public_scene = first["game_state"]["scenario"]
+        self.assertNotIn("correct", public_scene)
+        self.assertNotIn("explanation", public_scene)
+        stored = json.loads(self.db.execute("SELECT state FROM game_sessions WHERE id=?", (first["id"],)).fetchone()["state"])
+        self.assertEqual(stored["content_version"], "2026.10")
+        self.assertEqual(len(stored["scenario_ids"]), 6)
+        self.assertEqual(len(set(stored["scenario_ids"])), 6)
+        self.assertIn("correct", stored["scenarios"][0])
+        games.abandon_game(1, first["id"])
+
+        second = games.start_game(1, "safety")
+        second_state = json.loads(self.db.execute("SELECT state FROM game_sessions WHERE id=?", (second["id"],)).fetchone()["state"])
+        self.assertFalse(set(stored["scenario_ids"]) & set(second_state["scenario_ids"]))
+
+    def test_crossing_clock_pause_and_collision_are_server_authoritative(self):
+        session = games.start_game(1, "crossing")
+        self.assertIn("server_time_ms", session["game_state"])
+        self.assertIn("tick_ms", session["game_state"])
+        paused = games.action_game(1, session["id"], {"type": "pause"})
+        self.assertTrue(paused["game_state"]["paused"])
+        resumed = games.action_game(1, session["id"], {"type": "resume"})
+        self.assertFalse(resumed["game_state"]["paused"])
+
+        state = json.loads(self.db.execute("SELECT state FROM game_sessions WHERE id=?", (session["id"],)).fetchone()["state"])
+        state.update({"player": {"x": 0, "y": 0}, "elapsed_ms": 0, "clock_anchor_at": games._now_text(), "paused": False, "shield": 0})
+        state["player"]["x"] = games._crossing_lane(state["seed"], 1, 0)[0]
+        self.db.execute("UPDATE game_sessions SET state=? WHERE id=?", (json.dumps(state), session["id"]))
+        self._allow_next_action(session["id"])
+        collision = games.action_game(1, session["id"], {"direction": "up", "score": 999999})
+        self.assertEqual(collision["status"], "completed")
+        self.assertEqual(collision["result"]["outcome"], "Маршрут прерван")
+        self.assertLess(collision["score"], 999999)
 
     def test_safety_rewards_are_server_side_idempotent_and_capped(self):
         completed = self._complete_safety()
@@ -103,6 +146,29 @@ class Games(unittest.TestCase):
         session = games.start_game(1, "match")
         callbacks = [button.callback_data for row in _match_kb(session).inline_keyboard for button in row]
         self.assertTrue(all(len(value.encode()) <= 64 for value in callbacks))
+
+    def test_bot_keeps_core_actions_discoverable_without_becoming_a_second_site(self):
+        from hpoint.config import (
+            BTN_FIND_CANDIDATES, BTN_GAMES, BTN_HISTORY, BTN_NAVIGATOR,
+            BTN_NEED_HELP, BTN_PROFILE, BTN_SETTINGS, BTN_WANT_HELP, BTN_WEBSITE,
+        )
+        from hpoint.handlers import BOT_GUIDE, BOT_START_OVERVIEW, onboarding_text
+        from hpoint.keyboards import main_menu_kb
+
+        labels = [button.text for row in main_menu_kb().keyboard for button in row]
+        self.assertTrue({
+            BTN_NEED_HELP, BTN_WANT_HELP, BTN_FIND_CANDIDATES, BTN_PROFILE,
+            BTN_HISTORY, BTN_SETTINGS, BTN_GAMES, BTN_WEBSITE, BTN_NAVIGATOR,
+        }.issubset(labels))
+        self.assertLessEqual(len(labels), 11)
+        self.assertIn("Бот и сайт используют общие профиль", BOT_GUIDE)
+        self.assertIn("Сайт остаётся основным местом", BOT_GUIDE)
+        self.assertIn("Нужна помощь", BOT_START_OVERVIEW)
+        self.assertIn("Подобрать кандидатов", BOT_START_OVERVIEW)
+        self.assertIn("Мои кандидаты", BOT_START_OVERVIEW)
+        self.assertIn("H-Point+", BOT_START_OVERVIEW)
+        self.assertIn("Как пользоваться", BOT_START_OVERVIEW)
+        self.assertIn("Как вас зовут?", onboarding_text())
 
     def test_games_page_and_http_api_access_controls(self):
         self.assertIn("H-Point Games", web.GAMES_PAGE)

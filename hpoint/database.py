@@ -320,6 +320,14 @@ def init_db():
       claimed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY(user_id,challenge_id,reward_date)
     );
+    CREATE TABLE IF NOT EXISTS game_scenario_history(
+      user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      game_code TEXT NOT NULL,
+      scenario_id TEXT NOT NULL,
+      content_version TEXT NOT NULL,
+      selected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(user_id,game_code,scenario_id)
+    );
     CREATE INDEX IF NOT EXISTS idx_request_candidates_request ON request_candidates(request_id,status,score);
     CREATE INDEX IF NOT EXISTS idx_request_candidates_candidate ON request_candidates(candidate_id,status);
     CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status,created_at);
@@ -335,6 +343,7 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_game_sessions_user_status ON game_sessions(user_id,status,started_at);
     CREATE INDEX IF NOT EXISTS idx_game_transactions_user ON game_transactions(user_id,id DESC);
     CREATE INDEX IF NOT EXISTS idx_game_daily_rewards_date ON game_daily_rewards(user_id,reward_date);
+    CREATE INDEX IF NOT EXISTS idx_game_scenario_history_rotation ON game_scenario_history(user_id,game_code,selected_at);
     """
     if getattr(db, "is_postgres", False):
         schema = schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY").replace("INTEGER", "BIGINT")
@@ -343,6 +352,7 @@ def init_db():
     db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", ("001_initial",))
     db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", ("002_hpoint_games",))
     db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", ("003_hpoint_games_rewards",))
+    db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", ("004_learning_game_content",))
     # Safe migration of the old project.
     for t,n,d in [
       ("users","email","TEXT"),("users","password_hash","TEXT"),("users","tg_user_id","INTEGER"),
