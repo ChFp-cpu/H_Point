@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import random
 import re
 import secrets
@@ -267,6 +268,8 @@ MISSION_SCENARIOS = (
 # The historical inline lists above are kept only so an interrupted upgrade
 # can still read an already-persisted legacy session.  New sessions use the
 # versioned content source below, which has stable IDs and editorial metadata.
+LEGACY_SAFETY_SCENARIOS = SAFETY_SCENARIOS
+LEGACY_MISSION_SCENARIOS = MISSION_SCENARIOS
 SAFETY_SCENARIOS = CONTENT_SAFETY_SCENARIOS
 MISSION_SCENARIOS = CONTENT_MISSION_SCENARIOS
 
@@ -404,6 +407,7 @@ def _select_learning_scenarios(user_id: int, game_code: str) -> list[dict]:
     if len(selected) < LEARNING_SESSION_LENGTH:
         remaining = [item for item in catalog_items if item["id"] not in {scene["id"] for scene in selected}]
         selected.extend(rng.sample(remaining, LEARNING_SESSION_LENGTH - len(selected)))
+        _db().execute("DELETE FROM game_scenario_history WHERE user_id=? AND game_code=?", (user_id, game_code))
     for scene in selected:
         _db().execute(
             "INSERT OR IGNORE INTO game_scenario_history(user_id,game_code,scenario_id,content_version) VALUES(?,?,?,?)",
@@ -419,7 +423,7 @@ def _learning_scenes(state: dict, game_code: str) -> list[dict]:
         return snapshots
     # Old sessions were ordered against the small original bank.  Keep that
     # order and length so deployment never changes an in-progress lesson.
-    return list(published_scenarios(game_code))[:_LEGACY_LEARNING_LENGTHS[game_code]]
+    return list(LEGACY_SAFETY_SCENARIOS if game_code == "safety" else LEGACY_MISSION_SCENARIOS)
 
 
 def _make_crossing_state(user_id: int, equipped: set[str]) -> dict:
@@ -427,6 +431,7 @@ def _make_crossing_state(user_id: int, equipped: set[str]) -> dict:
     return {
         "seed": secrets.randbelow(2**31 - 1), "player": {"x": 3, "y": 0}, "ticks": 0,
         "elapsed_ms": 0, "clock_anchor_at": clock_anchor, "paused": False,
+        "traffic_checked_ms": 0,
         "distance": 0, "coins": 0, "deliveries": 0, "collected": [],
         "shield": 1 if "crossing_wayfinder" in equipped else 0,
         "last_notice": "Двигайтесь вперёд: соберите ресурсы и доберитесь до точки помощи.",
@@ -546,6 +551,30 @@ def _crossing_elapsed_ms(state: dict) -> int:
 
 def _crossing_tick(state: dict) -> int:
     return max(0, _crossing_elapsed_ms(state) // _CROSSING_TICK_MS)
+
+
+def _crossing_hit_between(state: dict, x: int, y: int, start_ms: int, end_ms: int) -> bool:
+    """Sweep the same continuous lane positions that the browser paints.
+
+    Checking the interval also catches a car passing a stationary player
+    between sync requests; a delayed browser cannot skip a collision.
+    """
+    if y <= 0 or y % 4 not in (1, 2):
+        return False
+    speed = 1 if y % 2 else -1
+    offsets = (0, 3, 5) if y % 9 == 1 else (0, 3)
+    start_ms, end_ms = sorted((max(0, start_ms), max(0, end_ms)))
+    for offset in offsets:
+        base = (state["seed"] // 17 + y * 3 + offset) % 7
+        a = base + start_ms / _CROSSING_TICK_MS * speed
+        b = base + end_ms / _CROSSING_TICK_MS * speed
+        low, high = sorted((a, b))
+        # Car half-width .39 + hero half-width .23, both in grid cells.
+        first = math.ceil((low - x - .62) / 7)
+        last = math.floor((high - x + .62) / 7)
+        if first <= last:
+            return True
+    return False
 
 
 def _set_crossing_paused(state: dict, paused: bool) -> None:
@@ -697,7 +726,37 @@ def _check_action_timing(row: dict) -> None:
 
 
 def _crossing_action(state: dict, action: dict) -> tuple[dict, bool, dict | None]:
+    # Upgrade a session created by the old turn clock once, preserving its
+    # seed, position and score instead of resetting traffic on every sync.
+    if not state.get("clock_anchor_at"):
+        state["elapsed_ms"] = max(0, int(state.get("ticks", 0))) * _CROSSING_TICK_MS
+        state["clock_anchor_at"] = _now_text()
+        state["traffic_checked_ms"] = state["elapsed_ms"]
+        state.setdefault("paused", False)
     control = action.get("type")
+    elapsed = _crossing_elapsed_ms(state)
+    player = state["player"]
+
+    def hit(x, y, start, end):
+        grace = int(state.get("invulnerable_until_ms", 0))
+        if end < grace or not _crossing_hit_between(state, x, y, max(start, grace), end):
+            return False
+        if state["shield"] > 0:
+            state["shield"] -= 1
+            state["invulnerable_until_ms"] = elapsed + _CROSSING_TICK_MS
+            state["last_notice"] = "Проводник защитил героя от столкновения."
+            return False
+        return True
+
+    previous = int(state.get("traffic_checked_ms", elapsed))
+    state["traffic_checked_ms"] = elapsed
+    if not state.get("paused") and hit(player["x"], player["y"], previous, elapsed):
+        score = state["distance"] * 10 + state["coins"] * 5 + state["deliveries"] * 20
+        state["score"] = score
+        state["last_notice"] = "Машина пересекла вашу клетку. Переждите поток на безопасной полосе."
+        return state, True, {"score": score, "outcome": "Маршрут прерван", "metric": state["distance"]}
+    if control == "sync":
+        return state, False, None
     if control == "pause":
         _set_crossing_paused(state, True)
         state["last_notice"] = "Маршрут поставлен на паузу. Машины остановлены на сервере."
@@ -711,7 +770,6 @@ def _crossing_action(state: dict, action: dict) -> tuple[dict, bool, dict | None
         raise ValueError("Выберите направление движения.")
     if state.get("paused"):
         raise ValueError("Сначала продолжите маршрут.")
-    player = state["player"]
     shifts = {"up": (0, 1), "down": (0, -1), "left": (-1, 0), "right": (1, 0)}
     dx, dy = shifts[direction]
     next_x = max(0, min(6, int(player["x"]) + dx))
@@ -734,14 +792,9 @@ def _crossing_action(state: dict, action: dict) -> tuple[dict, bool, dict | None
         state["last_notice"] = "Маршрут открыт — двигайтесь к следующей точке помощи."
     score = state["distance"] * 10 + state["coins"] * 5 + state["deliveries"] * 20
     state["score"] = score
-    cars = _crossing_lane(state["seed"], next_y, state["ticks"])
-    if next_x in cars:
-        if state["shield"] > 0:
-            state["shield"] -= 1
-            state["last_notice"] = "Проводник защитил героя от столкновения."
-        else:
-            state["last_notice"] = "Маршрут перекрыт. В следующий раз выберите безопасную клетку."
-            return state, True, {"score": score, "outcome": "Маршрут прерван", "metric": state["distance"]}
+    if hit(next_x, next_y, elapsed, elapsed):
+        state["last_notice"] = "Маршрут перекрыт. В следующий раз выберите безопасную клетку."
+        return state, True, {"score": score, "outcome": "Маршрут прерван", "metric": state["distance"]}
     if state["distance"] >= 30:
         state["last_notice"] = "Все контрольные точки пройдены — помощь доставлена!"
         state["score"] = score + 40

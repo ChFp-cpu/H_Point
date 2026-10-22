@@ -78,7 +78,9 @@ class Web(unittest.TestCase):
   self.assertNotIn("Всё готово",web.WORKSPACE_SHELL_UI)
  def test_games_page_uses_server_clock_for_smooth_crossing(self):
   self.assertIn("requestAnimationFrame(drawCars)",web.GAMES_PAGE)
-  self.assertIn("server_time_ms",web.GAMES_PAGE)
+  self.assertIn("elapsed_ms",web.GAMES_PAGE)
+  self.assertIn("performance.now()",web.GAMES_PAGE)
+  self.assertIn("anchorCrossingClock",web.GAMES_PAGE)
   self.assertIn("type:'pause'",web.GAMES_PAGE)
   self.assertIn("visibilitychange",web.GAMES_PAGE)
  def test_head_for_public_page_and_health(self):

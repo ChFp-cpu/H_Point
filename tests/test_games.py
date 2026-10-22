@@ -92,6 +92,65 @@ class Games(unittest.TestCase):
         self.assertEqual(collision["result"]["outcome"], "Маршрут прерван")
         self.assertLess(collision["score"], 999999)
 
+    def test_legacy_learning_sessions_keep_their_original_bank(self):
+        self.assertEqual(games._learning_scenes({}, "safety"), list(games.LEGACY_SAFETY_SCENARIOS))
+        self.assertEqual(games._learning_scenes({}, "mission"), list(games.LEGACY_MISSION_SCENARIOS))
+        self.assertEqual(len(games._learning_scenes({}, "mission")), 5)
+
+    def test_crossing_traffic_is_continuous_and_stationary_players_can_be_hit(self):
+        from unittest.mock import patch
+
+        start = datetime(2026, 10, 22, tzinfo=timezone.utc)
+        with patch.object(games, "_now", return_value=start):
+            state = games._make_crossing_state(1, set())
+        state.update({"seed": 0, "player": {"x": 0, "y": 1}, "distance": 1})
+        self.assertFalse(games._crossing_hit_between(state, 0, 1, 0, 0))
+        self.assertTrue(games._crossing_hit_between(state, 0, 1, 0, 750))
+        self.assertFalse(games._crossing_hit_between(state, 0, 0, 0, 100000))
+        with patch.object(games, "_now", return_value=start + timedelta(milliseconds=750)):
+            _, finished, result = games._crossing_action(state, {"type": "sync", "score": 999999})
+        self.assertTrue(finished)
+        self.assertEqual(result["outcome"], "Маршрут прерван")
+        self.assertEqual(result["score"], 10)
+
+    def test_crossing_pause_freezes_the_continuous_clock(self):
+        from unittest.mock import patch
+
+        start = datetime(2026, 10, 22, tzinfo=timezone.utc)
+        with patch.object(games, "_now", return_value=start):
+            state = games._make_crossing_state(1, set())
+            games._crossing_action(state, {"type": "pause"})
+        with patch.object(games, "_now", return_value=start + timedelta(seconds=20)):
+            self.assertEqual(games._crossing_elapsed_ms(state), 0)
+            games._crossing_action(state, {"type": "resume"})
+        with patch.object(games, "_now", return_value=start + timedelta(seconds=21)):
+            self.assertEqual(games._crossing_elapsed_ms(state), 1000)
+
+    def test_old_crossing_sessions_upgrade_once_without_resetting_the_world(self):
+        from unittest.mock import patch
+
+        start = datetime(2026, 10, 22, tzinfo=timezone.utc)
+        state = games._make_crossing_state(1, set())
+        state.pop("clock_anchor_at")
+        state.pop("elapsed_ms")
+        state["ticks"] = 5
+        seed = state["seed"]
+        with patch.object(games, "_now", return_value=start):
+            games._crossing_action(state, {"type": "sync"})
+        with patch.object(games, "_now", return_value=start + timedelta(milliseconds=500)):
+            games._crossing_action(state, {"type": "sync"})
+            self.assertEqual(games._crossing_elapsed_ms(state), 4250)
+        self.assertEqual(state["seed"], seed)
+
+    def test_learning_rotation_starts_a_new_cycle_without_internal_duplicates(self):
+        from hpoint.game_content import SAFETY_SCENARIOS
+        batches = [games._select_learning_scenarios(1, "safety") for _ in range(4)]
+        self.assertEqual(len({item["id"] for batch in batches[:3] for item in batch}), 18)
+        self.assertEqual(len({item["id"] for batch in batches for item in batch}), len(SAFETY_SCENARIOS))
+        self.assertTrue(all(len({item["id"] for item in batch}) == 6 for batch in batches))
+        next_batch = games._select_learning_scenarios(1, "safety")
+        self.assertFalse({item["id"] for item in batches[-1]} & {item["id"] for item in next_batch})
+
     def test_safety_rewards_are_server_side_idempotent_and_capped(self):
         completed = self._complete_safety()
         self.assertEqual(completed["status"], "completed")
