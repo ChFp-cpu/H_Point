@@ -145,7 +145,8 @@ async def notify_helper_offer(bot: Bot, request_id: int, helper_id: int) -> None
     request = get_request(request_id)
     helper = get_user(helper_id)
     requester = get_user(request["requester_id"]) if request else None
-    if not request or not helper or not requester or not helper["tg_user_id"]:
+    offer = get_current_helper_offer(request_id)
+    if not request or not helper or not requester or not helper["tg_user_id"] or not offer or offer["candidate_id"] != helper_id:
         return
     try:
         await bot.send_message(
@@ -154,7 +155,7 @@ async def notify_helper_offer(bot: Bot, request_id: int, helper_id: int) -> None
             f"{request_text(request)}\n\n"
             f"<b>Кому нужна помощь:</b> {user_link(requester)}\n\n"
             "Подтвердите, что готовы помочь. До вашего согласия заявка никому не назначена.",
-            reply_markup=helper_offer_kb(request_id),
+            reply_markup=helper_offer_kb(request_id, offer["offer_token"] or ""),
         )
     except Exception:
         logging.exception("Не удалось отправить предложение помощнику %s по заявке %s", helper_id, request_id)
@@ -822,12 +823,12 @@ async def _candidate_card(candidate: dict) -> str:
     )
 
 
-async def _show_candidates(message: Message, request_id: int, *, edit: bool = False) -> None:
+async def _show_candidates(message: Message, request_id: int, *, edit: bool = False, actor_id: int | None = None) -> None:
     req = get_request(request_id)
     if not req:
         await message.answer("Заявка не найдена.")
         return
-    if req["requester_id"] != message.from_user.id:
+    if req["requester_id"] != (actor_id if actor_id is not None else message.from_user.id):
         await message.answer("Эта заявка принадлежит другому пользователю.")
         return
     if req["status"] != STATUS_OPEN:
@@ -839,13 +840,15 @@ async def _show_candidates(message: Message, request_id: int, *, edit: bool = Fa
         return
 
     matches = get_candidates_for_request(request_id, limit=20)
+    offer = get_current_helper_offer(request_id)
+    waiting = (f"\n\n⏳ Ждём ответ: {escape(offer['name'])}. Можно отменить приглашение и выбрать другого помощника." if offer else "")
     if not matches:
         text = (
             "⚡ <b>Подбор кандидатов</b>\n\n"
             "Пока нет доступных кандидатов. Попробуйте обновить подбор позже.\n\n"
-            f"{request_text(req)}"
+            f"{request_text(req)}{waiting}"
         )
-        markup = candidates_navigation_kb(request_id)
+        markup = candidates_navigation_kb(request_id, offer)
         if edit:
             await message.edit_text(text, reply_markup=markup)
         else:
@@ -855,7 +858,7 @@ async def _show_candidates(message: Message, request_id: int, *, edit: bool = Fa
     header = (
         f"⚡ <b>Кандидаты для заявки №{request_id}</b>\n\n"
         f"{escape(req['what'])}\n\n"
-        f"Найдено: <b>{len(matches)}</b>. Это люди, которые сейчас готовы помочь. Выберите одного — он подтвердит согласие сам."
+        f"Найдено: <b>{len(matches)}</b>. Это люди, которые сейчас готовы помочь. Выберите одного — он подтвердит согласие сам.{waiting}"
     )
     if edit:
         await message.edit_text(header)
@@ -867,7 +870,7 @@ async def _show_candidates(message: Message, request_id: int, *, edit: bool = Fa
             await _candidate_card(candidate),
             reply_markup=candidate_kb(request_id, candidate["user_id"]),
         )
-    await message.answer("Подбор можно обновить после изменения профилей или доступности.", reply_markup=candidates_navigation_kb(request_id))
+    await message.answer("Подбор можно обновить после изменения профилей или доступности.", reply_markup=candidates_navigation_kb(request_id, offer))
 
 
 async def _choose_candidate_request(message: Message, state: FSMContext) -> bool:
@@ -927,9 +930,14 @@ async def cb_candidate_assign(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Кандидат больше недоступен.", show_alert=True)
         return
 
+    if get_current_helper_offer(request_id):
+        await callback.answer("Сначала отмените текущее приглашение, затем выберите другого помощника.", show_alert=True)
+        await _show_candidates(callback.message, request_id, actor_id=callback.from_user.id)
+        return
+
     if not offer_helper(request_id, candidate_id):
         await callback.answer("Кандидат уже занят, вышел из очереди или заявка изменилась. Обновляю список.", show_alert=True)
-        await _show_candidates(callback.message, request_id)
+        await _show_candidates(callback.message, request_id, actor_id=callback.from_user.id)
         return
 
     await callback.answer("Предложение отправлено")
@@ -942,7 +950,7 @@ async def cb_candidate_assign(callback: CallbackQuery, bot: Bot) -> None:
         f"{request_text(req)}\n\n"
         f"<b>Вы выбрали:</b> {user_link(candidate)}\n\n"
         "Помощник сам подтвердит или отклонит предложение. Чат появится только после его согласия.",
-        reply_markup=main_menu_kb(),
+        reply_markup=candidates_navigation_kb(request_id, get_current_helper_offer(request_id)),
     )
     await notify_helper_offer(bot, request_id, candidate_id)
 
@@ -950,16 +958,33 @@ async def cb_candidate_assign(callback: CallbackQuery, bot: Bot) -> None:
 @router.callback_query(F.data.startswith("offer:"))
 async def cb_helper_offer_response(callback: CallbackQuery, bot: Bot) -> None:
     try:
-        _, action, request_id_s = callback.data.split(":")
+        parts = callback.data.split(":")
+        if len(parts) not in (3, 4):
+            raise ValueError("offer")
+        _, action, request_id_s = parts[:3]
+        token = parts[3] if len(parts) == 4 else ""
         request_id = int(request_id_s)
     except (ValueError, TypeError):
         await callback.answer("Некорректное предложение.", show_alert=True)
+        return
+    if action == "cancel":
+        offer = get_current_helper_offer(request_id)
+        if not offer or not withdraw_helper_offer(request_id, callback.from_user.id, offer["candidate_id"], token):
+            await callback.answer("Приглашение уже изменилось или помощь подтверждена.", show_alert=True)
+            return
+        await callback.answer("Приглашение отменено, заявка остаётся открытой")
+        if offer["tg_user_id"]:
+            try:
+                await bot.send_message(offer["tg_user_id"], f"↩️ Автор отменил приглашение по заявке №{request_id}. Подтверждать его больше не нужно; вы можете помогать другим.")
+            except Exception:
+                logging.exception("Не удалось уведомить об отмене приглашения %s", request_id)
+        await _show_candidates(callback.message, request_id, edit=True, actor_id=callback.from_user.id)
         return
     if action not in ("accept", "decline"):
         await callback.answer("Некорректное действие.", show_alert=True)
         return
     accepted = action == "accept"
-    if not respond_to_helper_offer(request_id, callback.from_user.id, accepted):
+    if not respond_to_helper_offer(request_id, callback.from_user.id, accepted, token):
         await callback.answer("Предложение уже неактуально.", show_alert=True)
         return
     request = get_request(request_id)
@@ -997,7 +1022,7 @@ async def cb_candidate_refresh(callback: CallbackQuery) -> None:
         await callback.answer("Заявка недоступна.", show_alert=True)
         return
     await callback.answer("Подбор обновлён")
-    await _show_candidates(callback.message, request_id, edit=True)
+    await _show_candidates(callback.message, request_id, edit=True, actor_id=callback.from_user.id)
 
 
 @router.callback_query(F.data.startswith("candidate:back:"))

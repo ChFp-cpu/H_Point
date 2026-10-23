@@ -1,5 +1,5 @@
 """Бизнес-логика H-Point без Telegram UI."""
-import json, re
+import json, re, secrets
 from datetime import datetime, timedelta, timezone
 from .config import *
 from .database import db, get_request, get_user, get_active_help, save_request_candidates, get_request_candidates, insert_id, request_identity_verification, wallet_add_entry
@@ -90,20 +90,21 @@ def remove_from_queue(user_id: int) -> None:
 def get_current_helper_offer(request_id: int):
     """Return the one helper currently deciding on a request, if any."""
     return db.execute(
-        """SELECT rc.request_id, rc.candidate_id, rc.status, rc.updated_at,
+        """SELECT rc.request_id, rc.candidate_id, rc.status, rc.updated_at, rc.offer_token,
                   u.name, u.username, u.tg_user_id
            FROM request_candidates rc
            JOIN users u ON u.user_id = rc.candidate_id
-           WHERE rc.request_id = ? AND rc.status = 'offered'
+           JOIN requests r ON r.id = rc.request_id
+           WHERE rc.request_id = ? AND rc.status = 'offered' AND r.status = ?
            ORDER BY rc.updated_at DESC LIMIT 1""",
-        (request_id,),
+        (request_id, STATUS_OPEN),
     ).fetchone()
 
 
 def get_helper_offers(helper_id: int, limit: int = 20):
     """Offers awaiting a helper's answer; used by both the site and the bot."""
     return db.execute(
-        """SELECT rc.request_id, rc.updated_at, r.category, r.what, r.place,
+        """SELECT rc.request_id, rc.updated_at, rc.offer_token, r.category, r.what, r.place,
                   r.time_needed, r.urgency, r.details, r.requester_id,
                   requester.name requester_name, requester.username requester_username
            FROM request_candidates rc
@@ -115,7 +116,7 @@ def get_helper_offers(helper_id: int, limit: int = 20):
     ).fetchall()
 
 
-def offer_helper(request_id: int, helper_id: int) -> bool:
+def offer_helper(request_id: int, helper_id: int, replace_offer_token: str | None = None) -> bool:
     """Let a requester invite one available volunteer without assigning them yet."""
     try:
         db.execute("BEGIN IMMEDIATE")
@@ -134,32 +135,64 @@ def offer_helper(request_id: int, helper_id: int) -> bool:
             db.execute("ROLLBACK")
             return False
 
-        # A new choice withdraws the previous offer, so a requester never has
-        # several volunteers waiting for a reply at the same time.
+        current = get_current_helper_offer(request_id)
+        # A stale tab must not silently replace an invitation the author did
+        # not see. Replacing one requires its exact confirmed token.
+        if current:
+            if current["candidate_id"] == helper_id or replace_offer_token is None or (current["offer_token"] or "") != replace_offer_token:
+                db.execute("ROLLBACK")
+                return False
+        elif replace_offer_token is not None:
+            db.execute("ROLLBACK")
+            return False
         db.execute(
             "UPDATE request_candidates SET status='withdrawn', updated_at=CURRENT_TIMESTAMP "
             "WHERE request_id=? AND status='offered' AND candidate_id!=?",
             (request_id, helper_id),
         )
         db.execute(
-            """INSERT INTO request_candidates(request_id,candidate_id,score,status,seen_at,updated_at)
-               VALUES(?,?,?,'offered',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            """INSERT INTO request_candidates(request_id,candidate_id,score,status,offer_token,seen_at,updated_at)
+               VALUES(?,?,?,'offered',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
                ON CONFLICT(request_id,candidate_id) DO UPDATE SET
-                 score=excluded.score,status='offered',updated_at=CURRENT_TIMESTAMP""",
-            (request_id, helper_id, match_score(request, helper_id)),
+                 score=excluded.score,status='offered',offer_token=excluded.offer_token,updated_at=CURRENT_TIMESTAMP""",
+            (request_id, helper_id, match_score(request, helper_id), secrets.token_hex(8)),
         )
-        db.execute("COMMIT")
         db.execute(
             "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
-            (request_id, helper_id, "helper_invited", "Помощнику отправлено предложение подтвердить участие."),
+            (request_id, request["requester_id"], "helper_invited", "Помощнику отправлено предложение подтвердить участие."),
         )
+        db.execute("COMMIT")
         return True
     except Exception:
         db.execute("ROLLBACK")
         raise
 
 
-def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool) -> bool:
+def withdraw_helper_offer(request_id: int, requester_id: int, helper_id: int, offer_token: str) -> bool:
+    """Revoke only this pending invitation, not the request or an active match."""
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
+        if lock:
+            db.execute("SELECT user_id FROM users WHERE user_id=? FOR UPDATE", (helper_id,)).fetchone()
+        request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
+        offer = db.execute(
+            "SELECT * FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='offered'" + lock,
+            (request_id, helper_id),
+        ).fetchone()
+        if not request or request["requester_id"] != requester_id or request["status"] != STATUS_OPEN or not offer or (offer["offer_token"] or "") != offer_token:
+            db.execute("ROLLBACK")
+            return False
+        db.execute("UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND candidate_id=? AND status='offered'", (request_id, helper_id))
+        db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)", (request_id, requester_id, "helper_invitation_withdrawn", "Автор отозвал приглашение помощнику. Заявка остаётся открытой."))
+        db.execute("COMMIT")
+        return True
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool, offer_token: str | None = None) -> bool:
     """Accept or decline an invitation atomically, keeping the queue shared."""
     try:
         db.execute("BEGIN IMMEDIATE")
@@ -172,7 +205,7 @@ def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool) -> bo
             (request_id, helper_id),
         ).fetchone()
         reward_ready = (int(request["reward_rub"] or 0) == 0 or request["reward_payment_status"] == "paid") if request else False
-        if not offer or not request or request["status"] != STATUS_OPEN or not reward_ready:
+        if not offer or not request or request["status"] != STATUS_OPEN or (accept and not reward_ready) or (offer_token is not None and (offer["offer_token"] or "") != offer_token):
             db.execute("ROLLBACK")
             return False
         if not accept:
@@ -181,11 +214,11 @@ def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool) -> bo
                 "WHERE request_id=? AND candidate_id=? AND status='offered'",
                 (request_id, helper_id),
             )
-            db.execute("COMMIT")
             db.execute(
                 "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
                 (request_id, helper_id, "helper_declined", "Помощник отказался от предложения."),
             )
+            db.execute("COMMIT")
             return True
 
         current = db.execute(
@@ -504,16 +537,16 @@ def smart_match(request_id, limit=20, query=""):
                        CROSS JOIN (SELECT id,category,what,lat,lon FROM requests WHERE id=?) r
                        WHERE u.user_id != ? AND u.user_id IS NOT NULL AND u.is_blocked=0
                        """,(request_id,req["requester_id"])).fetchall()
-    declined_for_request = {
+    unavailable_for_request = {
         row["candidate_id"] for row in db.execute(
-            "SELECT candidate_id FROM request_candidates WHERE request_id=? AND status='declined'",
+            "SELECT candidate_id FROM request_candidates WHERE request_id=? AND status IN ('declined','offered')",
             (request_id,),
         ).fetchall()
     }
     out=[]
     terms = _query_terms(query)
     for u in rows:
-        if u["user_id"] in declined_for_request or get_active_help(u["user_id"]) is not None: continue
+        if u["user_id"] in unavailable_for_request or get_active_help(u["user_id"]) is not None: continue
         cats=get_helper_categories(u["user_id"])
         if cats and req["category"] not in cats: continue
         category_bonus=100 if (not cats or req["category"] in cats) else 0

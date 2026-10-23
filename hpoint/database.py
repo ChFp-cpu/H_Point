@@ -207,6 +207,7 @@ def init_db():
       candidate_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
       score REAL NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'pending',
+      offer_token TEXT,
       seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY(request_id,candidate_id)
@@ -362,6 +363,7 @@ def init_db():
       ("users","lat","REAL"),("users","lon","REAL"),("users","city","TEXT DEFAULT ''"),("users","bio","TEXT DEFAULT ''"),
       ("users","role","TEXT NOT NULL DEFAULT 'user'"),("users","is_blocked","INTEGER NOT NULL DEFAULT 0"),("users","blocked_reason","TEXT"),
       ("users","last_seen_at","TEXT"),("users","helper_availability","TEXT NOT NULL DEFAULT ''"),
+      ("request_candidates","offer_token","TEXT"),
       ("requests","lat","REAL"),("requests","lon","REAL"),("requests","expires_at","TEXT"),("requests","views","INTEGER NOT NULL DEFAULT 0"),("requests","reward_rub","INTEGER NOT NULL DEFAULT 0"),("requests","reward_payment_status","TEXT NOT NULL DEFAULT 'none'"),("requests","cancel_reason","TEXT"),("requests","cancelled_at","TEXT"),("community_events","image_data","TEXT NOT NULL DEFAULT ''"),("billing_invoices","amount_rub","INTEGER NOT NULL DEFAULT 0"),
       ("billing_invoices","currency","TEXT NOT NULL DEFAULT 'RUB'"),("billing_invoices","provider_payment_id","TEXT"),
       ("game_daily_rewards","result_hp","INTEGER NOT NULL DEFAULT 0")
@@ -1373,7 +1375,7 @@ def link_by_code(code,tg_user_id,username=None):
         ]:
             db.execute(f"UPDATE {table} SET {col}=? WHERE {col}=?",(canonical,web_uid))
 
-        db.execute("INSERT OR IGNORE INTO request_candidates(request_id,candidate_id,score,status,seen_at,updated_at) SELECT request_id,?,score,status,seen_at,updated_at FROM request_candidates WHERE candidate_id=?",(canonical,web_uid))
+        db.execute("INSERT OR IGNORE INTO request_candidates(request_id,candidate_id,score,status,offer_token,seen_at,updated_at) SELECT request_id,?,score,status,offer_token,seen_at,updated_at FROM request_candidates WHERE candidate_id=?",(canonical,web_uid))
         db.execute("DELETE FROM request_candidates WHERE candidate_id=?",(web_uid,))
         db.execute("INSERT INTO ai_usage(user_id,request_count,token_count,period_start,updated_at) SELECT ?,request_count,token_count,period_start,updated_at FROM ai_usage WHERE user_id=? ON CONFLICT(user_id,period_start) DO UPDATE SET request_count=ai_usage.request_count+excluded.request_count,token_count=ai_usage.token_count+excluded.token_count",(canonical,web_uid))
         db.execute("DELETE FROM ai_usage WHERE user_id=?",(web_uid,))

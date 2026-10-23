@@ -83,14 +83,19 @@ def candidate_kb(request_id, candidate_id):
         [InlineKeyboardButton(text="🤝 Выбрать помощника", callback_data=f"candidate:assign:{request_id}:{candidate_id}")]
     ])
 
-def helper_offer_kb(request_id):
+def helper_offer_kb(request_id, offer_token=""):
+    suffix = f":{offer_token}" if offer_token else ""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Помогу", callback_data=f"offer:accept:{request_id}"),
-         InlineKeyboardButton(text="↩️ Не смогу", callback_data=f"offer:decline:{request_id}")]
+        [InlineKeyboardButton(text="✅ Помогу", callback_data=f"offer:accept:{request_id}{suffix}"),
+         InlineKeyboardButton(text="↩️ Отклонить", callback_data=f"offer:decline:{request_id}{suffix}")]
     ])
 
-def candidates_navigation_kb(request_id):
-    return InlineKeyboardMarkup(inline_keyboard=[
+def candidates_navigation_kb(request_id, offer=None):
+    rows = []
+    if offer:
+        rows.append([InlineKeyboardButton(text="↩️ Отменить приглашение", callback_data=f"offer:cancel:{request_id}:{offer['offer_token'] or ''}")])
+    rows.extend([
         [InlineKeyboardButton(text="🔄 Обновить кандидатов", callback_data=f"candidate:refresh:{request_id}")],
         [InlineKeyboardButton(text="⬅️ К заявке", callback_data=f"candidate:back:{request_id}")]
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

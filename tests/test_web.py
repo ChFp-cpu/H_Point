@@ -35,7 +35,7 @@ class Web(unittest.TestCase):
    self.assertEqual(request(22,"/api/helper/offers")["offers"][0]["request_id"],rid)
    self.assertEqual(request(11,"/api/sync")["outgoing_offers"][0]["helper_name"],"Helper")
    with patch.object(web,"notify_telegram_user") as notify:
-    self.assertTrue(request(22,"/api/helper/offers/respond",{"request_id":rid,"accept":True})["accepted"])
+    self.assertTrue(request(22,"/api/helper/offers/respond",{"request_id":rid,"accept":True,"offer_token":services.get_current_helper_offer(rid)["offer_token"]})["accepted"])
     self.assertEqual({call.args[0] for call in notify.call_args_list},{11,22})
    self.assertEqual(request(11,"/api/sync")["outgoing_offers"],[])
    self.assertEqual(len(request(22,"/api/chats")["chats"]),1)
@@ -536,7 +536,7 @@ class Web(unittest.TestCase):
    with urllib.request.urlopen(offer,timeout=3) as response:self.assertTrue(json.load(response)["offered"])
    self.assertEqual(database.get_request(rid)["status"],"open")
    with urllib.request.urlopen(urllib.request.Request(base+"/api/helper/offers",headers=headers),timeout=3) as response:self.assertEqual(json.load(response)["offers"][0]["request_id"],rid)
-   response_request=urllib.request.Request(base+"/api/helper/offers/respond",data=json.dumps({"request_id":rid,"accept":True}).encode(),headers=headers,method="POST")
+   response_request=urllib.request.Request(base+"/api/helper/offers/respond",data=json.dumps({"request_id":rid,"accept":True,"offer_token":services.get_current_helper_offer(rid)["offer_token"]}).encode(),headers=headers,method="POST")
    with urllib.request.urlopen(response_request,timeout=3) as response:self.assertTrue(json.load(response)["accepted"])
    request=database.get_request(rid);self.assertEqual(request["helper_id"],2);self.assertEqual(request["status"],"in_progress")
    self.assertIsNotNone(web.chat_for_request(rid))
