@@ -105,9 +105,17 @@ class Web(unittest.TestCase):
    return urllib.request.urlopen(req,timeout=3)
   try:
    password="ValidPassword123"
-   with post("/api/auth/register",{"name":"New User","email":"new@example.com","password":password,"password_confirm":password}) as response:
-    created=json.load(response);cookie=response.headers["Set-Cookie"].split(";",1)[0]
+   delivered=[]
+   with patch.object(web,"email_delivery_configured",return_value=True),patch.object(web,"send_email_verification_code",side_effect=lambda address,code:delivered.append(code) or True):
+    with post("/api/auth/register",{"name":"New User","email":"new@example.com","password":password,"password_confirm":password}) as response:
+     created=json.load(response);pending=response.headers["Set-Cookie"].split(";",1)[0]
    self.assertTrue(created["ok"])
+   self.assertTrue(created["verification_required"])
+   with self.assertRaises(urllib.error.HTTPError) as unconfirmed:
+    urllib.request.urlopen(urllib.request.Request(base+"/api/me",headers={"Cookie":pending}),timeout=3)
+   self.assertEqual(unconfirmed.exception.code,401);unconfirmed.exception.close()
+   with post("/api/auth/email/verify",{"code":delivered[0]},pending) as response:
+    self.assertTrue(json.load(response)["verified"]);cookie=response.headers["Set-Cookie"].split(";",1)[0]
    with urllib.request.urlopen(urllib.request.Request(base+"/api/me",headers={"Cookie":cookie}),timeout=3) as response:
     self.assertEqual(json.load(response)["user"]["email"],"new@example.com")
    with post("/api/auth/login",{"email":"new@example.com","password":password}) as response:
@@ -162,11 +170,12 @@ class Web(unittest.TestCase):
    request={"what":"Нужна помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"}
    with self.assertRaises(urllib.error.HTTPError) as blocked:
     post("/api/requests",request,cookie)
-   self.assertEqual(blocked.exception.code,403);blocked.exception.close()
+   self.assertEqual(blocked.exception.code,401);blocked.exception.close()
    with self.assertRaises(urllib.error.HTTPError) as wrong:
     post("/api/auth/email/verify",{"code":"000000"},cookie)
    self.assertEqual(wrong.exception.code,400);wrong.exception.close()
-   with post("/api/auth/email/verify",{"code":delivered[0][1]},cookie) as response:self.assertTrue(json.load(response)["verified"])
+   with post("/api/auth/email/verify",{"code":delivered[0][1]},cookie) as response:
+    self.assertTrue(json.load(response)["verified"]);cookie=response.headers["Set-Cookie"].split(";",1)[0]
    with post("/api/requests",request,cookie) as response:self.assertTrue(json.load(response)["ok"])
    with self.assertRaises(urllib.error.HTTPError) as reused:
     post("/api/auth/email/verify",{"code":delivered[0][1]},cookie)
@@ -183,7 +192,7 @@ class Web(unittest.TestCase):
     register({"name":"Weak User","email":"weak@example.com","password":"weakpassword12","password_confirm":"weakpassword12"})
    self.assertEqual(weak.exception.code,400);weak.exception.close()
    with self.assertRaises(urllib.error.HTTPError) as short:
-    register({"name":"Short User","email":"short@example.com","password":"Aa1234","password_confirm":"Aa1234"})
+    register({"name":"Short User","email":"short@example.com","password":"Aa123","password_confirm":"Aa123"})
    self.assertEqual(short.exception.code,400);short.exception.close()
    with self.assertRaises(urllib.error.HTTPError) as mismatch:
     register({"name":"Mismatch User","email":"mismatch@example.com","password":"SecurePass123A","password_confirm":"SecurePass123B"})
@@ -335,6 +344,7 @@ class Web(unittest.TestCase):
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_parallel_sessions_keep_other_device_signed_in(self):
   uid=database.create_web_user("Parallel","parallel@example.com","hash")
+  self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=?",(uid,))
   first,second=web.new_sess(uid),web.new_sess(uid)
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler)
   thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
@@ -351,6 +361,7 @@ class Web(unittest.TestCase):
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_session_tokens_are_hashed_and_legacy_tokens_upgrade(self):
   uid=database.create_web_user("Session User","session@example.com","hash")
+  self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=?",(uid,))
   token=web.new_sess(uid)
   stored=self.db.execute("SELECT token FROM sessions WHERE user_id=?",(uid,)).fetchone()["token"]
   self.assertNotEqual(stored,token)
@@ -369,6 +380,7 @@ class Web(unittest.TestCase):
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_account_deletion_requires_confirmation_and_revokes_session(self):
   uid=database.create_web_user("Erase Me","erase@example.com","hash");token=web.new_sess(uid)
+  self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=?",(uid,))
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
   try:
    base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Content-Type":"application/json","Cookie":f"hpoint_session={token}"}
@@ -530,7 +542,7 @@ class Web(unittest.TestCase):
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_unlink_telegram_preserves_website_data(self):
-  database.create_user(77,"Linked",tg_user_id=77,web_verified=True);self.db.execute("UPDATE users SET email='linked@example.com',password_hash='hash',balance=333 WHERE user_id=77")
+  database.create_user(77,"Linked",tg_user_id=77,web_verified=True);self.db.execute("UPDATE users SET email='linked@example.com',password_hash='hash',email_verified=1,balance=333 WHERE user_id=77")
   token=web.new_sess(77,"unlink-device")
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
   try:

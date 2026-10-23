@@ -24,6 +24,8 @@ _telegram_username = BOT_USERNAME or None
 ASSETS = {
     "community-team.jpg": (Path(__file__).resolve().parent.parent / "assets" / "community-team.jpg", "image/jpeg"),
     "community-park.jpg": (Path(__file__).resolve().parent.parent / "assets" / "community-park.jpg", "image/jpeg"),
+    "welcome-help.jpg": (Path(__file__).resolve().parent.parent / "assets" / "welcome-help.jpg", "image/jpeg"),
+    "welcome-grow.jpg": (Path(__file__).resolve().parent.parent / "assets" / "welcome-grow.jpg", "image/jpeg"),
     "community-volunteers.jpg": (Path(__file__).resolve().parent.parent / "assets" / "community-volunteers.jpg", "image/jpeg"),
     "community-garden.jpg": (Path(__file__).resolve().parent.parent / "assets" / "community-garden.jpg", "image/jpeg"),
     "favicon.svg": (Path(__file__).resolve().parent.parent / "assets" / "favicon.svg", "image/svg+xml"),
@@ -94,8 +96,8 @@ def password_needs_upgrade(stored):
         return True
 
 def password_error(password):
-    if not 12 <= len(password) <= 256:
-        return "Пароль должен быть от 12 до 256 символов."
+    if not 6 <= len(password) <= 256:
+        return "Пароль должен быть от 6 до 256 символов."
     if not re.search(r"[a-z]", password) or not re.search(r"[A-Z]", password) or not re.search(r"\d", password):
         return "В пароле нужны строчная и заглавная латинские буквы, а также цифра."
     return None
@@ -112,24 +114,36 @@ def _send_email(address, subject, body):
     message["From"] = SMTP_FROM
     message["To"] = address
     message.set_content(body)
-    try:
-        context = ssl.create_default_context()
-        if SMTP_USE_SSL:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS, context=context) as client:
-                client.login(SMTP_USERNAME, SMTP_PASSWORD)
-                client.send_message(message)
-        else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as client:
+    for attempt in range(2):
+        phase = "connect"
+        try:
+            context = ssl.create_default_context()
+            client = (smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS, context=context)
+                      if SMTP_USE_SSL else smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS))
+            with client:
+                phase = "tls"
                 client.ehlo()
-                if SMTP_USE_TLS:
+                if SMTP_USE_TLS and not SMTP_USE_SSL:
                     client.starttls(context=context)
                     client.ehlo()
+                phase = "login"
                 client.login(SMTP_USERNAME, SMTP_PASSWORD)
+                phase = "send"
                 client.send_message(message)
-        return True
-    except Exception:
-        logging.exception("Transactional email delivery failed")
-        return False
+                # SMTP acceptance is definitive even if QUIT subsequently fails.
+                phase = "accepted"
+            return True
+        except Exception as error:
+            if phase == "accepted":
+                return True
+            transient = isinstance(error, (TimeoutError, ConnectionError, smtplib.SMTPServerDisconnected))
+            if attempt == 0 and phase in {"connect", "tls", "login"} and transient:
+                continue
+            # Never retry DATA: the server may already have accepted the message.
+            # Do not log recipients, codes or provider credentials.
+            logging.error("Transactional email delivery failed: phase=%s type=%s smtp_code=%s",
+                          phase, type(error).__name__, getattr(error, "smtp_code", None))
+            return False
 
 def send_email_verification_code(address, code):
     return _send_email(
@@ -182,7 +196,7 @@ def revoke_session(token):
     if token:
         db.execute("DELETE FROM sessions WHERE token IN (?,?)", (session_token_hash(token), token))
 
-def get_sess(h):
+def get_sess(h, allow_unverified=False):
     t=cookie_value(h,"hpoint_session")
     if not t: return None
     token_hash=session_token_hash(t)
@@ -193,7 +207,8 @@ def get_sess(h):
         r=db.execute("SELECT * FROM sessions WHERE token=? AND expires_at>?",(t,now().isoformat())).fetchone()
         if r:
             db.execute("UPDATE sessions SET token=? WHERE token=?",(token_hash,t))
-    return get_user(r["user_id"]) if r else None
+    user = get_user(r["user_id"]) if r else None
+    return user if user and (allow_unverified or account_is_verified(user)) else None
 
 def new_sess(uid, device_id=None):
     t=secrets.token_urlsafe(32)
@@ -213,7 +228,52 @@ def device_cookie(value):
 
 def session_headers(h, uid):
     device = cookie_value(h, "hpoint_device") or secrets.token_urlsafe(24)
-    return {"Set-Cookie": [session_cookie(new_sess(uid, device), SESSION_TTL), device_cookie(device)]}
+    return {"Set-Cookie": [session_cookie(new_sess(uid, device), SESSION_TTL), device_cookie(device), verification_cookie("", 0)]}
+
+def verification_cookie(value, max_age):
+    secure = "; Secure" if SESSION_COOKIE_SECURE else ""
+    return f"hpoint_verification={value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}{secure}"
+
+def verification_token_hash(token):
+    # Domain separation prevents using a pending token as a normal login session.
+    return session_token_hash("email-verification:" + token)
+
+def email_verification_user(h):
+    token = cookie_value(h, "hpoint_verification")
+    row = db.execute("SELECT user_id FROM sessions WHERE token=? AND expires_at>?",
+                     (verification_token_hash(token), now().isoformat())).fetchone() if token else None
+    user = get_user(row["user_id"]) if row else get_sess(h, allow_unverified=True)
+    if not user:
+        reply(h, {"ok": False, "error": "Войдите по email и паролю, чтобы запросить новый код."}, 401)
+        return None
+    if user["is_blocked"]:
+        reply(h, {"ok": False, "error": "account_blocked"}, 403)
+        return None
+    return user
+
+def email_challenge(h, user, pending=True):
+    if not email_delivery_configured():
+        return reply(h, {"ok": False, "error": "Отправка писем временно недоступна. Попробуйте позже или войдите через Telegram."}, 503)
+    uid = user["user_id"]
+    if not database.reserve_auth_attempts(("email_resend", str(uid), 3)):
+        return reply(h, {"ok": False, "error": "Слишком много кодов. Повторите через 15 минут."}, 429)
+    code = database.create_email_verification_code(uid)
+    if not send_email_verification_code(user["email"], code):
+        db.execute("DELETE FROM email_verification_codes WHERE user_id=? AND code_hash=?",
+                   (uid, hashlib.sha256(code.encode()).hexdigest()))
+        return reply(h, {"ok": False, "error": "Не удалось отправить код. Вход не выполнен. Повторите попытку или войдите через Telegram."}, 503)
+    headers = None
+    if pending:
+        previous = cookie_value(h, "hpoint_verification")
+        if previous:
+            db.execute("DELETE FROM sessions WHERE token=?", (verification_token_hash(previous),))
+        token = secrets.token_urlsafe(32)
+        expires = (now() + dt.timedelta(seconds=EMAIL_VERIFICATION_TTL_SECONDS)).isoformat()
+        db.execute("DELETE FROM sessions WHERE expires_at<=?", (now().isoformat(),))
+        db.execute("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)",
+                   (verification_token_hash(token), uid, expires))
+        headers = {"Set-Cookie": [verification_cookie(token, EMAIL_VERIFICATION_TTL_SECONDS), session_cookie("", 0)]}
+    return reply(h, {"ok": True, "verification_required": pending, "email_verification_sent": True, "sent": True}, headers=headers)
 
 MAX_JSON_BODY = 20_000
 EVENT_JSON_BODY = EVENT_IMAGE_MAX_BYTES * 2 + 10_000
@@ -427,10 +487,10 @@ function toast(s){$('toast').textContent=s;$('toast').style.display='block';setT
 function go(t){document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.t===t));document.querySelectorAll('.panel').forEach(x=>x.classList.toggle('active',x.id==='p-'+t));if(t==='requests')requests();if(t==='match'){requests();setTimeout(initMatchMap,50)}if(t==='chat')loadChats();if(t==='map')setTimeout(loadBigMap,50);if(t==='history')history();if(t==='profile')profile();if(t==='billing'){prices('appprices',true);billing()}}
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>go(b.dataset.t));
 function prices(id,paid){$(id).innerHTML=products.map(p=>`<div class="card"><span class="ey">H·POINT+</span><h3>${p[1]}</h3><p class="muted">${p[2]}</p><div class="price">${p[3]} ₽</div>${paid?`<button class="btn grad" onclick="buy('${p[0]}')">Оплатить</button>`:''}</div>`).join('')}
-function authForm(reg){$('modal').style.display='flex';$('modalbody').innerHTML=reg?`<h2>Создать аккаунт</h2><p class="muted">Войдите через Telegram или используйте email. Telegram подтверждает аккаунт и синхронизирует сайт с ботом.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Продолжить с Telegram</button><div class="muted" style="text-align:center">или</div><input id="an" class="input" placeholder="Имя"><input id="ae" class="input" placeholder="Email"><input id="ap" class="input" type="password" autocomplete="new-password" placeholder="Пароль от 12 символов"><button class="btn light" onclick="register()">Зарегистрироваться по email</button><div id="err" class="muted"></div></div>`:`<h2>Войти</h2><p class="muted">Telegram откроет тот же профиль и историю заявок.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Войти через Telegram</button><div class="muted" style="text-align:center">или</div><input id="ae" class="input" placeholder="Email" autocomplete="email"><input id="ap" class="input" type="password" autocomplete="current-password" placeholder="Пароль"><button class="btn light" onclick="login()">Войти по email</button><div id="err" class="muted"></div></div>`}
+function authForm(reg){$('modal').style.display='flex';$('modalbody').innerHTML=reg?`<h2>Создать аккаунт</h2><p class="muted">Войдите через Telegram или используйте email. Telegram подтверждает аккаунт и синхронизирует сайт с ботом.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Продолжить с Telegram</button><div class="muted" style="text-align:center">или</div><input id="an" class="input" placeholder="Имя"><input id="ae" class="input" placeholder="Email"><input id="ap" class="input" type="password" autocomplete="new-password" placeholder="Пароль от 6 символов"><button class="btn light" onclick="register()">Зарегистрироваться по email</button><div id="err" class="muted"></div></div>`:`<h2>Войти</h2><p class="muted">Telegram откроет тот же профиль и историю заявок.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Войти через Telegram</button><div class="muted" style="text-align:center">или</div><input id="ae" class="input" placeholder="Email" autocomplete="email"><input id="ap" class="input" type="password" autocomplete="current-password" placeholder="Пароль"><button class="btn light" onclick="login()">Войти по email</button><div id="err" class="muted"></div></div>`}
 function closeModal(){$('modal').style.display='none'}
 async function register(){try{let d=await api('/api/auth/register',{method:'POST',body:JSON.stringify({name:an.value,email:ae.value,password:ap.value,password_confirm:ap.value})});closeModal();toast('Аккаунт создан');await load();if(d.link_code)go('profile')}catch(e){$('err').textContent=e.message}}
-async function login(){try{await api('/api/auth/login',{method:'POST',body:JSON.stringify({email:ae.value,password:ap.value})});closeModal();await load();toast('С возвращением')}catch(e){$('err').textContent=e.message}}
+async function login(){if(window.hpointAuthBusy)return;window.hpointAuthBusy=true;try{let d=await api('/api/auth/login',{method:'POST',body:JSON.stringify({email:$('ae').value,password:$('ap').value})});if(d.verification_required){showEmailVerification(true);toast('Подтвердите email, чтобы войти');return}closeModal();await load();toast('С возвращением')}catch(e){if($('err'))$('err').textContent=e.message}finally{window.hpointAuthBusy=false}}
 async function telegramLogin(){try{let d=await api('/api/auth/telegram/start',{method:'POST',body:'{}'});window.open(d.bot_url,'hpointTelegramLogin','noopener');$('modalbody').innerHTML=`<h2>Подтвердите вход в Telegram</h2><p class="muted">Открылся бот H·Point. Нажмите «Start» в Telegram — сайт войдёт автоматически.</p><div id="tgLoginStatus" class="ey">Ожидаем подтверждение…</div>`;let tries=0;let poll=setInterval(async()=>{tries++;try{let r=await fetch('/api/auth/telegram/complete?ticket='+encodeURIComponent(d.ticket),{credentials:'same-origin'});if(r.status===202){if(tries>150){clearInterval(poll);$('tgLoginStatus').textContent='Ссылка истекла. Начните вход заново.'}return}let done=await r.json();if(done.ok){clearInterval(poll);closeModal();await load();toast('Вход через Telegram выполнен')}}catch(e){clearInterval(poll);$('tgLoginStatus').textContent='Не удалось подтвердить вход.'}},2000)}catch(e){$('err').textContent=e.message==='telegram_login_unavailable'?'Вход через Telegram пока настраивается.':'Не удалось начать вход через Telegram.'}}
 async function logout(){await fetch('/api/auth/logout',{method:'POST'});location.reload()}
 function landing(){ $('landing').style.display='block';$('app').style.display='none';$('nav').innerHTML='<button class="btn light" onclick="authForm(false)">Войти</button><button class="btn dark" onclick="authForm(true)">Регистрация</button>';prices('prices',false)}
@@ -526,7 +586,7 @@ async function openProfiles(){try{let d=await api('/api/profiles');$('modal').st
 
 UI_OVERRIDES=r'''
 products[3]=['verification','Проверка личности','Рассмотрение заявки после привязки Telegram',99];
-function authForm(reg){$('modal').style.display='flex';$('modalbody').innerHTML=reg?`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Создайте общий профиль</h2><p class="muted">Telegram создаёт профиль бесплатно и сразу объединяет сайт с ботом. Email можно добавить для отдельного входа.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Продолжить бесплатно с Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="an" class="input" placeholder="Имя"><input id="ae" class="input" placeholder="Email"><input id="ap" class="input" type="password" autocomplete="new-password" placeholder="Пароль от 12 символов"><button class="btn light" onclick="register()">Создать аккаунт</button><div id="err" class="muted"></div></div>`:`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Войти в H·Point</h2><p class="muted">Через Telegram вы попадёте в тот же профиль и историю заявок.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Войти через Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="ae" class="input" placeholder="Email" autocomplete="email"><input id="ap" class="input" type="password" autocomplete="current-password" placeholder="Пароль"><button class="btn light" onclick="login()">Войти по email</button><div id="err" class="muted"></div></div>`}
+function authForm(reg){$('modal').style.display='flex';$('modalbody').innerHTML=reg?`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Создайте общий профиль</h2><p class="muted">Telegram создаёт профиль бесплатно и сразу объединяет сайт с ботом. Email можно добавить для отдельного входа.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Продолжить бесплатно с Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="an" class="input" placeholder="Имя"><input id="ae" class="input" placeholder="Email"><input id="ap" class="input" type="password" autocomplete="new-password" placeholder="Пароль от 6 символов"><button class="btn light" onclick="register()">Создать аккаунт</button><div id="err" class="muted"></div></div>`:`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Войти в H·Point</h2><p class="muted">Через Telegram вы попадёте в тот же профиль и историю заявок.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Войти через Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="ae" class="input" placeholder="Email" autocomplete="email"><input id="ap" class="input" type="password" autocomplete="current-password" placeholder="Пароль"><button class="btn light" onclick="login()">Войти по email</button><div id="err" class="muted"></div></div>`}
 async function telegramLogin(){const popup=window.open('', 'hpointTelegramLogin', 'popup,width=480,height=720');if(popup)popup.opener=null;try{let d=await api('/api/auth/telegram/start',{method:'POST',body:'{}'});if(popup)popup.location.replace(d.bot_url);else window.location.assign(d.bot_url);$('modalbody').innerHTML=`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Подтвердите вход в Telegram</h2><p class="muted">В открывшемся боте нажмите Start. После этого сайт автоматически откроет ваш общий профиль.</p><div id="tgLoginStatus" class="ey">Ожидаем подтверждение…</div>`;let tries=0,poll=setInterval(async()=>{tries++;try{let r=await fetch('/api/auth/telegram/complete?ticket='+encodeURIComponent(d.ticket),{credentials:'same-origin'});if(r.status===202){if(tries>150){clearInterval(poll);$('tgLoginStatus').textContent='Ссылка истекла. Начните вход заново.'}return}let done=await r.json();if(done.ok){clearInterval(poll);closeModal();await load();toast('Вход через Telegram выполнен')}}catch(e){clearInterval(poll);$('tgLoginStatus').textContent='Не удалось подтвердить вход.'}},2000)}catch(e){if(popup)popup.close();let target=$('err');if(target)target.textContent=e.message==='telegram_login_unavailable'?'Вход через Telegram пока настраивается.':'Не удалось начать вход через Telegram.'}}
 let chatTimer=null,chatRefreshing=false,chatSending=false;
 function renderRequests(d){$('mine').innerHTML=d.requests.length?d.requests.map(r=>`<div class="request"><div class="avatar">${esc((r.what||'?')[0].toUpperCase())}</div><div class="requestmain"><b>#${r.id} · ${esc(r.what)}</b><div class="muted">${esc(r.category_name)} · ${esc(r.place)} · ${esc(r.status_title)} · 👁 ${Number(r.views||0)}</div></div><span class="badge ${r.status==='done'?'ok':r.status==='in_progress'?'warn':''}">${esc(r.urgency)}</span>${r.status==='in_progress'&&r.helper_id===d.current_user_id?`<button class="btn grad" onclick="finish(${r.id})">Завершить</button>`:''}${r.status==='in_progress'?`<button class="btn light" onclick="openChat(${r.id})">Чат</button>`:''}${r.status==='done'&&r.requester_id===d.current_user_id&&!r.requester_rating?`<button class="btn light" onclick="review(${r.id},'requester')">Оценить</button>`:''}${r.status==='done'&&r.helper_id===d.current_user_id&&!r.helper_rating?`<button class="btn light" onclick="review(${r.id},'helper')">Оценить</button>`:''}</div>`).join(''):'<div class="empty">Здесь появятся ваши заявки.</div>';$('rid').innerHTML=d.requests.filter(r=>r.status==='open').map(r=>`<option value="${r.id}">#${r.id} — ${esc(r.what)}</option>`).join('')||'<option value="">Нет открытых заявок</option>'}
@@ -577,13 +637,13 @@ LANDING_ENHANCEMENTS=r'''
 '''
 
 ACCOUNT_SECURITY_UI=r'''
-function passwordClientProblem(password){if(password.length<12||password.length>256)return 'Пароль должен быть от 12 до 256 символов.';if(!/[a-z]/.test(password)||!/[A-Z]/.test(password)||!/\d/.test(password))return 'Нужны строчная и заглавная латинские буквы, а также цифра.';return ''}
+function passwordClientProblem(password){if(password.length<6||password.length>256)return 'Пароль должен быть от 6 до 256 символов.';if(!/[a-z]/.test(password)||!/[A-Z]/.test(password)||!/\d/.test(password))return 'Нужны строчная и заглавная латинские буквы, а также цифра.';return ''}
 function updatePasswordHint(){let hint=$('passwordHint'),problem=passwordClientProblem($('ap')?.value||'');if(hint)hint.textContent=problem||'Пароль соответствует требованиям.'}
-function authForm(reg){$('modal').style.display='flex';$('modalbody').innerHTML=reg?`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Создайте защищённый профиль</h2><p class="muted">Telegram сразу объединяет сайт с ботом. Для входа по email подтвердите почту кодом из письма.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Продолжить с Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="an" class="input" maxlength="50" autocomplete="name" placeholder="Имя"><input id="ae" class="input" type="email" autocomplete="email" placeholder="Email"><input id="ap" class="input" type="password" autocomplete="new-password" placeholder="Придумайте пароль"><ul class="passwordRules"><li>от 12 до 256 символов</li><li>строчная и заглавная латинские буквы</li><li>хотя бы одна цифра</li></ul><input id="ap2" class="input" type="password" autocomplete="new-password" placeholder="Повторите пароль"><p id="passwordHint" class="muted passwordHint" aria-live="polite"></p><button class="btn light" onclick="register()">Создать аккаунт</button><div id="err" class="muted" aria-live="polite"></div></div>`:`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Войти в H·Point</h2><p class="muted">Войдите через Telegram или подтверждённый email.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Войти через Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="ae" class="input" type="email" autocomplete="email" placeholder="Email"><input id="ap" class="input" type="password" autocomplete="current-password" placeholder="Пароль"><button class="btn light" onclick="login()">Войти</button><div id="err" class="muted" aria-live="polite"></div></div>`;if(reg){$('ap').addEventListener('input',updatePasswordHint);$('ap2').addEventListener('input',()=>{let err=$('err');if($('ap2').value&&$('ap').value!==$('ap2').value)err.textContent='Пароли пока не совпадают.';else err.textContent=''})}}
-function showEmailVerification(){let modal=$('modal'),body=$('modalbody');modal.style.display='flex';body.innerHTML=`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Подтвердите email</h2><p class="muted">Мы отправили шестизначный код. Он действует 10 минут и используется один раз.</p><div class="form"><input id="emailCode" class="input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="Код из письма"><button class="btn grad" onclick="verifyEmailCode()">Подтвердить почту</button><button class="btn light" onclick="resendEmailCode()">Отправить новый код</button><div id="err" class="muted" aria-live="polite"></div></div>`}
-async function register(){let password=$('ap').value,confirm=$('ap2').value,problem=passwordClientProblem(password);if(problem){$('err').textContent=problem;return}if(password!==confirm){$('err').textContent='Пароли не совпадают.';return}try{let d=await api('/api/auth/register',{method:'POST',body:JSON.stringify({name:$('an').value,email:$('ae').value,password:password,password_confirm:confirm})});await load();if(d.email_verification_sent){showEmailVerification();toast('Аккаунт создан: подтвердите почту кодом')}else{closeModal();toast('Аккаунт создан. Подтвердите email в профиле, когда отправка кодов будет доступна.')}}catch(e){$('err').textContent=e.message}}
-async function verifyEmailCode(){try{await api('/api/auth/email/verify',{method:'POST',body:JSON.stringify({code:$('emailCode').value.trim()})});closeModal();toast('Email подтверждён');await syncTick();if(document.querySelector('.tab.active')?.dataset.t==='profile')await profile()}catch(e){$('err').textContent=e.message}}
-async function resendEmailCode(){try{await api('/api/auth/email/resend',{method:'POST',body:'{}'});toast('Новый код отправлен')}catch(e){$('err').textContent=e.message}}
+function authForm(reg){$('modal').style.display='flex';$('modalbody').innerHTML=reg?`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Создайте защищённый профиль</h2><p class="muted">Telegram сразу объединяет сайт с ботом. Для входа по email подтвердите почту кодом из письма.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Продолжить с Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="an" class="input" maxlength="50" autocomplete="name" placeholder="Имя"><input id="ae" class="input" type="email" autocomplete="email" placeholder="Email"><input id="ap" class="input" type="password" autocomplete="new-password" placeholder="Придумайте пароль"><ul class="passwordRules"><li>от 6 до 256 символов</li><li>строчная и заглавная латинские буквы</li><li>хотя бы одна цифра</li></ul><input id="ap2" class="input" type="password" autocomplete="new-password" placeholder="Повторите пароль"><p id="passwordHint" class="muted passwordHint" aria-live="polite"></p><button class="btn light" onclick="register()">Создать аккаунт</button><div id="err" class="muted" aria-live="polite"></div></div>`:`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Войти в H·Point</h2><p class="muted">Войдите через Telegram или подтверждённый email.</p><div class="form"><button class="btn grad" onclick="telegramLogin()">Войти через Telegram</button><div class="muted" style="text-align:center">или по email</div><input id="ae" class="input" type="email" autocomplete="email" placeholder="Email"><input id="ap" class="input" type="password" autocomplete="current-password" placeholder="Пароль"><button class="btn light" onclick="login()">Войти</button><div id="err" class="muted" aria-live="polite"></div></div>`;if(reg){$('ap').addEventListener('input',updatePasswordHint);$('ap2').addEventListener('input',()=>{let err=$('err');if($('ap2').value&&$('ap').value!==$('ap2').value)err.textContent='Пароли пока не совпадают.';else err.textContent=''})}}
+function showEmailVerification(sent=false){let modal=$('modal'),body=$('modalbody');modal.style.display='flex';body.innerHTML=`<div class="authBrand"><img src="/assets/hpoint-logo.png" alt="H-Point"></div><h2>Подтвердите email</h2><p id="emailVerificationNotice" class="muted">${sent?'Код отправлен на вашу почту. Проверьте также папку «Спам».':'Введите код из письма или запросите новый.'} Код действует 10 минут. Вход станет доступен только после подтверждения.</p><div class="form"><input id="emailCode" class="input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="Код из письма"><button class="btn grad" onclick="verifyEmailCode()">Подтвердить почту</button><button class="btn light" onclick="resendEmailCode()">Отправить новый код</button><button class="btn light" onclick="authForm(false)">Вернуться ко входу</button><div id="err" class="muted" aria-live="polite"></div></div>`}
+async function register(){if(window.hpointAuthBusy)return;let password=$('ap').value,confirm=$('ap2').value,problem=passwordClientProblem(password);if(problem){$('err').textContent=problem;return}if(password!==confirm){$('err').textContent='Пароли не совпадают.';return}window.hpointAuthBusy=true;try{let d=await api('/api/auth/register',{method:'POST',body:JSON.stringify({name:$('an').value,email:$('ae').value,password:password,password_confirm:confirm})});if(!d.verification_required||!d.email_verification_sent)throw Error('Не удалось начать подтверждение email. Повторите попытку.');showEmailVerification(true);toast('Подтвердите email, чтобы завершить регистрацию')}catch(e){if($('err'))$('err').textContent=e.message}finally{window.hpointAuthBusy=false}}
+async function verifyEmailCode(){if(window.hpointEmailBusy)return;let code=$('emailCode').value.trim();if(!/^\d{6}$/.test(code)){$('err').textContent='Введите 6 цифр из письма.';return}window.hpointEmailBusy=true;try{await api('/api/auth/email/verify',{method:'POST',body:JSON.stringify({code})});closeModal();await load();toast('Email подтверждён. Вы вошли в аккаунт.')}catch(e){if($('err'))$('err').textContent=e.message}finally{window.hpointEmailBusy=false}}
+async function resendEmailCode(){if(window.hpointEmailBusy)return;window.hpointEmailBusy=true;try{await api('/api/auth/email/resend',{method:'POST',body:'{}'});if($('err'))$('err').textContent='';if($('emailVerificationNotice'))$('emailVerificationNotice').textContent='Новый код отправлен. Проверьте почту и папку «Спам». Код действует 10 минут.';toast('Новый код отправлен')}catch(e){if($('err'))$('err').textContent=e.message}finally{window.hpointEmailBusy=false}}
 function emailVerificationCard(u){let card=$('emailState');if(!card){card=document.createElement('div');card.id='emailState';let anchor=$('profInfo');anchor.parentElement.insertBefore(card,anchor.nextSibling)}if(u.email_verified){card.className='emailVerificationCard';card.innerHTML='<span class="badge ok">✓ Email подтверждён</span><p class="muted">Почта подтверждена одноразовым кодом и может использоваться для входа.</p>';return}card.className='emailVerificationCard warn';let configured=u.email_delivery_configured;card.innerHTML='<span class="badge warn">Требуется подтверждение email</span><p class="muted">'+(configured?'Подтвердите код из письма, чтобы публиковать заявки и отвечать на них.':'Отправка кодов ещё не настроена. Можно сразу подтвердить профиль через Telegram.')+'</p><div class="profileActions">'+(configured?'<button class="btn grad" onclick="showEmailVerification()">Ввести код</button><button class="btn light" onclick="resendEmailCode()">Новый код</button>':'')+'</div>'}
 async function profile(providedUser){let u=providedUser||(await api('/api/me')).user,linked=Boolean(u.tg_linked);$('pn').value=u.name||'';$('pc').value=u.city||'';$('pb').value=u.bio||'';$('profInfo').innerHTML=`<p><b>${esc(u.name)}</b></p><p class="muted">${esc(u.email||'')}<br>Рейтинг: ${u.stats.helped_avg?u.stats.helped_avg.toFixed(1):'—'} · ${u.stats.helped} помощей</p>`;emailVerificationCard(u);$('tgState').innerHTML=(linked?'<span class="badge ok">✓ Telegram привязан</span>':'<span class="badge warn">Telegram не привязан</span>')+(u.telegram_url?` <a class="btn light" href="${esc(u.telegram_url)}" target="_blank" rel="noopener">Перейти в Telegram</a>`:'');$('tgLinkButton').style.display=linked?'none':'';$('code').textContent=linked?'Подключено':u.link_code_available?'Код уже создан — получите новый при необходимости':'Нажмите «Получить код»';$('tgGuide').innerHTML=linked?'Сайт и бот используют один профиль. Входить можно одновременно с нескольких устройств; выход завершает только текущий сеанс.':'Получите код и отправьте в боте: <b>/link КОД</b>.';renderIdentityCard(u)}
 '''
@@ -593,12 +653,12 @@ PASSWORD_CSS=r'''
 '''
 
 PASSWORD_UI_ENHANCEMENTS=r'''
-function passwordChecks(password){return {length:password.length>=12&&password.length<=256,lower:/[a-z]/.test(password),upper:/[A-Z]/.test(password),digit:/\d/.test(password)}}
-function passwordClientProblem(password){let c=passwordChecks(password);if(!c.length)return 'Пароль должен быть от 12 до 256 символов.';if(!c.lower||!c.upper||!c.digit)return 'Нужны строчная и заглавная латинские буквы, а также цифра.';return ''}
+function passwordChecks(password){return {length:password.length>=6&&password.length<=256,lower:/[a-z]/.test(password),upper:/[A-Z]/.test(password),digit:/\d/.test(password)}}
+function passwordClientProblem(password){let c=passwordChecks(password);if(!c.length)return 'Пароль должен быть от 6 до 256 символов.';if(!c.lower||!c.upper||!c.digit)return 'Нужны строчная и заглавная латинские буквы, а также цифра.';return ''}
 function updatePasswordHint(){let password=$('ap')?.value||'',checks=passwordChecks(password),items=document.querySelectorAll('#passwordRules li');items.forEach(item=>{let key=item.dataset.rule;item.classList.toggle('ok',Boolean(checks[key]));item.classList.toggle('bad',Boolean(password)&&!checks[key])});let hint=$('passwordHint');if(hint){let problem=passwordClientProblem(password);hint.textContent=password?(problem||'Пароль соответствует требованиям.'):'Введите пароль по требованиям ниже.';hint.className='passwordHint '+(password&&!problem?'good':password?'bad':'')}}
 function togglePassword(id,button){let input=$(id),visible=input.type==='text';input.type=visible?'password':'text';button.textContent=visible?'👁️':'🙈';button.setAttribute('aria-label',visible?'Показать пароль':'Скрыть пароль')}
 function decoratePasswordInput(id,autocomplete){let input=$(id);if(!input)return;let wrap=document.createElement('div');wrap.className='passwordField';input.parentNode.insertBefore(wrap,input);wrap.appendChild(input);let button=document.createElement('button');button.type='button';button.className='passwordToggle';button.textContent='👁️';button.setAttribute('aria-label','Показать пароль');button.onclick=()=>togglePassword(id,button);wrap.appendChild(button);input.autocomplete=autocomplete}
-function passwordRulesMarkup(){return '<ul id="passwordRules" class="passwordRules"><li data-rule="length">от 12 до 256 символов</li><li data-rule="lower">строчная латинская буква</li><li data-rule="upper">заглавная латинская буква</li><li data-rule="digit">хотя бы одна цифра</li></ul>'}
+function passwordRulesMarkup(){return '<ul id="passwordRules" class="passwordRules"><li data-rule="length">от 6 до 256 символов</li><li data-rule="lower">строчная латинская буква</li><li data-rule="upper">заглавная латинская буква</li><li data-rule="digit">хотя бы одна цифра</li></ul>'}
 const originalAuthForm=window.authForm;
 window.authForm=function(reg){originalAuthForm(reg);let body=$('modalbody'),rules=body.querySelector('.passwordRules');if(reg){if(rules)rules.outerHTML=passwordRulesMarkup();decoratePasswordInput('ap','new-password');decoratePasswordInput('ap2','new-password');$('ap').addEventListener('input',updatePasswordHint);updatePasswordHint()}else{decoratePasswordInput('ap','current-password')}}
 '''
@@ -967,7 +1027,7 @@ GAMES_NAV_CSS=r'''
 
 GAMES_NAV_UI=r'''
 (function(){
-  function addGamesLink(){var nav=document.getElementById('nav');if(!nav||document.getElementById('gamesNavLink'))return;var link=document.createElement('a');link.id='gamesNavLink';link.href='/games';link.setAttribute('aria-label','Открыть H-Point Games');link.innerHTML='<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 8h10c2.5 0 4.3 2.4 3.5 4.8l-1 3.1a2.6 2.6 0 0 1-4.6.8l-.6-.9h-4.6l-.6.9a2.6 2.6 0 0 1-4.6-.8l-1-3.1C2.7 10.4 4.5 8 7 8Z" stroke="currentColor" stroke-width="1.8"/><path d="M8 11v3m-1.5-1.5h3M16 12h.01M18 14h.01" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><span>Игры</span>';nav.prepend(link)}
+  function addGamesLink(){var app=document.getElementById('app');if(!app||getComputedStyle(app).display==='none')return;var nav=document.getElementById('nav');if(!nav||document.getElementById('gamesNavLink'))return;var link=document.createElement('a');link.id='gamesNavLink';link.href='/games';link.setAttribute('aria-label','Открыть H-Point Games');link.innerHTML='<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 8h10c2.5 0 4.3 2.4 3.5 4.8l-1 3.1a2.6 2.6 0 0 1-4.6.8l-.6-.9h-4.6l-.6.9a2.6 2.6 0 0 1-4.6-.8l-1-3.1C2.7 10.4 4.5 8 7 8Z" stroke="currentColor" stroke-width="1.8"/><path d="M8 11v3m-1.5-1.5h3M16 12h.01M18 14h.01" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><span>Игры</span>';nav.prepend(link)}
   var previousLoad=window.load;window.load=async function(){var result=await previousLoad.apply(this,arguments);addGamesLink();return result};
   var previousLanding=window.landing;window.landing=function(){var result=previousLanding.apply(this,arguments);addGamesLink();return result};
   var previousSync=window.applySync;window.applySync=function(){var result=previousSync.apply(this,arguments);addGamesLink();return result};
@@ -1020,8 +1080,8 @@ SITE_NAV_UI=r'''
   function refreshVisibleDetails(){if(!siteInstalled)return;if(siteRoute==='profile'&&siteData&&window.profile)window.profile(siteData.user);if(siteRoute==='wallet'&&window.loadWallet)window.loadWallet();if(siteRoute==='billing'&&window.billing)window.billing();if(siteRoute==='requests'&&window.loadOpenRequests)window.loadOpenRequests();if(siteRoute==='chat'&&window.loadChats)window.loadChats()}
   window.applySync=function(data){siteData=data;if(!siteInstalled)return legacyApplySync(data);window.hpointWallet=data.wallet||{};if(typeof renderAuditHeader==='function')renderAuditHeader(data.user,window.hpointWallet,false);if(typeof renderRequests==='function')renderRequests(data);renderHome(data);configurePrimaryNav(data.user);return data};
   window.go=function(target){navigate(target)};
-  window.load=async function(){let result=await legacyLoad.apply(this,arguments);if(installPanels()){configurePrimaryNav(siteData&&siteData.user);navigate(parseRoute(),{history:false})}else{configurePrimaryNav(null)}return result};
-  window.landing=function(){let result=legacyLanding.apply(this,arguments);configurePrimaryNav(null);return result};
+  window.load=async function(){let result=await legacyLoad.apply(this,arguments);if(siteData&&siteData.user&&getComputedStyle($('app')).display!=='none'&&installPanels()){configurePrimaryNav(siteData.user);navigate(parseRoute(),{history:false})}else{configurePrimaryNav(null)}return result};
+  window.landing=function(){siteData=null;siteInstalled=false;let result=legacyLanding.apply(this,arguments);configurePrimaryNav(null);return result};
   const inheritedSync=window.syncTick;window.syncTick=async function(){let result=await inheritedSync.apply(this,arguments);refreshVisibleDetails();return result};
   window.addEventListener('popstate',function(){if(siteInstalled)navigate(parseRoute(),{history:false})});
   window.addEventListener('hashchange',function(){if(siteInstalled)navigate(parseRoute(),{history:false})});
@@ -1065,7 +1125,7 @@ WORKSPACE_SHELL_UI=r'''
   // One help workspace contains one candidate panel and one chat list.
   // Rare account actions belong to profile settings.
   function accountControls(){let user=state.data.user,identity=user.identity_verification||{};return '<section class="workspaceCard" style="margin-top:16px"><h3>Управление аккаунтом</h3><div class="workspaceActions">'+(user.identity_verified?'<span class="workspaceTag open">Личность подтверждена</span>':identity.status==='pending'?'<span class="workspaceTag">Заявка на проверке</span>':'<button class="btn light" type="button" data-ws-action="identity">Проверка личности</button>')+''+(user.tg_linked?'<button class="btn light" type="button" data-ws-action="unlink-telegram">Отвязать Telegram</button>':'')+'</div></section>'}
-  function renderPrimaryNav(user){let spacer=document.querySelector('.nav .sp'),actions=$('nav');if(!spacer||!actions)return;let top=state.route==='home'?'home':state.route==='help'?'help':state.route==='rating'?'help':'profile';spacer.innerHTML='<nav id="sitePrimaryNav" aria-label="Основная навигация"><button class="'+(top==='home'?'active':'')+'" type="button" data-ws-action="route" data-route="home">Главная</button><button class="'+(top==='help'?'active':'')+'" type="button" data-ws-action="route" data-route="help">Помощь</button><a href="/games">Игры</a></nav>';if(user){let wallet=state.data&&state.data.wallet||{},rating=user.stats&&user.stats.helped_avg;actions.innerHTML='<div class="workspaceHeaderActions"><button class="workspaceBalance" type="button" data-ws-action="route" data-route="wallet" title="Открыть кошелёк"><span>HP</span><b>'+number(user.balance)+'</b><i>'+money(wallet.balance_rub)+'</i></button><button class="btn light" type="button" data-ws-action="support">Поддержка</button><button class="btn light" type="button" data-ws-action="route" data-route="profile">Профиль'+(rating?' · ★ '+Number(rating).toFixed(1):'')+'</button><button class="btn grad" type="button" data-ws-action="request">+ Заявка</button></div>'}else{actions.innerHTML='<div class="workspaceHeaderActions"><button class="btn light" type="button" onclick="authForm(false)">Войти</button><button class="btn grad" type="button" onclick="authForm(true)">Регистрация</button></div>'}}
+  function renderPrimaryNav(user){document.querySelector('.nav')?.classList.remove('guestHeader');let spacer=document.querySelector('.nav .sp'),actions=$('nav');if(!spacer||!actions)return;let top=state.route==='home'?'home':state.route==='help'?'help':state.route==='rating'?'help':'profile';spacer.innerHTML='<nav id="sitePrimaryNav" aria-label="Основная навигация"><button class="'+(top==='home'?'active':'')+'" type="button" data-ws-action="route" data-route="home">Главная</button><button class="'+(top==='help'?'active':'')+'" type="button" data-ws-action="route" data-route="help">Помощь</button><a href="/games">Игры</a></nav>';if(user){let wallet=state.data&&state.data.wallet||{},rating=user.stats&&user.stats.helped_avg;actions.innerHTML='<div class="workspaceHeaderActions"><button class="workspaceBalance" type="button" data-ws-action="route" data-route="wallet" title="Открыть кошелёк"><span>HP</span><b>'+number(user.balance)+'</b><i>'+money(wallet.balance_rub)+'</i></button><button class="btn light" type="button" data-ws-action="support">Поддержка</button><button class="btn light" type="button" data-ws-action="route" data-route="profile">Профиль'+(rating?' · ★ '+Number(rating).toFixed(1):'')+'</button><button class="btn grad" type="button" data-ws-action="request">+ Заявка</button></div>'}else{actions.innerHTML='<div class="workspaceHeaderActions"><button class="btn light" type="button" onclick="authForm(false)">Войти</button><button class="btn grad" type="button" onclick="authForm(true)">Регистрация</button></div>'}}
   function pageHead(title,description,mark){return '<div class="workspaceTopbar"><div><h1 class="workspaceTitle">'+esc(title)+'</h1>'+(description?'<p class="workspaceSubtitle">'+esc(description)+'</p>':'')+'</div></div>'}
   function metric(label,value){return '<article class="workspaceMetric"><span>'+esc(label)+'</span><b>'+value+'</b></article>'}
   function requestActionMarkup(row,mine){let id=Number(row.id),actions=[];if(mine){actions.push('<button class="btn light" type="button" data-ws-action="track" data-id="'+id+'">Детали</button>');if(row.status==='open')actions.push('<button class="btn grad" type="button" data-ws-action="help-tab" data-tab="match" data-id="'+id+'">Подбор</button>');if(row.status==='in_progress')actions.push('<button class="btn light" type="button" data-ws-action="chat" data-id="'+id+'">Чат</button>');if(row.status==='in_progress'&&Number(row.helper_id)===Number(state.data.current_user_id))actions.push('<button class="btn grad" type="button" data-ws-action="finish" data-id="'+id+'">Завершить</button>');if(row.status==='done'&&((Number(row.requester_id)===Number(state.data.current_user_id)&&!row.requester_rating)||(Number(row.helper_id)===Number(state.data.current_user_id)&&!row.helper_rating)))actions.push('<button class="btn grad" type="button" data-ws-action="review" data-id="'+id+'" data-side="'+(Number(row.requester_id)===Number(state.data.current_user_id)?'requester':'helper')+'">Оценить</button>')}else{actions.push('<button class="btn grad" type="button" data-ws-action="join" data-id="'+id+'">Хочу помочь</button>')}return actions.join('')}
@@ -1122,14 +1182,16 @@ WORKSPACE_SHELL_UI=r'''
     const photos={
       team:['community-team.jpg','Команда волонтёров общается у фургона','RDNE Stock project','https://www.pexels.com/photo/people-volunteering-6646949/'],
       park:['community-park.jpg','Пять волонтёров вместе после уборки парка','Anna Shvets','https://www.pexels.com/photo/volunteers-standing-on-green-grass-field-while-smiling-at-the-camera-5029855/'],
+      welcomeHelp:['welcome-help.jpg','Два волонтёра вместе собирают продукты для помощи','cottonbro studio','https://www.pexels.com/photo/two-volunteers-packing-the-charity-goods-6590929/'],
+      welcomeGrow:['welcome-grow.jpg','Волонтёры передают друг другу растения','Mikhail Nilov','https://www.pexels.com/photo/a-man-and-woman-smiling-while-holding-potted-plants-8543103/',560,839],
       people:['community-volunteers.jpg','Волонтёры передают воду и собирают вещи для помощи','RDNE Stock project','https://www.pexels.com/photo/three-people-donating-goods-6646918/'],
       garden:['community-garden.jpg','Люди вместе работают в общественном саду','Oceanflynn','https://commons.wikimedia.org/wiki/File:Parkdale_Community_garden_volunteer_day.JPG']
     },item=photos[kind]||photos.people,garden=kind==='garden';
-    return '<figure class="workspacePhoto"><img src="/assets/'+item[0]+'" alt="'+item[1]+'" width="'+(garden?1280:960)+'" height="'+(garden?960:640)+'" loading="'+(eager?'eager':'lazy')+'" decoding="async"><figcaption><a href="'+item[3]+'" target="_blank" rel="noopener">'+item[2]+'</a> · <a href="'+(garden?'https://creativecommons.org/licenses/by-sa/4.0/':'https://www.pexels.com/license/')+'" target="_blank" rel="noopener">'+(garden?'CC BY-SA 4.0':'Pexels')+'</a></figcaption></figure>';
+    return '<figure class="workspacePhoto"><img src="/assets/'+item[0]+'" alt="'+item[1]+'" width="'+(item[4]||(garden?1280:960))+'" height="'+(item[5]||(garden?960:640))+'" loading="'+(eager?'eager':'lazy')+'" decoding="async"><figcaption><a href="'+item[3]+'" target="_blank" rel="noopener">'+item[2]+'</a> · <a href="'+(garden?'https://creativecommons.org/licenses/by-sa/4.0/':'https://www.pexels.com/license/')+'" target="_blank" rel="noopener">'+(garden?'CC BY-SA 4.0':'Pexels')+'</a></figcaption></figure>';
   }
   function peopleComposition(){return '<div class="peopleComposition"><div class="peopleFrame peopleFrameMain">'+photo('team',true)+'</div><div class="peopleCompositionNote"><span aria-hidden="true">✳</span><b>Вместе<br>получается!</b></div><div class="peopleFrame peopleFrameSmall">'+photo('park')+'</div></div>'}
   function communityStory(){return '<section class="communityPhotoStory"><div><span class="workspaceKicker">ЛЮДИ. ВСТРЕЧИ. ОБЩИЕ ДЕЛА.</span><h2>Есть повод собраться</h2><p>Встреча соседей, мастер-класс или помощь общему саду. Организуйте событие и найдите компанию рядом.</p></div>'+photo('garden')+'</section>'}
-  function decorateLanding(){let cover=document.querySelector('#landing .cover');if(!cover||cover.classList.contains('peopleCover'))return;cover.classList.add('peopleCover');cover.innerHTML=peopleComposition()}
+  function decorateLanding(){let cover=document.querySelector('#landing .cover');if(!cover||cover.classList.contains('peopleCover'))return;cover.classList.add('peopleCover');cover.innerHTML='<div class="welcomeComposition"><div class="welcomePhotoMain">'+photo('welcomeHelp',true)+'</div><div class="welcomePhotoSide">'+photo('welcomeGrow',true)+'</div><p class="welcomePhotoNote"><span aria-hidden="true">✳</span>С маленького дела<br>начинается знакомство.</p></div>';let hero=document.querySelector('#landing .hero');if(hero){hero.querySelector('h1').innerHTML='Помогать проще,<br>когда мы рядом.';let copy=hero.querySelector('p');if(copy)copy.textContent='Попросите о помощи, поделитесь своим умением или найдите компанию для доброго дела. Всё начинается с одного знакомства.';hero.querySelector('.audiencePortrait')?.remove()}}
   function communityLinks(){return '<nav class="workspaceCommunityNav" aria-label="Сообщество"><button type="button" data-ws-action="route" data-route="activities">Активности</button><button type="button" data-ws-action="route" data-route="league">Прогресс и лига H-Point</button><button type="button" data-ws-action="route" data-route="donate">Поддержать проект</button></nav>'}
   function parkCommunity(){let storage=$('workspaceLegacyStorage');if(!storage){storage=document.createElement('div');storage.id='workspaceLegacyStorage';storage.hidden=true;app().appendChild(storage)}root().querySelectorAll('#p-activities,#p-progress,#p-donate').forEach(panel=>storage.appendChild(panel))}
   function attachCommunity(){let route=state.route;if(!['activities','league','donate'].includes(route))return;let id=route==='activities'?'p-activities':route==='league'?'p-progress':'p-donate',ensure=route==='activities'?ensureActivitiesPanel:route==='league'?ensureProgressPanel:ensureDonationPanel;ensure();let panel=$(id),slot=$('workspaceCommunitySlot');if(!panel||!slot)return;panel.classList.add('active');slot.appendChild(panel);let key=route+':'+String(state.data.current_user_id);if(state.communityLoaded!==key){state.communityLoaded=key;(route==='activities'?loadActivities:route==='league'?loadProgress:loadDonationMenu)()}}
@@ -1155,17 +1217,17 @@ WORKSPACE_SHELL_UI=r'''
   async function postAndRefresh(url,body,success){try{await api(url,{method:'POST',body:JSON.stringify(body||{})});toast(success);await refresh()}catch(error){toast(error.message)}}
   async function handleAction(button){let action=button.dataset.wsAction,id=Number(button.dataset.id||0);if(action==='account-menu'){openProfileMenu();return}if(action==='unlink-telegram'){unlinkTelegram();return}if(action==='map-retry'){retryMap();return}if(action==='account-settings'){state.profileDetails=true;setRoute('profile');return}if(action==='request-filter'){state.requestQuery=($('wsRequestQuery')||{}).value||'';state.requestStatus=($('wsRequestStatus')||{}).value||'';render();return}if(action==='route'){setRoute(button.dataset.route);if(button.dataset.route==='wallet')refreshWallet();if(button.dataset.route==='billing')refreshBilling();return}if(action==='help-tab'){state.helpTab=button.dataset.tab||'mine';if(button.dataset.id)state.matchRequestId=id;state.matches=null;setRoute('help');return}if(action==='request'){requestForm();return}if(action==='support'){openSupport();return}if(action==='track'){openRequestTracking(id);return}if(action==='chat'){openWorkspaceChat(id);return}if(action==='chat-send'){sendWorkspaceChat();return}if(action==='match-load'){loadMatches();return}if(action==='assign'){assignCandidate(id,Number(button.dataset.user));return}if(action==='finish'){await postAndRefresh('/api/requests/finish',{request_id:id},'Помощь завершена');return}if(action==='review'){review(id,button.dataset.side);return}if(action==='join'||action==='queue'){if(typeof window.helper==='function')window.helper(action==='join'?id:undefined);setTimeout(refresh,900);return}if(action==='offer'){await postAndRefresh('/api/helper/offers/respond',{request_id:id,accept:button.dataset.accept==='true'},button.dataset.accept==='true'?'Помощь подтверждена':'Предложение отклонено');return}if(action==='profile-save'){saveProfile();return}if(action==='profile-details'){state.profileDetails=!state.profileDetails;render();return}if(action==='link-code'){linkCode();return}if(action==='contacts-save'){saveContacts();return}if(action==='email-send'){postAndRefresh('/api/auth/email/resend',{},'Код отправлен на email');return}if(action==='email-verify'){postAndRefresh('/api/auth/email/verify',{code:(($('wsEmailCode')||{}).value||'').trim()},'Email подтверждён');return}if(action==='phone-send'){postAndRefresh('/api/profile/phone/send-code',{},'SMS-код отправлен');return}if(action==='phone-verify'){postAndRefresh('/api/profile/phone/verify',{code:(($('wsPhoneCode')||{}).value||'').trim()},'Телефон подтверждён');return}if(action==='identity'){postAndRefresh('/api/identity-verification',{},'Запрос на проверку создан');return}if(action==='buy'){if(typeof window.buy==='function')window.buy(button.dataset.item,button.dataset.method);return}}
   function install(){let target=app();if(!target)return false;target.classList.add('workspaceApp');if(!root()){let shell=document.createElement('section');shell.id='hpointWorkspace';shell.setAttribute('aria-live','polite');target.prepend(shell)}state.installed=true;return true}
-  function renderGuestHeader(){let spacer=document.querySelector('.nav .sp'),actions=$('nav');if(!spacer||!actions)return;spacer.innerHTML='<nav id="sitePrimaryNav" aria-label="Основная навигация"><button class="active" type="button" onclick="location.hash=\'#/home\'">Главная</button><button type="button" onclick="authForm(false)">Помощь</button><a href="/games">Игры</a></nav>';actions.innerHTML='<div class="workspaceHeaderActions"><button class="btn light" type="button" onclick="authForm(false)">Войти</button><button class="btn grad" type="button" onclick="authForm(true)">Регистрация</button></div>'}
+  function renderGuestHeader(){let spacer=document.querySelector('.nav .sp'),actions=$('nav');if(!spacer||!actions)return;document.querySelector('.nav')?.classList.add('guestHeader');spacer.replaceChildren();actions.innerHTML='<div class="workspaceHeaderActions"><button class="btn light" type="button" onclick="authForm(false)">Войти</button><button class="btn grad" type="button" onclick="authForm(true)">Регистрация</button></div>';let paid=$('prices')?.closest('section');if(paid)paid.hidden=true}
   document.addEventListener('click',function(event){let button=event.target.closest('[data-ws-action]');if(button)handleAction(button)});
   window.go=function(target){let routes={home:'home',requests:'help',match:'help',chat:'help',map:'help',history:'help',activities:'activities',events:'activities',donate:'donate',progress:'league',profile:'profile',wallet:'wallet',billing:'billing'};if(target==='games'){location.assign('/games');return}if(target==='requests')state.helpTab='mine';if(target==='match')state.helpTab='match';if(target==='chat')state.helpTab='chats';setRoute(routes[target]||'help');if(target==='wallet')refreshWallet();if(target==='billing')refreshBilling()};
   window.hpointWorkspace={refresh:refresh,openChat:openWorkspaceChat,state:state};
   const inheritedAuditHeader=window.renderAuditHeader;
-  if(typeof inheritedAuditHeader==='function')window.renderAuditHeader=function(){let result=inheritedAuditHeader.apply(this,arguments);if(state.installed&&state.data&&state.data.user)queueMicrotask(function(){renderPrimaryNav(state.data.user)});return result};
+  if(typeof inheritedAuditHeader==='function')window.renderAuditHeader=function(user){if(!user){renderGuestHeader();return}let result=inheritedAuditHeader.apply(this,arguments);if(state.installed&&state.data&&state.data.user)queueMicrotask(function(){if(state.data&&state.data.user)renderPrimaryNav(state.data.user)});return result};
   const inheritedBilling=window.billing;
   if(typeof inheritedBilling==='function')window.billing=async function(){let result=await inheritedBilling.apply(this,arguments);if(state.installed&&state.data&&state.data.user)renderPrimaryNav(state.data.user);return result};
   window.applySync=function(data){let result=inheritedApplySync.apply(this,arguments);if(state.installed&&data&&data.user){state.data={...(state.data||{}),...data,open:state.data&&state.data.open||[],chats:state.data&&state.data.chats||[],offers:state.data&&state.data.offers||[],games:state.data&&state.data.games||{},progress:state.data&&state.data.progress||{}};render()}return result};
   window.load=async function(){let result=await inheritedLoad.apply(this,arguments);let target=app();if(target&&getComputedStyle(target).display!=='none'){install();await refresh()}else renderGuestHeader();return result};
-  window.landing=function(){let result=inheritedLanding.apply(this,arguments);renderGuestHeader();decorateLanding();return result};
+  window.landing=function(){state.data=null;state.installed=false;let result=inheritedLanding.apply(this,arguments);renderGuestHeader();decorateLanding();return result};
   if(inheritedSync)window.syncTick=async function(){let result=await inheritedSync.apply(this,arguments);if(state.installed)refresh();return result};
   window.addEventListener('hashchange',function(){if(state.installed){state.route=currentRoute();render()}});
   window.addEventListener('popstate',function(){if(state.installed){state.route=currentRoute();render()}});
@@ -1547,19 +1609,20 @@ class Handler(BaseHTTPRequestHandler):
                 problem=password_error(pw)
                 if problem:return reply(self,{"ok":False,"error":problem},400)
                 if not database.reserve_auth_attempts(("register",e,AUTH_ATTEMPT_LIMIT),("register_ip",subject,AUTH_ATTEMPT_LIMIT)):return reply(self,{"ok":False,"error":"Слишком много попыток. Повторите через 15 минут."},429)
-                if get_user_by_email(e):
-                    return reply(self,{"ok":False,"error":"Не удалось создать аккаунт с этим email."},409)
+                existing=get_user_by_email(e)
+                if existing:
+                    if not existing["is_blocked"] and not existing["email_verified"] and not existing["tg_user_id"] and pv(pw,existing["password_hash"] or ""):
+                        return email_challenge(self,existing)
+                    return reply(self,{"ok":False,"error":"Этот email уже используется. Войдите или восстановите пароль."},409)
+                if not email_delivery_configured():
+                    return reply(self,{"ok":False,"error":"Отправка писем временно недоступна. Попробуйте позже или войдите через Telegram."},503)
                 try:
-                    uid=create_web_user(n,e,ph(pw));c=database.create_link_code(uid)
+                    uid=create_web_user(n,e,ph(pw))
                 except Exception:
                     logging.exception("Registration could not be completed")
                     return reply(self,{"ok":False,"error":"Не удалось создать аккаунт с этим email."},409)
-                sent=False
-                if email_delivery_configured():
-                    code=database.create_email_verification_code(uid)
-                    sent=send_email_verification_code(e,code)
                 database.clear_auth_failures("register",e);database.clear_auth_failures("register_ip",subject)
-                return reply(self,{"ok":True,"link_code":c,"email_verification_sent":sent,"email_delivery_configured":email_delivery_configured()},headers=session_headers(self,uid))
+                return email_challenge(self,get_user(uid))
             if p.path=="/api/auth/login":
                 email=str(d.get("email","")).strip().lower()
                 subject=client_key(self)
@@ -1570,6 +1633,8 @@ class Handler(BaseHTTPRequestHandler):
                 if u["is_blocked"]:return reply(self,{"ok":False,"error":"Аккаунт заблокирован."},403)
                 database.clear_auth_failures("login",email);database.clear_auth_failures("login_ip",subject)
                 if password_needs_upgrade(u["password_hash"]):db.execute("UPDATE users SET password_hash=? WHERE user_id=?",(ph(str(d.get("password",""))),u["user_id"]))
+                if not u["email_verified"]:
+                    return email_challenge(self,u)
                 return reply(self,{"ok":True},headers=session_headers(self,u["user_id"]))
             if p.path=="/api/auth/password/reset/request":
                 email=str(d.get("email","")).strip().lower(); subject=client_key(self)
@@ -1595,17 +1660,13 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute("UPDATE users SET password_hash=? WHERE user_id=?",(ph(password),user["user_id"])); db.execute("DELETE FROM sessions WHERE user_id=?",(user["user_id"],))
                 return reply(self,{"ok":True})
             if p.path=="/api/auth/email/resend":
-                u=auth(self)
+                u=email_verification_user(self)
                 if not u:return
                 if u["email_verified"]:return reply(self,{"ok":True,"already_verified":True})
                 if not u["email"]:return reply(self,{"ok":False,"error":"В профиле нет email для подтверждения."},409)
-                if not email_delivery_configured():return reply(self,{"ok":False,"error":"Отправка кодов временно не настроена."},503)
-                if not database.reserve_auth_attempts(("email_resend",str(u["user_id"]),3)):return reply(self,{"ok":False,"error":"Слишком много кодов. Повторите позже."},429)
-                code=database.create_email_verification_code(u["user_id"])
-                if not send_email_verification_code(u["email"],code):return reply(self,{"ok":False,"error":"Не удалось отправить код. Повторите позже."},503)
-                return reply(self,{"ok":True,"sent":True})
+                return email_challenge(self,u,pending=get_sess(self) is None)
             if p.path=="/api/auth/email/verify":
-                u=auth(self)
+                u=email_verification_user(self)
                 if not u:return
                 subject=str(u["user_id"])+":"+client_key(self)
                 if not database.reserve_auth_attempts(("email_verify",subject,5)):return reply(self,{"ok":False,"error":"Слишком много попыток. Запросите новый код."},429)
@@ -1614,11 +1675,18 @@ class Handler(BaseHTTPRequestHandler):
                     messages={"expired":"Код истёк. Запросите новый.","too_many_attempts":"Слишком много попыток. Запросите новый код.","invalid":"Неверный код."}
                     return reply(self,{"ok":False,"error":messages.get(status,"Не удалось подтвердить email.")},400)
                 database.clear_auth_failures("email_verify",subject)
-                return reply(self,{"ok":True,"verified":True})
+                # Old, unconfirmed sessions must not become usable retroactively.
+                if not account_is_verified(u):
+                    db.execute("DELETE FROM sessions WHERE user_id=?",(u["user_id"],))
+                pending=cookie_value(self,"hpoint_verification")
+                if pending:db.execute("DELETE FROM sessions WHERE token=?",(verification_token_hash(pending),))
+                return reply(self,{"ok":True,"verified":True},headers=session_headers(self,u["user_id"]))
             if p.path=="/api/auth/logout":
                 c=self.headers.get("Cookie","");t=next((x.strip().split("=",1)[1] for x in c.split(";") if x.strip().startswith("hpoint_session=")),None)
                 revoke_session(t)
-                return reply(self,{"ok":True},headers={"Set-Cookie":session_cookie("", 0)})
+                pending=cookie_value(self,"hpoint_verification")
+                if pending:db.execute("DELETE FROM sessions WHERE token=?",(verification_token_hash(pending),))
+                return reply(self,{"ok":True},headers={"Set-Cookie":[session_cookie("", 0),verification_cookie("", 0)]})
             if p.path=="/api/auth/account/delete":
                 u=auth(self)
                 if not u:return
@@ -1633,6 +1701,9 @@ class Handler(BaseHTTPRequestHandler):
                 device=cookie_value(self,"hpoint_device")
                 row=db.execute("SELECT 1 FROM sessions WHERE user_id=? AND device_id=? AND expires_at>? LIMIT 1",(target,device,now().isoformat())).fetchone() if device else None
                 if not row:return reply(self,{"ok":False,"error":"Этот профиль недоступен на устройстве."},403)
+                target_user=get_user(target)
+                if not target_user or target_user["is_blocked"] or not account_is_verified(target_user):
+                    return reply(self,{"ok":False,"error":"Сначала войдите в этот профиль и подтвердите email."},403)
                 # Rotate the browser session on every switch.  This prevents a
                 # stale session token from being reused after the UI changes
                 # identity and makes all subsequent requests unambiguous.
@@ -1642,6 +1713,8 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/profile/telegram/unlink":
                 u=auth(self)
                 if not u:return
+                if not u["email_verified"] or not u["password_hash"]:
+                    return reply(self,{"ok":False,"error":"Сначала подтвердите email и задайте пароль через восстановление доступа, чтобы не потерять вход после отвязки Telegram."},409)
                 new_id=database.detach_telegram_to_web_profile(u["user_id"])
                 if new_id is None:return reply(self,{"ok":False,"error":"Telegram уже не привязан."},409)
                 return reply(self,{"ok":True},headers=session_headers(self,new_id))

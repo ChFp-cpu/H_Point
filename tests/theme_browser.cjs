@@ -14,7 +14,7 @@ async function loadPhotos(page){
     await Promise.all(photos.map(photo=>photo.decode().catch(()=>{})));
     await document.fonts.ready;
   });
-  for(const photo of await page.locator('.peopleComposition img,.homeTogether img,.communityPhotoStory img').all()){
+  for(const photo of await page.locator('.welcomeComposition img,.peopleComposition img,.homeTogether img,.communityPhotoStory img').all()){
     assert.ok(await photo.evaluate(e=>e.complete&&e.naturalWidth>0),'Real photographs must load');
     assert.equal(await photo.evaluate(e=>getComputedStyle(e).objectFit),'contain','Keep the complete photograph visible');
   }
@@ -267,6 +267,7 @@ async function loadPhotos(page){
       }
     }
     const guest=await browser.newContext({viewport:{width:320,height:844}}),guestPage=await guest.newPage();
+    guestPage.on('pageerror',error=>{console.error('Guest error:',error.stack);errors.push(error.message)});
     await guest.route('**/*',route=>new URL(route.request().url()).origin===base?route.continue():route.abort());
     for(const colorScheme of ['light','dark']){
       await guestPage.emulateMedia({colorScheme});await guestPage.goto(base);
@@ -275,7 +276,13 @@ async function loadPhotos(page){
       await loadPhotos(guestPage);
       await guestPage.screenshot({path:path.join(output,`${colorScheme}-guest-320.png`),fullPage:true,animations:'disabled'});
       assert.equal(await guestPage.locator('.peopleCover img').count(),2);
-      assert.equal(await guestPage.locator('.peopleCover img').first().getAttribute('src'),'/assets/community-team.jpg');
+      assert.equal(await guestPage.locator('.peopleCover img').first().getAttribute('src'),'/assets/welcome-help.jpg');
+      assert.equal(await guestPage.locator('.peopleCover img').last().getAttribute('src'),'/assets/welcome-grow.jpg');
+      assert.equal(await guestPage.locator('#landing img[src*="community-"]').count(),0,'Welcome photos differ from the signed-in home');
+      assert.equal(await guestPage.locator('#sitePrimaryNav').count(),0,'Private navigation must not appear before confirmation');
+      assert.deepEqual(await guestPage.locator('#nav button:visible').allTextContents(),['Войти','Регистрация']);
+      assert.equal(await guestPage.locator('a[href="/games"]:visible').count(),0);
+      assert.equal(await guestPage.locator('#prices').isVisible(),false);
       checks++;
     }
     // Registration, email confirmation and login use the actual forms and API.
@@ -288,7 +295,7 @@ async function loadPhotos(page){
         await guestPage.locator('#ap2').waitFor();
         assert.equal(await guestPage.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
         assert.equal(await guestPage.locator('#modal h2').evaluate(e=>getComputedStyle(e).color),colorScheme==='light'?'rgb(21, 35, 29)':'rgb(237, 244, 235)');
-        assert.match(await guestPage.locator('#passwordRules').innerText(),/от 12 до 256/);
+        assert.match(await guestPage.locator('#passwordRules').innerText(),/от 6 до 256/);
         assert.equal(await guestPage.locator('#ap').getAttribute('autocomplete'),'new-password');
         await guestPage.screenshot({path:path.join(output,`${colorScheme}-${width}-registration.png`),animations:'disabled'});
         await guestPage.locator('#modal .close').click();
@@ -306,15 +313,36 @@ async function loadPhotos(page){
     await guestPage.locator('#ap').fill('weak');await guestPage.locator('#ap2').fill('weak');
     await guestPage.getByRole('button',{name:'Создать аккаунт',exact:true}).click();
     assert.ok((await guestPage.locator('#err').innerText()).length>0);
-    await guestPage.locator('#ap').fill('ShortPwd123');await guestPage.locator('#ap2').fill('ShortPwd123');
+    await guestPage.locator('#ap').fill('Ab123');await guestPage.locator('#ap2').fill('Ab123');
     await guestPage.getByRole('button',{name:'Создать аккаунт',exact:true}).click();
-    assert.match(await guestPage.locator('#err').innerText(),/12/);
-    await guestPage.locator('#ap').fill('BrowserQaPassword123');await guestPage.locator('#ap2').fill('DifferentPassword123');
+    assert.match(await guestPage.locator('#err').innerText(),/6/);
+    await guestPage.locator('#ap').fill('Ab1234');await guestPage.locator('#ap2').fill('DifferentPassword123');
     await guestPage.getByRole('button',{name:'Создать аккаунт',exact:true}).click();
     assert.match(await guestPage.locator('#err').innerText(),/не совпадают/);
-    await guestPage.locator('#ap2').fill('BrowserQaPassword123');
+    await guestPage.locator('#ap2').fill('Ab1234');
+    await guestPage.route('**/api/auth/register',route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({ok:false,error:'Не удалось отправить код. Вход не выполнен.'})}));
+    await guestPage.getByRole('button',{name:'Создать аккаунт',exact:true}).click();
+    await guestPage.waitForFunction(()=>document.querySelector('#err')?.textContent.includes('Не удалось отправить код'));
+    assert.equal((await guest.request.get(base+'/api/me')).status(),401);
+    assert.equal(await guestPage.locator('#modal').isVisible(),true,'Mail failure must not dismiss registration');
+    await guestPage.unroute('**/api/auth/register');
     await guestPage.getByRole('button',{name:'Создать аккаунт',exact:true}).click();
     await guestPage.locator('#emailCode').waitFor();
+    assert.equal((await guest.request.get(base+'/api/me')).status(),401,'Registration is not login');
+    assert.equal((await guest.cookies()).some(cookie=>cookie.name==='hpoint_session'),false);
+    await guestPage.locator('#modal .close').click();
+    await guestPage.reload();
+    assert.equal(await guestPage.locator('#hpointWorkspace').isVisible(),false,'Closing the code dialog cannot enter the app');
+    await guestPage.getByRole('button',{name:'Войти',exact:true}).first().click();
+    await guestPage.locator('#ae').fill('browser-qa@example.test');await guestPage.locator('#ap').fill('Ab1234');
+    await guestPage.locator('#modal').getByRole('button',{name:'Войти',exact:true}).click();
+    await guestPage.locator('#emailCode').waitFor();
+    await guestPage.locator('#emailCode').fill('000000');
+    await guestPage.getByRole('button',{name:'Подтвердить почту',exact:true}).click();
+    await guestPage.waitForFunction(()=>document.querySelector('#err')?.textContent.includes('Неверный'));
+    assert.equal((await guest.request.get(base+'/api/me')).status(),401);
+    await guestPage.getByRole('button',{name:'Отправить новый код',exact:true}).click();
+    await guestPage.waitForFunction(()=>document.querySelector('#emailVerificationNotice')?.textContent.includes('Новый код отправлен'));
     const mail=JSON.parse(fs.readFileSync(process.env.HPOINT_QA_MAIL,'utf8'));
     assert.equal(mail.address,'browser-qa@example.test');
     await guestPage.locator('#emailCode').fill(mail.code);
@@ -326,7 +354,7 @@ async function loadPhotos(page){
     await guestPage.locator('#ae').fill('browser-qa@example.test');await guestPage.locator('#ap').fill('IncorrectPassword123');
     await guestPage.locator('#modal').getByRole('button',{name:'Войти',exact:true}).click();
     await guestPage.waitForFunction(()=>document.querySelector('#err')?.textContent.length>0);
-    await guestPage.locator('#ap').fill('BrowserQaPassword123');
+    await guestPage.locator('#ap').fill('Ab1234');
     await guestPage.locator('#modal').getByRole('button',{name:'Войти',exact:true}).click();
     await guestPage.locator('#hpointWorkspace').waitFor();
     assert.equal((await guest.request.get(base+'/api/me').then(r=>r.json())).user.email,'browser-qa@example.test');
@@ -338,11 +366,11 @@ async function loadPhotos(page){
     await guestPage.locator('#resetCode').waitFor();
     const resetMail=JSON.parse(fs.readFileSync(process.env.HPOINT_QA_MAIL,'utf8'));
     await guestPage.locator('#resetCode').fill(resetMail.code);
-    await guestPage.locator('#resetPassword').fill('UpdatedBrowserPassword123');
-    await guestPage.locator('#resetConfirm').fill('UpdatedBrowserPassword123');
+    await guestPage.locator('#resetPassword').fill('Cd5678');
+    await guestPage.locator('#resetConfirm').fill('Cd5678');
     await guestPage.getByRole('button',{name:'Сохранить пароль',exact:true}).click();
     await guestPage.locator('#ae').waitFor();
-    await guestPage.locator('#ae').fill('browser-qa@example.test');await guestPage.locator('#ap').fill('UpdatedBrowserPassword123');
+    await guestPage.locator('#ae').fill('browser-qa@example.test');await guestPage.locator('#ap').fill('Cd5678');
     await guestPage.locator('#modal').getByRole('button',{name:'Войти',exact:true}).click();
     await guestPage.locator('#hpointWorkspace').waitFor();
     assert.equal((await guest.request.get(base+'/api/me').then(r=>r.json())).user.email,'browser-qa@example.test');
