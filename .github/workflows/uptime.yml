@@ -13,12 +13,13 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 5
     steps:
       - name: Verify HTTPS health endpoint
         id: health
         run: |
+          python3 -c 'import socket; print("Resolved IPv4:", sorted({row[4][0] for row in socket.getaddrinfo("gethpoint.ru",443,socket.AF_INET)}))'
           # A transient route failure must be retried before declaring an outage.
           # Use IPv4 consistently and validate JSON fields, not its whitespace.
           body=$(curl --ipv4 --fail --silent --show-error --location \
