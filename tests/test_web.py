@@ -13,6 +13,37 @@ class Web(unittest.TestCase):
  def test_web_shares_logic(self):
   database.create_user(42,"Web",None);rid=services.create_request(42,{"what":"Помочь с компьютером","place":"x","time_needed":"x","urgency":"x","details":"x"})
   self.assertEqual(database.get_request(rid)["category"],"tech")
+ def test_helper_preferences_and_two_sided_offer_notifications(self):
+  database.create_user(11,"Author",tg_user_id=11,web_verified=True)
+  database.create_user(22,"Helper",tg_user_id=22,web_verified=True)
+  payload={"what":"Настроить компьютер","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test","category":"tech"}
+  rid=services.create_request(11,payload);services.create_request(22,payload)
+  tokens={uid:web.new_sess(uid) for uid in (11,22)}
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  def request(uid,path,data=None):
+   headers={"Cookie":"hpoint_session="+tokens[uid],"Content-Type":"application/json"}
+   req=urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}"+path,headers=headers,data=json.dumps(data).encode() if data is not None else None)
+   with urllib.request.urlopen(req,timeout=3) as response:return json.load(response)
+  try:
+   prefs=request(22,"/api/helper/preferences",{"categories":["tech"],"availability":"После 18:00","ready":True})
+   self.assertTrue(prefs["user"]["helper_ready"]);self.assertEqual(prefs["user"]["helper_availability"],"После 18:00")
+   matches=request(11,"/api/assistant/candidates",{"request_id":rid})["matches"]
+   self.assertEqual(matches[0]["user_id"],22)
+   with patch.object(web,"notify_telegram_user") as notify:
+    self.assertTrue(request(11,"/api/smart-match/assign",{"request_id":rid,"helper_id":22})["offered"])
+    self.assertEqual({call.args[0] for call in notify.call_args_list},{11,22})
+   self.assertEqual(request(22,"/api/helper/offers")["offers"][0]["request_id"],rid)
+   self.assertEqual(request(11,"/api/sync")["outgoing_offers"][0]["helper_name"],"Helper")
+   with patch.object(web,"notify_telegram_user") as notify:
+    self.assertTrue(request(22,"/api/helper/offers/respond",{"request_id":rid,"accept":True})["accepted"])
+    self.assertEqual({call.args[0] for call in notify.call_args_list},{11,22})
+   self.assertEqual(request(11,"/api/sync")["outgoing_offers"],[])
+   self.assertEqual(len(request(22,"/api/chats")["chats"]),1)
+   web_uid=database.create_web_user("Email member","league@example.test","hash")
+   self.assertLess(web_uid,0)
+   public=request(11,"/api/community/profile?id="+str(web_uid))["profile"]
+   self.assertEqual(public["id"],web_uid);self.assertEqual(public["stats"]["helped"],0)
+  finally:server.shutdown();thread.join(timeout=3);server.server_close()
  def test_page_contains_platform(self):
   self.assertIn("Smart Match",web.PAGE);self.assertIn("Telegram",web.PAGE);self.assertIn("руб",web.PAGE)
   self.assertIn('rel="icon" type="image/svg+xml" href="/assets/favicon.svg"',web.PAGE)
@@ -511,7 +542,7 @@ class Web(unittest.TestCase):
    self.assertIsNotNone(web.chat_for_request(rid))
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
- def test_helper_with_active_request_cannot_accept_another_request(self):
+ def test_helper_with_own_request_can_offer_help_without_assignment(self):
   database.create_user(1,"Requester");database.create_user(2,"Busy helper")
   target=services.create_request(1,{"what":"Нужна помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
   services.create_request(2,{"what":"Моя активная заявка","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
@@ -520,9 +551,10 @@ class Web(unittest.TestCase):
   try:
    base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Cookie":f"hpoint_session={token}","Content-Type":"application/json"}
    req=urllib.request.Request(base+"/api/requests/accept",data=json.dumps({"request_id":target}).encode(),headers=headers,method="POST")
-   with self.assertRaises(urllib.error.HTTPError) as denied:urllib.request.urlopen(req,timeout=3)
-   self.assertEqual(denied.exception.code,409);denied.exception.close()
+   with urllib.request.urlopen(req,timeout=3) as response:self.assertTrue(json.load(response)["queued"])
+   self.assertTrue(services.is_in_queue(2))
    self.assertEqual(database.get_request(target)["status"],"open")
+   self.assertIsNone(database.get_request(target)["helper_id"])
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_points_purchase_and_device_profile_switching(self):

@@ -1113,10 +1113,6 @@ async def want_help(message: Message, state: FSMContext, bot: Bot) -> None:
     if not await ensure_registered(message, state) or not await check_not_busy(message):
         return
     user_id = message.from_user.id
-    own = get_active_own_request(user_id)
-    if own:
-        await message.answer(f"У вас есть активная заявка №{own['id']}. Нельзя одновременно просить помощь и помогать.")
-        return
     if is_in_queue(user_id):
         await message.answer("Вы уже в очереди помощников.", reply_markup=leave_queue_kb())
         return

@@ -114,6 +114,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS users(
       user_id INTEGER PRIMARY KEY, name TEXT NOT NULL, username TEXT, email TEXT UNIQUE,
       password_hash TEXT, balance INTEGER NOT NULL DEFAULT 0, helper_categories TEXT NOT NULL DEFAULT '',
+      helper_availability TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, pro_until TEXT, verified_until TEXT,
       business_until TEXT, favorite_slots INTEGER NOT NULL DEFAULT 3,
       tg_user_id INTEGER UNIQUE, verification_code TEXT, verification_code_hash TEXT, verification_code_expires_at TEXT, web_verified INTEGER NOT NULL DEFAULT 0,
@@ -360,7 +361,7 @@ def init_db():
       ("users","full_name","TEXT DEFAULT ''"),("users","birth_date","TEXT"),("users","phone","TEXT"),("users","phone_verified","INTEGER NOT NULL DEFAULT 0"),
       ("users","lat","REAL"),("users","lon","REAL"),("users","city","TEXT DEFAULT ''"),("users","bio","TEXT DEFAULT ''"),
       ("users","role","TEXT NOT NULL DEFAULT 'user'"),("users","is_blocked","INTEGER NOT NULL DEFAULT 0"),("users","blocked_reason","TEXT"),
-      ("users","last_seen_at","TEXT"),
+      ("users","last_seen_at","TEXT"),("users","helper_availability","TEXT NOT NULL DEFAULT ''"),
       ("requests","lat","REAL"),("requests","lon","REAL"),("requests","expires_at","TEXT"),("requests","views","INTEGER NOT NULL DEFAULT 0"),("requests","reward_rub","INTEGER NOT NULL DEFAULT 0"),("requests","reward_payment_status","TEXT NOT NULL DEFAULT 'none'"),("requests","cancel_reason","TEXT"),("requests","cancelled_at","TEXT"),("community_events","image_data","TEXT NOT NULL DEFAULT ''"),("billing_invoices","amount_rub","INTEGER NOT NULL DEFAULT 0"),
       ("billing_invoices","currency","TEXT NOT NULL DEFAULT 'RUB'"),("billing_invoices","provider_payment_id","TEXT"),
       ("game_daily_rewards","result_hp","INTEGER NOT NULL DEFAULT 0")
@@ -920,6 +921,7 @@ def detach_telegram_to_web_profile(user_id):
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                    (web_id,source["name"],None,source["email"],source["password_hash"],source["balance"],source["helper_categories"],source["created_at"],
                     source["pro_until"],source["verified_until"],source["business_until"],source["favorite_slots"],0,source["email_verified"],source["full_name"],source["birth_date"],source["phone"],source["phone_verified"],source["lat"],source["lon"],source["city"],source["bio"],source["role"],source["is_blocked"],source["blocked_reason"]))
+        db.execute("UPDATE users SET helper_availability=? WHERE user_id=?",(source["helper_availability"] or "",web_id))
         for table, column in [
             ("requests","requester_id"),("requests","helper_id"),("helper_queue","user_id"),
             ("billing_invoices","user_id"),("subscriptions","user_id"),("web_login_tickets","user_id"),
@@ -1310,6 +1312,7 @@ def link_by_code(code,tg_user_id,username=None):
             admin_role = "admin" if tg_user_id in ADMIN_TELEGRAM_IDS else "user"
             db.execute("""INSERT INTO users(user_id,name,username,balance,helper_categories,tg_user_id,web_verified,role)
                 VALUES(?,?,?,?,?,?,1,?)""", (canonical,row["name"],username,row["balance"],row["helper_categories"],tg_user_id,admin_role))
+            db.execute("UPDATE users SET helper_availability=? WHERE user_id=?",(row["helper_availability"] or "",canonical))
             for table,col in [
                 ("requests","requester_id"),("requests","helper_id"),
                 ("helper_queue","user_id"),("billing_invoices","user_id"),
@@ -1425,6 +1428,8 @@ def link_by_code(code,tg_user_id,username=None):
              merged_pro,merged_verified,merged_business,merged_favorite_slots,tg_user_id,
              merged_email_verified,merged_full_name,merged_birth_date,merged_phone,merged_phone_verified,merged_lat,merged_lon,merged_city,merged_bio,canonical))
 
+        db.execute("UPDATE users SET helper_availability=? WHERE user_id=?",
+                   (tg_row["helper_availability"] or row["helper_availability"] or "", canonical))
         db.execute("COMMIT")
         clear_auth_failures("telegram_link", str(tg_user_id))
         return True,"linked"

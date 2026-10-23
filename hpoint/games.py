@@ -1323,7 +1323,9 @@ def game_state(user_id: int | None) -> dict:
     return {
         "ok": True, "authenticated": True, "catalog": catalog(), "balance": int(user["balance"] or 0) if user else 0,
         "profile": dict(profile) if profile else {"games_played": 0, "games_completed": 0, "games_hp_earned": 0},
-        "records": records, "achievements": achievements, "store": store, "transactions": transactions,
+        "records": records, "achievements": achievements,
+        "achievement_catalog": [{"id": key, **item, "unlocked": any(a["id"] == key for a in achievements)} for key,item in ACHIEVEMENTS.items()],
+        "store": store, "transactions": transactions,
         "challenges": _daily_challenge_state(user_id), "economy": {
             "daily_cap": GAME_DAILY_REWARD_CAP, "per_game_cap": GAME_PER_TITLE_REWARD_CAP,
             "earned_today": int(daily_total or 0), "remaining_today": max(0, GAME_DAILY_REWARD_CAP - int(daily_total or 0)), "day": day,

@@ -45,6 +45,7 @@ services.add_to_queue(904)
 database.create_web_login_ticket(901,"theme-browser-data")
 database.create_web_login_ticket(905,"theme-browser-empty")
 database.create_web_login_ticket(905,"theme-browser-game-deep")
+database.create_web_login_ticket(904,"mobile-helper")
 '''
         subprocess.run([sys.executable, "-c", seed], cwd=root, env=env, check=True)
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0

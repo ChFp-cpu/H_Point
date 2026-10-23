@@ -55,16 +55,18 @@ async function loadPhotos(page){
           checks++;
           if(audit.outside.length||audit.overlap||audit.overflow||audit.scheme!==colorScheme)failures.push({width,route,colorScheme,...audit});
           const primaryNav=page.locator(route==='games'?'.gamesPrimaryNav':'#sitePrimaryNav');
-          assert.deepEqual(await primaryNav.locator('button,a').allTextContents(),['Главная','Помощь','Игры','Активности','Прогресс']);
+          assert.deepEqual(await primaryNav.locator('button,a').allTextContents(),['Главная','Помощь','Игры','Активности']);
           if(route!=='games'){
-            assert.equal(await page.locator('#hpointWorkspace [data-route="activities"],#hpointWorkspace [data-route="league"]').count(),0,'Activities and progress are available only in the primary navigation');
+            assert.equal(await page.locator('#hpointWorkspace [data-route="activities"]').count(),0,'Activities are available in the primary navigation');
+            assert.equal(await page.locator('#hpointWorkspace [data-route="league"]').count(),route==='#/home'?1:0,'The league opens only from the home summary');
             assert.equal(await page.locator('.workspaceCommunityNav').count(),0,'No duplicate community navigation');
             assert.equal(await page.locator('#hpointWorkspace [data-route="donate"]').count(),['#/profile','#/profile/wallet','#/profile/billing','#/donate'].includes(route)?1:0,'Project support belongs to the account menu');
           }
           if(width===1440||width===390){await loadPhotos(page);await page.screenshot({path:path.join(output,`${colorScheme}-${width}-${route.replace(/[^a-z]/g,'')}.png`),fullPage:true,animations:'disabled'})}
           if(route==='#/help'){
-            assert.equal(await page.getByRole('heading',{name:'Smart Match',exact:true}).count(),1);
-            assert.equal(await page.getByRole('heading',{name:'Чаты',exact:true}).count(),1);
+            assert.equal(await page.locator('.helpNavigation button').count(),6);
+            assert.equal(await page.locator('#workspaceHistory').getAttribute('open'),null);
+            assert.equal(await page.locator('#workspaceMapSlot').count(),0,'Map does not force scrolling on the requests screen');
           }
           if(route==='#/profile/billing')assert.equal(await page.locator('.workspaceProduct').count(),8);
           if(route==='#/league')assert.equal(await page.locator('.leagueCategoryTop').first().evaluate(e=>getComputedStyle(e).color),colorScheme==='light'?'rgb(21, 35, 29)':'rgb(237, 244, 235)');
@@ -77,9 +79,16 @@ async function loadPhotos(page){
     await page.goto(base+'/#/home');
     await page.locator('#sitePrimaryNav [data-route="activities"]').click();
     await page.locator('#workspaceCommunitySlot>#p-activities').waitFor();
-    await page.locator('#sitePrimaryNav [data-route="league"]').click();
+    await page.locator('#sitePrimaryNav [data-route="home"]').click();
+    await page.getByRole('button',{name:'Перейти в Лигу →',exact:true}).click();
     await page.locator('#workspaceCommunitySlot>#p-progress .leagueBoard').waitFor();
-    assert.equal(await page.locator('#sitePrimaryNav [aria-current="page"]').innerText(),'Прогресс');
+    assert.equal(await page.locator('#sitePrimaryNav [data-route="league"]').count(),0);
+    await page.getByRole('button',{name:/Тестовый участник/}).first().click();
+    await page.locator('.communityProfile').waitFor();
+    assert.deepEqual(await page.locator('.communityProfile .progressMetric b').allTextContents(),['1','★ 5.0','0']);
+    assert.equal(await page.locator('.communityProfile .reviewCard').count(),1);
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+    await page.locator('#modal .close').click();
     await page.locator('.workspaceHeaderActions [data-route="profile"]').click();
     await page.locator('.workspaceAccountNav [data-route="donate"]').click();
     await page.locator('.workspaceAccountMain #p-donate').waitFor();
@@ -210,6 +219,7 @@ async function loadPhotos(page){
     }
     console.log('Gameplay passed: continuous traffic, pause, five resumable titles, endless stages and manual save');
     await page.goto(base+'/#/help');
+    await page.locator('.helpNavigation [data-tab="chats"]').click();
     const chatButton=page.locator('.workspaceChatButton').first();
     await chatButton.waitFor();
     assert.equal(await chatButton.count(),1,'The fixture must exercise a real chat');
@@ -224,6 +234,7 @@ async function loadPhotos(page){
     }
     // A small SDK double checks mounting, not third-party map rendering.
     // The same real map element and its controls must survive SPA navigation.
+    await page.locator('.helpNavigation [data-tab="map"]').click();
     await page.evaluate(()=>{
       window.ymaps={ready:callback=>callback(),Map:class{
         constructor(){this.geoObjects={add(){},remove(){}};this.container={fitToViewport(){}}}
@@ -236,6 +247,7 @@ async function loadPhotos(page){
     const mapElement=await page.locator('#workspaceMapSlot #bigMap').elementHandle();
     await page.getByRole('button',{name:/^Профиль/}).first().click();
     await page.getByRole('button',{name:'Помощь',exact:true}).click();
+    await page.locator('.helpNavigation [data-tab="map"]').click();
     assert.equal(await mapElement.evaluate(e=>e===document.querySelector('#workspaceMapSlot #bigMap')),true);
     assert.equal(await page.locator('#workspaceMapSlot #mapTools').count(),1);
     assert.equal(await page.getByRole('button',{name:'◎ Показать меня',exact:true}).isVisible(),true);

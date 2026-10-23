@@ -120,14 +120,17 @@ def offer_helper(request_id: int, helper_id: int) -> bool:
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
+        if lock:
+            db.execute("SELECT user_id FROM users WHERE user_id=? FOR UPDATE", (helper_id,)).fetchone()
         request = db.execute("SELECT * FROM requests WHERE id = ?" + lock, (request_id,)).fetchone()
-        available = db.execute("SELECT 1 FROM helper_queue WHERE user_id = ?" + lock, (helper_id,)).fetchone()
+        available = db.execute("SELECT 1 FROM helper_queue q JOIN users u ON u.user_id=q.user_id WHERE q.user_id=? AND u.is_blocked=0" + lock, (helper_id,)).fetchone()
         busy = db.execute(
             "SELECT 1 FROM requests WHERE helper_id = ? AND status = ?" + lock,
             (helper_id, STATUS_IN_PROGRESS),
         ).fetchone()
         reward_ready = (int(request["reward_rub"] or 0) == 0 or request["reward_payment_status"] == "paid") if request else False
-        if not request or request["status"] != STATUS_OPEN or request["requester_id"] == helper_id or not reward_ready or not available or busy:
+        categories = get_helper_categories(helper_id)
+        if not request or request["status"] != STATUS_OPEN or request["requester_id"] == helper_id or not reward_ready or not available or busy or (categories and request["category"] not in categories):
             db.execute("ROLLBACK")
             return False
 
@@ -161,11 +164,13 @@ def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool) -> bo
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
+        if lock:
+            db.execute("SELECT user_id FROM users WHERE user_id=? FOR UPDATE", (helper_id,)).fetchone()
+        request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
         offer = db.execute(
             "SELECT * FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='offered'" + lock,
             (request_id, helper_id),
         ).fetchone()
-        request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
         reward_ready = (int(request["reward_rub"] or 0) == 0 or request["reward_payment_status"] == "paid") if request else False
         if not offer or not request or request["status"] != STATUS_OPEN or not reward_ready:
             db.execute("ROLLBACK")
@@ -497,16 +502,8 @@ def smart_match(request_id, limit=20, query=""):
                        FROM users u
                        JOIN helper_queue q ON q.user_id=u.user_id
                        CROSS JOIN (SELECT id,category,what,lat,lon FROM requests WHERE id=?) r
-                       WHERE u.user_id != ? AND u.user_id IS NOT NULL
-                       AND NOT EXISTS (
-                         SELECT 1 FROM requests own
-                         WHERE own.requester_id=u.user_id AND own.status IN (?,?)
-                       )""",(request_id,req["requester_id"],STATUS_OPEN,STATUS_IN_PROGRESS)).fetchall()
-    offered_elsewhere = {
-        row["candidate_id"] for row in db.execute(
-            "SELECT candidate_id FROM request_candidates WHERE status='offered'"
-        ).fetchall()
-    }
+                       WHERE u.user_id != ? AND u.user_id IS NOT NULL AND u.is_blocked=0
+                       """,(request_id,req["requester_id"])).fetchall()
     declined_for_request = {
         row["candidate_id"] for row in db.execute(
             "SELECT candidate_id FROM request_candidates WHERE request_id=? AND status='declined'",
@@ -516,12 +513,13 @@ def smart_match(request_id, limit=20, query=""):
     out=[]
     terms = _query_terms(query)
     for u in rows:
-        if u["user_id"] in offered_elsewhere or u["user_id"] in declined_for_request or get_active_help(u["user_id"]) is not None: continue
+        if u["user_id"] in declined_for_request or get_active_help(u["user_id"]) is not None: continue
         cats=get_helper_categories(u["user_id"])
+        if cats and req["category"] not in cats: continue
         category_bonus=100 if (not cats or req["category"] in cats) else 0
         distance=haversine_km(req["lat"],req["lon"],u["lat"],u["lon"])
-        stats=db.execute("""SELECT AVG(helper_rating) avg,COUNT(*) n FROM requests
-                            WHERE helper_id=? AND status=? AND helper_rating IS NOT NULL""",(u["user_id"],STATUS_DONE)).fetchone()
+        stats=db.execute("""SELECT AVG(requester_rating) avg,COUNT(*) n FROM requests
+                            WHERE helper_id=? AND status=? AND requester_rating IS NOT NULL""",(u["user_id"],STATUS_DONE)).fetchone()
         rating=float(stats["avg"]) if stats["avg"] is not None else 0.0
         rating_bonus=rating*12
         verified_bonus=12 if is_verified(u["user_id"]) else 0
@@ -542,7 +540,7 @@ def smart_match(request_id, limit=20, query=""):
                     # A requester only needs the distance to compare helpers.
                     # Publishing even rounded coordinates would expose a
                     # helper's neighbourhood before they accept the task.
-                    "lat":None,"lon":None,"reasons":reasons})
+                    "lat":None,"lon":None,"availability":u["helper_availability"] or "По договорённости","reasons":reasons})
     out.sort(key=lambda x:(x["score"],x["rating"],-(x["distance_km"] or 999)),reverse=True)
     out = out[:limit]
     save_request_candidates(request_id, out)
