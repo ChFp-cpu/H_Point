@@ -13,6 +13,19 @@ class Web(unittest.TestCase):
  def test_web_shares_logic(self):
   database.create_user(42,"Web",None);rid=services.create_request(42,{"what":"Помочь с компьютером","place":"x","time_needed":"x","urgency":"x","details":"x"})
   self.assertEqual(database.get_request(rid)["category"],"tech")
+ def test_request_promotion_uses_catalog_prices_without_creating_a_purchase(self):
+  database.create_user(42,"Web",tg_user_id=42,web_verified=True);token=web.new_sess(42)
+  before=database.get_user(42)["balance"]
+  catalog={**web.MONETIZATION_ITEMS,"boost":{**web.MONETIZATION_ITEMS["boost"],"rub":63,"hp":29}}
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   with patch.object(web,"MONETIZATION_ITEMS",catalog):
+    request=urllib.request.Request(f"http://127.0.0.1:{server.server_port}/api/sync",headers={"Cookie":"hpoint_session="+token})
+    with urllib.request.urlopen(request,timeout=3) as response:promotion=json.load(response)["request_promotion"]
+   self.assertEqual((promotion["item_type"],promotion["rub"],promotion["hp"]),("boost",63,29))
+   self.assertEqual(database.get_user(42)["balance"],before)
+   self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM billing_invoices").fetchone()["n"],0)
+  finally:server.shutdown();thread.join(timeout=3);server.server_close()
  def test_helper_preferences_and_two_sided_offer_notifications(self):
   database.create_user(11,"Author",tg_user_id=11,web_verified=True)
   database.create_user(22,"Helper",tg_user_id=22,web_verified=True)
