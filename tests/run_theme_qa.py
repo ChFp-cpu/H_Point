@@ -22,7 +22,8 @@ def main():
                    WEB_HOST="127.0.0.1", WEB_PORT=str(port), WEB_PUBLIC_URL=base,
                    BOT_TOKEN="", BOT_USERNAME="", RUN_TELEGRAM_BOT="0", SESSION_COOKIE_SECURE="0",
                    SMTP_HOST="", SMTP_PASSWORD="", BREVO_API_KEY="", YANDEX_MAPS_API_KEY="browser-qa-placeholder",
-                   HPOINT_QA_URL=base, HPOINT_QA_OUTPUT=str(output), APP_ENV="development")
+                   HPOINT_QA_URL=base, HPOINT_QA_OUTPUT=str(output), APP_ENV="development",
+                   HPOINT_QA_MAIL=str(Path(task_dir) / "mail.json"))
         seed = '''
 from hpoint import database, services
 database.init_db()
@@ -43,10 +44,25 @@ services.set_rating(done,903,5)
 services.add_to_queue(904)
 database.create_web_login_ticket(901,"theme-browser-data")
 database.create_web_login_ticket(905,"theme-browser-empty")
+database.create_web_login_ticket(905,"theme-browser-game-deep")
 '''
         subprocess.run([sys.executable, "-c", seed], cwd=root, env=env, check=True)
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        server = subprocess.Popen([sys.executable, "-m", "hpoint.web"], cwd=root, env=env,
+        # Mail is intercepted inside this disposable server; no provider or
+        # production setting is modified. Exercise the real verification flow.
+        launch = '''
+from hpoint import web
+import json, os
+from pathlib import Path
+def record_mail(address, code):
+    Path(os.environ["HPOINT_QA_MAIL"]).write_text(json.dumps({"address": address, "code": code}), encoding="utf-8")
+    return True
+web.email_delivery_configured = lambda: True
+web.send_email_verification_code = record_mail
+web.send_password_reset_code = record_mail
+web.run()
+'''
+        server = subprocess.Popen([sys.executable, "-c", launch], cwd=root, env=env,
                                   stdout=subprocess.DEVNULL, creationflags=flags)
         try:
             for _ in range(150):
@@ -60,7 +76,8 @@ database.create_web_login_ticket(905,"theme-browser-empty")
                     time.sleep(0.1)
             else:
                 raise RuntimeError("Local QA server did not become ready")
-            subprocess.run(["node", "tests/theme_browser.cjs"], cwd=root, env=env, check=True)
+            script = sys.argv[1] if len(sys.argv) > 1 else "tests/theme_browser.cjs"
+            subprocess.run(["node", script], cwd=root, env=env, check=True)
         finally:
             if os.name == "nt":
                 # The Windows venv executable is a launcher with a child

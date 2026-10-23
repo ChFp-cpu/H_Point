@@ -1,4 +1,5 @@
 import unittest,sqlite3,urllib.request,urllib.error,json,threading
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 from hpoint import database,services
@@ -189,6 +190,27 @@ class Web(unittest.TestCase):
    self.assertEqual(mismatch.exception.code,400);mismatch.exception.close()
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_unconfigured_sms_does_not_send_or_create_a_verification_code(self):
+  database.create_user(77,"Проверка контактов",tg_user_id=77,web_verified=True)
+  self.db.execute("UPDATE users SET phone='+79990000000',email_verified=1 WHERE user_id=77")
+  token=web.new_sess(77)
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler)
+  thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   base=f"http://127.0.0.1:{server.server_address[1]}"
+   headers={"Content-Type":"application/json","Cookie":f"hpoint_session={token}"}
+   with patch.object(web,"sms_delivery_configured",return_value=False),patch.object(web,"send_phone_verification_code") as send:
+    with self.assertRaises(urllib.error.HTTPError) as unavailable:
+     urllib.request.urlopen(urllib.request.Request(base+"/api/profile/phone/send-code",data=b"{}",headers=headers,method="POST"),timeout=3)
+    self.assertEqual(unavailable.exception.code,503)
+    result=json.load(unavailable.exception);unavailable.exception.close()
+    self.assertNotIn("code",result);send.assert_not_called()
+    self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM phone_verification_codes WHERE user_id=77").fetchone()["n"],0)
+    user=web.user_payload(database.get_user(77))
+    self.assertTrue(user["tg_linked"]);self.assertTrue(user["email_verified"])
+    self.assertFalse(user["sms_delivery_configured"])
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
  def test_telegram_login_creates_one_shared_profile(self):
   old_username=web._telegram_username;web._telegram_username="hpoint_test_bot"
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler)
@@ -374,11 +396,16 @@ class Web(unittest.TestCase):
     data=None
     if payload is not None:headers["Content-Type"]="application/json";data=json.dumps(payload).encode()
     return urllib.request.urlopen(urllib.request.Request(base+path,data=data,headers=headers,method=method),timeout=3)
-   with request("/api/chats/send","POST",{"request_id":rid,"text":"Здравствуйте!"},1) as response:
-    self.assertEqual(json.load(response)["messages"][-1]["text"],"Здравствуйте!")
+   with patch.object(web,"notify_telegram_user") as notice:
+    with request("/api/chats/send","POST",{"request_id":rid,"text":"Здравствуйте! <b>Текст</b> & детали\nВторая строка"},1) as response:
+     self.assertEqual(json.load(response)["messages"][-1]["text"],"Здравствуйте! <b>Текст</b> & детали\nВторая строка")
+    notice.assert_called_once()
+    self.assertEqual(notice.call_args.args[0],2)
+    self.assertIn("Здравствуйте! &lt;b&gt;Текст&lt;/b&gt; &amp; детали\nВторая строка",notice.call_args.args[1])
+    self.assertIn(f"/chat #{rid} ваш ответ",notice.call_args.args[1])
    with request(f"/api/chats?request_id={rid}",uid=2) as response:
     chat=json.load(response)["chats"][0]
-   self.assertEqual(chat["messages"][-1]["text"],"Здравствуйте!")
+   self.assertEqual(chat["messages"][-1]["text"],"Здравствуйте! <b>Текст</b> & детали\nВторая строка")
    with self.assertRaises(urllib.error.HTTPError) as denied:
     request("/api/chats/send","POST",{"request_id":rid,"text":"Вмешательство"},3)
    self.assertEqual(denied.exception.code,403)
@@ -402,6 +429,51 @@ class Web(unittest.TestCase):
    for asset in ("hpoint-brand-hero.png", "hpoint-route-network.png", "hpoint-match-field.png", "hpoint-logo-dark.png"):
     with urllib.request.urlopen(base+"/assets/"+asset,timeout=3) as response:
      self.assertEqual(response.headers.get_content_type(),"image/png");self.assertGreater(len(response.read()),1000)
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_telegram_chat_notice_keeps_full_text_and_escapes_html(self):
+  from html import unescape
+  from hpoint.chat_notifications import chat_notification
+  text="<&>\n🙂"*200
+  body=chat_notification(31,"<Автор>",text)
+  self.assertIn(text,unescape(body))
+  self.assertIn("&lt;Автор&gt;",body)
+  self.assertIn("/chat #31 ваш ответ",body)
+  self.assertLess(len(unescape(body)),4096)
+ def test_bot_reply_targets_the_notified_request_and_rejects_outsiders(self):
+  import asyncio
+  from types import SimpleNamespace
+  from unittest.mock import AsyncMock
+  from hpoint import handlers
+  for uid in (1,2,3):database.create_user(uid,f"Участник {uid}")
+  payload={"what":"Чат заявки","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"}
+  old=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(old,2));services.complete_request(old,2)
+  current=services.create_request(3,payload);self.assertTrue(services.try_assign_helper(current,2))
+  text="Ответ <с деталями> & второй строкой\nСпасибо!"
+  message=SimpleNamespace(chat=SimpleNamespace(type="private"),from_user=SimpleNamespace(id=2),text=f"/chat #{old} {text}",answer=AsyncMock())
+  bot=SimpleNamespace(send_message=AsyncMock())
+  with patch.object(handlers,"db",self.db),patch.object(handlers,"ensure_registered",AsyncMock(return_value=True)):
+   asyncio.run(handlers.cmd_chat(message,None,bot))
+   self.assertEqual(bot.send_message.call_args.args[0],1)
+   self.assertIn("Ответ &lt;с деталями&gt; &amp; второй строкой",bot.send_message.call_args.args[1])
+   saved=self.db.execute("SELECT m.text,c.request_id FROM chat_messages m JOIN chats c ON c.id=m.chat_id").fetchall()
+   self.assertEqual([(row["request_id"],row["text"]) for row in saved],[(old,text)])
+   message.from_user.id=3;bot.send_message.reset_mock()
+   asyncio.run(handlers.cmd_chat(message,None,bot));bot.send_message.assert_not_called()
+   self.assertEqual(self.db.execute("SELECT COUNT(*) FROM chat_messages").fetchone()[0],1)
+ def test_game_login_redirect_is_limited_to_known_local_destinations(self):
+  database.create_user(1,"Игрок")
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  class NoRedirect(urllib.request.HTTPRedirectHandler):
+   def redirect_request(self,*args,**kwargs):return None
+  opener=urllib.request.build_opener(NoRedirect())
+  from urllib.parse import urlencode
+  try:
+   for index,(target,expected) in enumerate((("/games?game=crossing","/games?game=crossing"),("https://example.com","/"),("//example.com","/"))):
+    ticket=f"game-destination-{index}";database.create_web_login_ticket(1,ticket)
+    with self.assertRaises(urllib.error.HTTPError) as redirect:
+     opener.open(f"http://127.0.0.1:{server.server_port}/auth/telegram?"+urlencode({"ticket":ticket,"next":target}),timeout=3)
+    with redirect.exception as response:self.assertEqual(response.code,303);self.assertEqual(response.headers["Location"],expected)
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_helper_is_offered_request_and_must_confirm(self):

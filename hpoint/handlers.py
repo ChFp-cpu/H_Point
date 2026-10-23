@@ -14,6 +14,7 @@ from .states import Registration, HelpRequest, Review, Billing
 from .keyboards import *
 from .billing import create_pending_invoice
 from . import games as game_service
+from .chat_notifications import chat_notification
 
 router = Router()
 
@@ -30,19 +31,19 @@ BOT_GUIDE = (
     "👤 <b>Мой профиль</b> — баланс HP, рейтинг, статистика и статус проверки.\n"
     "📜 <b>История</b> — завершённые и текущие заявки.\n"
     "⚙️ <b>Настройки помощи</b> — указать категории, в которых вы готовы помогать.\n"
-    "🎮 <b>Игры H-Point</b> — мини-игры, достижения и общий HP-баланс.\n"
+    "🎮 <b>Игры H-Point</b> — открыть выбранную игру на сайте; достижения и HP общие.\n"
     "💳 <b>H-Point+</b> — платные возможности и безопасный переход к оплате.\n"
     "🌐 <b>Перейти на сайт</b> — одноразовый вход в тот же профиль без пароля.\n\n"
     "<b>Как проходит помощь</b>\n"
     "1. Создайте заявку или встаньте в очередь.\n"
     "2. Автор выбирает кандидата; помощник подтверждает согласие.\n"
-    "3. Общайтесь через /chat ТЕКСТ, завершите помощь и поставьте оценки.\n\n"
+    "3. Сообщения с сайта приходят сюда целиком. Ответьте командой /chat #НОМЕР ТЕКСТ из уведомления, завершите помощь и поставьте оценки.\n\n"
     "<b>Синхронизация и безопасность</b>\n"
     "Бот и сайт используют общие профиль, заявки, историю, HP и игровые достижения. "
     "Чтобы подключить существующий сайт: сайт → «Профиль» → «Получить код Telegram», затем в боте <b>/link КОД</b>. "
     "Код вводите только в этом боте. Для отмены незавершённого действия используйте /cancel. "
     "Уточнить подбор можно командой <b>/ask НУЖНЫЙ ОПЫТ</b>; вернуть меню — /menu.\n\n"
-    "Сайт остаётся основным местом для карты, расширенного профиля, контактов, подтверждения email/телефона и платежей — бот открывает его безопасной одноразовой ссылкой."
+    "Сайт остаётся основным местом для карты, активностей, Лиги H-Point, игр, профиля, подтверждения email и платежей — бот открывает его одноразовой ссылкой."
 )
 
 # The first reply for a returning participant remains short enough for a
@@ -266,15 +267,20 @@ async def cmd_chat(message: Message, state: FSMContext, bot: Bot) -> None:
         return
     if not await ensure_registered(message, state):
         return
-    text = (message.text or "").partition(" ")[2].strip()[:1000]
+    text = (message.text or "").partition(" ")[2].strip()
+    first, _, rest = text.partition(" ")
+    target_id = int(first[1:]) if first.startswith("#") and first[1:].isascii() and first[1:].isdigit() and len(first) <= 12 else None
+    if target_id is not None:
+        text = rest.strip()
+    text = text[:1000]
     if not text:
         await message.answer("Отправьте сообщение так: <b>/chat ТЕКСТ</b>")
         return
     user_id = message.from_user.id
-    request = get_active_own_request(user_id)
-    if not request or request["status"] != STATUS_IN_PROGRESS:
+    request = get_request(target_id) if target_id is not None else get_active_own_request(user_id)
+    if target_id is None and (not request or request["status"] != STATUS_IN_PROGRESS):
         request = get_active_help(user_id)
-    if not request or request["status"] != STATUS_IN_PROGRESS:
+    if not request or not request["helper_id"] or user_id not in (request["requester_id"], request["helper_id"]) or (target_id is None and request["status"] != STATUS_IN_PROGRESS):
         await message.answer("Чат доступен после назначения помощника по активной заявке.")
         return
     chat_id = get_or_create_chat_for_request(request["id"])
@@ -288,8 +294,7 @@ async def cmd_chat(message: Message, state: FSMContext, bot: Bot) -> None:
         try:
             await bot.send_message(
                 other["tg_user_id"],
-                f"💬 Новое сообщение по заявке №{request['id']} от {escape(get_user(user_id)['name'])}. "
-                "Откройте сайт H-Point или ответьте: /chat ТЕКСТ",
+                chat_notification(request["id"], get_user(user_id)["name"], text),
             )
         except Exception:
             logging.exception("Не удалось отправить уведомление о сообщении в Telegram")
@@ -481,12 +486,25 @@ _GAME_TILE_LABELS = {
 }
 
 
-def _games_menu_kb() -> InlineKeyboardMarkup:
+def _game_website_url(user_id=None, game=None, section=None):
+    target = "/games"
+    if game in game_service.GAME_CATALOG:
+        target += "?" + urlencode({"game": game})
+    elif section in {"store", "achievements"}:
+        target += "#" + section
+    if user_id is None:
+        return WEB_PUBLIC_URL.rstrip("/") + target
+    token = secrets.token_urlsafe(32)
+    create_web_login_ticket(user_id, token)
+    return WEB_PUBLIC_URL.rstrip("/") + "/auth/telegram?" + urlencode({"ticket": token, "next": target})
+
+
+def _games_menu_kb(user_id=None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚶 H-Crossing", callback_data="g:start:crossing"), InlineKeyboardButton(text="📍 H-Dispatch", callback_data="g:start:dispatch")],
-        [InlineKeyboardButton(text="🧩 H-Match", callback_data="g:start:match"), InlineKeyboardButton(text="🛡 H-Safety", callback_data="g:start:safety")],
-        [InlineKeyboardButton(text="💚 H-Mission", callback_data="g:start:mission")],
-        [InlineKeyboardButton(text="🏆 Прогресс и достижения", callback_data="g:progress"), InlineKeyboardButton(text="🛍 Магазин", callback_data="g:shop")],
+        [InlineKeyboardButton(text="🚶 H-Crossing ↗", url=_game_website_url(user_id, "crossing")), InlineKeyboardButton(text="📍 H-Dispatch ↗", url=_game_website_url(user_id, "dispatch"))],
+        [InlineKeyboardButton(text="🧩 H-Match ↗", url=_game_website_url(user_id, "match")), InlineKeyboardButton(text="🛡 H-Safety ↗", url=_game_website_url(user_id, "safety"))],
+        [InlineKeyboardButton(text="💚 H-Mission ↗", url=_game_website_url(user_id, "mission"))],
+        [InlineKeyboardButton(text="🏆 Прогресс и достижения ↗", url=_game_website_url(user_id, section="achievements")), InlineKeyboardButton(text="🛍 Магазин ↗", url=_game_website_url(user_id, section="store"))],
     ])
 
 
@@ -650,11 +668,12 @@ async def games_menu(message: Message, state: FSMContext) -> None:
     # Entering the games intentionally leaves any unfinished text form, so a
     # later answer cannot be misinterpreted as a request or review field.
     await state.clear()
-    await message.answer(_games_summary(message.from_user.id), reply_markup=_games_menu_kb())
+    await message.answer("🎮 <b>Игры H-Point — на сайте</b>\n\nВыберите игру: откроется её полный интерфейс в вашем профиле. HP, рекорды и достижения общие с ботом.\n\nЛичная ссылка действует 5 минут. Чтобы получить новую, снова нажмите «Игры H-Point».", reply_markup=_games_menu_kb(message.from_user.id))
 
 
 @router.callback_query(F.data.startswith("g:"))
 async def game_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
+    """Old game messages now lead to the same full website UI."""
     if callback.message.chat.type != "private":
         await callback.answer("Игры доступны только в личном чате.", show_alert=True)
         return
@@ -664,131 +683,19 @@ async def game_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.clear()
     parts = (callback.data or "").split(":")
-    try:
-        command = parts[1]
-        if command == "menu":
-            await callback.answer()
-            await callback.message.edit_text(_games_summary(callback.from_user.id), reply_markup=_games_menu_kb())
-            return
-        if command == "progress":
-            payload = game_service.game_state(callback.from_user.id)
-            records = payload.get("records", {})
-            lines = ["🏆 <b>Игровой прогресс</b>"]
-            for code, details in game_service.GAME_CATALOG.items():
-                record = records.get(code, {})
-                lines.append(f"\n<b>{escape(details['short_title'])}</b> — рекорд {record.get('best_score', 0)}, завершено {record.get('completions', 0)}")
-            if payload.get("achievements"):
-                lines.append("\n<b>Достижения</b>")
-                lines.extend(f"• {escape(item['title'])}" for item in payload["achievements"])
-            await callback.answer()
-            await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="← К играм", callback_data="g:menu")]]))
-            return
-        if command == "shop":
-            payload = game_service.game_state(callback.from_user.id)
-            rows = []
-            for item in payload.get("store", []):
-                status = "✓ " if item["owned"] else ""
-                label = f"{status}{item['title']} — {item['price']} HP"
-                rows.append([InlineKeyboardButton(text=label[:64], callback_data=f"g:item:{item['id']}")])
-            rows.append([InlineKeyboardButton(text="← К играм", callback_data="g:menu")])
-            await callback.answer()
-            await callback.message.edit_text("🛍 <b>Магазин игр</b>\n\nВыберите предмет. Покупка списывает реальные H-Points в общей истории операций.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-            return
-        if command == "item":
-            item_id = parts[2]
-            item = game_service.STORE_ITEMS.get(item_id)
-            if not item:
-                raise ValueError("Предмет не найден.")
-            payload = game_service.game_state(callback.from_user.id)
-            owned = next((entry for entry in payload["store"] if entry["id"] == item_id), None)
-            action = f"g:use:{item_id}" if owned and owned["owned"] else f"g:buy:{item_id}"
-            label = "Использовать" if owned and owned["owned"] else f"Купить за {item['price']} HP"
-            await callback.answer()
-            await callback.message.edit_text(
-                f"<b>{escape(item['title'])}</b>\n\n{escape(item['description'])}\n\nСтоимость: <b>{item['price']} HP</b>",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text=label, callback_data=action)],
-                    [InlineKeyboardButton(text="← В магазин", callback_data="g:shop")],
-                ]),
-            )
-            return
-        if command == "buy":
-            item_id = parts[2]
-            result = game_service.purchase_item(callback.from_user.id, item_id, secrets.token_urlsafe(18))
-            await callback.answer("Покупка выполнена")
-            await callback.message.edit_text(
-                f"✅ Предмет приобретён. Баланс: <b>{result['balance']} HP</b>\n\nТеперь включите его перед следующей игрой.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Использовать", callback_data=f"g:use:{item_id}"), InlineKeyboardButton(text="К играм", callback_data="g:menu")]]),
-            )
-            return
-        if command == "use":
-            item_id = parts[2]
-            payload = game_service.game_state(callback.from_user.id)
-            item = next((entry for entry in payload["store"] if entry["id"] == item_id), None)
-            if not item or not item["owned"]:
-                raise ValueError("Сначала приобретите предмет.")
-            result = game_service.equip_item(callback.from_user.id, item_id, not item["equipped"])
-            await callback.answer("Предмет включён" if result["equipped"] else "Предмет выключен")
-            await callback.message.edit_text(
-                "✅ Предмет будет применён в следующем запуске этой игры." if result["equipped"] else "Предмет выключен.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="← В магазин", callback_data="g:shop"), InlineKeyboardButton(text="К играм", callback_data="g:menu")]]),
-            )
-            return
-        if command == "start":
-            session = game_service.start_game(callback.from_user.id, parts[2])
-            await callback.answer("Игра началась")
-            await _send_or_edit_game(callback.message, session, edit=True)
-            return
-        if command == "restart":
-            previous = parts[2]
-            active = game_service.game_session(callback.from_user.id, previous)
-            game_service.abandon_game(callback.from_user.id, previous)
-            session = game_service.start_game(callback.from_user.id, active["game"])
-            await callback.answer("Новая игра")
-            await _send_or_edit_game(callback.message, session, edit=True)
-            return
-        if command == "view":
-            session = game_service.game_session(callback.from_user.id, parts[2])
-            await callback.answer()
-            await _send_or_edit_game(callback.message, session, edit=True)
-            return
-        if command == "move":
-            session = game_service.action_game(callback.from_user.id, parts[2], {"direction": parts[3]})
-        elif command == "vol":
-            session = game_service.game_session(callback.from_user.id, parts[2])
-            await callback.answer("Выберите подходящую заявку")
-            await callback.message.edit_text(_game_text(session) + "\n\n<b>Выберите заявку для волонтёра:</b>", reply_markup=_dispatch_kb(session, parts[3]))
-            return
-        elif command == "assign":
-            session = game_service.action_game(callback.from_user.id, parts[2], {"type": "assign", "volunteer_id": parts[3], "job_id": parts[4]})
-        elif command == "pick":
-            session = game_service.game_session(callback.from_user.id, parts[2])
-            row, col = int(parts[3]), int(parts[4])
-            options = []
-            for dr, dc, label in ((-1, 0, "⬆️"), (1, 0, "⬇️"), (0, -1, "⬅️"), (0, 1, "➡️")):
-                rr, cc = row + dr, col + dc
-                if 0 <= rr < 7 and 0 <= cc < 7:
-                    options.append(InlineKeyboardButton(text=label, callback_data=f"g:swap:{parts[2]}:{row}:{col}:{rr}:{cc}"))
-            await callback.answer("Выберите соседнюю клетку")
-            await callback.message.edit_text(_game_text(session) + "\n\n<b>Куда переместить выбранный предмет?</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[options, [InlineKeyboardButton(text="← К полю", callback_data=f"g:view:{parts[2]}")]]))
-            return
-        elif command == "swap":
-            session = game_service.action_game(callback.from_user.id, parts[2], {"type": "swap", "a": [int(parts[3]), int(parts[4])], "b": [int(parts[5]), int(parts[6])]})
-        elif command == "hint":
-            session = game_service.action_game(callback.from_user.id, parts[2], {"type": "hint"})
-        elif command == "answer":
-            session = game_service.action_game(callback.from_user.id, parts[2], {"type": "answer", "choice": int(parts[3])})
-        elif command == "choose":
-            session = game_service.action_game(callback.from_user.id, parts[2], {"type": "choose", "choice": int(parts[3])})
-        else:
-            raise ValueError("Неизвестное игровое действие.")
-        await callback.answer()
-        await _send_or_edit_game(callback.message, session, edit=True, feedback=session.get("feedback"))
-    except (ValueError, IndexError) as exc:
-        await callback.answer(str(exc) or "Действие сейчас недоступно.", show_alert=True)
-    except Exception:
-        logging.exception("Telegram game action failed")
-        await callback.answer("Не удалось выполнить игровое действие. Попробуйте ещё раз.", show_alert=True)
+    game = parts[2] if len(parts) > 2 and parts[1] == "start" and parts[2] in game_service.GAME_CATALOG else None
+    if game is None and len(parts) > 2 and parts[1] in {"restart", "view", "move", "vol", "assign", "pick", "swap", "hint", "answer", "choose"}:
+        try:
+            game = game_service.game_session(callback.from_user.id, parts[2])["game"]
+        except ValueError:
+            pass
+    await callback.answer("Полная версия игры — на сайте")
+    await callback.message.edit_text(
+        "🎮 Игры теперь открываются на сайте: с игровым полем, анимацией и удобным управлением. Ваш прогресс сохранён.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Играть на сайте ↗", url=_game_website_url(callback.from_user.id, game, "store" if len(parts) > 1 and parts[1] in {"shop", "item", "buy", "use"} else None))
+        ]]),
+    )
 
 
 @router.message(Command("cancel"))

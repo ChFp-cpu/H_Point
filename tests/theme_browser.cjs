@@ -7,6 +7,18 @@ const base=process.env.HPOINT_QA_URL||'http://127.0.0.1:8110';
 if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base))throw Error('Only a local QA server is allowed');
 const output=path.resolve(process.env.HPOINT_QA_OUTPUT||'.theme-qa');
 fs.mkdirSync(output,{recursive:true});
+async function loadPhotos(page){
+  await page.evaluate(async()=>{
+    const photos=[...document.querySelectorAll('img[src^="/assets/"]')];
+    photos.forEach(photo=>photo.loading='eager');
+    await Promise.all(photos.map(photo=>photo.decode().catch(()=>{})));
+    await document.fonts.ready;
+  });
+  for(const photo of await page.locator('.peopleComposition img,.homeTogether img,.communityPhotoStory img').all()){
+    assert.ok(await photo.evaluate(e=>e.complete&&e.naturalWidth>0),'Real photographs must load');
+    assert.equal(await photo.evaluate(e=>getComputedStyle(e).objectFit),'contain','Keep the complete photograph visible');
+  }
+}
 (async()=>{
   const browser=await chromium.launch({channel:'msedge',headless:true});
   const context=await browser.newContext();
@@ -42,12 +54,13 @@ fs.mkdirSync(output,{recursive:true});
           });
           checks++;
           if(audit.outside.length||audit.overlap||audit.overflow||audit.scheme!==colorScheme)failures.push({width,route,colorScheme,...audit});
-          if(width===1440||width===390)await page.screenshot({path:path.join(output,`${colorScheme}-${width}-${route.replace(/[^a-z]/g,'')}.png`),fullPage:true});
+          if(width===1440||width===390){await loadPhotos(page);await page.screenshot({path:path.join(output,`${colorScheme}-${width}-${route.replace(/[^a-z]/g,'')}.png`),fullPage:true,animations:'disabled'})}
           if(route==='#/help'){
             assert.equal(await page.getByRole('heading',{name:'Smart Match',exact:true}).count(),1);
             assert.equal(await page.getByRole('heading',{name:'Чаты',exact:true}).count(),1);
           }
           if(route==='#/profile/billing')assert.equal(await page.locator('.workspaceProduct').count(),8);
+          if(route==='#/league')assert.equal(await page.locator('.leagueCategoryTop').first().evaluate(e=>getComputedStyle(e).color),colorScheme==='light'?'rgb(21, 35, 29)':'rgb(237, 244, 235)');
         }
       }
       console.log('Responsive screens passed:',colorScheme);
@@ -123,15 +136,33 @@ fs.mkdirSync(output,{recursive:true});
         }
       }
     }
-    // Complete every turn-based game through the actual UI, not just screenshots.
+    // One unfinished session per title can be resumed; another title never blocks it.
+    const pending={};
+    for(const game of ['crossing','dispatch','match','safety','mission']){
+      const response=await context.request.post(base+'/api/games/start',{data:{game}});
+      assert.ok(response.ok());pending[game]=await response.json();
+    }
+    assert.equal((await context.request.get(base+'/api/games/state').then(r=>r.json())).active_sessions.length,5);
+    await page.goto(base+'/games');
+    assert.equal(await page.getByRole('button',{name:'Продолжить',exact:true}).count(),5);
+    for(const [game,session] of Object.entries(pending)){
+      const resumed=await context.request.post(base+'/api/games/start',{data:{game}}).then(r=>r.json());
+      assert.equal(resumed.id,session.id);
+      await context.request.post(base+'/api/games/abandon',{data:{session_id:session.id}});
+    }
+    // Complete an endless stage, explicitly continue it, then save through the UI.
     for(const game of ['H-Dispatch','H-Match','H-Safety','H-Mission']){
       await page.goto(base+'/games');
       await page.locator('.game-card').filter({has:page.getByRole('heading',{name:game,exact:true})}).getByRole('button',{name:'Играть',exact:true}).click();
       await page.locator('#gameStage').waitFor();
-      for(let turn=0;turn<24;turn++){
+      let firstId,firstScore;
+      for(let turn=0;turn<60;turn++){
         const snapshot=await context.request.get(base+'/api/games/state').then(r=>r.json()),session=snapshot.active_session;
-        if(!session)break;
+        assert.ok(session,'A stage must not end the endless session');
+        firstId??=session.id;assert.equal(session.id,firstId);
         const s=session.game_state;
+        if(s.round>=2){assert.ok(session.score>=firstScore);await page.locator('#finishGame').click();break}
+        if(s.round_finished){firstScore=session.score;await page.locator('#nextRound').click();await page.waitForTimeout(220);continue}
         if(game==='H-Dispatch'){
           const job=s.jobs.find(item=>!item.assigned),worker=s.volunteers.find(v=>v.skills.includes(job.skill)&&Math.max(1,job.distance-Math.max(0,v.speed-2))<=job.deadline);
           assert.ok(worker,'Every dispatch task has an informed, feasible assignment');
@@ -151,6 +182,8 @@ fs.mkdirSync(output,{recursive:true});
           await page.locator('#nextScenario').waitFor();
           const text=await page.locator('.feedback').textContent();await page.waitForTimeout(150);
           assert.equal(await page.locator('.feedback').textContent(),text,'Lessons advance only on an explicit click');
+          const after=await context.request.get(base+'/api/games/state').then(r=>r.json());
+          if(after.active_session.game_state.round_finished)firstScore=after.active_session.score;
           await page.locator('#nextScenario').click();
         }
         await page.waitForTimeout(220);
@@ -158,7 +191,7 @@ fs.mkdirSync(output,{recursive:true});
       await page.locator('.end-card').waitFor();
       assert.equal((await context.request.get(base+'/api/games/state').then(r=>r.json())).active_session,null,`${game} completes and saves its result`);
     }
-    console.log('Gameplay passed: continuous traffic, pause, stable selection, four completed games');
+    console.log('Gameplay passed: continuous traffic, pause, five resumable titles, endless stages and manual save');
     await page.goto(base+'/#/help');
     const chatButton=page.locator('.workspaceChatButton').first();
     await chatButton.waitFor();
@@ -195,7 +228,19 @@ fs.mkdirSync(output,{recursive:true});
     await page.locator('#wsBio').fill('Профиль сохранён через интерфейс');await page.getByRole('button',{name:'Сохранить профиль',exact:true}).click();
     await page.getByRole('heading',{name:'Проверенный профиль',exact:true}).waitFor();
     const saved=await context.request.get(base+'/api/me').then(r=>r.json());assert.equal(saved.user.city,'Новый город');assert.equal(saved.user.bio,'Профиль сохранён через интерфейс');
+    assert.equal(await page.getByRole('button',{name:'Панель администратора',exact:true}).count(),1);
+    assert.equal(await page.getByRole('button',{name:'Сменить аккаунт',exact:true}).count(),1);
+    assert.equal(await page.getByRole('button',{name:'Выйти из аккаунта',exact:true}).count(),1);
     await page.getByRole('button',{name:'Панель администратора',exact:true}).click();await page.locator('.adminMetrics').waitFor();
+    for(const colorScheme of ['light','dark']){
+      await page.emulateMedia({colorScheme});
+      for(const width of [390,1440]){
+        await page.setViewportSize({width,height:900});
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,'Administrator view fits the screen');
+        assert.equal(await page.locator('.adminMetric b').first().evaluate(e=>getComputedStyle(e).color),colorScheme==='light'?'rgb(43, 101, 21)':'rgb(184, 243, 107)');
+        await page.screenshot({path:path.join(output,`${colorScheme}-${width}-admin.png`),animations:'disabled'});checks++;
+      }
+    }
     await page.locator('#modal .close').click();
     await page.getByRole('button',{name:'Сменить аккаунт',exact:true}).click();await page.getByRole('heading',{name:'Профили на этом устройстве',exact:true}).waitFor();
     await page.locator('#modal .close').click();
@@ -227,11 +272,92 @@ fs.mkdirSync(output,{recursive:true});
       await guestPage.emulateMedia({colorScheme});await guestPage.goto(base);
       await guestPage.getByRole('button',{name:'Войти',exact:true}).first().waitFor();
       assert.equal(await guestPage.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
-      await guestPage.screenshot({path:path.join(output,`${colorScheme}-guest-320.png`),fullPage:true});
-      assert.equal(await guestPage.locator('.peopleCover img').getAttribute('src'),'/assets/community-volunteers.jpg');
+      await loadPhotos(guestPage);
+      await guestPage.screenshot({path:path.join(output,`${colorScheme}-guest-320.png`),fullPage:true,animations:'disabled'});
+      assert.equal(await guestPage.locator('.peopleCover img').count(),2);
+      assert.equal(await guestPage.locator('.peopleCover img').first().getAttribute('src'),'/assets/community-team.jpg');
       checks++;
     }
+    // Registration, email confirmation and login use the actual forms and API.
+    // The isolated server captures email to a temporary file instead of sending it.
+    for(const colorScheme of ['light','dark']){
+      await guestPage.emulateMedia({colorScheme});
+      for(const width of [320,390,1440]){
+        await guestPage.setViewportSize({width,height:900});
+        await guestPage.evaluate(()=>authForm(true));
+        await guestPage.locator('#ap2').waitFor();
+        assert.equal(await guestPage.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+        assert.equal(await guestPage.locator('#modal h2').evaluate(e=>getComputedStyle(e).color),colorScheme==='light'?'rgb(21, 35, 29)':'rgb(237, 244, 235)');
+        assert.match(await guestPage.locator('#passwordRules').innerText(),/от 12 до 256/);
+        assert.equal(await guestPage.locator('#ap').getAttribute('autocomplete'),'new-password');
+        await guestPage.screenshot({path:path.join(output,`${colorScheme}-${width}-registration.png`),animations:'disabled'});
+        await guestPage.locator('#modal .close').click();
+        await guestPage.getByRole('button',{name:'Войти',exact:true}).first().click();
+        await guestPage.locator('#ae').waitFor();
+        assert.equal(await guestPage.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+        assert.equal(await guestPage.locator('#passwordRules').count(),0,'Login does not repeat new-password rules');
+        await guestPage.screenshot({path:path.join(output,`${colorScheme}-${width}-login.png`),animations:'disabled'});
+        await guestPage.locator('#modal .close').click();checks+=2;
+      }
+    }
+    await guestPage.evaluate(()=>authForm(true));
+    await guestPage.locator('#an').fill('Проверка регистрации');
+    await guestPage.locator('#ae').fill('browser-qa@example.test');
+    await guestPage.locator('#ap').fill('weak');await guestPage.locator('#ap2').fill('weak');
+    await guestPage.getByRole('button',{name:'Создать аккаунт',exact:true}).click();
+    assert.ok((await guestPage.locator('#err').innerText()).length>0);
+    await guestPage.locator('#ap').fill('ShortPwd123');await guestPage.locator('#ap2').fill('ShortPwd123');
+    await guestPage.getByRole('button',{name:'Создать аккаунт',exact:true}).click();
+    assert.match(await guestPage.locator('#err').innerText(),/12/);
+    await guestPage.locator('#ap').fill('BrowserQaPassword123');await guestPage.locator('#ap2').fill('DifferentPassword123');
+    await guestPage.getByRole('button',{name:'Создать аккаунт',exact:true}).click();
+    assert.match(await guestPage.locator('#err').innerText(),/не совпадают/);
+    await guestPage.locator('#ap2').fill('BrowserQaPassword123');
+    await guestPage.getByRole('button',{name:'Создать аккаунт',exact:true}).click();
+    await guestPage.locator('#emailCode').waitFor();
+    const mail=JSON.parse(fs.readFileSync(process.env.HPOINT_QA_MAIL,'utf8'));
+    assert.equal(mail.address,'browser-qa@example.test');
+    await guestPage.locator('#emailCode').fill(mail.code);
+    await guestPage.getByRole('button',{name:'Подтвердить почту',exact:true}).click();
+    await guestPage.locator('#modal').waitFor({state:'hidden'});
+    assert.equal((await guest.request.get(base+'/api/me').then(r=>r.json())).user.email_verified,true);
+    await guestPage.goto(base+'/#/profile');await guestPage.getByRole('button',{name:'Выйти из аккаунта',exact:true}).click();
+    await guestPage.getByRole('button',{name:'Войти',exact:true}).first().click();
+    await guestPage.locator('#ae').fill('browser-qa@example.test');await guestPage.locator('#ap').fill('IncorrectPassword123');
+    await guestPage.locator('#modal').getByRole('button',{name:'Войти',exact:true}).click();
+    await guestPage.waitForFunction(()=>document.querySelector('#err')?.textContent.length>0);
+    await guestPage.locator('#ap').fill('BrowserQaPassword123');
+    await guestPage.locator('#modal').getByRole('button',{name:'Войти',exact:true}).click();
+    await guestPage.locator('#hpointWorkspace').waitFor();
+    assert.equal((await guest.request.get(base+'/api/me').then(r=>r.json())).user.email,'browser-qa@example.test');
+    await guestPage.goto(base+'/#/profile');await guestPage.getByRole('button',{name:'Выйти из аккаунта',exact:true}).click();
+    await guestPage.getByRole('button',{name:'Войти',exact:true}).first().click();
+    await guestPage.getByRole('button',{name:'Забыли пароль?',exact:true}).click();
+    await guestPage.locator('#resetEmail').fill('browser-qa@example.test');
+    await guestPage.getByRole('button',{name:'Получить код',exact:true}).click();
+    await guestPage.locator('#resetCode').waitFor();
+    const resetMail=JSON.parse(fs.readFileSync(process.env.HPOINT_QA_MAIL,'utf8'));
+    await guestPage.locator('#resetCode').fill(resetMail.code);
+    await guestPage.locator('#resetPassword').fill('UpdatedBrowserPassword123');
+    await guestPage.locator('#resetConfirm').fill('UpdatedBrowserPassword123');
+    await guestPage.getByRole('button',{name:'Сохранить пароль',exact:true}).click();
+    await guestPage.locator('#ae').waitFor();
+    await guestPage.locator('#ae').fill('browser-qa@example.test');await guestPage.locator('#ap').fill('UpdatedBrowserPassword123');
+    await guestPage.locator('#modal').getByRole('button',{name:'Войти',exact:true}).click();
+    await guestPage.locator('#hpointWorkspace').waitFor();
+    assert.equal((await guest.request.get(base+'/api/me').then(r=>r.json())).user.email,'browser-qa@example.test');
+    const deep=await browser.newContext(),deepPage=await deep.newPage();
+    await deep.route('**/*',route=>new URL(route.request().url()).origin===base?route.continue():route.abort());
+    await deepPage.goto(base+'/auth/telegram?ticket=theme-browser-game-deep&next='+encodeURIComponent('/games?game=crossing'));
+    await deepPage.locator('#crossGrid').waitFor();
+    const deepSession=(await deep.request.get(base+'/api/games/state').then(r=>r.json())).active_session;
+    await deepPage.locator('#backGames').click();await deepPage.locator('.game-card').first().waitFor();
+    await deepPage.locator('.game-card').filter({has:deepPage.getByRole('heading',{name:'H-Crossing',exact:true})}).getByRole('button',{name:'Продолжить',exact:true}).click();
+    await deepPage.locator('.pause-layer').waitFor();
+    assert.equal((await deep.request.get(base+'/api/games/state').then(r=>r.json())).active_session.id,deepSession.id);
+    await deep.close();
+    console.log('Auth passed: email registration, password validation, verification, logout/login, password reset, Telegram game deep link');
     assert.deepEqual(errors,[]);
     console.log(JSON.stringify({ok:true,checks,liveThemePreservesDraft:true,liveThemePreservesGame:true,errors,output}));
-  }catch(error){console.error('Browser errors:',errors);console.error(await page.locator('#workspaceMapSlot').textContent().catch(()=>''));await page.screenshot({path:path.join(output,'failure.png'),fullPage:true});throw error}finally{await browser.close()}
+  }catch(error){console.error('Browser errors:',errors);console.error(await page.locator('body').innerText().then(text=>text.slice(-2500)).catch(()=>''));await page.screenshot({path:path.join(output,'failure.png'),fullPage:true});throw error}finally{await browser.close()}
 })().catch(error=>{console.error(error);process.exitCode=1});
