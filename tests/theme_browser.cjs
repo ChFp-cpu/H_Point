@@ -54,6 +54,13 @@ async function loadPhotos(page){
           });
           checks++;
           if(audit.outside.length||audit.overlap||audit.overflow||audit.scheme!==colorScheme)failures.push({width,route,colorScheme,...audit});
+          const primaryNav=page.locator(route==='games'?'.gamesPrimaryNav':'#sitePrimaryNav');
+          assert.deepEqual(await primaryNav.locator('button,a').allTextContents(),['Главная','Помощь','Игры','Активности','Прогресс']);
+          if(route!=='games'){
+            assert.equal(await page.locator('#hpointWorkspace [data-route="activities"],#hpointWorkspace [data-route="league"]').count(),0,'Activities and progress are available only in the primary navigation');
+            assert.equal(await page.locator('.workspaceCommunityNav').count(),0,'No duplicate community navigation');
+            assert.equal(await page.locator('#hpointWorkspace [data-route="donate"]').count(),['#/profile','#/profile/wallet','#/profile/billing','#/donate'].includes(route)?1:0,'Project support belongs to the account menu');
+          }
           if(width===1440||width===390){await loadPhotos(page);await page.screenshot({path:path.join(output,`${colorScheme}-${width}-${route.replace(/[^a-z]/g,'')}.png`),fullPage:true,animations:'disabled'})}
           if(route==='#/help'){
             assert.equal(await page.getByRole('heading',{name:'Smart Match',exact:true}).count(),1);
@@ -67,6 +74,16 @@ async function loadPhotos(page){
     }
     fs.writeFileSync(path.join(output,'responsive.json'),JSON.stringify({checks,failures},null,2));
     assert.deepEqual(failures,[]);
+    await page.goto(base+'/#/home');
+    await page.locator('#sitePrimaryNav [data-route="activities"]').click();
+    await page.locator('#workspaceCommunitySlot>#p-activities').waitFor();
+    await page.locator('#sitePrimaryNav [data-route="league"]').click();
+    await page.locator('#workspaceCommunitySlot>#p-progress .leagueBoard').waitFor();
+    assert.equal(await page.locator('#sitePrimaryNav [aria-current="page"]').innerText(),'Прогресс');
+    await page.locator('.workspaceHeaderActions [data-route="profile"]').click();
+    await page.locator('.workspaceAccountNav [data-route="donate"]').click();
+    await page.locator('.workspaceAccountMain #p-donate').waitFor();
+    assert.equal(await page.locator('.workspaceAccountNav [data-route="donate"]').getAttribute('class'),'active');
     // Changing only the emulated system preference must preserve the exact DOM
     // input, draft, route and game session (no reload or rerender).
     await page.goto(base+'/#/profile');
@@ -280,7 +297,7 @@ async function loadPhotos(page){
       assert.equal(await guestPage.locator('.peopleCover img').last().getAttribute('src'),'/assets/welcome-grow.jpg');
       assert.equal(await guestPage.locator('#landing img[src*="community-"]').count(),0,'Welcome photos differ from the signed-in home');
       assert.equal(await guestPage.locator('#sitePrimaryNav').count(),0,'Private navigation must not appear before confirmation');
-      assert.deepEqual(await guestPage.locator('#nav button:visible').allTextContents(),['Войти','Регистрация']);
+      assert.equal(await guestPage.locator('header button:visible,#nav a:visible').count(),0,'Guest header contains no registration or login buttons');
       assert.equal(await guestPage.locator('a[href="/games"]:visible').count(),0);
       assert.equal(await guestPage.locator('#prices').isVisible(),false);
       checks++;
