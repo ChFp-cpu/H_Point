@@ -4,6 +4,9 @@ on:
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:
+  push:
+    branches: [codex/stabilize-mvp]
+    paths: [.github/workflows/uptime.yml]
 
 permissions:
   contents: read
@@ -16,8 +19,12 @@ jobs:
       - name: Verify HTTPS health endpoint
         id: health
         run: |
-          body=$(curl --fail --silent --show-error --location --max-time 20 https://gethpoint.ru/api/health)
-          test "$body" = '{"ok": true, "database": true}' -o "$body" = '{"ok":true,"database":true}'
+          # A transient route failure must be retried before declaring an outage.
+          # Use IPv4 consistently and validate JSON fields, not its whitespace.
+          body=$(curl --ipv4 --fail --silent --show-error --location \
+            --connect-timeout 8 --max-time 20 --retry 3 --retry-all-errors \
+            --retry-delay 3 --retry-max-time 100 https://gethpoint.ru/api/health)
+          printf '%s' "$body" | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True and data.get("database") is True, "Application or database is unhealthy"'
       - name: Notify on failure
         if: failure()
         env:
