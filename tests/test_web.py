@@ -573,7 +573,7 @@ class Web(unittest.TestCase):
    self.assertIsNotNone(web.chat_for_request(rid))
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
- def test_helper_with_own_request_can_offer_help_without_assignment(self):
+ def test_helper_with_own_request_can_accept_another_request(self):
   database.create_user(1,"Requester");database.create_user(2,"Busy helper")
   target=services.create_request(1,{"what":"Нужна помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
   services.create_request(2,{"what":"Моя активная заявка","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
@@ -582,10 +582,11 @@ class Web(unittest.TestCase):
   try:
    base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Cookie":f"hpoint_session={token}","Content-Type":"application/json"}
    req=urllib.request.Request(base+"/api/requests/accept",data=json.dumps({"request_id":target}).encode(),headers=headers,method="POST")
-   with urllib.request.urlopen(req,timeout=3) as response:self.assertTrue(json.load(response)["queued"])
-   self.assertTrue(services.is_in_queue(2))
-   self.assertEqual(database.get_request(target)["status"],"open")
-   self.assertIsNone(database.get_request(target)["helper_id"])
+   with urllib.request.urlopen(req,timeout=3) as response:self.assertTrue(json.load(response)["matched"])
+   self.assertFalse(services.is_in_queue(2))
+   self.assertEqual(database.get_request(target)["status"],"in_progress")
+   self.assertEqual(database.get_request(target)["helper_id"],2)
+   self.assertIsNotNone(web.chat_for_request(target))
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_points_purchase_and_device_profile_switching(self):

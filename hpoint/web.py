@@ -15,7 +15,7 @@ from .theme import SYSTEM_THEME_CSS, APP_THEME_CSS, SYSTEM_THEME_META
 from .chat_notifications import chat_notification
 from .services import *
 from .billing import create_pending_invoice, create_request_reward_invoice, create_payment, fulfill_invoice, purchase_with_points, purchase_with_wallet, verify_robokassa_result
-from .keyboards import helper_offer_kb, candidate_kb, application_kb, confirm_paid_completion_kb
+from .keyboards import helper_offer_kb, candidate_kb, application_kb, confirm_paid_completion_kb, request_chat_kb
 
 database.init_db()
 _telegram_bot = None
@@ -699,7 +699,7 @@ function hpointRenderMapTasks(tasks){let host=$('mapTasks');if(!host)return;host
 function hpointSetMapNotice(text){let node=$('mapNotice');if(node)node.textContent=text}
 async function mapLocateMe(){try{let point=await hpointGetBrowserLocation();hpointSetMapNotice('Ваше местоположение обновлено.');await loadBigMap()}catch(error){hpointSetMapNotice(hpointGeoMessage(error));toast(hpointGeoMessage(error))}}
 function helperGeoFallback(message,requestId){$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Поделитесь геопозицией</h2><p class="muted">Так автор заявки увидит только расстояние до вас, без вашей точки и адреса. '+esc(message)+'</p><div class="form"><button class="btn grad" onclick="helper('+(requestId?Number(requestId):'')+')">Разрешить геолокацию</button><button class="btn light" onclick="helperWithoutLocation('+(requestId?Number(requestId):'')+')">Продолжить без геолокации</button></div>'}
-async function joinHelper(position,requestId){let body=position?{lat:position.lat,lon:position.lon}:{};if(requestId)body.request_id=Number(requestId);let endpoint=requestId?'/api/requests/accept':'/api/helper/queue';let result=await api(endpoint,{method:'POST',body:JSON.stringify(body)});closeModal();toast(result.message);go('requests');await requests();return result}
+async function joinHelper(position,requestId){let body=position?{lat:position.lat,lon:position.lon}:{};if(requestId)body.request_id=Number(requestId);let endpoint=requestId?'/api/requests/accept':'/api/helper/queue';let result=await api(endpoint,{method:'POST',body:JSON.stringify(body)});closeModal();toast(result.message);if(result.matched&&window.hpointWorkspace){await hpointWorkspace.refresh();await hpointWorkspace.openChat(result.request_id)}else{go('requests');await requests()}return result}
 async function helper(requestId){let point;try{toast('Определяем местоположение…');point=await hpointGetBrowserLocation()}catch(error){helperGeoFallback(hpointGeoMessage(error),requestId);return}try{return await joinHelper(point,requestId)}catch(error){toast(error.message||'Не удалось отправить предложение помощи.')}}
 async function helperWithoutLocation(requestId){try{return await joinHelper(null,requestId)}catch(error){let target=$('err');if(target)target.textContent=error.message;else toast(error.message)}}
 async function acceptOpenRequest(id){return helper(Number(id))}
@@ -1210,7 +1210,7 @@ WORKSPACE_SHELL_UI=r'''
   function requestCard(row,mine){let reward=Number(row.reward_rub||0)>0?' · '+money(row.reward_rub):'',place=mine&&row.place?' · '+esc(row.place):'';return '<article class="workspaceRequest"><div class="workspaceRequestMain"><b>#'+Number(row.id)+' · '+esc(compact(row.what))+'</b><div class="workspaceRequestMeta">'+esc(row.category_name||'Другое')+' · '+esc(row.urgency||'без срочности')+place+reward+'</div><span class="workspaceTag '+statusClass(row)+'">'+esc(statusLabel(row))+'</span>'+(Number(row.reward_rub)?'<p class="muted">'+esc(rewardNote(row))+'</p>':'')+'</div><div class="workspaceRequestActions">'+responseActionMarkup(row,mine)+'</div></article>'}
   function applicationNotices(){
     let incoming=state.data.applications||[],sent=state.data.my_applications||[];
-    return (incoming.length?'<details class="workspaceFold requestResponses"><summary>Отклики на ваши заявки · '+number(incoming.length)+'</summary>'+incoming.map(response=>'<article class="workspacePendingInvite"><div><b>'+esc(response.helper_name)+' хочет помочь</b><p>№'+Number(response.request_id)+' · '+esc(compact(response.what))+'</p></div><div class="workspaceActions"><button class="btn grad" type="button" data-ws-action="help-tab" data-tab="match" data-id="'+Number(response.request_id)+'">Посмотреть отклик</button>'+responseCancelButton(response,'Отклонить')+'</div></article>').join('')+'</details>':'')+(sent.length?'<details class="workspaceFold sentResponses"><summary>Ваши отклики · '+number(sent.length)+'</summary>'+sent.map(response=>'<article class="workspacePendingInvite"><div><b>Отклик отправлен · '+esc(response.requester_name)+'</b><p>№'+Number(response.request_id)+' · '+esc(compact(response.what))+'</p></div><div class="workspaceActions">'+responseCancelButton(response,'Отозвать отклик')+'</div></article>').join('')+'</details>':'');
+    return (incoming.length?'<details class="workspaceFold requestResponses"><summary>Отклики на ваши заявки · '+number(incoming.length)+'</summary>'+incoming.map(response=>'<article class="workspacePendingInvite"><div><b>'+esc(response.helper_name)+' хочет помочь</b><p>№'+Number(response.request_id)+' · '+esc(compact(response.what))+'</p></div><div class="workspaceActions"><button class="btn grad" type="button" data-ws-action="application-accept" data-id="'+Number(response.request_id)+'" data-user="'+Number(response.helper_id)+'" data-token="'+esc(response.application_token)+'">Принять помощь и открыть чат</button>'+responseCancelButton(response,'Отклонить')+'</div></article>').join('')+'</details>':'')+(sent.length?'<details class="workspaceFold sentResponses"><summary>Ваши отклики · '+number(sent.length)+'</summary>'+sent.map(response=>'<article class="workspacePendingInvite"><div><b>Отклик отправлен · '+esc(response.requester_name)+'</b><p>№'+Number(response.request_id)+' · '+esc(compact(response.what))+'</p></div><div class="workspaceActions">'+responseCancelButton(response,'Отозвать отклик')+'</div></article>').join('')+'</details>':'');
   }
   async function handleResponseAction(button){if(button.disabled)return;button.disabled=true;try{await api('/api/requests/response/cancel',{method:'POST',body:JSON.stringify({request_id:Number(button.dataset.id),helper_id:Number(button.dataset.user),application_token:button.dataset.token})});state.matches=null;await refresh();if(state.route==='help'&&state.helpTab==='match')await loadMatches();toast('Отклик отменён. Сама заявка остаётся открытой.')}catch(error){await refresh();toast(error.message)}finally{button.disabled=false}}
   function homeBody(){
@@ -1349,19 +1349,39 @@ WORKSPACE_SHELL_UI=r'''
   async function refresh(){
     try{
       let results=await Promise.all([api('/api/sync'),api('/api/requests?open=1'),api('/api/chats'),api('/api/helper/offers'),api('/api/games/state'),api('/api/progress')]),sync=results[0],offers=results[3].offers||[],statuses=Object.fromEntries((sync.requests||[]).map(row=>[row.id,row.status])),applicationKeys=(sync.applications||[]).map(row=>row.request_id+':'+row.helper_id+':'+row.application_token).sort(),changed=state.lastApplicationKeys&&JSON.stringify(applicationKeys)!==JSON.stringify(state.lastApplicationKeys);
-      if(state.lastStatuses){let accepted=(sync.requests||[]).find(row=>row.status==='in_progress'&&state.lastStatuses[row.id]==='open');if(accepted)toast('Помощник подтвердил заявку №'+accepted.id+'. Чат готов.')}
+      const newlyAccepted=state.lastStatuses?(sync.requests||[]).filter(row=>row.status==='in_progress'&&(state.lastStatuses[row.id]==='open'||(state.lastOfferIds||[]).includes(row.id))).map(row=>Number(row.id)):[];
+      state.pendingChats=[...new Set([...(state.pendingChats||[]),...newlyAccepted])].filter(id=>(sync.requests||[]).some(row=>Number(row.id)===id&&row.status==='in_progress'));
+      let accepted=(sync.requests||[]).find(row=>state.pendingChats.includes(Number(row.id))&&(results[2].chats||[]).some(chat=>Number(chat.request_id)===Number(row.id)));
+      if(accepted)toast('Помощь по заявке №'+accepted.id+' подтверждена. Открываем чат.');
       if(state.lastOfferIds&&offers.some(offer=>!state.lastOfferIds.includes(offer.request_id)))toast('Вас просят помочь — подтвердите предложение.');
       if(state.lastApplicationKeys&&applicationKeys.some(key=>!state.lastApplicationKeys.includes(key)))toast('Новый отклик на вашу заявку — откройте «Отклики».');
       state.lastStatuses=statuses;state.lastOfferIds=offers.map(offer=>offer.request_id);state.lastApplicationKeys=applicationKeys;
       state.data={...sync,open:results[1].requests||[],chats:results[2].chats||[],offers,games:results[4],progress:results[5]};
       if(changed)state.matches=null;if(!state.wallet)state.wallet=sync.wallet||{};render();
+      let deepChat=location.hash.match(/^#\/help\/chat\/(\d+)$/);if(deepChat&&Number(state.chatId)!==Number(deepChat[1])){await openWorkspaceChat(Number(deepChat[1]));return}
+      if(accepted){state.pendingChats=state.pendingChats.filter(id=>id!==Number(accepted.id));state.matches=null;state.matchRequestId=null;if(state.helpTab!=='chats'||Number(state.chatId)!==Number(accepted.id))await openWorkspaceChat(accepted.id);return}
+      if(state.route==='help'&&state.helpTab==='chats'&&state.chatId)await refreshWorkspaceChat();
       if(changed&&state.route==='help'&&state.helpTab==='match'&&!state.matchLoading)await loadMatches();
     }catch(error){console.warn('workspace refresh',error);if(error&&error.message==='auth_required')renderGuestHeader()}
   }
-  async function openWorkspaceChat(id){state.helpTab='chats';state.chatId=Number(id);state.chat=null;setRoute('help');render();try{let data=await api('/api/chats?request_id='+Number(id));state.chat=data.chats&&data.chats[0]||null;render()}catch(error){toast(error.message)}}
+  async function openWorkspaceChat(id){state.helpTab='chats';state.chatId=Number(id);state.chat=null;setRoute('help');render();try{let data=await api('/api/chats?request_id='+Number(id));if(Number(state.chatId)!==Number(id))return;state.chat=data.chats&&data.chats[0]||null;render();document.querySelector('.workspaceChatPanel')?.scrollIntoView({block:'start',behavior:'auto'})}catch(error){toast(error.message)}}
+  async function refreshWorkspaceChat(){
+    if(state.chatRefreshing||state.chatSending||!state.chatId)return;
+    const id=Number(state.chatId);state.chatRefreshing=true;
+    try{
+      const data=await api('/api/chats?request_id='+id),next=data.chats&&data.chats[0]||null;
+      if(Number(state.chatId)!==id||state.route!=='help'||state.helpTab!=='chats'||state.chatSending)return;
+      if(JSON.stringify(next)===JSON.stringify(state.chat))return;
+      const messages=document.querySelector('.workspaceMessages'),top=messages?.scrollTop||0,atEnd=!messages||messages.scrollHeight-messages.scrollTop-messages.clientHeight<40;
+      state.chat=next;render();
+      const updated=document.querySelector('.workspaceMessages');if(updated)updated.scrollTop=atEnd?updated.scrollHeight:top;
+    }
+    catch(error){console.warn('chat refresh',error)}finally{state.chatRefreshing=false}
+  }
+  setInterval(function(){if(state.installed&&state.route==='help'&&state.helpTab==='chats'&&document.visibilityState==='visible')refreshWorkspaceChat()},3000);
   async function sendWorkspaceChat(){let input=$('wsChatText'),text=input&&input.value.trim(),button=document.querySelector('[data-ws-action="chat-send"]');if(!text||!state.chatId||state.chatSending)return;state.chatSending=true;if(button)button.disabled=true;try{let data=await api('/api/chats/send',{method:'POST',body:JSON.stringify({request_id:Number(state.chatId),text:text})});if(state.chat)state.chat.messages=data.messages||[];if(input)input.value='';render();refresh()}catch(error){toast(error.message)}finally{state.chatSending=false;if(button)button.disabled=false}}
   async function loadMatches(){let select=$('wsMatchRequest'),question=$('wsMatchQuestion');if(!select||state.matchLoading)return;let id=Number(select.value);state.matchRequestId=id;state.matchQuestion=question?question.value.trim():'';state.matches=null;state.matchLoading=true;render();try{let data=await api('/api/assistant/candidates',{method:'POST',body:JSON.stringify({request_id:id,question:state.matchQuestion})});if(Number(state.matchRequestId)!==id)return;state.matches=data;state.data.outgoing_offers=(state.data.outgoing_offers||[]).filter(offer=>Number(offer.request_id)!==id);if(data.offer)state.data.outgoing_offers.push({request_id:id,helper_id:data.offer.candidate_id,helper_name:data.offer.name,offer_token:data.offer.offer_token})}catch(error){state.matches=null;toast(error.message)}finally{state.matchLoading=false;render()}}
-  async function assignCandidate(id,user){let waiting=(state.data.outgoing_offers||[]).find(offer=>Number(offer.request_id)===Number(id));if(waiting&&!window.confirm('Приглашение для '+(waiting.helper_name||'текущего помощника')+' будет отменено. Пригласить другого помощника?'))return;try{let payload={request_id:Number(id),helper_id:Number(user)};if(waiting)payload.replace_offer_token=waiting.offer_token||'';await api('/api/smart-match/assign',{method:'POST',body:JSON.stringify(payload)});state.matches=null;await refresh();if(state.route==='help'&&state.helpTab==='match')await loadMatches();toast('Приглашение отправлено. Условия оплаты указаны в заявке.')}catch(error){await refresh();if(state.route==='help'&&state.helpTab==='match')await loadMatches();toast(error.message)}}
+  async function assignCandidate(id,user){let waiting=(state.data.outgoing_offers||[]).find(offer=>Number(offer.request_id)===Number(id));if(waiting&&!window.confirm('Приглашение для '+(waiting.helper_name||'текущего помощника')+' будет отменено. Пригласить другого помощника?'))return;try{let payload={request_id:Number(id),helper_id:Number(user)};if(waiting)payload.replace_offer_token=waiting.offer_token||'';let result=await api('/api/smart-match/assign',{method:'POST',body:JSON.stringify(payload)});state.matches=null;await refresh();if(result.matched){await openWorkspaceChat(result.request_id||id);toast('Помощь подтверждена. Чат открыт.');return}if(state.route==='help'&&state.helpTab==='match')await loadMatches();toast('Приглашение отправлено. Условия оплаты указаны в заявке.')}catch(error){await refresh();if(state.route==='help'&&state.helpTab==='match')await loadMatches();toast(error.message)}}
   async function cancelInvitation(button){button.disabled=true;try{await api('/api/helper/offers/withdraw',{method:'POST',body:JSON.stringify({request_id:Number(button.dataset.id),helper_id:Number(button.dataset.user),offer_token:button.dataset.offerToken||''})});state.matches=null;await refresh();if(state.route==='help'&&state.helpTab==='match')await loadMatches();toast('Приглашение отменено. Заявка остаётся открытой.')}catch(error){await refresh();if(state.route==='help'&&state.helpTab==='match')await loadMatches();toast(error.message)}finally{button.disabled=false}}
   async function refreshWallet(){try{let data=await api('/api/wallet');state.wallet=data.wallet||{};render()}catch(error){toast(error.message)}}
   async function refreshBilling(){try{let data=await api('/api/billing');state.billing=data;render()}catch(error){toast(error.message)}}
@@ -1369,13 +1389,24 @@ WORKSPACE_SHELL_UI=r'''
   async function linkCode(){try{let data=await api('/api/auth/link-code',{method:'POST',body:'{}'});state.linkCode=data.code||'';render();toast('Код привязки создан')}catch(error){toast(error.message)}}
   async function saveContacts(){try{await api('/api/profile/contacts',{method:'POST',body:JSON.stringify({full_name:($('wsFullName')||{}).value||'',birth_date:($('wsBirth')||{}).value||'',phone:($('wsPhone')||{}).value||''})});toast('Контактные данные сохранены');await refresh()}catch(error){toast(error.message)}}
   async function postAndRefresh(url,body,success){try{await api(url,{method:'POST',body:JSON.stringify(body||{})});toast(success);await refresh()}catch(error){toast(error.message)}}
-  async function handleAction(button){if(button.disabled)return;let action=button.dataset.wsAction,id=Number(button.dataset.id||0);if(['reward-reserve','reward-card','paid-confirm'].includes(action)){await handleRewardAction(button);return}if(action==='offer-cancel'){await cancelInvitation(button);return}if(action==='helper-preferences-save'){await saveHelperPreferences(button);return}if(action==='account-menu'){openProfileMenu();return}if(action==='unlink-telegram'){unlinkTelegram();return}if(action==='map-retry'){retryMap();return}if(action==='account-settings'){state.profileDetails=true;setRoute('profile');return}if(action==='request-filter'){state.requestQuery=($('wsRequestQuery')||{}).value||'';state.requestStatus=($('wsRequestStatus')||{}).value||'';render();return}if(action==='route'){setRoute(button.dataset.route);if(button.dataset.route==='wallet')refreshWallet();if(button.dataset.route==='billing')refreshBilling();return}if(action==='help-tab'){state.helpTab=button.dataset.tab||'mine';if(button.dataset.id)state.matchRequestId=id;state.matches=null;setRoute('help');render();if(state.helpTab==='match')await loadMatches();window.scrollTo({top:0,behavior:'auto'});return}if(action==='request'){requestForm();return}if(action==='support'){openSupport();return}if(action==='track'){openRequestTracking(id);return}if(action==='chat'){openWorkspaceChat(id);return}if(action==='chat-send'){sendWorkspaceChat();return}if(action==='match-load'){loadMatches();return}if(action==='assign'){button.disabled=true;try{await assignCandidate(id,Number(button.dataset.user))}finally{button.disabled=false}return}if(action==='finish'){let row=ownRequests().find(item=>Number(item.id)===id);await postAndRefresh('/api/requests/finish',{request_id:id},Number(row?.reward_rub)?'Автору отправлен запрос на подтверждение помощи и выплату.':'Помощь завершена');return}if(action==='review'){review(id,button.dataset.side);return}if(action==='join'||action==='queue'){if(typeof window.helper==='function')window.helper(action==='join'?id:undefined);setTimeout(refresh,900);return}if(action==='offer'){button.disabled=true;try{await postAndRefresh('/api/helper/offers/respond',{request_id:id,accept:button.dataset.accept==='true',offer_token:button.dataset.offerToken||''},button.dataset.accept==='true'?'Помощь подтверждена':'Предложение отклонено')}finally{button.disabled=false}return}if(action==='profile-save'){saveProfile();return}if(action==='profile-details'){state.profileDetails=!state.profileDetails;render();return}if(action==='link-code'){linkCode();return}if(action==='contacts-save'){saveContacts();return}if(action==='email-send'){postAndRefresh('/api/auth/email/resend',{},'Код отправлен на email');return}if(action==='email-verify'){postAndRefresh('/api/auth/email/verify',{code:(($('wsEmailCode')||{}).value||'').trim()},'Email подтверждён');return}if(action==='phone-send'){postAndRefresh('/api/profile/phone/send-code',{},'SMS-код отправлен');return}if(action==='phone-verify'){postAndRefresh('/api/profile/phone/verify',{code:(($('wsPhoneCode')||{}).value||'').trim()},'Телефон подтверждён');return}if(action==='identity'){postAndRefresh('/api/identity-verification',{},'Запрос на проверку создан');return}if(action==='buy'){if(typeof window.buy==='function')window.buy(button.dataset.item,button.dataset.method);return}}
+  async function respondWorkspaceOffer(button){
+    const id=Number(button.dataset.id),accept=button.dataset.accept==='true';
+    button.disabled=true;
+    try{
+      const result=await api('/api/helper/offers/respond',{method:'POST',body:JSON.stringify({request_id:id,accept,offer_token:button.dataset.offerToken||''})});
+      state.matches=null;
+      await refresh();
+      if(result.accepted){state.matchRequestId=null;await openWorkspaceChat(result.request_id||id);toast('Помощь подтверждена. Чат открыт.')}
+      else toast('Предложение отклонено');
+    }catch(error){toast(error.message)}finally{button.disabled=false}
+  }
+  async function handleAction(button){if(button.disabled)return;let action=button.dataset.wsAction,id=Number(button.dataset.id||0);if(['reward-reserve','reward-card','paid-confirm'].includes(action)){await handleRewardAction(button);return}if(action==='application-accept'){button.disabled=true;try{await api('/api/requests/response/accept',{method:'POST',body:JSON.stringify({request_id:id,helper_id:Number(button.dataset.user),application_token:button.dataset.token})});await refresh();await openWorkspaceChat(id)}catch(error){toast(error.message);await refresh()}finally{button.disabled=false}return}if(action==='offer-cancel'){await cancelInvitation(button);return}if(action==='helper-preferences-save'){await saveHelperPreferences(button);return}if(action==='account-menu'){openProfileMenu();return}if(action==='unlink-telegram'){unlinkTelegram();return}if(action==='map-retry'){retryMap();return}if(action==='account-settings'){state.profileDetails=true;setRoute('profile');return}if(action==='request-filter'){state.requestQuery=($('wsRequestQuery')||{}).value||'';state.requestStatus=($('wsRequestStatus')||{}).value||'';render();return}if(action==='route'){setRoute(button.dataset.route);if(button.dataset.route==='wallet')refreshWallet();if(button.dataset.route==='billing')refreshBilling();return}if(action==='help-tab'){state.helpTab=button.dataset.tab||'mine';if(button.dataset.id)state.matchRequestId=id;state.matches=null;setRoute('help');render();if(state.helpTab==='match')await loadMatches();window.scrollTo({top:0,behavior:'auto'});return}if(action==='request'){requestForm();return}if(action==='support'){openSupport();return}if(action==='track'){openRequestTracking(id);return}if(action==='chat'){openWorkspaceChat(id);return}if(action==='chat-send'){sendWorkspaceChat();return}if(action==='match-load'){loadMatches();return}if(action==='assign'){button.disabled=true;try{await assignCandidate(id,Number(button.dataset.user))}finally{button.disabled=false}return}if(action==='finish'){let row=ownRequests().find(item=>Number(item.id)===id);await postAndRefresh('/api/requests/finish',{request_id:id},Number(row?.reward_rub)?'Автору отправлен запрос на подтверждение помощи и выплату.':'Помощь завершена');return}if(action==='review'){review(id,button.dataset.side);return}if(action==='join'||action==='queue'){if(typeof window.helper==='function')window.helper(action==='join'?id:undefined);setTimeout(refresh,900);return}if(action==='offer'){await respondWorkspaceOffer(button);return}if(action==='profile-save'){saveProfile();return}if(action==='profile-details'){state.profileDetails=!state.profileDetails;render();return}if(action==='link-code'){linkCode();return}if(action==='contacts-save'){saveContacts();return}if(action==='email-send'){postAndRefresh('/api/auth/email/resend',{},'Код отправлен на email');return}if(action==='email-verify'){postAndRefresh('/api/auth/email/verify',{code:(($('wsEmailCode')||{}).value||'').trim()},'Email подтверждён');return}if(action==='phone-send'){postAndRefresh('/api/profile/phone/send-code',{},'SMS-код отправлен');return}if(action==='phone-verify'){postAndRefresh('/api/profile/phone/verify',{code:(($('wsPhoneCode')||{}).value||'').trim()},'Телефон подтверждён');return}if(action==='identity'){postAndRefresh('/api/identity-verification',{},'Запрос на проверку создан');return}if(action==='buy'){if(typeof window.buy==='function')window.buy(button.dataset.item,button.dataset.method);return}}
   function install(){let target=app();if(!target)return false;target.classList.add('workspaceApp');if(!root()){let shell=document.createElement('section');shell.id='hpointWorkspace';shell.setAttribute('aria-live','polite');target.prepend(shell)}state.installed=true;return true}
   function renderGuestHeader(){let spacer=document.querySelector('.nav .sp'),actions=$('nav');if(!spacer||!actions)return;document.querySelector('.nav')?.classList.add('guestHeader');spacer.replaceChildren();actions.replaceChildren();let paid=$('prices')?.closest('section');if(paid)paid.hidden=true}
   document.addEventListener('click',function(event){let button=event.target.closest('[data-ws-action]');if(!button)return;if(button.dataset.wsAction==='response-cancel'){handleResponseAction(button);return}if(['request-promo','request-promo-dismiss'].includes(button.dataset.wsAction)||button.dataset.promoItem){handlePromotion(button);return}handleAction(button)});
   document.addEventListener('toggle',function(event){if(event.target.id==='workspaceHistory')state.historyOpen=event.target.open},true);
   document.addEventListener('change',function(event){if(event.target.id==='wsMatchRequest'){state.matchRequestId=Number(event.target.value);state.matches=null;loadMatches()}});
-  window.go=function(target){let routes={home:'home',requests:'help',match:'help',chat:'help',map:'help',history:'help',activities:'activities',events:'activities',donate:'donate',progress:'league',profile:'profile',wallet:'wallet',billing:'billing'};if(target==='games'){location.assign('/games');return}if(target==='requests')state.helpTab='mine';if(target==='match')state.helpTab='match';if(target==='chat')state.helpTab='chats';setRoute(routes[target]||'help');render();if(target==='match')loadMatches();if(target==='wallet')refreshWallet();if(target==='billing')refreshBilling()};
+  window.go=function(target){let routes={home:'home',requests:'help',match:'help',chat:'help',map:'help',history:'help',activities:'activities',events:'activities',donate:'donate',progress:'league',profile:'profile',wallet:'wallet',billing:'billing'};if(target==='games'){location.assign('/games');return}if(target==='requests')state.helpTab='mine';if(target==='match')state.helpTab='match';if(target==='chat')state.helpTab='chats';if(target==='map')state.helpTab='map';setRoute(routes[target]||'help');render();if(target==='match')loadMatches();if(target==='wallet')refreshWallet();if(target==='billing')refreshBilling()};
   window.hpointWorkspace={refresh:refresh,openChat:openWorkspaceChat,state:state};
   const inheritedAuditHeader=window.renderAuditHeader;
   if(typeof inheritedAuditHeader==='function')window.renderAuditHeader=function(user){if(!user){renderGuestHeader();return}let result=inheritedAuditHeader.apply(this,arguments);if(state.installed&&state.data&&state.data.user)queueMicrotask(function(){if(state.data&&state.data.user)renderPrimaryNav(state.data.user)});return result};
@@ -1383,7 +1414,7 @@ WORKSPACE_SHELL_UI=r'''
   if(typeof inheritedBilling==='function')window.billing=async function(){let result=await inheritedBilling.apply(this,arguments);if(state.installed&&state.data&&state.data.user)renderPrimaryNav(state.data.user);return result};
   window.applySync=function(data){let result=inheritedApplySync.apply(this,arguments);if(state.installed&&data&&data.user){state.data={...(state.data||{}),...data,open:state.data&&state.data.open||[],chats:state.data&&state.data.chats||[],offers:state.data&&state.data.offers||[],games:state.data&&state.data.games||{},progress:state.data&&state.data.progress||{}};render()}return result};
   window.load=async function(){let result=await inheritedLoad.apply(this,arguments);let target=app();if(target&&getComputedStyle(target).display!=='none'){install();await refresh()}else renderGuestHeader();return result};
-  window.landing=function(){state.data=null;state.lastStatuses=null;state.lastApplicationKeys=null;state.lastOfferIds=null;state.historyOpen=false;state.installed=false;let result=inheritedLanding.apply(this,arguments);renderGuestHeader();decorateLanding();return result};
+  window.landing=function(){state.data=null;state.lastStatuses=null;state.lastApplicationKeys=null;state.lastOfferIds=null;state.pendingChats=[];state.chatId=null;state.chat=null;state.historyOpen=false;state.installed=false;let result=inheritedLanding.apply(this,arguments);renderGuestHeader();decorateLanding();return result};
   if(inheritedSync)window.syncTick=async function(){let result=await inheritedSync.apply(this,arguments);if(state.installed)await refresh();return result};
   window.addEventListener('hashchange',function(){if(state.installed){state.route=currentRoute();render()}});
   window.addEventListener('popstate',function(){if(state.installed){state.route=currentRoute();render()}});
@@ -2070,24 +2101,35 @@ class Handler(BaseHTTPRequestHandler):
                 try:lat,lon=coordinates_from_payload(d)
                 except ValueError:return reply(self,{"ok":False,"error":"Некорректные координаты."},400)
                 request=get_request(rid)
-                if not request or request["status"]!=STATUS_OPEN or request["requester_id"]==u["user_id"]:
+                if not request or request["requester_id"]==u["user_id"]:
                     return reply(self,{"ok":False,"error":"Эта заявка недоступна."},409)
-                if get_active_help(u["user_id"]):
-                    return reply(self,{"ok":False,"error":"Сначала завершите текущую помощь."},409)
                 if lat is not None:
                     db.execute("UPDATE users SET lat=?,lon=? WHERE user_id=?",(lat,lon,u["user_id"]))
-                applied=apply_to_request(rid,u["user_id"])
-                if applied=="unavailable":return reply(self,{"ok":False,"error":"Эта заявка или ваша доступность уже изменились."},409)
-                if applied=="created":
-                    application=db.execute("SELECT offer_token FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='applied'",(rid,u["user_id"])).fetchone()
+                accepted=accept_open_request(rid,u["user_id"])
+                if accepted=="awaiting_funds":return reply(self,{"ok":False,"error":"Автор ещё не создал резерв вознаграждения в кошельке H-Point. До резерва платную помощь начинать нельзя."},409)
+                if accepted=="unavailable":return reply(self,{"ok":False,"error":"Заявка уже принята другим помощником или у вас есть текущая помощь. Обновите список."},409)
+                if accepted=="created":
                     author=get_user(request["requester_id"])
                     if author and author["tg_user_id"]:
-                        notify_telegram_user(author["tg_user_id"],f"🤝 <b>{escape(u['name'])} хочет помочь</b>\nЗаявка №{rid}: {escape(request['what'])}\n\nОтклик сохранён. Выберите помощника, чтобы он подтвердил участие и появился чат.",reply_markup=application_kb(rid,u["user_id"],application["offer_token"]) if application else candidate_kb(rid,u["user_id"]))
+                        notify_telegram_user(author["tg_user_id"],f"🤝 <b>{escape(u['name'])} принял вашу заявку</b>\nЗаявка №{rid}: {escape(request['what'])}\n\nПомощник назначен, чат создан. Повторно выбирать человека или подтверждать отклик не нужно.",reply_markup=request_chat_kb(rid))
                     if u["tg_user_id"]:
-                        notify_telegram_user(u["tg_user_id"],f"✅ Ваш отклик на заявку №{rid} отправлен автору. Его статус виден на сайте в разделе «Помощь». Когда вас выберут, подтвердите участие.",reply_markup=application_kb(rid,u["user_id"],application["offer_token"],False) if application else None)
-                suffix=" Расстояние видно автору заявки, ваша точка скрыта." if lat is not None else " Геопозиция не указана, поэтому расстояние не будет показано."
-                message="Автор уже пригласил вас. Подтвердите участие в уведомлении «Вас просят помочь»." if applied=="offered" else "Ваш отклик сохранён и доступен автору заявки." if applied=="created" else "Вы уже откликнулись на эту заявку. Автор видит ваш отклик."
-                return reply(self,{"ok":True,"request_id":rid,"queued":True,"applied":applied in ("created","applied"),"created":applied=="created","message":message+suffix})
+                        notify_telegram_user(u["tg_user_id"],f"✅ Вы приняли заявку №{rid}. Чат с автором уже создан — договоритесь о деталях.",reply_markup=request_chat_kb(rid))
+                return reply(self,{"ok":True,"request_id":rid,"matched":True,"chat_ready":True,"created":accepted=="created","message":"Помощь подтверждена. Чат открыт."})
+            if p.path=="/api/requests/response/accept":
+                u=auth(self)
+                if not u:return
+                if not verified_community_account(self,u):return
+                try:rid=int(d["request_id"]);hid=int(d["helper_id"])
+                except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректный отклик."},400)
+                token=d.get("application_token")
+                if not isinstance(token,str) or not 1<=len(token)<=32:return reply(self,{"ok":False,"error":"Некорректный отклик."},400)
+                result=accept_open_request(rid,hid,author_id=u["user_id"],application_token=token)
+                if result=="awaiting_funds":return reply(self,{"ok":False,"error":"Сначала зарезервируйте вознаграждение в кошельке H-Point."},409)
+                if result!="created":return reply(self,{"ok":False,"error":"Отклик изменился или помощь уже принята."},409)
+                for person in (get_user(hid),u):
+                    if person and person["tg_user_id"]:
+                        notify_telegram_user(person["tg_user_id"],f"🤝 Помощь по заявке №{rid} подтверждена. Чат уже создан, повторный выбор и согласие не нужны.",reply_markup=request_chat_kb(rid))
+                return reply(self,{"ok":True,"request_id":rid,"matched":True})
             if p.path=="/api/requests/response/cancel":
                 u=auth(self)
                 if not u:return
@@ -2125,6 +2167,19 @@ class Handler(BaseHTTPRequestHandler):
                 replacement=d.get("replace_offer_token")
                 if replacement is not None and (not isinstance(replacement,str) or len(replacement)>32):return reply(self,{"ok":False,"error":"Некорректное приглашение."},400)
                 previous=get_current_helper_offer(rid)
+                application=db.execute("SELECT offer_token FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='applied'",(rid,hid)).fetchone()
+                if application:
+                    if previous and previous["candidate_id"]!=hid and replacement!=previous["offer_token"]:
+                        return reply(self,{"ok":False,"error":"Сначала подтвердите замену текущего приглашения."},409)
+                    accepted=accept_open_request(rid,hid,author_id=u["user_id"],application_token=application["offer_token"])
+                    if accepted=="awaiting_funds":return reply(self,{"ok":False,"error":"Сначала зарезервируйте вознаграждение в кошельке H-Point."},409)
+                    if accepted!="created":return reply(self,{"ok":False,"error":"Отклик уже изменился. Обновите список."},409)
+                    for person in (u,get_user(hid)):
+                        if person and person["tg_user_id"]:
+                            notify_telegram_user(person["tg_user_id"],f"🤝 Помощь по заявке №{rid} подтверждена. Чат создан, повторное согласие не требуется.",reply_markup=request_chat_kb(rid))
+                    if previous and previous["tg_user_id"]:
+                        notify_telegram_user(previous["tg_user_id"],f"Приглашение по заявке №{rid} отменено: помощь уже подтверждена с другим участником.")
+                    return reply(self,{"ok":True,"request_id":rid,"matched":True})
                 if not offer_helper(rid,hid,replacement):return reply(self,{"ok":False,"error":"Приглашение или доступность кандидата изменились. Обновите подбор."},409)
                 offer=get_current_helper_offer(rid)
                 if previous and previous["candidate_id"]!=hid and previous["tg_user_id"]:
@@ -2179,9 +2234,9 @@ class Handler(BaseHTTPRequestHandler):
                     chat_for_request(rid)
                     requester=get_user(request["requester_id"])
                     if requester and requester["tg_user_id"]:
-                        notify_telegram_user(requester["tg_user_id"],f"🎉 Помощник подтвердил заявку №{rid}. Чат уже создан.")
+                        notify_telegram_user(requester["tg_user_id"],f"🎉 Помощник подтвердил заявку №{rid}. Чат уже создан.",reply_markup=request_chat_kb(rid))
                     if u["tg_user_id"]:
-                        notify_telegram_user(u["tg_user_id"],f"✅ Вы подтвердили помощь по заявке №{rid}. Откройте «Помощь → Чаты» на сайте, чтобы договориться.")
+                        notify_telegram_user(u["tg_user_id"],f"✅ Вы подтвердили помощь по заявке №{rid}. Чат с автором уже открыт — договоритесь о деталях.",reply_markup=request_chat_kb(rid))
                 else:
                     requester=get_user(request["requester_id"])
                     if requester and requester["tg_user_id"]:

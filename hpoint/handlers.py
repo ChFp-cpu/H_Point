@@ -28,7 +28,7 @@ BOT_GUIDE = (
     "🆘 <b>Мне нужна помощь</b> — ответьте на 5 коротких вопросов, чтобы создать заявку.\n"
     "🤝 <b>Хочу помочь</b> — встать в общую очередь помощников сайта и бота.\n"
     "⚡ <b>Подобрать кандидатов</b> / 👥 <b>Мои кандидаты</b> — выбрать человека для своей открытой заявки; он подтвердит участие сам.\n"
-    "📨 Отклик на вашу заявку придёт сюда с кнопками выбора и отказа; он также сохранён на сайте и в «Моих кандидатах».\n"
+    "📨 На сайте «Хочу помочь» в карточке заявки сразу назначает помощника и открывает чат. Уведомление с кнопкой чата придёт обоим в Telegram.\n"
     "👤 <b>Мой профиль</b> — баланс HP, рейтинг, статистика и статус проверки.\n"
     "📜 <b>История</b> — завершённые и текущие заявки.\n"
     "⚙️ <b>Настройки помощи</b> — указать категории, в которых вы готовы помогать.\n"
@@ -109,30 +109,32 @@ async def notify_match(bot: Bot, request_id: int) -> None:
         logging.error("Не найдены участники заявки %s", request_id)
         return
 
-    try:
-        await bot.send_message(
-            helper["user_id"],
-            "🤝 <b>Вы нашли, кому помочь!</b>\n\n"
-            f"{request_text(req)}\n\n"
-            f"<b>Кому помогаете:</b> {user_link(requester)}\n\n"
-            "Свяжитесь с человеком на сайте или отправьте /chat ТЕКСТ. Когда помощь будет оказана — нажмите «Завершить помощь».",
-            reply_markup=finish_kb(request_id),
-        )
-    except Exception:
-        logging.exception("Не удалось уведомить помощника %s по заявке %s", helper["user_id"], request_id)
+    if helper["tg_user_id"]:
+        try:
+            await bot.send_message(
+                helper["tg_user_id"],
+                "🤝 <b>Вы нашли, кому помочь!</b>\n\n"
+                f"{request_text(req)}\n\n"
+                f"<b>Кому помогаете:</b> {user_link(requester)}\n\n"
+                "Свяжитесь с человеком на сайте или отправьте /chat ТЕКСТ. Когда помощь будет оказана — нажмите «Завершить помощь».",
+                reply_markup=finish_kb(request_id),
+            )
+        except Exception:
+            logging.exception("Не удалось уведомить помощника %s по заявке %s", helper["user_id"], request_id)
 
-    try:
-        await bot.send_message(
-            requester["user_id"],
-            "🎉 <b>Для вашей заявки нашёлся помощник!</b>\n\n"
-            f"{request_text(req)}\n\n"
-            f"<b>Ваш помощник:</b> {user_link(helper)}\n\n"
-            "Помощник свяжется с вами. Можно ответить на сайте или командой /chat ТЕКСТ. После выполнения он нажмёт «Завершить помощь», "
-            "а вас попросят оценить взаимодействие.",
-            reply_markup=main_menu_kb(),
-        )
-    except Exception:
-        logging.exception("Не удалось уведомить автора %s по заявке %s", requester["user_id"], request_id)
+    if requester["tg_user_id"]:
+        try:
+            await bot.send_message(
+                requester["tg_user_id"],
+                "🎉 <b>Для вашей заявки нашёлся помощник!</b>\n\n"
+                f"{request_text(req)}\n\n"
+                f"<b>Ваш помощник:</b> {user_link(helper)}\n\n"
+                "Помощник свяжется с вами. Можно ответить на сайте или командой /chat ТЕКСТ. После выполнения он нажмёт «Завершить помощь», "
+                "а вас попросят оценить взаимодействие.",
+                reply_markup=request_chat_kb(request_id),
+            )
+        except Exception:
+            logging.exception("Не удалось уведомить автора %s по заявке %s", requester["user_id"], request_id)
 
 
 async def safe_notify_match(bot: Bot, request_id: int) -> None:
@@ -936,6 +938,17 @@ async def cb_candidate_assign(callback: CallbackQuery, bot: Bot) -> None:
     if get_current_helper_offer(request_id):
         await callback.answer("Сначала отмените текущее приглашение, затем выберите другого помощника.", show_alert=True)
         await _show_candidates(callback.message, request_id, actor_id=callback.from_user.id)
+        return
+
+    application=db.execute("SELECT offer_token FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='applied'",(request_id,candidate_id)).fetchone()
+    if application:
+        result=accept_open_request(request_id,candidate_id,author_id=callback.from_user.id,application_token=application["offer_token"])
+        if result!="created":
+            await callback.answer("Для платной помощи сначала нужен резерв в кошельке; либо отклик уже изменился.",show_alert=True)
+            return
+        await callback.answer("Помощь подтверждена, чат создан")
+        await callback.message.answer("Отклик принят. Повторное согласие помощника не требуется.",reply_markup=request_chat_kb(request_id))
+        await safe_notify_match(bot,request_id)
         return
 
     if not offer_helper(request_id, candidate_id):
