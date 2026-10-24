@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import random
 import re
 import secrets
@@ -17,6 +18,13 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from . import database
+from .game_content import (
+    CONTENT_VERSION,
+    LEARNING_SESSION_LENGTH,
+    MISSION_SCENARIOS as CONTENT_MISSION_SCENARIOS,
+    SAFETY_SCENARIOS as CONTENT_SAFETY_SCENARIOS,
+    published_scenarios,
+)
 from .config import (
     GAME_ACTION_MIN_INTERVAL_MS,
     GAME_DAILY_REWARD_CAP,
@@ -257,6 +265,14 @@ MISSION_SCENARIOS = (
     },
 )
 
+# The historical inline lists above are kept only so an interrupted upgrade
+# can still read an already-persisted legacy session.  New sessions use the
+# versioned content source below, which has stable IDs and editorial metadata.
+LEGACY_SAFETY_SCENARIOS = SAFETY_SCENARIOS
+LEGACY_MISSION_SCENARIOS = MISSION_SCENARIOS
+SAFETY_SCENARIOS = CONTENT_SAFETY_SCENARIOS
+MISSION_SCENARIOS = CONTENT_MISSION_SCENARIOS
+
 _PURCHASE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{12,128}$")
 _TILES = ("food", "book", "tool", "cloth", "kit", "box")
 
@@ -351,9 +367,71 @@ def _score_target(game_code: str, score: int) -> int:
     return min(GAME_PER_TITLE_REWARD_CAP, earned)
 
 
+# Crossing advances from server time, not from browser-provided frames.  The
+# client receives enough data to draw it smoothly, but score and collisions
+# are always calculated against this server clock.
+_CROSSING_TICK_MS = 750
+_LEGACY_LEARNING_LENGTHS = {"safety": 6, "mission": 5}
+
+
+def _timestamp_ms(value: str | None) -> int:
+    try:
+        stamp = datetime.fromisoformat(value or "")
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return int(stamp.timestamp() * 1000)
+    except (TypeError, ValueError):
+        return int(_now().timestamp() * 1000)
+
+
+def _select_learning_scenarios(user_id: int, game_code: str) -> list[dict]:
+    """Select a frozen, non-repeating learning set for a new session.
+
+    A participant sees each published scenario once before the rotation can
+    reuse it.  The final partial batch carries remaining unseen prompts into
+    the next cycle without repeating a prompt inside one session.
+    """
+    catalog_items = list(published_scenarios(game_code))
+    if len(catalog_items) < LEARNING_SESSION_LENGTH:
+        raise RuntimeError("Недостаточно опубликованных учебных сценариев.")
+    seen = {
+        row["scenario_id"]
+        for row in _db().execute(
+            "SELECT scenario_id FROM game_scenario_history WHERE user_id=? AND game_code=?",
+            (user_id, game_code),
+        ).fetchall()
+    }
+    unseen = [item for item in catalog_items if item["id"] not in seen]
+    rng = secrets.SystemRandom()
+    selected = rng.sample(unseen, min(len(unseen), LEARNING_SESSION_LENGTH))
+    if len(selected) < LEARNING_SESSION_LENGTH:
+        remaining = [item for item in catalog_items if item["id"] not in {scene["id"] for scene in selected}]
+        selected.extend(rng.sample(remaining, LEARNING_SESSION_LENGTH - len(selected)))
+        _db().execute("DELETE FROM game_scenario_history WHERE user_id=? AND game_code=?", (user_id, game_code))
+    for scene in selected:
+        _db().execute(
+            "INSERT OR IGNORE INTO game_scenario_history(user_id,game_code,scenario_id,content_version) VALUES(?,?,?,?)",
+            (user_id, game_code, scene["id"], scene["version"]),
+        )
+    return copy.deepcopy(selected)
+
+
+def _learning_scenes(state: dict, game_code: str) -> list[dict]:
+    """Return server-side snapshots, retaining sessions begun before 2026.10."""
+    snapshots = state.get("scenarios")
+    if isinstance(snapshots, list) and snapshots:
+        return snapshots
+    # Old sessions were ordered against the small original bank.  Keep that
+    # order and length so deployment never changes an in-progress lesson.
+    return list(LEGACY_SAFETY_SCENARIOS if game_code == "safety" else LEGACY_MISSION_SCENARIOS)
+
+
 def _make_crossing_state(user_id: int, equipped: set[str]) -> dict:
+    clock_anchor = _now_text()
     return {
         "seed": secrets.randbelow(2**31 - 1), "player": {"x": 3, "y": 0}, "ticks": 0,
+        "elapsed_ms": 0, "clock_anchor_at": clock_anchor, "paused": False,
+        "traffic_checked_ms": 0,
         "distance": 0, "coins": 0, "deliveries": 0, "collected": [],
         "shield": 1 if "crossing_wayfinder" in equipped else 0,
         "last_notice": "Двигайтесь вперёд: соберите ресурсы и доберитесь до точки помощи.",
@@ -415,8 +493,13 @@ def _make_match_board(seed: int) -> list[list[str]]:
 
 def _make_match_state(user_id: int, equipped: set[str]) -> dict:
     seed = secrets.randbelow(2**31 - 1)
+    board = _make_match_board(seed)
+    # Every new stage must begin with an actual move, not a dead random board.
+    while not _legal_match_swaps(board):
+        seed = secrets.randbelow(2**31 - 1)
+        board = _make_match_board(seed)
     return {
-        "seed": seed, "rng_nonce": 0, "board": _make_match_board(seed), "moves": 18,
+        "seed": seed, "rng_nonce": 0, "board": board, "moves": 18,
         "score": 0, "target_tile": "book", "target_goal": 12, "target_count": 0,
         "max_combo": 0, "last_combo": 0, "hints": 1 if "match_hint" in equipped else 0,
         "last_notice": "Соберите три одинаковых предмета в ряд.", "equipped": sorted(equipped),
@@ -424,11 +507,21 @@ def _make_match_state(user_id: int, equipped: set[str]) -> dict:
 
 
 def _make_safety_state(user_id: int, equipped: set[str]) -> dict:
-    return {"index": 0, "correct": 0, "answers": [], "equipped": sorted(equipped), "last_notice": "Выберите самый безопасный вариант."}
+    scenarios = _select_learning_scenarios(user_id, "safety")
+    return {
+        "content_version": CONTENT_VERSION, "scenario_ids": [item["id"] for item in scenarios], "scenarios": scenarios,
+        "index": 0, "correct": 0, "answers": [], "equipped": sorted(equipped),
+        "last_notice": "Выберите самый безопасный вариант.",
+    }
 
 
 def _make_mission_state(user_id: int, equipped: set[str]) -> dict:
-    return {"index": 0, "reputation": 0, "answers": [], "equipped": sorted(equipped), "last_notice": "Помогайте бережно, с уважением к границам и согласию."}
+    scenarios = _select_learning_scenarios(user_id, "mission")
+    return {
+        "content_version": CONTENT_VERSION, "scenario_ids": [item["id"] for item in scenarios], "scenarios": scenarios,
+        "index": 0, "reputation": 0, "answers": [], "equipped": sorted(equipped),
+        "last_notice": "Помогайте бережно, с уважением к границам и согласию.",
+    }
 
 
 _NEW_SESSION = {
@@ -451,20 +544,73 @@ def _crossing_lane(seed: int, row: int, tick: int) -> list[int]:
     return cars
 
 
+def _crossing_elapsed_ms(state: dict) -> int:
+    elapsed = max(0, int(state.get("elapsed_ms", int(state.get("ticks", 0)) * _CROSSING_TICK_MS)))
+    if state.get("paused"):
+        return elapsed
+    anchor = state.get("clock_anchor_at")
+    if not anchor:
+        return elapsed
+    return max(elapsed, elapsed + int(_now().timestamp() * 1000) - _timestamp_ms(anchor))
+
+
+def _crossing_tick(state: dict) -> int:
+    return max(0, _crossing_elapsed_ms(state) // _CROSSING_TICK_MS)
+
+
+def _crossing_hit_between(state: dict, x: int, y: int, start_ms: int, end_ms: int) -> bool:
+    """Sweep the same continuous lane positions that the browser paints.
+
+    Checking the interval also catches a car passing a stationary player
+    between sync requests; a delayed browser cannot skip a collision.
+    """
+    if y <= 0 or y % 4 not in (1, 2):
+        return False
+    speed = 1 if y % 2 else -1
+    offsets = (0, 3, 5) if y % 9 == 1 else (0, 3)
+    start_ms, end_ms = sorted((max(0, start_ms), max(0, end_ms)))
+    for offset in offsets:
+        base = (state["seed"] // 17 + y * 3 + offset) % 7
+        a = base + start_ms / _CROSSING_TICK_MS * speed
+        b = base + end_ms / _CROSSING_TICK_MS * speed
+        low, high = sorted((a, b))
+        # Car half-width .39 + hero half-width .23, both in grid cells.
+        first = math.ceil((low - x - .62) / 7)
+        last = math.floor((high - x + .62) / 7)
+        if first <= last:
+            return True
+    return False
+
+
+def _set_crossing_paused(state: dict, paused: bool) -> None:
+    if bool(state.get("paused")) == paused:
+        return
+    state["elapsed_ms"] = _crossing_elapsed_ms(state)
+    state["clock_anchor_at"] = _now_text()
+    state["paused"] = paused
+    state["ticks"] = state["elapsed_ms"] // _CROSSING_TICK_MS
+
+
 def _crossing_view(state: dict) -> dict:
     player = state["player"]
+    tick = _crossing_tick(state)
     low = max(0, int(player["y"]) - 3)
     rows = []
     for row in range(low, low + 10):
         lane = row % 4 in (1, 2)
         rows.append({
-            "y": row, "lane": lane, "cars": _crossing_lane(state["seed"], row, state["ticks"]),
+            "y": row, "lane": lane, "cars": _crossing_lane(state["seed"], row, tick),
             "coin": bool(row and (state["seed"] + row * 7) % 5 == 0 and row not in state["collected"]),
             "delivery": bool(row and row % 10 == 0),
+            "bonus": ("shield" if (row // 8) % 2 == 0 else "supplies") if row >= 4 and row % 8 == 4 and row not in state.get("bonuses_collected", []) else None,
+            "bonus_x": (state["seed"] + row * 5) % 7,
         })
     return {
         "player": player, "rows": rows, "distance": state["distance"], "coins": state["coins"],
         "deliveries": state["deliveries"], "shield": state["shield"], "notice": state["last_notice"],
+        "seed": state["seed"], "elapsed_ms": _crossing_elapsed_ms(state),
+        "server_time_ms": int(_now().timestamp() * 1000), "tick_ms": _CROSSING_TICK_MS,
+        "paused": bool(state.get("paused")),
     }
 
 
@@ -494,28 +640,36 @@ def _public_session(row: dict, state: dict | None = None) -> dict:
         }
     elif game_code == "safety":
         index = state["index"]
-        if index < len(SAFETY_SCENARIOS):
-            scene = SAFETY_SCENARIOS[index]
+        scenes = _learning_scenes(state, "safety")
+        if index < len(scenes):
+            scene = scenes[index]
             data["game_state"] = {
-                "index": index, "total": len(SAFETY_SCENARIOS), "correct": state["correct"],
-                "scenario": {key: scene[key] for key in ("level", "title", "scene", "question", "choices")},
+                "index": index, "total": len(scenes), "correct": state["correct"],
+                "content_version": state.get("content_version", "legacy"),
+                "scenario": {"id": scene.get("id"), "difficulty": scene.get("difficulty", scene.get("level", "")), "tags": scene.get("tags", ()), "title": scene["title"], "scene": scene["scene"], "question": scene["question"], "choices": scene["choices"]},
                 "notice": state["last_notice"],
             }
         else:
-            data["game_state"] = {"index": index, "total": len(SAFETY_SCENARIOS), "correct": state["correct"], "finished": True}
+            data["game_state"] = {"index": index, "total": len(scenes), "correct": state["correct"], "finished": True}
     elif game_code == "mission":
         index = state["index"]
-        if index < len(MISSION_SCENARIOS):
-            scene = MISSION_SCENARIOS[index]
+        scenes = _learning_scenes(state, "mission")
+        if index < len(scenes):
+            scene = scenes[index]
             data["game_state"] = {
-                "index": index, "total": len(MISSION_SCENARIOS), "reputation": state["reputation"],
-                "scenario": {"title": scene["title"], "person": scene["person"], "place": scene["place"], "scene": scene["scene"], "choices": [choice[0] for choice in scene["choices"]]},
+                "index": index, "total": len(scenes), "reputation": state["reputation"],
+                "content_version": state.get("content_version", "legacy"),
+                "scenario": {"id": scene.get("id"), "difficulty": scene.get("difficulty"), "tags": scene.get("tags", ()), "title": scene["title"], "person": scene["person"], "place": scene["place"], "scene": scene["scene"], "choices": [choice[0] for choice in scene["choices"]]},
                 "notice": state["last_notice"],
             }
         else:
-            data["game_state"] = {"index": index, "total": len(MISSION_SCENARIOS), "reputation": state["reputation"], "finished": True}
+            data["game_state"] = {"index": index, "total": len(scenes), "reputation": state["reputation"], "finished": True}
     if state.get("result"):
         data["result"] = state["result"]
+    data["game_state"].update({key: state.get(key, default) for key, default in {
+        "round": 1, "round_finished": False, "streak": 0, "bonus_notice": "",
+        "bonus_score": 0, "hints": 0, "hidden_choices": [],
+    }.items()})
     return data
 
 
@@ -525,13 +679,15 @@ def start_game(user_id: int, game_code: str) -> dict:
     _begin()
     try:
         _ensure_profile(user_id)
-        cutoff = (_now() - timedelta(seconds=GAME_SESSION_TTL_SECONDS)).isoformat()
         _db().execute("UPDATE game_sessions SET status='expired' WHERE user_id=? AND status='active' AND expires_at<=?", (user_id, _now_text()))
-        active_count = _db().execute("SELECT COUNT(*) n FROM game_sessions WHERE user_id=? AND status='active' AND started_at>?", (user_id, cutoff)).fetchone()["n"]
-        if int(active_count or 0) >= 3:
-            raise ValueError("Завершите или перезапустите одну из текущих игр.")
+        _db().execute(_lock_sql("SELECT user_id FROM users WHERE user_id=?"), (user_id,)).fetchone()
+        existing = _db().execute("SELECT * FROM game_sessions WHERE user_id=? AND game_code=? AND status='active' ORDER BY started_at DESC LIMIT 1", (user_id, game_code)).fetchone()
+        if existing:
+            _db().execute("COMMIT")
+            return _public_session(dict(existing))
         equipped = _equipped_item_ids(user_id, game_code)
         state = _NEW_SESSION[game_code](user_id, equipped)
+        state.update({"endless": True, "round": 1, "play_actions": 0})
         session_id = secrets.token_urlsafe(24)
         stamp = _now_text()
         expires = (_now() + timedelta(seconds=GAME_SESSION_TTL_SECONDS)).isoformat()
@@ -583,22 +739,62 @@ def _check_action_timing(row: dict) -> None:
 
 
 def _crossing_action(state: dict, action: dict) -> tuple[dict, bool, dict | None]:
+    # Upgrade a session created by the old turn clock once, preserving its
+    # seed, position and score instead of resetting traffic on every sync.
+    if not state.get("clock_anchor_at"):
+        state["elapsed_ms"] = max(0, int(state.get("ticks", 0))) * _CROSSING_TICK_MS
+        state["clock_anchor_at"] = _now_text()
+        state["traffic_checked_ms"] = state["elapsed_ms"]
+        state.setdefault("paused", False)
+    control = action.get("type")
+    elapsed = _crossing_elapsed_ms(state)
+    player = state["player"]
+
+    def hit(x, y, start, end):
+        grace = int(state.get("invulnerable_until_ms", 0))
+        if end < grace or not _crossing_hit_between(state, x, y, max(start, grace), end):
+            return False
+        if state["shield"] > 0:
+            state["shield"] -= 1
+            state["invulnerable_until_ms"] = elapsed + _CROSSING_TICK_MS
+            state["last_notice"] = "Проводник защитил героя от столкновения."
+            return False
+        return True
+
+    previous = int(state.get("traffic_checked_ms", elapsed))
+    state["traffic_checked_ms"] = elapsed
+    if not state.get("paused") and hit(player["x"], player["y"], previous, elapsed):
+        score = state["distance"] * 10 + state["coins"] * 5 + state["deliveries"] * 20 + state.get("bonus_score", 0)
+        state["score"] = score
+        state["last_notice"] = "Машина пересекла вашу клетку. Переждите поток на безопасной полосе."
+        return state, True, {"score": score, "outcome": "Маршрут прерван", "metric": state["distance"]}
+    if control == "sync":
+        return state, False, None
+    if control == "pause":
+        _set_crossing_paused(state, True)
+        state["last_notice"] = "Маршрут поставлен на паузу. Машины остановлены на сервере."
+        return state, False, None
+    if control == "resume":
+        _set_crossing_paused(state, False)
+        state["last_notice"] = "Маршрут продолжен. Следите за движением машин."
+        return state, False, None
     direction = action.get("direction")
     if direction not in {"up", "down", "left", "right"}:
         raise ValueError("Выберите направление движения.")
-    player = state["player"]
+    if state.get("paused"):
+        raise ValueError("Сначала продолжите маршрут.")
     shifts = {"up": (0, 1), "down": (0, -1), "left": (-1, 0), "right": (1, 0)}
     dx, dy = shifts[direction]
     next_x = max(0, min(6, int(player["x"]) + dx))
     next_y = max(0, int(player["y"]) + dy)
-    state["ticks"] += 1
+    state["ticks"] = _crossing_tick(state)
     if next_x == player["x"] and next_y == player["y"]:
         state["last_notice"] = "Здесь край маршрута — выберите другое направление."
         return state, False, None
     player["x"], player["y"] = next_x, next_y
     if dy > 0:
         state["distance"] = max(state["distance"], next_y)
-    if next_y and (state["seed"] + next_y * 7) % 5 == 0 and next_y not in state["collected"]:
+    if next_y and (state["seed"] + next_y * 7) % 5 == 0 and next_y not in state["collected"] and next_x == (state["seed"] + next_y * 5) % 7:
         state["collected"].append(next_y)
         state["coins"] += 1
         state["last_notice"] = "Найден полезный ресурс: +5 к счёту."
@@ -607,20 +803,25 @@ def _crossing_action(state: dict, action: dict) -> tuple[dict, bool, dict | None
         state["last_notice"] = "Помощь доставлена в контрольную точку!"
     else:
         state["last_notice"] = "Маршрут открыт — двигайтесь к следующей точке помощи."
-    score = state["distance"] * 10 + state["coins"] * 5 + state["deliveries"] * 20
-    state["score"] = score
-    cars = _crossing_lane(state["seed"], next_y, state["ticks"])
-    if next_x in cars:
-        if state["shield"] > 0:
-            state["shield"] -= 1
-            state["last_notice"] = "Проводник защитил героя от столкновения."
+    if next_y >= 4 and next_y % 8 == 4 and next_x == (state["seed"] + next_y * 5) % 7 and next_y not in state.setdefault("bonuses_collected", []):
+        state["bonuses_collected"].append(next_y)
+        if (next_y // 8) % 2 == 0:
+            state["shield"] += 1
+            state["bonus_notice"] = "Подобран щит: защита от одного столкновения!"
         else:
-            state["last_notice"] = "Маршрут перекрыт. В следующий раз выберите безопасную клетку."
-            return state, True, {"score": score, "outcome": "Маршрут прерван", "metric": state["distance"]}
-    if state["distance"] >= 30:
-        state["last_notice"] = "Все контрольные точки пройдены — помощь доставлена!"
-        state["score"] = score + 40
-        return state, True, {"score": state["score"], "outcome": "Маршрут завершён", "metric": state["distance"]}
+            state["coins"] += 3
+            state["bonus_notice"] = "Подобраны припасы: +3 ресурса!"
+    score = state["distance"] * 10 + state["coins"] * 5 + state["deliveries"] * 20 + state.get("bonus_score", 0)
+    state["score"] = score
+    if hit(next_x, next_y, elapsed, elapsed):
+        state["last_notice"] = "Маршрут перекрыт. В следующий раз выберите безопасную клетку."
+        return state, True, {"score": score, "outcome": "Маршрут прерван", "metric": state["distance"]}
+    milestones = state["distance"] // 30
+    if milestones > state.get("milestones", 0):
+        state["bonus_score"] = state.get("bonus_score", 0) + 40 * (milestones - state.get("milestones", 0))
+        state["milestones"] = milestones
+        state["last_notice"] = "Контрольный участок пройден: +40 очков. Дорога продолжается!"
+    state["score"] = state["distance"] * 10 + state["coins"] * 5 + state["deliveries"] * 20 + state.get("bonus_score", 0)
     return state, False, None
 
 
@@ -752,7 +953,7 @@ def _match_action(state: dict, action: dict) -> tuple[dict, bool, dict | None, d
     state["last_combo"] = combo
     state["max_combo"] = max(state["max_combo"], combo)
     state["last_notice"] = f"Каскад x{combo}: +{gained} очков."
-    finished = state["moves"] <= 0 or state["target_count"] >= state["target_goal"]
+    finished = state["moves"] <= 0 or state["target_count"] >= state["target_goal"] or not _legal_match_swaps(state["board"])
     if finished:
         if state["target_count"] >= state["target_goal"]:
             state["score"] += 120
@@ -765,13 +966,14 @@ def _safety_action(state: dict, action: dict) -> tuple[dict, bool, dict | None, 
     if action.get("type") != "answer":
         raise ValueError("Выберите вариант ответа.")
     index = state["index"]
-    if index >= len(SAFETY_SCENARIOS):
+    scenes = _learning_scenes(state, "safety")
+    if index >= len(scenes):
         raise ValueError("Игра уже завершена.")
     try:
         selected = int(action.get("choice"))
     except (TypeError, ValueError):
         raise ValueError("Некорректный вариант ответа.")
-    scene = SAFETY_SCENARIOS[index]
+    scene = scenes[index]
     if not 0 <= selected < len(scene["choices"]):
         raise ValueError("Некорректный вариант ответа.")
     correct = selected == scene["correct"]
@@ -782,7 +984,7 @@ def _safety_action(state: dict, action: dict) -> tuple[dict, bool, dict | None, 
     state["index"] += 1
     state["last_notice"] = scene["principle"]
     feedback = {"correct": correct, "explanation": scene["explanation"], "principle": scene["principle"]}
-    finished = state["index"] >= len(SAFETY_SCENARIOS)
+    finished = state["index"] >= len(scenes)
     final = {"score": state["correct"], "outcome": "Курс завершён", "metric": state["correct"]} if finished else None
     return state, finished, final, feedback
 
@@ -791,13 +993,14 @@ def _mission_action(state: dict, action: dict) -> tuple[dict, bool, dict | None,
     if action.get("type") != "choose":
         raise ValueError("Выберите вариант действия.")
     index = state["index"]
-    if index >= len(MISSION_SCENARIOS):
+    scenes = _learning_scenes(state, "mission")
+    if index >= len(scenes):
         raise ValueError("История уже завершена.")
     try:
         selected = int(action.get("choice"))
     except (TypeError, ValueError):
         raise ValueError("Некорректный вариант действия.")
-    scene = MISSION_SCENARIOS[index]
+    scene = scenes[index]
     if not 0 <= selected < len(scene["choices"]):
         raise ValueError("Некорректный вариант действия.")
     choice, reputation, explanation = scene["choices"][selected]
@@ -807,7 +1010,7 @@ def _mission_action(state: dict, action: dict) -> tuple[dict, bool, dict | None,
     state["index"] += 1
     state["last_notice"] = explanation
     feedback = {"reputation": reputation, "explanation": explanation, "choice": choice}
-    finished = state["index"] >= len(MISSION_SCENARIOS)
+    finished = state["index"] >= len(scenes)
     final = {"score": state["reputation"], "outcome": "История завершена", "metric": state["reputation"]} if finished else None
     return state, finished, final, feedback
 
@@ -938,6 +1141,64 @@ def _complete_session_tx(user_id: int, row: dict, state: dict, final: dict) -> d
     }
 
 
+def _finish_summary(game_code: str, state: dict) -> dict:
+    if int(state.get("play_actions", 0)) < 1:
+        raise ValueError("Сначала сделайте хотя бы один ход.")
+    score = int(state.get("score", 0))
+    metric = state.get({"crossing": "distance", "dispatch": "completed", "safety": "correct", "mission": "reputation"}.get(game_code, "score"), score)
+    return {"score": score, "metric": metric, "max_combo": state.get("max_combo", 0), "outcome": "Результат сохранён"}
+
+
+def _next_round(user_id: int, game_code: str, state: dict) -> dict:
+    if not state.get("round_finished") or game_code == "crossing":
+        raise ValueError("Сначала закончите текущий этап.")
+    fresh = _NEW_SESSION[game_code](user_id, set(state.get("equipped", [])))
+    for key in ("score", "correct", "reputation", "completed", "max_combo", "hints", "streak", "play_actions", "good_swaps"):
+        if key in state:
+            fresh[key] = state[key]
+    fresh.update({"endless": True, "round": int(state.get("round", 1)) + 1, "round_finished": False})
+    fresh["last_notice"] = "Новый этап. Общий счёт и заработанные бонусы сохранены."
+    return fresh
+
+
+def _learning_hint(state: dict, game_code: str) -> None:
+    if int(state.get("hints", 0)) < 1:
+        raise ValueError("Подсказку можно заработать серией удачных решений.")
+    scene = _learning_scenes(state, game_code)[state["index"]]
+    hidden = state.setdefault("hidden_choices", [])
+    choices = [i for i in range(len(scene["choices"])) if i not in hidden and (i != scene["correct"] if game_code == "safety" else scene["choices"][i][1] < max(item[1] for item in scene["choices"]))]
+    if not choices:
+        raise ValueError("Все слабые варианты уже убраны.")
+    hidden.append(choices[0])
+    state["hints"] -= 1
+    state["last_notice"] = "Подсказка убрала один неподходящий вариант."
+
+
+def _award_play_bonus(game_code: str, state: dict, action: dict, feedback: dict | None, previous_completed: int) -> None:
+    state["play_actions"] = int(state.get("play_actions", 0)) + 1
+    if game_code == "dispatch" and action.get("type") == "assign":
+        state["streak"] = int(state.get("streak", 0)) + 1 if state["completed"] > previous_completed else 0
+        if state["streak"] and state["streak"] % 3 == 0:
+            state["score"] += 50
+            state["bonus_notice"] = "Три успешных назначения подряд: +50 очков!"
+    elif game_code == "match" and feedback and feedback.get("valid"):
+        state["good_swaps"] = int(state.get("good_swaps", 0)) + 1
+        if state["good_swaps"] % 3 == 0:
+            state["hints"] += 1
+            state["bonus_notice"] = "Три удачных перестановки: +1 подсказка!"
+    elif game_code in {"safety", "mission"} and feedback:
+        good = feedback.get("correct") if game_code == "safety" else feedback.get("reputation", 0) > 0
+        state["streak"] = int(state.get("streak", 0)) + 1 if good else 0
+        state["hidden_choices"] = []
+        target = 3 if game_code == "safety" else 2
+        if state["streak"] and state["streak"] % target == 0:
+            state["hints"] = int(state.get("hints", 0)) + 1
+            state["bonus_notice"] = f"Серия из {target} удачных решений: +1 подсказка!"
+            feedback["bonus"] = state["bonus_notice"]
+    if state.get("bonus_notice"):
+        state["last_notice"] += " " + state["bonus_notice"]
+
+
 def action_game(user_id: int, session_id: str, action: dict) -> dict:
     if not isinstance(action, dict):
         raise ValueError("Некорректное игровое действие.")
@@ -947,10 +1208,24 @@ def action_game(user_id: int, session_id: str, action: dict) -> dict:
         if row["status"] != "active":
             _db().execute("COMMIT")
             return _public_session(row, state)
-        _check_action_timing(row)
         feedback: dict | None = None
         game_code = row["game_code"]
-        if game_code == "crossing":
+        state["bonus_notice"] = ""
+        previous_completed = int(state.get("completed", 0))
+        if not (game_code == "crossing" and action.get("type") in {"pause", "resume"}):
+            _check_action_timing(row)
+        if action.get("type") == "finish":
+            final = _finish_summary(game_code, state)
+            finished = True
+        elif action.get("type") == "next_round":
+            state = _next_round(user_id, game_code, state)
+            finished, final = False, None
+        elif state.get("round_finished"):
+            raise ValueError("Откройте следующий этап или сохраните результат.")
+        elif action.get("type") == "hint" and game_code in {"safety", "mission"}:
+            _learning_hint(state, game_code)
+            finished, final = False, None
+        elif game_code == "crossing":
             state, finished, final = _crossing_action(state, action)
         elif game_code == "dispatch":
             state, finished, final = _dispatch_action(state, action)
@@ -962,6 +1237,12 @@ def action_game(user_id: int, session_id: str, action: dict) -> dict:
             state, finished, final, feedback = _mission_action(state, action)
         else:
             raise ValueError("Неизвестная игровая сессия.")
+        if action.get("type") not in {"finish", "next_round", "sync", "pause", "resume", "hint"}:
+            _award_play_bonus(game_code, state, action, feedback, previous_completed)
+        if finished and final and game_code != "crossing" and action.get("type") != "finish":
+            state["score"] = max(int(state.get("score", 0)), int(final["score"]))
+            state["round_finished"] = True
+            finished, final = False, None
         score = int(final["score"]) if finished and final else int(state.get("score", row["score"] or 0))
         stamp = _now_text()
         if finished and final:
@@ -973,7 +1254,8 @@ def action_game(user_id: int, session_id: str, action: dict) -> dict:
             )
             row.update({"state": _dumps(state), "status": "completed", "score": score, "last_action_at": stamp, "completed_at": stamp})
         else:
-            _db().execute("UPDATE game_sessions SET state=?,score=?,last_action_at=? WHERE id=?", (_dumps(state), score, stamp, session_id))
+            expires = (_now() + timedelta(seconds=GAME_SESSION_TTL_SECONDS)).isoformat()
+            _db().execute("UPDATE game_sessions SET state=?,score=?,last_action_at=?,expires_at=? WHERE id=?", (_dumps(state), score, stamp, expires, session_id))
             row.update({"state": _dumps(state), "score": score, "last_action_at": stamp})
         _db().execute("COMMIT")
     except Exception:
@@ -1041,12 +1323,15 @@ def game_state(user_id: int | None) -> dict:
     return {
         "ok": True, "authenticated": True, "catalog": catalog(), "balance": int(user["balance"] or 0) if user else 0,
         "profile": dict(profile) if profile else {"games_played": 0, "games_completed": 0, "games_hp_earned": 0},
-        "records": records, "achievements": achievements, "store": store, "transactions": transactions,
+        "records": records, "achievements": achievements,
+        "achievement_catalog": [{"id": key, **item, "unlocked": any(a["id"] == key for a in achievements)} for key,item in ACHIEVEMENTS.items()],
+        "store": store, "transactions": transactions,
         "challenges": _daily_challenge_state(user_id), "economy": {
             "daily_cap": GAME_DAILY_REWARD_CAP, "per_game_cap": GAME_PER_TITLE_REWARD_CAP,
             "earned_today": int(daily_total or 0), "remaining_today": max(0, GAME_DAILY_REWARD_CAP - int(daily_total or 0)), "day": day,
         },
         "active_session": _public_session(dict(active)) if active else None,
+        "active_sessions": [{"id": item["id"], "game": item["game_code"]} for item in _db().execute("SELECT id,game_code FROM game_sessions WHERE user_id=? AND status='active' AND expires_at>?", (user_id, _now_text())).fetchall()],
     }
 
 

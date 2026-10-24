@@ -1,4 +1,5 @@
 import unittest,sqlite3,urllib.request,urllib.error,json,threading
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 from hpoint import database,services
@@ -7,11 +8,55 @@ import hpoint.web as web
 class Web(unittest.TestCase):
  def setUp(self):
   self.old=database.db;self.db=sqlite3.connect(":memory:",isolation_level=None,check_same_thread=False);self.db.row_factory=sqlite3.Row
-  database.db=self.db;services.db=self.db;billing.db=self.db;web.database.db=self.db;web.db=self.db;database.init_db()
- def tearDown(self):database.db=self.old;services.db=self.old;billing.db=self.old;web.database.db=self.old;web.db=self.old;self.db.close()
+  database.db=self.db;services.db=self.db;billing.db=self.db;web.database.db=self.db;web.db=self.db;database.init_db();self.notification_patch=patch.object(web,"notify_telegram_user",return_value=False);self.notification_patch.start()
+ def tearDown(self):self.notification_patch.stop();database.db=self.old;services.db=self.old;billing.db=self.old;web.database.db=self.old;web.db=self.old;self.db.close()
  def test_web_shares_logic(self):
   database.create_user(42,"Web",None);rid=services.create_request(42,{"what":"Помочь с компьютером","place":"x","time_needed":"x","urgency":"x","details":"x"})
   self.assertEqual(database.get_request(rid)["category"],"tech")
+ def test_request_promotion_uses_catalog_prices_without_creating_a_purchase(self):
+  database.create_user(42,"Web",tg_user_id=42,web_verified=True);token=web.new_sess(42)
+  before=database.get_user(42)["balance"]
+  catalog={**web.MONETIZATION_ITEMS,"boost":{**web.MONETIZATION_ITEMS["boost"],"rub":63,"hp":29}}
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   with patch.object(web,"MONETIZATION_ITEMS",catalog):
+    request=urllib.request.Request(f"http://127.0.0.1:{server.server_port}/api/sync",headers={"Cookie":"hpoint_session="+token})
+    with urllib.request.urlopen(request,timeout=3) as response:promotion=json.load(response)["request_promotion"]
+   self.assertEqual((promotion["item_type"],promotion["rub"],promotion["hp"]),("boost",63,29))
+   self.assertEqual(database.get_user(42)["balance"],before)
+   self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM billing_invoices").fetchone()["n"],0)
+  finally:server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_helper_preferences_and_two_sided_offer_notifications(self):
+  database.create_user(11,"Author",tg_user_id=11,web_verified=True)
+  database.create_user(22,"Helper",tg_user_id=22,web_verified=True)
+  payload={"what":"Настроить компьютер","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test","category":"tech"}
+  rid=services.create_request(11,payload);services.create_request(22,payload)
+  tokens={uid:web.new_sess(uid) for uid in (11,22)}
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  def request(uid,path,data=None):
+   headers={"Cookie":"hpoint_session="+tokens[uid],"Content-Type":"application/json"}
+   req=urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}"+path,headers=headers,data=json.dumps(data).encode() if data is not None else None)
+   with urllib.request.urlopen(req,timeout=3) as response:return json.load(response)
+  try:
+   prefs=request(22,"/api/helper/preferences",{"categories":["tech"],"availability":"После 18:00","ready":True})
+   self.assertTrue(prefs["user"]["helper_ready"]);self.assertEqual(prefs["user"]["helper_availability"],"После 18:00")
+   matches=request(11,"/api/assistant/candidates",{"request_id":rid})["matches"]
+   self.assertEqual(matches[0]["user_id"],22)
+   with patch.object(web,"notify_telegram_user") as notify:
+    self.assertTrue(request(11,"/api/smart-match/assign",{"request_id":rid,"helper_id":22})["offered"])
+    self.assertEqual({call.args[0] for call in notify.call_args_list},{11,22})
+   self.assertEqual(request(22,"/api/helper/offers")["offers"][0]["request_id"],rid)
+   self.assertEqual(request(11,"/api/sync")["outgoing_offers"][0]["helper_name"],"Helper")
+   with patch.object(web,"notify_telegram_user") as notify:
+    self.assertTrue(request(22,"/api/helper/offers/respond",{"request_id":rid,"accept":True,"offer_token":services.get_current_helper_offer(rid)["offer_token"]})["accepted"])
+    self.assertEqual({call.args[0] for call in notify.call_args_list},{11,22})
+   self.assertEqual(request(11,"/api/sync")["outgoing_offers"],[])
+   self.assertEqual(len(request(22,"/api/chats")["chats"]),1)
+   web_uid=database.create_web_user("Email member","league@example.test","hash")
+   self.assertLess(web_uid,0)
+   public=request(11,"/api/community/profile?id="+str(web_uid))["profile"]
+   self.assertEqual(public["id"],web_uid);self.assertEqual(public["stats"]["helped"],0)
+  finally:server.shutdown();thread.join(timeout=3);server.server_close()
  def test_page_contains_platform(self):
   self.assertIn("Smart Match",web.PAGE);self.assertIn("Telegram",web.PAGE);self.assertIn("руб",web.PAGE)
   self.assertIn('rel="icon" type="image/svg+xml" href="/assets/favicon.svg"',web.PAGE)
@@ -41,6 +86,48 @@ class Web(unittest.TestCase):
   self.assertIn("hpointShowcaseGo",web.PAGE)
   self.assertIn("https://*.yandex.ru",web.CSP)
   self.assertIn("https://*.yandex.net",web.CSP)
+  self.assertNotIn("unsafe-eval",web.CSP)
+ def test_site_navigation_has_three_primary_routes_and_keeps_tools_reachable(self):
+  self.assertIn('SITE_NAV_UI',web.__dict__)
+  self.assertIn('sitePrimaryNav',web.PAGE)
+  self.assertIn('Главная',web.SITE_NAV_UI)
+  self.assertIn('Помощь',web.SITE_NAV_UI)
+  self.assertIn('Игры',web.SITE_NAV_UI)
+  self.assertIn("legacyHead.remove()",web.SITE_NAV_UI)
+  self.assertIn("['requests'",web.SITE_NAV_UI)
+  self.assertIn("['match'",web.SITE_NAV_UI)
+  self.assertIn("['chat'",web.SITE_NAV_UI)
+  self.assertIn("['map'",web.SITE_NAV_UI)
+  self.assertIn("['history'",web.SITE_NAV_UI)
+  self.assertIn("['wallet'",web.SITE_NAV_UI)
+  self.assertIn("['billing'",web.SITE_NAV_UI)
+  self.assertIn("window.history.pushState",web.SITE_NAV_UI)
+  self.assertNotIn(".tabs{display:none",web.SITE_NAV_CSS)
+ def test_workspace_shell_uses_real_data_without_a_card_catalog(self):
+  self.assertIn('WORKSPACE_SHELL_UI',web.__dict__)
+  self.assertIn('workspaceHelpGrid',web.WORKSPACE_SHELL_CSS)
+  self.assertIn('workspaceMapSlot',web.WORKSPACE_SHELL_UI)
+  self.assertIn("/api/sync",web.WORKSPACE_SHELL_UI)
+  self.assertIn("/api/requests?open=1",web.WORKSPACE_SHELL_UI)
+  self.assertIn("/api/assistant/candidates",web.WORKSPACE_SHELL_UI)
+  self.assertIn("/api/chats/send",web.WORKSPACE_SHELL_UI)
+  self.assertIn("/api/wallet",web.WORKSPACE_SHELL_UI)
+  self.assertIn("/api/billing",web.WORKSPACE_SHELL_UI)
+  self.assertIn("openWorkspaceChat",web.WORKSPACE_SHELL_UI)
+  self.assertIn("state.profileDetails",web.WORKSPACE_SHELL_UI)
+  self.assertIn('@media(max-width:900px)',web.WORKSPACE_HEADER_CSS)
+  self.assertIn('@media(max-width:380px)',web.WORKSPACE_HEADER_CSS)
+  self.assertIn('.workspaceSectionTabs{display:grid',web.WORKSPACE_HEADER_CSS)
+  self.assertIn('font-size:0!important',web.WORKSPACE_HEADER_CSS)
+  self.assertNotIn("Что ещё доступно",web.WORKSPACE_SHELL_UI)
+  self.assertNotIn("Всё готово",web.WORKSPACE_SHELL_UI)
+ def test_games_page_uses_server_clock_for_smooth_crossing(self):
+  self.assertIn("requestAnimationFrame(drawCars)",web.GAMES_PAGE)
+  self.assertIn("elapsed_ms",web.GAMES_PAGE)
+  self.assertIn("performance.now()",web.GAMES_PAGE)
+  self.assertIn("anchorCrossingClock",web.GAMES_PAGE)
+  self.assertIn("type:'pause'",web.GAMES_PAGE)
+  self.assertIn("visibilitychange",web.GAMES_PAGE)
  def test_head_for_public_page_and_health(self):
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
   try:
@@ -61,10 +148,18 @@ class Web(unittest.TestCase):
    req=urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers=headers,method="POST")
    return urllib.request.urlopen(req,timeout=3)
   try:
-   password="Aa1234"
-   with post("/api/auth/register",{"name":"New User","email":"new@example.com","password":password,"password_confirm":password}) as response:
-    created=json.load(response);cookie=response.headers["Set-Cookie"].split(";",1)[0]
+   password="ValidPassword123"
+   delivered=[]
+   with patch.object(web,"email_delivery_configured",return_value=True),patch.object(web,"send_email_verification_code",side_effect=lambda address,code:delivered.append(code) or True):
+    with post("/api/auth/register",{"name":"New User","email":"new@example.com","password":password,"password_confirm":password}) as response:
+     created=json.load(response);pending=response.headers["Set-Cookie"].split(";",1)[0]
    self.assertTrue(created["ok"])
+   self.assertTrue(created["verification_required"])
+   with self.assertRaises(urllib.error.HTTPError) as unconfirmed:
+    urllib.request.urlopen(urllib.request.Request(base+"/api/me",headers={"Cookie":pending}),timeout=3)
+   self.assertEqual(unconfirmed.exception.code,401);unconfirmed.exception.close()
+   with post("/api/auth/email/verify",{"code":delivered[0]},pending) as response:
+    self.assertTrue(json.load(response)["verified"]);cookie=response.headers["Set-Cookie"].split(";",1)[0]
    with urllib.request.urlopen(urllib.request.Request(base+"/api/me",headers={"Cookie":cookie}),timeout=3) as response:
     self.assertEqual(json.load(response)["user"]["email"],"new@example.com")
    with post("/api/auth/login",{"email":"new@example.com","password":password}) as response:
@@ -119,11 +214,12 @@ class Web(unittest.TestCase):
    request={"what":"Нужна помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"}
    with self.assertRaises(urllib.error.HTTPError) as blocked:
     post("/api/requests",request,cookie)
-   self.assertEqual(blocked.exception.code,403);blocked.exception.close()
+   self.assertEqual(blocked.exception.code,401);blocked.exception.close()
    with self.assertRaises(urllib.error.HTTPError) as wrong:
     post("/api/auth/email/verify",{"code":"000000"},cookie)
    self.assertEqual(wrong.exception.code,400);wrong.exception.close()
-   with post("/api/auth/email/verify",{"code":delivered[0][1]},cookie) as response:self.assertTrue(json.load(response)["verified"])
+   with post("/api/auth/email/verify",{"code":delivered[0][1]},cookie) as response:
+    self.assertTrue(json.load(response)["verified"]);cookie=response.headers["Set-Cookie"].split(";",1)[0]
    with post("/api/requests",request,cookie) as response:self.assertTrue(json.load(response)["ok"])
    with self.assertRaises(urllib.error.HTTPError) as reused:
     post("/api/auth/email/verify",{"code":delivered[0][1]},cookie)
@@ -139,9 +235,33 @@ class Web(unittest.TestCase):
    with self.assertRaises(urllib.error.HTTPError) as weak:
     register({"name":"Weak User","email":"weak@example.com","password":"weakpassword12","password_confirm":"weakpassword12"})
    self.assertEqual(weak.exception.code,400);weak.exception.close()
+   with self.assertRaises(urllib.error.HTTPError) as short:
+    register({"name":"Short User","email":"short@example.com","password":"Aa123","password_confirm":"Aa123"})
+   self.assertEqual(short.exception.code,400);short.exception.close()
    with self.assertRaises(urllib.error.HTTPError) as mismatch:
     register({"name":"Mismatch User","email":"mismatch@example.com","password":"SecurePass123A","password_confirm":"SecurePass123B"})
    self.assertEqual(mismatch.exception.code,400);mismatch.exception.close()
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_unconfigured_sms_does_not_send_or_create_a_verification_code(self):
+  database.create_user(77,"Проверка контактов",tg_user_id=77,web_verified=True)
+  self.db.execute("UPDATE users SET phone='+79990000000',email_verified=1 WHERE user_id=77")
+  token=web.new_sess(77)
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler)
+  thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   base=f"http://127.0.0.1:{server.server_address[1]}"
+   headers={"Content-Type":"application/json","Cookie":f"hpoint_session={token}"}
+   with patch.object(web,"sms_delivery_configured",return_value=False),patch.object(web,"send_phone_verification_code") as send:
+    with self.assertRaises(urllib.error.HTTPError) as unavailable:
+     urllib.request.urlopen(urllib.request.Request(base+"/api/profile/phone/send-code",data=b"{}",headers=headers,method="POST"),timeout=3)
+    self.assertEqual(unavailable.exception.code,503)
+    result=json.load(unavailable.exception);unavailable.exception.close()
+    self.assertNotIn("code",result);send.assert_not_called()
+    self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM phone_verification_codes WHERE user_id=77").fetchone()["n"],0)
+    user=web.user_payload(database.get_user(77))
+    self.assertTrue(user["tg_linked"]);self.assertTrue(user["email_verified"])
+    self.assertFalse(user["sms_delivery_configured"])
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_telegram_login_creates_one_shared_profile(self):
@@ -175,6 +295,24 @@ class Web(unittest.TestCase):
    self.assertEqual(row["id"],rid);self.assertIsNone(row["lat"]);self.assertIsNone(row["lon"]);self.assertNotIn("details",row);self.assertNotEqual(row["place"],"район")
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_public_open_feed_preserves_status_and_excludes_history_and_own_requests(self):
+  for uid in (1,2,3):database.create_user(uid,f"User {uid}",tg_user_id=uid,web_verified=True)
+  payload={"what":"Помочь с техникой","place":"Скрытый адрес","time_needed":"сегодня","urgency":"обычная","details":"Личные сведения","lat":55.75,"lon":37.62}
+  opened=services.create_request(1,payload)
+  done=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(done,3));self.assertTrue(services.complete_request(done,3))
+  active=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(active,3))
+  cancelled=services.create_request(1,payload);self.assertTrue(services.cancel_request(cancelled,1,"test"))
+  own=services.create_request(2,payload)
+  token=web.new_sess(2);server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   for path in ("/api/requests?open=1","/api/search"):
+    request=urllib.request.Request(f"http://127.0.0.1:{server.server_port}"+path,headers={"Cookie":"hpoint_session="+token})
+    with urllib.request.urlopen(request,timeout=3) as response:rows=json.load(response)["requests"]
+    self.assertEqual([row["id"] for row in rows],[opened])
+    self.assertEqual(rows[0]["status"],"open");self.assertEqual(rows[0]["status_title"],"Ожидает помощника")
+    self.assertNotIn("details",rows[0]);self.assertIsNone(rows[0]["lat"]);self.assertIsNone(rows[0]["lon"]);self.assertNotEqual(rows[0]["place"],payload["place"])
+   self.assertEqual([database.get_request(rid)["status"] for rid in (opened,done,active,cancelled,own)],["open","done","in_progress","cancelled","open"])
+  finally:server.shutdown();thread.join(timeout=3);server.server_close()
  def test_helper_location_updates_distance_and_active_map_stays_private(self):
   database.create_user(1,"Requester");database.create_user(2,"Helper")
   rid=services.create_request(1,{"what":"Нужна дрель","place":"район","time_needed":"сегодня","urgency":"обычная","details":"Точный адрес","lat":55.75123,"lon":37.61987})
@@ -239,9 +377,9 @@ class Web(unittest.TestCase):
   telegram_request=services.create_request(42,{"what":"Заявка из Telegram","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"bot"})
   web_uid=database.create_web_user("Site","site@example.com","hash")
   site_old_request=services.create_request(web_uid,{"what":"Заявка до привязки","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"site"})
-  self.db.execute("UPDATE users SET verification_code='LINK1234',verification_code_expires_at=? WHERE user_id=?",((datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat(),web_uid))
+  self.db.execute("UPDATE users SET verification_code='A1B2C3D4',verification_code_expires_at=? WHERE user_id=?",((datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat(),web_uid))
   token=web.new_sess(web_uid)
-  ok,_=database.link_by_code("LINK1234",42,"telegram_user")
+  ok,_=database.link_by_code("A1B2C3D4",42,"telegram_user")
   self.assertTrue(ok)
 
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler)
@@ -268,6 +406,7 @@ class Web(unittest.TestCase):
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_parallel_sessions_keep_other_device_signed_in(self):
   uid=database.create_web_user("Parallel","parallel@example.com","hash")
+  self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=?",(uid,))
   first,second=web.new_sess(uid),web.new_sess(uid)
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler)
   thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
@@ -282,8 +421,28 @@ class Web(unittest.TestCase):
    with get(second) as response:self.assertEqual(json.load(response)["user"]["id"],uid)
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_session_tokens_are_hashed_and_legacy_tokens_upgrade(self):
+  uid=database.create_web_user("Session User","session@example.com","hash")
+  self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=?",(uid,))
+  token=web.new_sess(uid)
+  stored=self.db.execute("SELECT token FROM sessions WHERE user_id=?",(uid,)).fetchone()["token"]
+  self.assertNotEqual(stored,token)
+  self.assertEqual(len(stored),64)
+  legacy="legacy-session-token"
+  expiry=(datetime.now(timezone.utc)+timedelta(days=1)).isoformat()
+  self.db.execute("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)",(legacy,uid,expiry))
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   base=f"http://127.0.0.1:{server.server_address[1]}"
+   with urllib.request.urlopen(urllib.request.Request(base+"/api/me",headers={"Cookie":f"hpoint_session={legacy}"}),timeout=3) as response:self.assertTrue(json.load(response)["ok"])
+   upgraded=self.db.execute("SELECT token FROM sessions WHERE user_id=? AND token!=?",(uid,stored)).fetchone()["token"]
+   self.assertNotEqual(upgraded,legacy)
+   self.assertEqual(len(upgraded),64)
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
  def test_account_deletion_requires_confirmation_and_revokes_session(self):
   uid=database.create_web_user("Erase Me","erase@example.com","hash");token=web.new_sess(uid)
+  self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=?",(uid,))
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
   try:
    base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Content-Type":"application/json","Cookie":f"hpoint_session={token}"}
@@ -311,11 +470,16 @@ class Web(unittest.TestCase):
     data=None
     if payload is not None:headers["Content-Type"]="application/json";data=json.dumps(payload).encode()
     return urllib.request.urlopen(urllib.request.Request(base+path,data=data,headers=headers,method=method),timeout=3)
-   with request("/api/chats/send","POST",{"request_id":rid,"text":"Здравствуйте!"},1) as response:
-    self.assertEqual(json.load(response)["messages"][-1]["text"],"Здравствуйте!")
+   with patch.object(web,"notify_telegram_user") as notice:
+    with request("/api/chats/send","POST",{"request_id":rid,"text":"Здравствуйте! <b>Текст</b> & детали\nВторая строка"},1) as response:
+     self.assertEqual(json.load(response)["messages"][-1]["text"],"Здравствуйте! <b>Текст</b> & детали\nВторая строка")
+    notice.assert_called_once()
+    self.assertEqual(notice.call_args.args[0],2)
+    self.assertIn("Здравствуйте! &lt;b&gt;Текст&lt;/b&gt; &amp; детали\nВторая строка",notice.call_args.args[1])
+    self.assertIn(f"/chat #{rid} ваш ответ",notice.call_args.args[1])
    with request(f"/api/chats?request_id={rid}",uid=2) as response:
     chat=json.load(response)["chats"][0]
-   self.assertEqual(chat["messages"][-1]["text"],"Здравствуйте!")
+   self.assertEqual(chat["messages"][-1]["text"],"Здравствуйте! <b>Текст</b> & детали\nВторая строка")
    with self.assertRaises(urllib.error.HTTPError) as denied:
     request("/api/chats/send","POST",{"request_id":rid,"text":"Вмешательство"},3)
    self.assertEqual(denied.exception.code,403)
@@ -341,6 +505,51 @@ class Web(unittest.TestCase):
      self.assertEqual(response.headers.get_content_type(),"image/png");self.assertGreater(len(response.read()),1000)
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_telegram_chat_notice_keeps_full_text_and_escapes_html(self):
+  from html import unescape
+  from hpoint.chat_notifications import chat_notification
+  text="<&>\n🙂"*200
+  body=chat_notification(31,"<Автор>",text)
+  self.assertIn(text,unescape(body))
+  self.assertIn("&lt;Автор&gt;",body)
+  self.assertIn("/chat #31 ваш ответ",body)
+  self.assertLess(len(unescape(body)),4096)
+ def test_bot_reply_targets_the_notified_request_and_rejects_outsiders(self):
+  import asyncio
+  from types import SimpleNamespace
+  from unittest.mock import AsyncMock
+  from hpoint import handlers
+  for uid in (1,2,3):database.create_user(uid,f"Участник {uid}")
+  payload={"what":"Чат заявки","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"}
+  old=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(old,2));services.complete_request(old,2)
+  current=services.create_request(3,payload);self.assertTrue(services.try_assign_helper(current,2))
+  text="Ответ <с деталями> & второй строкой\nСпасибо!"
+  message=SimpleNamespace(chat=SimpleNamespace(type="private"),from_user=SimpleNamespace(id=2),text=f"/chat #{old} {text}",answer=AsyncMock())
+  bot=SimpleNamespace(send_message=AsyncMock())
+  with patch.object(handlers,"db",self.db),patch.object(handlers,"ensure_registered",AsyncMock(return_value=True)):
+   asyncio.run(handlers.cmd_chat(message,None,bot))
+   self.assertEqual(bot.send_message.call_args.args[0],1)
+   self.assertIn("Ответ &lt;с деталями&gt; &amp; второй строкой",bot.send_message.call_args.args[1])
+   saved=self.db.execute("SELECT m.text,c.request_id FROM chat_messages m JOIN chats c ON c.id=m.chat_id").fetchall()
+   self.assertEqual([(row["request_id"],row["text"]) for row in saved],[(old,text)])
+   message.from_user.id=3;bot.send_message.reset_mock()
+   asyncio.run(handlers.cmd_chat(message,None,bot));bot.send_message.assert_not_called()
+   self.assertEqual(self.db.execute("SELECT COUNT(*) FROM chat_messages").fetchone()[0],1)
+ def test_game_login_redirect_is_limited_to_known_local_destinations(self):
+  database.create_user(1,"Игрок")
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  class NoRedirect(urllib.request.HTTPRedirectHandler):
+   def redirect_request(self,*args,**kwargs):return None
+  opener=urllib.request.build_opener(NoRedirect())
+  from urllib.parse import urlencode
+  try:
+   for index,(target,expected) in enumerate((("/games?game=crossing","/games?game=crossing"),("https://example.com","/"),("//example.com","/"))):
+    ticket=f"game-destination-{index}";database.create_web_login_ticket(1,ticket)
+    with self.assertRaises(urllib.error.HTTPError) as redirect:
+     opener.open(f"http://127.0.0.1:{server.server_port}/auth/telegram?"+urlencode({"ticket":ticket,"next":target}),timeout=3)
+    with redirect.exception as response:self.assertEqual(response.code,303);self.assertEqual(response.headers["Location"],expected)
+  finally:
+   server.shutdown();thread.join(timeout=3);server.server_close()
  def test_helper_is_offered_request_and_must_confirm(self):
   database.create_user(1,"Requester");database.create_user(2,"Helper")
   rid=services.create_request(1,{"what":"Нужна помощь с техникой","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
@@ -358,13 +567,13 @@ class Web(unittest.TestCase):
    with urllib.request.urlopen(offer,timeout=3) as response:self.assertTrue(json.load(response)["offered"])
    self.assertEqual(database.get_request(rid)["status"],"open")
    with urllib.request.urlopen(urllib.request.Request(base+"/api/helper/offers",headers=headers),timeout=3) as response:self.assertEqual(json.load(response)["offers"][0]["request_id"],rid)
-   response_request=urllib.request.Request(base+"/api/helper/offers/respond",data=json.dumps({"request_id":rid,"accept":True}).encode(),headers=headers,method="POST")
+   response_request=urllib.request.Request(base+"/api/helper/offers/respond",data=json.dumps({"request_id":rid,"accept":True,"offer_token":services.get_current_helper_offer(rid)["offer_token"]}).encode(),headers=headers,method="POST")
    with urllib.request.urlopen(response_request,timeout=3) as response:self.assertTrue(json.load(response)["accepted"])
    request=database.get_request(rid);self.assertEqual(request["helper_id"],2);self.assertEqual(request["status"],"in_progress")
    self.assertIsNotNone(web.chat_for_request(rid))
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
- def test_helper_with_active_request_cannot_accept_another_request(self):
+ def test_helper_with_own_request_can_offer_help_without_assignment(self):
   database.create_user(1,"Requester");database.create_user(2,"Busy helper")
   target=services.create_request(1,{"what":"Нужна помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
   services.create_request(2,{"what":"Моя активная заявка","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
@@ -373,9 +582,10 @@ class Web(unittest.TestCase):
   try:
    base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Cookie":f"hpoint_session={token}","Content-Type":"application/json"}
    req=urllib.request.Request(base+"/api/requests/accept",data=json.dumps({"request_id":target}).encode(),headers=headers,method="POST")
-   with self.assertRaises(urllib.error.HTTPError) as denied:urllib.request.urlopen(req,timeout=3)
-   self.assertEqual(denied.exception.code,409);denied.exception.close()
+   with urllib.request.urlopen(req,timeout=3) as response:self.assertTrue(json.load(response)["queued"])
+   self.assertTrue(services.is_in_queue(2))
    self.assertEqual(database.get_request(target)["status"],"open")
+   self.assertIsNone(database.get_request(target)["helper_id"])
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_points_purchase_and_device_profile_switching(self):
@@ -388,14 +598,14 @@ class Web(unittest.TestCase):
    def post(path,payload,cookie_value=cookie):
     return urllib.request.urlopen(urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers={"Content-Type":"application/json","Cookie":cookie_value},method="POST"),timeout=3)
    with post("/api/payments/hp",{"item_type":"pro","purchase_key":"test-hp-one"}) as response:self.assertTrue(json.load(response)["created"])
-   self.assertEqual(database.get_user(1)["balance"],820)
+   self.assertEqual(database.get_user(1)["balance"],910)
    with urllib.request.urlopen(urllib.request.Request(base+"/api/profiles",headers={"Cookie":cookie}),timeout=3) as response:self.assertEqual(len(json.load(response)["profiles"]),2)
    with post("/api/profiles/switch",{"user_id":2}) as response: switched=response.headers["Set-Cookie"].split(";",1)[0]
    with urllib.request.urlopen(urllib.request.Request(base+"/api/me",headers={"Cookie":switched+"; hpoint_device="+device}),timeout=3) as response:self.assertEqual(json.load(response)["user"]["id"],2)
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_unlink_telegram_preserves_website_data(self):
-  database.create_user(77,"Linked",tg_user_id=77,web_verified=True);self.db.execute("UPDATE users SET email='linked@example.com',password_hash='hash',balance=333 WHERE user_id=77")
+  database.create_user(77,"Linked",tg_user_id=77,web_verified=True);self.db.execute("UPDATE users SET email='linked@example.com',password_hash='hash',email_verified=1,balance=333 WHERE user_id=77")
   token=web.new_sess(77,"unlink-device")
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
   try:

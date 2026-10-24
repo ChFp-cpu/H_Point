@@ -14,8 +14,60 @@ from .states import Registration, HelpRequest, Review, Billing
 from .keyboards import *
 from .billing import create_pending_invoice
 from . import games as game_service
+from .chat_notifications import chat_notification
 
 router = Router()
+
+
+# The bot deliberately stays focused on the help flow.  This guide makes every
+# available control discoverable without turning the reply keyboard into a
+# second, crowded version of the website.
+BOT_GUIDE = (
+    "ℹ️ <b>Как пользоваться H-Point</b>\n\n"
+    "<b>Основное меню</b>\n"
+    "🆘 <b>Мне нужна помощь</b> — ответьте на 5 коротких вопросов, чтобы создать заявку.\n"
+    "🤝 <b>Хочу помочь</b> — встать в общую очередь помощников сайта и бота.\n"
+    "⚡ <b>Подобрать кандидатов</b> / 👥 <b>Мои кандидаты</b> — выбрать человека для своей открытой заявки; он подтвердит участие сам.\n"
+    "📨 Отклик на вашу заявку придёт сюда с кнопками выбора и отказа; он также сохранён на сайте и в «Моих кандидатах».\n"
+    "👤 <b>Мой профиль</b> — баланс HP, рейтинг, статистика и статус проверки.\n"
+    "📜 <b>История</b> — завершённые и текущие заявки.\n"
+    "⚙️ <b>Настройки помощи</b> — указать категории, в которых вы готовы помогать.\n"
+    "🎮 <b>Игры H-Point</b> — открыть выбранную игру на сайте; достижения и HP общие.\n"
+    "💳 <b>H-Point+</b> — платные возможности и безопасный переход к оплате.\n"
+    "🌐 <b>Перейти на сайт</b> — одноразовый вход в тот же профиль без пароля.\n\n"
+    "<b>Как проходит помощь</b>\n"
+    "1. Создайте заявку или встаньте в очередь.\n"
+    "2. Автор выбирает кандидата; помощник подтверждает согласие.\n"
+    "3. Сообщения с сайта приходят сюда целиком. Ответьте командой /chat #НОМЕР ТЕКСТ из уведомления, завершите помощь и поставьте оценки.\n\n"
+    "<b>Синхронизация и безопасность</b>\n"
+    "Бот и сайт используют общие профиль, заявки, историю, HP и игровые достижения. "
+    "Чтобы подключить существующий сайт: сайт → «Профиль» → «Получить код Telegram», затем в боте <b>/link КОД</b>. "
+    "Код вводите только в этом боте. Для отмены незавершённого действия используйте /cancel. "
+    "Уточнить подбор можно командой <b>/ask НУЖНЫЙ ОПЫТ</b>; вернуть меню — /menu.\n\n"
+    "Сайт остаётся основным местом для карты, активностей, Лиги H-Point, игр, профиля, подтверждения email и платежей — бот открывает его одноразовой ссылкой."
+)
+
+# The first reply for a returning participant remains short enough for a
+# messenger, but names every visible main-menu group.  The separate guide
+# keeps the explanations discoverable without adding secondary controls to the
+# reply keyboard.
+BOT_START_OVERVIEW = (
+    "<b>Что открывает меню</b>\n"
+    "🆘 Нужна помощь — новая заявка; 🤝 хочу помочь — очередь помощников.\n"
+    "⚡ Подобрать кандидатов и 👥 Мои кандидаты — выбор и статус помощника.\n"
+    "👤 профиль, 📜 история и ⚙️ настройки — ваш аккаунт и готовность помогать.\n"
+    "🎮 Игры, 💳 H-Point+ и 🌐 сайт — достижения, доступы и полный веб-интерфейс.\n"
+    "ℹ️ «Как пользоваться» показывает подробный порядок действий и команды чата."
+)
+
+
+def onboarding_text() -> str:
+    return (
+        "👋 <b>H-Point — помощь рядом.</b>\n\n"
+        "Сначала создадим ваш профиль, а затем откроется понятное главное меню.\n\n"
+        + BOT_GUIDE
+        + "\n\n<b>Как вас зовут?</b>"
+    )
 
 
 def user_link(user) -> str:
@@ -94,7 +146,8 @@ async def notify_helper_offer(bot: Bot, request_id: int, helper_id: int) -> None
     request = get_request(request_id)
     helper = get_user(helper_id)
     requester = get_user(request["requester_id"]) if request else None
-    if not request or not helper or not requester or not helper["tg_user_id"]:
+    offer = get_current_helper_offer(request_id)
+    if not request or not helper or not requester or not helper["tg_user_id"] or not offer or offer["candidate_id"] != helper_id:
         return
     try:
         await bot.send_message(
@@ -103,7 +156,7 @@ async def notify_helper_offer(bot: Bot, request_id: int, helper_id: int) -> None
             f"{request_text(request)}\n\n"
             f"<b>Кому нужна помощь:</b> {user_link(requester)}\n\n"
             "Подтвердите, что готовы помочь. До вашего согласия заявка никому не назначена.",
-            reply_markup=helper_offer_kb(request_id),
+            reply_markup=helper_offer_kb(request_id, offer["offer_token"] or ""),
         )
     except Exception:
         logging.exception("Не удалось отправить предложение помощнику %s по заявке %s", helper_id, request_id)
@@ -156,33 +209,28 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     user = get_user(message.from_user.id)
     if user is None:
         await state.set_state(Registration.name)
-        await message.answer(
-            "👋 <b>H-Point — помощь рядом.</b>\n\n"
-            "1. Напишите имя — создадим профиль.\n"
-            "2. В меню можно попросить о помощи или предложить её.\n"
-            "3. Для сайта нажмите «🌐 Перейти на сайт».\n\n"
-            "Уже есть профиль на сайте? Откройте там «Профиль», получите код и отправьте сюда <b>/link КОД</b>.\n\n"
-            "Как вас зовут?"
-        )
+        await message.answer(onboarding_text())
         return
-    await show_main_menu(message, f"С возвращением, {escape(user['name'])}! Выберите действие:")
+    await show_main_menu(
+        message,
+        f"С возвращением, {escape(user['name'])}!\n\n" + BOT_START_OVERVIEW,
+    )
     if payload == "profile":
         await profile(message, state)
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    await message.answer(
-        "<b>H-Point — помощь рядом</b>\n\n"
-        "Создайте заявку, чтобы попросить о помощи, или встаньте в очередь, "
-        "чтобы помочь кому-то. После подбора вы получите уведомление; "
-        "завершение заявки и оценки доступны в боте.\n\n"
-        "<b>Как подключить сайт:</b> на сайте откройте «Профиль» → «Получить код привязки», "
-        "затем отправьте боту <b>/link КОД</b>. После этого заявки и история будут общими.\n\n"
-        "Основные действия находятся в меню. Команды: /start, /profile, /website, "
-        "/history, /settings, /billing, /games, /verifyme, /chat, /cancel, /ask.\n\n"
-        "Команда /ask уточняет подбор для вашей активной заявки. В группах бот отвечает только на команды и не публикует заявки или профили."
-    )
+    await message.answer(BOT_GUIDE, reply_markup=main_menu_kb())
+
+
+@router.message(Command("menu"))
+@router.message(StateFilter(None), F.text == BTN_NAVIGATOR)
+async def cmd_menu_guide(message: Message, state: FSMContext) -> None:
+    if not await ensure_registered(message, state):
+        return
+    await state.clear()
+    await message.answer(BOT_GUIDE, reply_markup=main_menu_kb())
 
 
 @router.message(Command("ask"))
@@ -221,15 +269,20 @@ async def cmd_chat(message: Message, state: FSMContext, bot: Bot) -> None:
         return
     if not await ensure_registered(message, state):
         return
-    text = (message.text or "").partition(" ")[2].strip()[:1000]
+    text = (message.text or "").partition(" ")[2].strip()
+    first, _, rest = text.partition(" ")
+    target_id = int(first[1:]) if first.startswith("#") and first[1:].isascii() and first[1:].isdigit() and len(first) <= 12 else None
+    if target_id is not None:
+        text = rest.strip()
+    text = text[:1000]
     if not text:
         await message.answer("Отправьте сообщение так: <b>/chat ТЕКСТ</b>")
         return
     user_id = message.from_user.id
-    request = get_active_own_request(user_id)
-    if not request or request["status"] != STATUS_IN_PROGRESS:
+    request = get_request(target_id) if target_id is not None else get_active_own_request(user_id)
+    if target_id is None and (not request or request["status"] != STATUS_IN_PROGRESS):
         request = get_active_help(user_id)
-    if not request or request["status"] != STATUS_IN_PROGRESS:
+    if not request or not request["helper_id"] or user_id not in (request["requester_id"], request["helper_id"]) or (target_id is None and request["status"] != STATUS_IN_PROGRESS):
         await message.answer("Чат доступен после назначения помощника по активной заявке.")
         return
     chat_id = get_or_create_chat_for_request(request["id"])
@@ -243,8 +296,7 @@ async def cmd_chat(message: Message, state: FSMContext, bot: Bot) -> None:
         try:
             await bot.send_message(
                 other["tg_user_id"],
-                f"💬 Новое сообщение по заявке №{request['id']} от {escape(get_user(user_id)['name'])}. "
-                "Откройте сайт H-Point или ответьте: /chat ТЕКСТ",
+                chat_notification(request["id"], get_user(user_id)["name"], text),
             )
         except Exception:
             logging.exception("Не удалось отправить уведомление о сообщении в Telegram")
@@ -393,7 +445,7 @@ async def website(message: Message, state: FSMContext) -> None:
 @router.message(Registration.name, F.text)
 async def reg_name(message: Message, state: FSMContext) -> None:
     name = message.text.strip()
-    if name.startswith("/") or name in (BTN_NEED_HELP, BTN_WANT_HELP, BTN_FIND_CANDIDATES, BTN_MY_CANDIDATES, BTN_PROFILE, BTN_HISTORY, BTN_SETTINGS, BTN_WEBSITE, BTN_GAMES, BTN_CANCEL):
+    if name.startswith("/") or name in (BTN_NEED_HELP, BTN_WANT_HELP, BTN_FIND_CANDIDATES, BTN_MY_CANDIDATES, BTN_PROFILE, BTN_HISTORY, BTN_SETTINGS, BTN_WEBSITE, BTN_GAMES, BTN_NAVIGATOR, BTN_CANCEL, "💳 H-Point+"):
         await message.answer("Пожалуйста, напишите своё имя обычным текстом.")
         return
     if not name or len(name) > MAX_NAME_LEN:
@@ -404,7 +456,8 @@ async def reg_name(message: Message, state: FSMContext) -> None:
     await show_main_menu(
         message,
         f"✅ Регистрация завершена, {escape(name)}! Вам начислено <b>{START_BALANCE} HP</b>.\n\n"
-        "Нажмите «🌐 Перейти на сайт», чтобы открыть этот же профиль в браузере.",
+        "Нажмите «🌐 Перейти на сайт», чтобы открыть этот же профиль в браузере, "
+        "или «ℹ️ Как пользоваться», чтобы увидеть назначение всех кнопок.",
     )
 
 
@@ -435,12 +488,25 @@ _GAME_TILE_LABELS = {
 }
 
 
-def _games_menu_kb() -> InlineKeyboardMarkup:
+def _game_website_url(user_id=None, game=None, section=None):
+    target = "/games"
+    if game in game_service.GAME_CATALOG:
+        target += "?" + urlencode({"game": game})
+    elif section in {"store", "achievements"}:
+        target += "#" + section
+    if user_id is None:
+        return WEB_PUBLIC_URL.rstrip("/") + target
+    token = secrets.token_urlsafe(32)
+    create_web_login_ticket(user_id, token)
+    return WEB_PUBLIC_URL.rstrip("/") + "/auth/telegram?" + urlencode({"ticket": token, "next": target})
+
+
+def _games_menu_kb(user_id=None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚶 H-Crossing", callback_data="g:start:crossing"), InlineKeyboardButton(text="📍 H-Dispatch", callback_data="g:start:dispatch")],
-        [InlineKeyboardButton(text="🧩 H-Match", callback_data="g:start:match"), InlineKeyboardButton(text="🛡 H-Safety", callback_data="g:start:safety")],
-        [InlineKeyboardButton(text="💚 H-Mission", callback_data="g:start:mission")],
-        [InlineKeyboardButton(text="🏆 Прогресс и достижения", callback_data="g:progress"), InlineKeyboardButton(text="🛍 Магазин", callback_data="g:shop")],
+        [InlineKeyboardButton(text="🚶 H-Crossing ↗", url=_game_website_url(user_id, "crossing")), InlineKeyboardButton(text="📍 H-Dispatch ↗", url=_game_website_url(user_id, "dispatch"))],
+        [InlineKeyboardButton(text="🧩 H-Match ↗", url=_game_website_url(user_id, "match")), InlineKeyboardButton(text="🛡 H-Safety ↗", url=_game_website_url(user_id, "safety"))],
+        [InlineKeyboardButton(text="💚 H-Mission ↗", url=_game_website_url(user_id, "mission"))],
+        [InlineKeyboardButton(text="🏆 Прогресс и достижения ↗", url=_game_website_url(user_id, section="achievements")), InlineKeyboardButton(text="🛍 Магазин ↗", url=_game_website_url(user_id, section="store"))],
     ])
 
 
@@ -604,11 +670,12 @@ async def games_menu(message: Message, state: FSMContext) -> None:
     # Entering the games intentionally leaves any unfinished text form, so a
     # later answer cannot be misinterpreted as a request or review field.
     await state.clear()
-    await message.answer(_games_summary(message.from_user.id), reply_markup=_games_menu_kb())
+    await message.answer("🎮 <b>Игры H-Point — на сайте</b>\n\nВыберите игру: откроется её полный интерфейс в вашем профиле. HP, рекорды и достижения общие с ботом.\n\nЛичная ссылка действует 5 минут. Чтобы получить новую, снова нажмите «Игры H-Point».", reply_markup=_games_menu_kb(message.from_user.id))
 
 
 @router.callback_query(F.data.startswith("g:"))
 async def game_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
+    """Old game messages now lead to the same full website UI."""
     if callback.message.chat.type != "private":
         await callback.answer("Игры доступны только в личном чате.", show_alert=True)
         return
@@ -618,131 +685,19 @@ async def game_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.clear()
     parts = (callback.data or "").split(":")
-    try:
-        command = parts[1]
-        if command == "menu":
-            await callback.answer()
-            await callback.message.edit_text(_games_summary(callback.from_user.id), reply_markup=_games_menu_kb())
-            return
-        if command == "progress":
-            payload = game_service.game_state(callback.from_user.id)
-            records = payload.get("records", {})
-            lines = ["🏆 <b>Игровой прогресс</b>"]
-            for code, details in game_service.GAME_CATALOG.items():
-                record = records.get(code, {})
-                lines.append(f"\n<b>{escape(details['short_title'])}</b> — рекорд {record.get('best_score', 0)}, завершено {record.get('completions', 0)}")
-            if payload.get("achievements"):
-                lines.append("\n<b>Достижения</b>")
-                lines.extend(f"• {escape(item['title'])}" for item in payload["achievements"])
-            await callback.answer()
-            await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="← К играм", callback_data="g:menu")]]))
-            return
-        if command == "shop":
-            payload = game_service.game_state(callback.from_user.id)
-            rows = []
-            for item in payload.get("store", []):
-                status = "✓ " if item["owned"] else ""
-                label = f"{status}{item['title']} — {item['price']} HP"
-                rows.append([InlineKeyboardButton(text=label[:64], callback_data=f"g:item:{item['id']}")])
-            rows.append([InlineKeyboardButton(text="← К играм", callback_data="g:menu")])
-            await callback.answer()
-            await callback.message.edit_text("🛍 <b>Магазин игр</b>\n\nВыберите предмет. Покупка списывает реальные H-Points в общей истории операций.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-            return
-        if command == "item":
-            item_id = parts[2]
-            item = game_service.STORE_ITEMS.get(item_id)
-            if not item:
-                raise ValueError("Предмет не найден.")
-            payload = game_service.game_state(callback.from_user.id)
-            owned = next((entry for entry in payload["store"] if entry["id"] == item_id), None)
-            action = f"g:use:{item_id}" if owned and owned["owned"] else f"g:buy:{item_id}"
-            label = "Использовать" if owned and owned["owned"] else f"Купить за {item['price']} HP"
-            await callback.answer()
-            await callback.message.edit_text(
-                f"<b>{escape(item['title'])}</b>\n\n{escape(item['description'])}\n\nСтоимость: <b>{item['price']} HP</b>",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text=label, callback_data=action)],
-                    [InlineKeyboardButton(text="← В магазин", callback_data="g:shop")],
-                ]),
-            )
-            return
-        if command == "buy":
-            item_id = parts[2]
-            result = game_service.purchase_item(callback.from_user.id, item_id, secrets.token_urlsafe(18))
-            await callback.answer("Покупка выполнена")
-            await callback.message.edit_text(
-                f"✅ Предмет приобретён. Баланс: <b>{result['balance']} HP</b>\n\nТеперь включите его перед следующей игрой.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Использовать", callback_data=f"g:use:{item_id}"), InlineKeyboardButton(text="К играм", callback_data="g:menu")]]),
-            )
-            return
-        if command == "use":
-            item_id = parts[2]
-            payload = game_service.game_state(callback.from_user.id)
-            item = next((entry for entry in payload["store"] if entry["id"] == item_id), None)
-            if not item or not item["owned"]:
-                raise ValueError("Сначала приобретите предмет.")
-            result = game_service.equip_item(callback.from_user.id, item_id, not item["equipped"])
-            await callback.answer("Предмет включён" if result["equipped"] else "Предмет выключен")
-            await callback.message.edit_text(
-                "✅ Предмет будет применён в следующем запуске этой игры." if result["equipped"] else "Предмет выключен.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="← В магазин", callback_data="g:shop"), InlineKeyboardButton(text="К играм", callback_data="g:menu")]]),
-            )
-            return
-        if command == "start":
-            session = game_service.start_game(callback.from_user.id, parts[2])
-            await callback.answer("Игра началась")
-            await _send_or_edit_game(callback.message, session, edit=True)
-            return
-        if command == "restart":
-            previous = parts[2]
-            active = game_service.game_session(callback.from_user.id, previous)
-            game_service.abandon_game(callback.from_user.id, previous)
-            session = game_service.start_game(callback.from_user.id, active["game"])
-            await callback.answer("Новая игра")
-            await _send_or_edit_game(callback.message, session, edit=True)
-            return
-        if command == "view":
-            session = game_service.game_session(callback.from_user.id, parts[2])
-            await callback.answer()
-            await _send_or_edit_game(callback.message, session, edit=True)
-            return
-        if command == "move":
-            session = game_service.action_game(callback.from_user.id, parts[2], {"direction": parts[3]})
-        elif command == "vol":
-            session = game_service.game_session(callback.from_user.id, parts[2])
-            await callback.answer("Выберите подходящую заявку")
-            await callback.message.edit_text(_game_text(session) + "\n\n<b>Выберите заявку для волонтёра:</b>", reply_markup=_dispatch_kb(session, parts[3]))
-            return
-        elif command == "assign":
-            session = game_service.action_game(callback.from_user.id, parts[2], {"type": "assign", "volunteer_id": parts[3], "job_id": parts[4]})
-        elif command == "pick":
-            session = game_service.game_session(callback.from_user.id, parts[2])
-            row, col = int(parts[3]), int(parts[4])
-            options = []
-            for dr, dc, label in ((-1, 0, "⬆️"), (1, 0, "⬇️"), (0, -1, "⬅️"), (0, 1, "➡️")):
-                rr, cc = row + dr, col + dc
-                if 0 <= rr < 7 and 0 <= cc < 7:
-                    options.append(InlineKeyboardButton(text=label, callback_data=f"g:swap:{parts[2]}:{row}:{col}:{rr}:{cc}"))
-            await callback.answer("Выберите соседнюю клетку")
-            await callback.message.edit_text(_game_text(session) + "\n\n<b>Куда переместить выбранный предмет?</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[options, [InlineKeyboardButton(text="← К полю", callback_data=f"g:view:{parts[2]}")]]))
-            return
-        elif command == "swap":
-            session = game_service.action_game(callback.from_user.id, parts[2], {"type": "swap", "a": [int(parts[3]), int(parts[4])], "b": [int(parts[5]), int(parts[6])]})
-        elif command == "hint":
-            session = game_service.action_game(callback.from_user.id, parts[2], {"type": "hint"})
-        elif command == "answer":
-            session = game_service.action_game(callback.from_user.id, parts[2], {"type": "answer", "choice": int(parts[3])})
-        elif command == "choose":
-            session = game_service.action_game(callback.from_user.id, parts[2], {"type": "choose", "choice": int(parts[3])})
-        else:
-            raise ValueError("Неизвестное игровое действие.")
-        await callback.answer()
-        await _send_or_edit_game(callback.message, session, edit=True, feedback=session.get("feedback"))
-    except (ValueError, IndexError) as exc:
-        await callback.answer(str(exc) or "Действие сейчас недоступно.", show_alert=True)
-    except Exception:
-        logging.exception("Telegram game action failed")
-        await callback.answer("Не удалось выполнить игровое действие. Попробуйте ещё раз.", show_alert=True)
+    game = parts[2] if len(parts) > 2 and parts[1] == "start" and parts[2] in game_service.GAME_CATALOG else None
+    if game is None and len(parts) > 2 and parts[1] in {"restart", "view", "move", "vol", "assign", "pick", "swap", "hint", "answer", "choose"}:
+        try:
+            game = game_service.game_session(callback.from_user.id, parts[2])["game"]
+        except ValueError:
+            pass
+    await callback.answer("Полная версия игры — на сайте")
+    await callback.message.edit_text(
+        "🎮 Игры теперь открываются на сайте: с игровым полем, анимацией и удобным управлением. Ваш прогресс сохранён.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Играть на сайте ↗", url=_game_website_url(callback.from_user.id, game, "store" if len(parts) > 1 and parts[1] in {"shop", "item", "buy", "use"} else None))
+        ]]),
+    )
 
 
 @router.message(Command("cancel"))
@@ -862,19 +817,20 @@ async def _candidate_card(candidate: dict) -> str:
     score = min(100, round(float(candidate.get("score") or 0)))
     username = f" (@{escape(candidate['username'])})" if candidate.get("username") else ""
     return (
-        f"👤 <b>{escape(candidate.get('name') or 'Пользователь')}</b>{verified}{username}\n"
+        ("📨 <b>Откликнулся на вашу заявку</b>\n" if candidate.get("applied") else "")
+        + f"👤 <b>{escape(candidate.get('name') or 'Пользователь')}</b>{verified}{username}\n"
         f"⭐ {rating:.1f}/5 · {reviews} отзывов\n"
         f"📍 {distance_text}\n"
         f"🎯 Совпадение: <b>{score}%</b>"
     )
 
 
-async def _show_candidates(message: Message, request_id: int, *, edit: bool = False) -> None:
+async def _show_candidates(message: Message, request_id: int, *, edit: bool = False, actor_id: int | None = None) -> None:
     req = get_request(request_id)
     if not req:
         await message.answer("Заявка не найдена.")
         return
-    if req["requester_id"] != message.from_user.id:
+    if req["requester_id"] != (actor_id if actor_id is not None else message.from_user.id):
         await message.answer("Эта заявка принадлежит другому пользователю.")
         return
     if req["status"] != STATUS_OPEN:
@@ -886,13 +842,15 @@ async def _show_candidates(message: Message, request_id: int, *, edit: bool = Fa
         return
 
     matches = get_candidates_for_request(request_id, limit=20)
+    offer = get_current_helper_offer(request_id)
+    waiting = (f"\n\n⏳ Ждём ответ: {escape(offer['name'])}. Можно отменить приглашение и выбрать другого помощника." if offer else "")
     if not matches:
         text = (
             "⚡ <b>Подбор кандидатов</b>\n\n"
             "Пока нет доступных кандидатов. Попробуйте обновить подбор позже.\n\n"
-            f"{request_text(req)}"
+            f"{request_text(req)}{waiting}"
         )
-        markup = candidates_navigation_kb(request_id)
+        markup = candidates_navigation_kb(request_id, offer)
         if edit:
             await message.edit_text(text, reply_markup=markup)
         else:
@@ -902,7 +860,7 @@ async def _show_candidates(message: Message, request_id: int, *, edit: bool = Fa
     header = (
         f"⚡ <b>Кандидаты для заявки №{request_id}</b>\n\n"
         f"{escape(req['what'])}\n\n"
-        f"Найдено: <b>{len(matches)}</b>. Это люди, которые сейчас готовы помочь. Выберите одного — он подтвердит согласие сам."
+        f"Найдено: <b>{len(matches)}</b>. Это люди, которые сейчас готовы помочь. Выберите одного — он подтвердит согласие сам.{waiting}"
     )
     if edit:
         await message.edit_text(header)
@@ -914,7 +872,7 @@ async def _show_candidates(message: Message, request_id: int, *, edit: bool = Fa
             await _candidate_card(candidate),
             reply_markup=candidate_kb(request_id, candidate["user_id"]),
         )
-    await message.answer("Подбор можно обновить после изменения профилей или доступности.", reply_markup=candidates_navigation_kb(request_id))
+    await message.answer("Подбор можно обновить после изменения профилей или доступности.", reply_markup=candidates_navigation_kb(request_id, offer))
 
 
 async def _choose_candidate_request(message: Message, state: FSMContext) -> bool:
@@ -974,9 +932,14 @@ async def cb_candidate_assign(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Кандидат больше недоступен.", show_alert=True)
         return
 
+    if get_current_helper_offer(request_id):
+        await callback.answer("Сначала отмените текущее приглашение, затем выберите другого помощника.", show_alert=True)
+        await _show_candidates(callback.message, request_id, actor_id=callback.from_user.id)
+        return
+
     if not offer_helper(request_id, candidate_id):
         await callback.answer("Кандидат уже занят, вышел из очереди или заявка изменилась. Обновляю список.", show_alert=True)
-        await _show_candidates(callback.message, request_id)
+        await _show_candidates(callback.message, request_id, actor_id=callback.from_user.id)
         return
 
     await callback.answer("Предложение отправлено")
@@ -989,24 +952,63 @@ async def cb_candidate_assign(callback: CallbackQuery, bot: Bot) -> None:
         f"{request_text(req)}\n\n"
         f"<b>Вы выбрали:</b> {user_link(candidate)}\n\n"
         "Помощник сам подтвердит или отклонит предложение. Чат появится только после его согласия.",
-        reply_markup=main_menu_kb(),
+        reply_markup=candidates_navigation_kb(request_id, get_current_helper_offer(request_id)),
     )
     await notify_helper_offer(bot, request_id, candidate_id)
+
+
+@router.callback_query(F.data.startswith("ac:"))
+async def cb_application_cancel(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        _, rid, hid, token = callback.data.split(":")
+        request_id, helper_id = int(rid), int(hid)
+    except (ValueError, TypeError):
+        await callback.answer("Некорректный отклик.", show_alert=True)
+        return
+    if not cancel_request_application(request_id, helper_id, callback.from_user.id, token):
+        await callback.answer("Отклик уже изменился или помощник выбран.", show_alert=True)
+        return
+    await callback.answer("Отклик отменён")
+    await callback.message.edit_text("↩️ Отклик отменён. Сама заявка остаётся открытой.")
+    request = get_request(request_id)
+    other = get_user(request["requester_id"] if callback.from_user.id == helper_id else helper_id)
+    if other and other["tg_user_id"]:
+        try:
+            await bot.send_message(other["tg_user_id"], f"↩️ Отклик на заявку №{request_id} отозван помощником." if callback.from_user.id == helper_id else f"ℹ️ Автор отклонил ваш отклик на заявку №{request_id}.")
+        except Exception:
+            logging.exception("Не удалось уведомить об отмене отклика %s", request_id)
 
 
 @router.callback_query(F.data.startswith("offer:"))
 async def cb_helper_offer_response(callback: CallbackQuery, bot: Bot) -> None:
     try:
-        _, action, request_id_s = callback.data.split(":")
+        parts = callback.data.split(":")
+        if len(parts) not in (3, 4):
+            raise ValueError("offer")
+        _, action, request_id_s = parts[:3]
+        token = parts[3] if len(parts) == 4 else ""
         request_id = int(request_id_s)
     except (ValueError, TypeError):
         await callback.answer("Некорректное предложение.", show_alert=True)
+        return
+    if action == "cancel":
+        offer = get_current_helper_offer(request_id)
+        if not offer or not withdraw_helper_offer(request_id, callback.from_user.id, offer["candidate_id"], token):
+            await callback.answer("Приглашение уже изменилось или помощь подтверждена.", show_alert=True)
+            return
+        await callback.answer("Приглашение отменено, заявка остаётся открытой")
+        if offer["tg_user_id"]:
+            try:
+                await bot.send_message(offer["tg_user_id"], f"↩️ Автор отменил приглашение по заявке №{request_id}. Подтверждать его больше не нужно; вы можете помогать другим.")
+            except Exception:
+                logging.exception("Не удалось уведомить об отмене приглашения %s", request_id)
+        await _show_candidates(callback.message, request_id, edit=True, actor_id=callback.from_user.id)
         return
     if action not in ("accept", "decline"):
         await callback.answer("Некорректное действие.", show_alert=True)
         return
     accepted = action == "accept"
-    if not respond_to_helper_offer(request_id, callback.from_user.id, accepted):
+    if not respond_to_helper_offer(request_id, callback.from_user.id, accepted, token):
         await callback.answer("Предложение уже неактуально.", show_alert=True)
         return
     request = get_request(request_id)
@@ -1044,7 +1046,7 @@ async def cb_candidate_refresh(callback: CallbackQuery) -> None:
         await callback.answer("Заявка недоступна.", show_alert=True)
         return
     await callback.answer("Подбор обновлён")
-    await _show_candidates(callback.message, request_id, edit=True)
+    await _show_candidates(callback.message, request_id, edit=True, actor_id=callback.from_user.id)
 
 
 @router.callback_query(F.data.startswith("candidate:back:"))
@@ -1160,10 +1162,6 @@ async def want_help(message: Message, state: FSMContext, bot: Bot) -> None:
     if not await ensure_registered(message, state) or not await check_not_busy(message):
         return
     user_id = message.from_user.id
-    own = get_active_own_request(user_id)
-    if own:
-        await message.answer(f"У вас есть активная заявка №{own['id']}. Нельзя одновременно просить помощь и помогать.")
-        return
     if is_in_queue(user_id):
         await message.answer("Вы уже в очереди помощников.", reply_markup=leave_queue_kb())
         return
@@ -1179,7 +1177,7 @@ async def cb_leave_queue(callback: CallbackQuery) -> None:
     if is_in_queue(callback.from_user.id):
         remove_from_queue(callback.from_user.id)
         await callback.answer("Вы вышли из очереди")
-        await callback.message.edit_text("Вы вышли из очереди помощников.")
+        await callback.message.edit_text("Вы вышли из очереди помощников. Ожидающие отклики отозваны; уже принятая помощь не отменяется.")
     else:
         await callback.answer("Вы не в очереди", show_alert=True)
 
@@ -1318,7 +1316,9 @@ async def show_billing(message: Message, state: FSMContext) -> None:
     if is_business(user["user_id"]): status.append("💼 Business активен")
     await message.answer(
         "💳 <b>H-Point+</b>\n\n"
-        "Платные возможности оплачиваются в рублях через внешний эквайринг или H-Points.\n\n"
+        "Продвижение — приоритет одной открытой заявки до её закрытия.\n"
+        "PRO — приоритет профиля и заявок в автоматическом подборе на 30 дней, без автопродления.\n"
+        "Рейтинг и Лига не продаются; отклики не гарантированы. Проверка личности бесплатна в профиле сайта.\n\n"
         + ("\n".join(status)+"\n\n" if status else "") +
         "Выберите функцию:",
         reply_markup=billing_kb(),
@@ -1392,7 +1392,7 @@ def payment_button(item_type, request_id=None):
 async def cb_buy(callback: CallbackQuery, state: FSMContext):
     item_type=callback.data.split(":",1)[1]
     if item_type not in MONETIZATION_ITEMS:
-        await callback.answer("Неизвестный товар",show_alert=True);return
+        await callback.answer("Эта функция снята с продажи. Откройте обновлённое меню H-Point+.",show_alert=True);return
     if item_type in ("boost","more_responses"):
         requests=db.execute("SELECT id,what FROM requests WHERE requester_id=? AND status=? ORDER BY id DESC LIMIT 10",(callback.from_user.id,STATUS_OPEN)).fetchall()
         if not requests:
@@ -1420,8 +1420,7 @@ async def cb_buy_request(callback: CallbackQuery):
     await callback.message.answer(
         f"Заявка №{request_id}. Выберите функцию:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"🚀 Продвижение — {PRICE_BOOST_RUB} ₽",callback_data=f"payreq:boost:{request_id}")],
-            [InlineKeyboardButton(text=f"🔥 Больше откликов — {PRICE_MORE_RESPONSES_RUB} ₽",callback_data=f"payreq:more_responses:{request_id}")]
+            [InlineKeyboardButton(text=f"🚀 Продвижение — {PRICE_BOOST_RUB} ₽",callback_data=f"payreq:boost:{request_id}")]
         ])
     )
 
@@ -1430,6 +1429,8 @@ async def cb_pay_request(callback: CallbackQuery):
     try:_,item_type,rid=callback.data.split(":");rid=int(rid)
     except:
         await callback.answer("Некорректные данные",show_alert=True);return
+    if item_type != "boost":
+        await callback.answer("Эта функция больше не продаётся. Откройте H-Point+.",show_alert=True);return
     req=get_request(rid)
     if not req or req["requester_id"]!=callback.from_user.id or req["status"]!=STATUS_OPEN:
         await callback.answer("Заявка уже недоступна.",show_alert=True);return
@@ -1441,14 +1442,8 @@ async def cb_pay_request(callback: CallbackQuery):
 
 @router.message(Billing.ad_text,F.text)
 async def billing_ad_text(message: Message,state: FSMContext):
-    text=message.text.strip()
-    if not text or len(text)>MAX_TEXT_LEN:
-        await message.answer(f"Текст должен быть от 1 до {MAX_TEXT_LEN} символов.");return
     await state.clear()
-    await message.answer(
-        f"📢 Объявление подготовлено.\nЦена: <b>{PRICE_AD_RUB} ₽</b>",
-        reply_markup=payment_button("ad")
-    )
+    await message.answer("Локальные объявления сняты с новых продаж. Уже оплаченные права сохранены. Актуальные возможности:",reply_markup=billing_kb())
 
 @router.message(Command("commercial"))
 async def commercial_start(message: Message,state: FSMContext):

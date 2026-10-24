@@ -8,9 +8,10 @@ def main_menu_kb():
         [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_HISTORY)],
         [KeyboardButton(text=BTN_SETTINGS)],
         [KeyboardButton(text=BTN_GAMES)],
+        [KeyboardButton(text="💳 H-Point+"), KeyboardButton(text=BTN_NAVIGATOR)],
         [KeyboardButton(text=BTN_WEBSITE)],
-        [KeyboardButton(text="💳 H-Point+" )],
     ], resize_keyboard=True)
+
 
 def cancel_kb(*extra_rows):
     rows = [[KeyboardButton(text=t) for t in row] for row in extra_rows]
@@ -57,14 +58,8 @@ def settings_categories_kb(selected: set[str]):
 
 def billing_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🚀 Продвижение — {PRICE_BOOST_RUB} ₽", callback_data="buy:boost")],
-        [InlineKeyboardButton(text=f"🔥 Больше откликов — {PRICE_MORE_RESPONSES_RUB} ₽", callback_data="buy:more_responses")],
-        [InlineKeyboardButton(text=f"⭐ PRO — {PRICE_PRO_RUB} ₽/мес", callback_data="buy:pro")],
-        [InlineKeyboardButton(text=f"🔐 Проверка личности — {PRICE_VERIFICATION_RUB} ₽", callback_data="buy:verification")],
-        [InlineKeyboardButton(text=f"📌 Избранное+ — {PRICE_FAVORITES_RUB} ₽", callback_data="buy:favorites")],
-        [InlineKeyboardButton(text=f"💼 Business — {PRICE_BUSINESS_RUB} ₽/мес", callback_data="buy:business")],
-        [InlineKeyboardButton(text=f"🏢 Business Pro — {PRICE_BUSINESS_PRO_RUB} ₽/мес", callback_data="buy:business_pro")],
-        [InlineKeyboardButton(text=f"📢 Реклама — {PRICE_AD_RUB} ₽", callback_data="buy:ad")],
+        [InlineKeyboardButton(text=f"{item['title']} — {item['rub']} ₽" + (" / 30 дней" if key == "pro" else ""), callback_data=f"buy:{key}")]
+        for key, item in MONETIZATION_ITEMS.items()
     ])
 
 def choose_request_kb(requests):
@@ -82,14 +77,25 @@ def candidate_kb(request_id, candidate_id):
         [InlineKeyboardButton(text="🤝 Выбрать помощника", callback_data=f"candidate:assign:{request_id}:{candidate_id}")]
     ])
 
-def helper_offer_kb(request_id):
+def application_kb(request_id, helper_id, token, for_author=True):
+    rows = [[InlineKeyboardButton(text="🤝 Выбрать помощника", callback_data=f"candidate:assign:{request_id}:{helper_id}")]] if for_author else []
+    rows.append([InlineKeyboardButton(text="Отклонить отклик" if for_author else "Отозвать отклик", callback_data=f"ac:{request_id}:{helper_id}:{token}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def helper_offer_kb(request_id, offer_token=""):
+    suffix = f":{offer_token}" if offer_token else ""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Помогу", callback_data=f"offer:accept:{request_id}"),
-         InlineKeyboardButton(text="↩️ Не смогу", callback_data=f"offer:decline:{request_id}")]
+        [InlineKeyboardButton(text="✅ Помогу", callback_data=f"offer:accept:{request_id}{suffix}"),
+         InlineKeyboardButton(text="↩️ Отклонить", callback_data=f"offer:decline:{request_id}{suffix}")]
     ])
 
-def candidates_navigation_kb(request_id):
-    return InlineKeyboardMarkup(inline_keyboard=[
+def candidates_navigation_kb(request_id, offer=None):
+    rows = []
+    if offer:
+        rows.append([InlineKeyboardButton(text="↩️ Отменить приглашение", callback_data=f"offer:cancel:{request_id}:{offer['offer_token'] or ''}")])
+    rows.extend([
         [InlineKeyboardButton(text="🔄 Обновить кандидатов", callback_data=f"candidate:refresh:{request_id}")],
         [InlineKeyboardButton(text="⬅️ К заявке", callback_data=f"candidate:back:{request_id}")]
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

@@ -11,5 +11,9 @@
     request_body {
         max_size 32KB
     }
-    reverse_proxy app:8080
+    reverse_proxy app:8080 {
+        # The application uses this value for auth rate limits. Replace any
+        # inbound client-provided value rather than forwarding a spoofable one.
+        header_up X-Forwarded-For {remote_host}
+    }
 }

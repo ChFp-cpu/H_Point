@@ -30,6 +30,31 @@ class Core(unittest.TestCase):
         rid=services.create_request(1,{"what":"Помочь","place":"центр","time_needed":"сегодня","urgency":"🕊 Не срочно","details":"test","lat":55.75,"lon":37.62})
         match=services.smart_match(rid)[0]
         self.assertEqual((match["lat"],match["lon"]),(None,None))
+    def test_helpers_can_request_help_and_receive_multiple_invitations(self):
+        for uid in (1,2,3): self.add(uid)
+        payload={"what":"Помочь с компьютером","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test","category":"tech"}
+        own=services.create_request(2,payload)
+        first=services.create_request(1,payload);second=services.create_request(3,payload)
+        services.add_to_queue(2);services.set_helper_categories(2,["tech"])
+        self.assertEqual(services.smart_match(first)[0]["user_id"],2)
+        self.assertTrue(services.offer_helper(first,2))
+        self.assertEqual(services.smart_match(second)[0]["user_id"],2)
+        self.assertTrue(services.offer_helper(second,2))
+        self.assertEqual(len(services.get_helper_offers(2)),2)
+        self.assertTrue(services.respond_to_helper_offer(first,2,True))
+        self.assertFalse(services.respond_to_helper_offer(second,2,True))
+        self.assertEqual(database.get_request(own)["status"],"open")
+        self.assertEqual(database.get_request(second)["status"],"open")
+        self.assertEqual(database.get_request(first)["helper_id"],2)
+    def test_match_uses_reviews_of_helper_and_selected_categories(self):
+        self.add(1);self.add(2);services.add_to_queue(2)
+        payload={"what":"Компьютер","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test","category":"tech"}
+        done=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(done,2));self.assertTrue(services.complete_request(done,2))
+        self.assertTrue(services.set_rating(done,1,5));self.assertTrue(services.set_helper_rating(done,2,2))
+        services.add_to_queue(2);services.set_helper_categories(2,["tech"])
+        rid=services.create_request(1,payload)
+        match=services.smart_match(rid)[0];self.assertEqual(match["rating"],5);self.assertEqual(match["reviews"],1)
+        services.set_helper_categories(2,["shopping"]);self.assertEqual(services.smart_match(rid),[])
     def test_helper_offer_requires_queue_and_consent(self):
         self.add(1);self.add(2);self.add(3)
         rid=services.create_request(1,{"what":"Нужна помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
@@ -54,6 +79,22 @@ class Core(unittest.TestCase):
         self.assertTrue(database.auth_is_rate_limited("login","person@example.com",3))
         database.clear_auth_failures("login","person@example.com")
         self.assertFalse(database.auth_is_rate_limited("login","person@example.com",3))
+    def test_auth_attempt_reservations_enforce_a_shared_limit(self):
+        for _ in range(3):
+            self.assertTrue(database.reserve_auth_attempts(("login","person@example.com",3),("login_ip","127.0.0.1",3)))
+        self.assertFalse(database.reserve_auth_attempts(("login","person@example.com",3),("login_ip","127.0.0.1",3)))
+        # A rejected multi-subject reservation must not consume the other key.
+        self.assertFalse(database.auth_is_rate_limited("login_ip","127.0.0.2",3))
+    def test_telegram_link_code_is_hashed_and_single_use(self):
+        uid=database.create_web_user("Web","secure-link@example.com","hash")
+        code=database.create_link_code(uid)
+        row=database.get_user(uid)
+        self.assertEqual(len(code),32)
+        self.assertIsNone(row["verification_code"])
+        self.assertNotEqual(row["verification_code_hash"],code)
+        ok,_=database.link_by_code(code,556,"user556")
+        self.assertTrue(ok)
+        self.assertFalse(database.link_by_code(code,557,"user557")[0])
     def test_expired_telegram_link_code_cannot_link_account(self):
         uid=database.create_web_user("Web","expired@example.com","hash")
         self.db.execute("UPDATE users SET verification_code='EXPIRED',verification_code_expires_at=? WHERE user_id=?",((datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat(),uid))
@@ -173,10 +214,12 @@ class Core(unittest.TestCase):
             temp.cleanup()
     def test_link_migrates_web_account_to_telegram_id(self):
         uid=database.create_web_user("Web","web@example.com","hash")
+        self.db.execute("UPDATE users SET helper_availability='По вечерам' WHERE user_id=?",(uid,))
         self.db.execute("UPDATE users SET verification_code='ABCD1234',verification_code_expires_at=? WHERE user_id=?",((datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat(),uid))
         ok,msg=database.link_by_code("ABCD1234",555,"user555");self.assertTrue(ok)
         u=database.get_user(555);self.assertIsNotNone(u);self.assertEqual(u["name"],"Web");self.assertEqual(u["tg_user_id"],555)
         self.assertIsNone(database.get_user(uid))
+        self.assertEqual(database.get_user(555)["helper_availability"],"По вечерам")
     def test_identity_verification_requires_manual_admin_review(self):
         self.add(1);self.add(99)
         self.db.execute("UPDATE users SET role='admin' WHERE user_id=99")

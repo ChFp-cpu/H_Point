@@ -80,6 +80,7 @@ BTN_HISTORY = "📜 История"
 BTN_SETTINGS = "⚙️ Настройки помощи"
 BTN_WEBSITE = "🌐 Перейти на сайт"
 BTN_GAMES = "🎮 Игры H-Point"
+BTN_NAVIGATOR = "ℹ️ Как пользоваться"
 BTN_CANCEL = "❌ Отмена"
 BTN_NO_DETAILS = "Нет"
 
@@ -114,16 +115,20 @@ PAYMENT_FAIL_URL = os.getenv("PAYMENT_FAIL_URL", WEB_PUBLIC_URL + "/payment/resu
 
 PRICE_BOOST_RUB = 49
 PRICE_MORE_RESPONSES_RUB = 79
-PRICE_PRO_RUB = 299
+PRICE_PRO_RUB = 149
 PRICE_VERIFICATION_RUB = 99
 PRICE_FAVORITES_RUB = 149
 PRICE_BUSINESS_RUB = 999
 PRICE_BUSINESS_PRO_RUB = 1499
 PRICE_AD_RUB = 199
 MONETIZATION_ITEMS = {
-    "boost":{"title":"Продвижение заявки","description":"Приоритет заявки в Smart Match","rub":PRICE_BOOST_RUB,"hp":25},
+    "boost":{"title":"Продвижение заявки","description":"Одна ваша открытая заявка получает +100 к приоритету в ленте и автоматическом подборе до её закрытия. Не влияет на другие заявки и не гарантирует отклики.","rub":PRICE_BOOST_RUB,"hp":25,"term":"На срок одной открытой заявки","benefits":["Выше обычных заявок при одинаковых условиях","Разовая оплата; повторная покупка не нужна"]},
+    "pro":{"title":"H-Point PRO","description":"На 30 дней: +8 к приоритету вашего профиля среди подходящих помощников и +10 к приоритету ваших заявок при автоматическом подборе. Навыки, расстояние и согласие участников по-прежнему учитываются.","rub":PRICE_PRO_RUB,"hp":90,"term":"30 дней · без автопродления","benefits":["Подходит тем, кто регулярно помогает или обращается за помощью","Не заменяет продвижение +100 и не гарантирует выбор помощником"]},
+}
+# Historical invoice descriptions only. Never offer these for a new purchase;
+# existing invoices and paid entitlements must remain fulfillable.
+LEGACY_MONETIZATION_ITEMS = {
     "more_responses":{"title":"Больше откликов","description":"Повышенный приоритет заявки","rub":PRICE_MORE_RESPONSES_RUB,"hp":40},
-    "pro":{"title":"H-Point PRO","description":"PRO-доступ на 30 дней","rub":PRICE_PRO_RUB,"hp":180},
     "verification":{"title":"Проверка личности","description":"Рассмотрение заявки после привязки Telegram","rub":PRICE_VERIFICATION_RUB,"hp":70},
     "favorites":{"title":"Избранное+","description":"Дополнительные слоты избранных","rub":PRICE_FAVORITES_RUB,"hp":90},
     "business":{"title":"H-Point Business","description":"Business-доступ на 30 дней","rub":PRICE_BUSINESS_RUB,"hp":600},

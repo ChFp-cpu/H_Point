@@ -5,7 +5,28 @@ from .config import *
 from .database import db, get_invoice, get_request, get_user, insert_id, wallet_add_entry
 from .services import grant_entitlement
 
+def _validate_active_purchase(user_id, item_type, metadata, lock=False):
+    if item_type not in MONETIZATION_ITEMS:
+        raise ValueError("item is no longer sold")
+    if item_type == "boost":
+        request_id = metadata.get("request_id")
+        if not isinstance(request_id, int) or isinstance(request_id, bool):
+            raise ValueError("request_id required")
+        suffix = " FOR UPDATE" if lock and getattr(db, "is_postgres", False) else ""
+        request = db.execute("SELECT * FROM requests WHERE id=?" + suffix, (request_id,)).fetchone()
+        if not request or request["requester_id"] != user_id or request["status"] != "open":
+            raise ValueError("request is unavailable")
+        if int(request["priority_boost"] or 0) >= 100:
+            raise ValueError("request already promoted")
+        if int(request["reward_rub"] or 0) and request["reward_payment_status"] != "paid":
+            raise ValueError("request reward unpaid")
+
+def _lock_buyer(user_id):
+    if getattr(db, "is_postgres", False):
+        db.execute("SELECT user_id FROM users WHERE user_id=? FOR UPDATE", (user_id,))
+
 def create_pending_invoice(user_id,item_type,metadata=None):
+    _validate_active_purchase(user_id, item_type, metadata or {})
     item=MONETIZATION_ITEMS.get(item_type)
     if not item: raise ValueError("unknown billing item")
     payload=f"hpoint:v2:{uuid.uuid4().hex}"
@@ -36,7 +57,7 @@ def create_payment(invoice_id):
     if not ROBOKASSA_MERCHANT_LOGIN or not ROBOKASSA_PASSWORD_1 or not ROBOKASSA_PASSWORD_2:
         raise RuntimeError("Robokassa is not configured: set ROBOKASSA_MERCHANT_LOGIN, ROBOKASSA_PASSWORD_1 and ROBOKASSA_PASSWORD_2")
     amount=f'{inv["amount_rub"]:.2f}'
-    description=(MONETIZATION_ITEMS.get(inv["item_type"]) or {"title":"Вознаграждение за помощь"})["title"][:100]
+    description=(MONETIZATION_ITEMS.get(inv["item_type"]) or LEGACY_MONETIZATION_ITEMS.get(inv["item_type"]) or {"title":"Вознаграждение за помощь"})["title"][:100]
     params={"MerchantLogin":ROBOKASSA_MERCHANT_LOGIN,"OutSum":amount,"InvId":str(invoice_id),
             "Description":description,"Culture":"ru","Encoding":"utf-8",
             "SignatureValue":_signature(f"{amount}:{invoice_id}",ROBOKASSA_PASSWORD_1),
@@ -122,6 +143,7 @@ def purchase_with_points(user_id, item_type, metadata=None, idempotency_key=None
 
     db.execute("BEGIN IMMEDIATE")
     try:
+        _lock_buyer(user_id)
         existing = db.execute("SELECT * FROM billing_invoices WHERE payload=?", (payload,)).fetchone()
         if existing:
             if existing["user_id"] != user_id or existing["currency"] != "HP":
@@ -129,6 +151,7 @@ def purchase_with_points(user_id, item_type, metadata=None, idempotency_key=None
                 raise ValueError("purchase key already used")
             db.execute("COMMIT")
             return existing["id"], False
+        _validate_active_purchase(user_id, item_type, metadata, lock=True)
         changed = db.execute(
             "UPDATE users SET balance=balance-? WHERE user_id=? AND balance>=?",
             (price, user_id, price),
@@ -186,6 +209,7 @@ def purchase_with_wallet(user_id, item_type, metadata=None, idempotency_key=None
 
     db.execute("BEGIN IMMEDIATE")
     try:
+        _lock_buyer(user_id)
         existing = db.execute("SELECT * FROM billing_invoices WHERE payload=?", (payload,)).fetchone()
         if existing:
             if existing["user_id"] != user_id or existing["currency"] != "WALLET":
@@ -193,6 +217,7 @@ def purchase_with_wallet(user_id, item_type, metadata=None, idempotency_key=None
                 raise ValueError("purchase key already used")
             db.execute("COMMIT")
             return existing["id"], False
+        _validate_active_purchase(user_id, item_type, metadata, lock=True)
         balance = db.execute(
             "SELECT COALESCE(SUM(amount_rub), 0) AS balance FROM wallet_transactions WHERE user_id=?",
             (user_id,),
