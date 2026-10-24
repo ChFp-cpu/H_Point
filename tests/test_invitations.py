@@ -46,6 +46,47 @@ class InvitationCore(InvitationData, unittest.TestCase):
     def tearDown(self):
         self.close()
 
+    def test_paid_invite_before_reserve_then_author_confirms_wallet_release(self):
+        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        hp = [database.get_user(uid)["balance"] for uid in (1, 2)]
+        self.assertTrue(services.offer_helper(self.rid, 2))
+        token = self.current()["offer_token"]
+        self.assertFalse(services.respond_to_helper_offer(self.rid, 2, True, token))
+        with self.assertRaisesRegex(ValueError, "insufficient wallet"):
+            services.reserve_request_reward(self.rid, 1, 400)
+        database.wallet_add_entry(1, 500, "test", "Synthetic funds", "test")
+        with self.assertRaises(ValueError):
+            services.reserve_request_reward(self.rid, 2, 400)
+        with self.assertRaisesRegex(ValueError, "reward changed"):
+            services.reserve_request_reward(self.rid, 1, 399)
+        self.assertTrue(services.reserve_request_reward(self.rid, 1, 400))
+        self.assertFalse(services.reserve_request_reward(self.rid, 1, 400))
+        self.assertEqual(database.wallet_summary(1)["balance_rub"], 100)
+        self.assertEqual(database.wallet_summary(1)["reserved_rub"], 400)
+        self.assertEqual(database.wallet_summary(2)["balance_rub"], 0)
+        self.assertTrue(services.respond_to_helper_offer(self.rid, 2, True, token))
+        self.assertFalse(services.complete_request(self.rid, 2, confirmed_by=1))
+        self.assertEqual(services.request_help_completion(self.rid, 1), "unavailable")
+        self.assertEqual(services.request_help_completion(self.rid, 2), "created")
+        self.assertEqual(services.request_help_completion(self.rid, 2), "pending")
+        self.assertFalse(services.complete_request(self.rid, 2, confirmed_by=2))
+        self.assertFalse(services.complete_request(self.rid, 2, confirmed_by=4))
+        self.assertEqual(database.wallet_summary(2)["balance_rub"], 0)
+        self.assertTrue(services.complete_request(self.rid, 2, confirmed_by=1))
+        self.assertFalse(services.complete_request(self.rid, 2, confirmed_by=1))
+        self.assertEqual(database.wallet_summary(1)["reserved_rub"], 0)
+        self.assertEqual(database.wallet_summary(2)["balance_rub"], 400)
+        self.assertEqual([database.get_user(uid)["balance"] for uid in (1, 2)], hp)
+
+    def test_paid_reserve_is_returned_once_if_open_request_is_cancelled(self):
+        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        database.wallet_add_entry(1, 500, "test", "Synthetic funds", "test")
+        services.reserve_request_reward(self.rid, 1, 400)
+        self.assertTrue(services.cancel_request(self.rid, 1))
+        self.assertFalse(services.cancel_request(self.rid, 1))
+        self.assertEqual(database.wallet_summary(1)["balance_rub"], 500)
+        self.assertEqual(database.wallet_summary(1)["reserved_rub"], 0)
+
     def test_targeted_application_is_distinct_from_queue_and_prioritized(self):
         self.assertEqual(services.get_request_applications(1), [])
         services.set_helper_categories(2, ["shopping"])
@@ -169,6 +210,35 @@ class InvitationRace(unittest.TestCase):
             jobs = [pool.submit(run, action) for action in (first, second)]
             return [job.result(timeout=10) for job in jobs]
 
+    def test_simultaneous_reserve_debits_only_once(self):
+        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        database.wallet_add_entry(1,600,"test","Synthetic","test")
+        results=self.race(lambda:services.reserve_request_reward(self.rid,1,400),lambda:services.reserve_request_reward(self.rid,1,400))
+        self.assertEqual(sorted(results),[False,True])
+        self.assertEqual(database.wallet_summary(1)["balance_rub"],200)
+        self.assertEqual(database.wallet_summary(1)["reserved_rub"],400)
+
+    def test_two_reserves_cannot_overdraw_one_wallet(self):
+        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        other=services.create_request(1,{"what":"Другой резерв","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test","reward_rub":400})
+        database.wallet_add_entry(1,600,"test","Synthetic","test")
+        def reserve(rid):
+            try:return services.reserve_request_reward(rid,1,400)
+            except ValueError as error:return str(error)
+        results=self.race(lambda:reserve(self.rid),lambda:reserve(other))
+        self.assertIn(True,results);self.assertIn("insufficient wallet",results)
+        self.assertEqual(database.wallet_summary(1)["balance_rub"],200)
+
+    def test_simultaneous_confirmation_cannot_pay_helper_twice(self):
+        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        database.wallet_add_entry(1,600,"test","Synthetic","test")
+        services.reserve_request_reward(self.rid,1,400)
+        self.assertTrue(services.respond_to_helper_offer(self.rid,2,True,self.token))
+        self.assertEqual(services.request_help_completion(self.rid,2),"created")
+        results=self.race(lambda:services.complete_request(self.rid,2,confirmed_by=1),lambda:services.complete_request(self.rid,2,confirmed_by=1))
+        self.assertEqual(sorted(results),[False,True])
+        self.assertEqual(database.wallet_summary(2)["balance_rub"],400)
+
     def test_cancel_and_accept_cannot_both_succeed(self):
         cancelled, accepted = self.race(
             lambda: services.withdraw_helper_offer(self.rid, 1, 2, self.token),
@@ -220,6 +290,35 @@ class InvitationAPI(InvitationData, unittest.TestCase):
             self.request(uid, path, data)
         with error.exception as response:
             self.assertEqual(response.code, status)
+
+    def test_paid_request_api_invites_reserves_and_confirms_without_hp_or_direct_pay(self):
+        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        self.request(1, "/api/smart-match/assign", {"request_id":self.rid,"helper_id":2})
+        offer = self.request(2, "/api/helper/offers")["offers"][0]
+        self.assertEqual(offer["reward_rub"], 400)
+        self.assertIn("400", self.notify.call_args_list[0].args[1])
+        accept = {"request_id":self.rid,"accept":True,"offer_token":offer["offer_token"]}
+        self.assert_error(409, 2, "/api/helper/offers/respond", accept)
+        self.assert_error(409, 1, "/api/requests/reward/reserve", {"request_id":self.rid,"amount_rub":400})
+        database.wallet_add_entry(1, 500, "test", "Synthetic", "test")
+        self.assert_error(409, 2, "/api/requests/reward/reserve", {"request_id":self.rid,"amount_rub":400})
+        self.assertTrue(self.request(1, "/api/requests/reward/reserve", {"request_id":self.rid,"amount_rub":400})["created"])
+        self.assertFalse(self.request(1, "/api/requests/reward/reserve", {"request_id":self.rid,"amount_rub":400})["created"])
+        self.request(2, "/api/helper/offers/respond", accept)
+        self.assert_error(409, 1, "/api/requests/completion/confirm", {"request_id":self.rid})
+        self.assertTrue(self.request(2, "/api/requests/finish", {"request_id":self.rid})["awaiting_confirmation"])
+        self.assertEqual(database.wallet_summary(2)["balance_rub"], 0)
+        self.assertIn("paid_done:", self.notify.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
+        self.assert_error(409, 2, "/api/requests/completion/confirm", {"request_id":self.rid})
+        self.request(1, "/api/requests/completion/confirm", {"request_id":self.rid})
+        self.assert_error(409, 1, "/api/requests/completion/confirm", {"request_id":self.rid})
+        self.assertEqual(database.wallet_summary(2)["balance_rub"], 400)
+
+    def test_missing_merchant_does_not_create_a_ghost_reward_invoice(self):
+        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        with patch.object(web,"ROBOKASSA_MERCHANT_LOGIN",""),patch.object(web,"ROBOKASSA_PASSWORD_1",""),patch.object(web,"ROBOKASSA_PASSWORD_2",""):
+            self.assert_error(503,1,"/api/requests/reward/pay",{"request_id":self.rid})
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM billing_invoices WHERE item_type='request_reward'").fetchone()["n"],0)
 
     def test_targeted_application_reaches_site_and_canonical_telegram_accounts_once(self):
         self.db.execute("UPDATE users SET tg_user_id=? WHERE user_id=?", (1001, 1))
@@ -314,6 +413,27 @@ class InvitationAPI(InvitationData, unittest.TestCase):
 
 
 class InvitationBot(InvitationData, unittest.IsolatedAsyncioTestCase):
+    async def test_paid_bot_explains_reserve_and_requires_author_payout(self):
+        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        services.offer_helper(self.rid,2)
+        callback = self.callback(2,"accept",self.current()["offer_token"])
+        await handlers.cb_helper_offer_response(callback,self.bot)
+        self.assertIn("резерв",callback.answer.call_args.args[0])
+        database.wallet_add_entry(1,500,"test","Synthetic","test")
+        services.reserve_request_reward(self.rid,1,400)
+        await handlers.cb_helper_offer_response(callback,self.bot)
+        callback = self.callback(2,"finish","")
+        callback.data = f"finish:{self.rid}"
+        await handlers.cb_finish(callback,self.bot)
+        self.assertEqual(database.wallet_summary(2)["balance_rub"],0)
+        self.assertNotIn("+20 HP",callback.message.answer.call_args.args[0])
+        callback = self.callback(1,"confirm","")
+        callback.data = f"paid_done:{self.rid}"
+        await handlers.cb_paid_completion(callback,self.bot)
+        self.assertEqual(database.wallet_summary(2)["balance_rub"],400)
+        await handlers.cb_paid_completion(callback,self.bot)
+        self.assertEqual(database.wallet_summary(2)["balance_rub"],400)
+
     def setUp(self):
         self.prepare()
         self.bot = SimpleNamespace(send_message=AsyncMock())

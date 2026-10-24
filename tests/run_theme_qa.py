@@ -26,6 +26,7 @@ def main():
                    HPOINT_QA_MAIL=str(Path(task_dir) / "mail.json"))
         seed = '''
 from hpoint import database, services
+import os
 database.init_db()
 for uid, name in [(901,"Тестовый участник"),(902,"Тестовый помощник"),(903,"Автор заявки"),(904,"Кандидат"),(905,"Новый участник")]:
     database.create_user(uid,name,tg_user_id=uid,web_verified=True)
@@ -42,6 +43,8 @@ services.try_assign_helper(done,901)
 services.complete_request(done,901)
 services.set_rating(done,903,5)
 services.add_to_queue(904)
+if os.environ.get("HPOINT_QA_PAID_FLOW") == "1":
+    database.wallet_add_entry(901,500,"test","Synthetic wallet funds","paid-browser-seed")
 database.create_web_login_ticket(901,"theme-browser-data")
 database.create_web_login_ticket(905,"theme-browser-empty")
 database.create_web_login_ticket(905,"theme-browser-game-deep")

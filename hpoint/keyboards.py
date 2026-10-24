@@ -21,6 +21,9 @@ def cancel_kb(*extra_rows):
 def finish_kb(request_id):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Завершить помощь", callback_data=f"finish:{request_id}")]])
 
+def confirm_paid_completion_kb(request_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Подтвердить помощь и выплатить из резерва", callback_data=f"paid_done:{request_id}")]])
+
 def rating_kb(request_id, prefix="rate"):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{n} ⭐", callback_data=f"{prefix}:{request_id}:{n}") for n in range(1, 6)]])
 

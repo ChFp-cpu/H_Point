@@ -93,6 +93,7 @@ def request_text(req) -> str:
         f"<b>Когда:</b> {escape(req['time_needed'])}\n"
         f"<b>Срочность:</b> {escape(req['urgency'])}\n"
         f"<b>Детали:</b> {escape(req['details'])}"
+        + (f"\n💳 {escape(request_reward_note(req))}" if int(req["reward_rub"] or 0) else "")
     )
 
 
@@ -1008,6 +1009,11 @@ async def cb_helper_offer_response(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Некорректное действие.", show_alert=True)
         return
     accepted = action == "accept"
+    request = get_request(request_id)
+    offer = get_current_helper_offer(request_id)
+    if accepted and offer and offer["candidate_id"] == callback.from_user.id and (offer["offer_token"] or "") == token and int(request["reward_rub"] or 0) > 0 and request["reward_payment_status"] != "paid":
+        await callback.answer("Автор ещё не создал резерв в кошельке H-Point. До резерва не начинайте помощь.", show_alert=True)
+        return
     if not respond_to_helper_offer(request_id, callback.from_user.id, accepted, token):
         await callback.answer("Предложение уже неактуально.", show_alert=True)
         return
@@ -1208,8 +1214,19 @@ async def cb_finish(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Заявка не найдена.", show_alert=True); return
     if req["helper_id"] != callback.from_user.id:
         await callback.answer("Завершить помощь может только её помощник.", show_alert=True); return
-    if not complete_request(request_id, callback.from_user.id):
+    result = request_help_completion(request_id, callback.from_user.id)
+    if result == "unavailable":
         await callback.answer("Не удалось завершить: заявка уже закрыта или недостаточно HP у автора.", show_alert=True); return
+    if result in ("created", "pending"):
+        await callback.answer("Ожидается подтверждение автора")
+        await callback.message.answer("✅ Вы сообщили о выполнении. Деньги остаются в резерве до подтверждения автора; после этого поступят в ваш кошелёк H-Point.")
+        requester = get_user(req["requester_id"])
+        if result == "created" and requester and requester["tg_user_id"]:
+            try:
+                await bot.send_message(requester["tg_user_id"], f"✅ Помощник сообщил о выполнении заявки №{request_id}. Проверьте результат и подтвердите выплату {req['reward_rub']} ₽ из резерва.", reply_markup=confirm_paid_completion_kb(request_id))
+            except Exception:
+                logging.exception("Не удалось запросить подтверждение платной помощи %s", request_id)
+        return
     await callback.answer("Помощь завершена!")
     await callback.message.edit_reply_markup(reply_markup=None)
     helper = get_user(callback.from_user.id)
@@ -1229,6 +1246,27 @@ async def cb_finish(callback: CallbackQuery, bot: Bot) -> None:
         )
     except Exception:
         logging.exception("Не удалось запросить оценку у пользователя %s", requester["user_id"])
+
+
+@router.callback_query(F.data.startswith("paid_done:"))
+async def cb_paid_completion(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        request_id = int(callback.data.split(":")[1])
+    except (ValueError,IndexError):
+        await callback.answer("Некорректная заявка.", show_alert=True)
+        return
+    request = get_request(request_id)
+    if not request or not int(request["reward_rub"] or 0) or not complete_request(request_id, request["helper_id"], confirmed_by=callback.from_user.id):
+        await callback.answer("Выплата уже выполнена или подтверждение недоступно.", show_alert=True)
+        return
+    await callback.answer("Выплата из резерва выполнена")
+    await callback.message.edit_text(f"✅ Помощь по заявке №{request_id} подтверждена. {request['reward_rub']} ₽ зачислено в кошелёк помощника. H-Points не списывались.",reply_markup=rating_kb(request_id))
+    helper = get_user(request["helper_id"])
+    if helper and helper["tg_user_id"]:
+        try:
+            await bot.send_message(helper["tg_user_id"],f"💳 Автор подтвердил помощь по заявке №{request_id}. {request['reward_rub']} ₽ поступило в ваш кошелёк H-Point.",reply_markup=rating_kb(request_id,"ratehelp"))
+        except Exception:
+            logging.exception("Не удалось сообщить о выплате по заявке %s",request_id)
 
 
 async def start_review(callback: CallbackQuery, state: FSMContext, request_id: int, side: str, rating: int) -> None:

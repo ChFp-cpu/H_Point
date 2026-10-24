@@ -161,7 +161,7 @@ def init_db():
       what TEXT NOT NULL, place TEXT NOT NULL, time_needed TEXT NOT NULL, urgency TEXT NOT NULL,
       details TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', rating INTEGER,
       requester_rating INTEGER, requester_review TEXT, helper_rating INTEGER, helper_review TEXT,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, completion_requested_at TEXT,
       priority_boost INTEGER NOT NULL DEFAULT 0, lat REAL, lon REAL,
       expires_at TEXT, views INTEGER NOT NULL DEFAULT 0, reward_rub INTEGER NOT NULL DEFAULT 0,
       reward_payment_status TEXT NOT NULL DEFAULT 'none'
@@ -364,6 +364,7 @@ def init_db():
       ("users","role","TEXT NOT NULL DEFAULT 'user'"),("users","is_blocked","INTEGER NOT NULL DEFAULT 0"),("users","blocked_reason","TEXT"),
       ("users","last_seen_at","TEXT"),("users","helper_availability","TEXT NOT NULL DEFAULT ''"),
       ("request_candidates","offer_token","TEXT"),
+      ("requests","completion_requested_at","TEXT"),
       ("requests","lat","REAL"),("requests","lon","REAL"),("requests","expires_at","TEXT"),("requests","views","INTEGER NOT NULL DEFAULT 0"),("requests","reward_rub","INTEGER NOT NULL DEFAULT 0"),("requests","reward_payment_status","TEXT NOT NULL DEFAULT 'none'"),("requests","cancel_reason","TEXT"),("requests","cancelled_at","TEXT"),("community_events","image_data","TEXT NOT NULL DEFAULT ''"),("billing_invoices","amount_rub","INTEGER NOT NULL DEFAULT 0"),
       ("billing_invoices","currency","TEXT NOT NULL DEFAULT 'RUB'"),("billing_invoices","provider_payment_id","TEXT"),
       ("game_daily_rewards","result_hp","INTEGER NOT NULL DEFAULT 0")

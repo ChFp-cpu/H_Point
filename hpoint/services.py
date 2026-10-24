@@ -171,7 +171,7 @@ def get_helper_offers(helper_id: int, limit: int = 20):
     """Offers awaiting a helper's answer; used by both the site and the bot."""
     return db.execute(
         """SELECT rc.request_id, rc.updated_at, rc.offer_token, r.category, r.what, r.place,
-                  r.time_needed, r.urgency, r.details, r.requester_id,
+                  r.time_needed, r.urgency, r.details, r.requester_id, r.reward_rub, r.reward_payment_status,
                   requester.name requester_name, requester.username requester_username
            FROM request_candidates rc
            JOIN requests r ON r.id = rc.request_id
@@ -195,10 +195,9 @@ def offer_helper(request_id: int, helper_id: int, replace_offer_token: str | Non
             "SELECT 1 FROM requests WHERE helper_id = ? AND status = ?" + lock,
             (helper_id, STATUS_IN_PROGRESS),
         ).fetchone()
-        reward_ready = (int(request["reward_rub"] or 0) == 0 or request["reward_payment_status"] == "paid") if request else False
         categories = get_helper_categories(helper_id)
         applied = db.execute("SELECT 1 FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='applied'", (request_id, helper_id)).fetchone()
-        if not request or request["status"] != STATUS_OPEN or request["requester_id"] == helper_id or not reward_ready or not available or busy or (categories and request["category"] not in categories and not applied):
+        if not request or request["status"] != STATUS_OPEN or request["requester_id"] == helper_id or not available or busy or (categories and request["category"] not in categories and not applied):
             db.execute("ROLLBACK")
             return False
 
@@ -386,7 +385,80 @@ def try_assign_helper(request_id: int, helper_id: int) -> bool:
         raise
 
 
-def complete_request(request_id: int, helper_id: int) -> bool:
+def request_reward_note(request) -> str:
+    amount = int(request["reward_rub"] or 0)
+    if not amount:
+        return ""
+    if request["reward_payment_status"] == "released":
+        return f"{amount} ₽ зачислено помощнику в кошелёк H-Point."
+    if request["reward_payment_status"] == "paid":
+        return f"{amount} ₽ зарезервировано в кошельке H-Point. Выплата — после помощи и подтверждения автора."
+    return f"{amount} ₽ через кошелёк H-Point после помощи. Сумма пока не зарезервирована: перед началом автор должен создать резерв."
+
+
+def reserve_request_reward(request_id: int, requester_id: int, expected_amount: int) -> bool:
+    """Hold real wallet funds, without paying the helper or changing H-Points."""
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
+        if lock:
+            db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (requester_id,)).fetchone()
+        request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
+        if not request or request["requester_id"] != requester_id or request["status"] != STATUS_OPEN:
+            raise ValueError("request unavailable")
+        amount = int(request["reward_rub"] or 0)
+        if amount <= 0 or amount != expected_amount:
+            raise ValueError("reward changed")
+        if request["reward_payment_status"] == "paid":
+            db.execute("COMMIT")
+            return False
+        if request["reward_payment_status"] != "none":
+            raise ValueError("request unavailable")
+        # An already opened acquiring session must not race wallet funding.
+        invoices = db.execute("SELECT metadata FROM billing_invoices WHERE user_id=? AND item_type='request_reward' AND status='pending' AND provider_payment_id IS NOT NULL", (requester_id,)).fetchall()
+        if any(json.loads(row["metadata"] or "{}").get("request_id") == request_id for row in invoices):
+            raise ValueError("external payment pending")
+        balance = db.execute("SELECT COALESCE(SUM(amount_rub),0) amount FROM wallet_transactions WHERE user_id=?", (requester_id,)).fetchone()["amount"]
+        if int(balance or 0) < amount:
+            raise ValueError("insufficient wallet")
+        if not wallet_add_entry(requester_id, -amount, "reward_reserve", "Вознаграждение зарезервировано до подтверждения помощи автором", f"request:{request_id}:reserve", request_id):
+            raise ValueError("reserve already recorded")
+        db.execute("UPDATE requests SET reward_payment_status='paid' WHERE id=?", (request_id,))
+        db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)", (request_id, requester_id, "reward_reserved", f"В кошельке зарезервировано {amount} ₽. Выплата — после помощи и подтверждения автора."))
+        db.execute("COMMIT")
+        return True
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def request_help_completion(request_id: int, helper_id: int) -> str:
+    """Paid work needs the author's confirmation before any RUB transfer."""
+    request = get_request(request_id)
+    if not request or request["status"] != STATUS_IN_PROGRESS or request["helper_id"] != helper_id:
+        return "unavailable"
+    if not int(request["reward_rub"] or 0):
+        return "completed" if complete_request(request_id, helper_id) else "unavailable"
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
+        request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
+        if not request or request["status"] != STATUS_IN_PROGRESS or request["helper_id"] != helper_id or request["reward_payment_status"] != "paid":
+            db.execute("ROLLBACK")
+            return "unavailable"
+        if request["completion_requested_at"]:
+            db.execute("COMMIT")
+            return "pending"
+        db.execute("UPDATE requests SET completion_requested_at=CURRENT_TIMESTAMP WHERE id=?", (request_id,))
+        db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)", (request_id, helper_id, "completion_requested", "Помощник сообщил о выполнении. Ожидается подтверждение автора для выплаты из резерва."))
+        db.execute("COMMIT")
+        return "created"
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def complete_request(request_id: int, helper_id: int, confirmed_by: int | None = None) -> bool:
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
@@ -395,7 +467,7 @@ def complete_request(request_id: int, helper_id: int) -> bool:
             db.execute("ROLLBACK")
             return False
         paid_request = int(req["reward_rub"] or 0) > 0
-        if paid_request and req["reward_payment_status"] != "paid":
+        if paid_request and (req["reward_payment_status"] != "paid" or confirmed_by != req["requester_id"] or not req["completion_requested_at"]):
             db.execute("ROLLBACK")
             return False
         # H-Points are the incentive only for free neighbourly help.  A request
@@ -420,11 +492,11 @@ def complete_request(request_id: int, helper_id: int) -> bool:
             amount = int(req["reward_rub"])
             wallet_add_entry(helper_id, amount, "reward_earned", "Вознаграждение за завершённую заявку", f"request:{request_id}:earned", request_id)
             db.execute("UPDATE requests SET reward_payment_status='released' WHERE id=?", (request_id,))
-        db.execute("COMMIT")
         db.execute(
             "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
-            (request_id, helper_id, "completed", "Помощник отметил заявку как завершённую. Можно оставить отзыв."),
+            (request_id, confirmed_by if paid_request else helper_id, "completed", "Автор подтвердил помощь и выплату из резерва. Можно оставить отзыв." if paid_request else "Помощник отметил заявку как завершённую. Можно оставить отзыв."),
         )
+        db.execute("COMMIT")
         return True
     except Exception:
         db.execute("ROLLBACK")
