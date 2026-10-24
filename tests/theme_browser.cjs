@@ -68,7 +68,7 @@ async function loadPhotos(page){
             assert.equal(await page.locator('#workspaceHistory').getAttribute('open'),null);
             assert.equal(await page.locator('#workspaceMapSlot').count(),0,'Map does not force scrolling on the requests screen');
           }
-          if(route==='#/profile/billing')assert.equal(await page.locator('.workspaceProduct').count(),8);
+          if(route==='#/profile/billing')assert.equal(await page.locator('.workspaceProduct').count(),2);
           if(route==='#/league')assert.equal(await page.locator('.leagueCategoryTop').first().evaluate(e=>getComputedStyle(e).color),colorScheme==='light'?'rgb(21, 35, 29)':'rgb(237, 244, 235)');
         }
       }

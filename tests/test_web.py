@@ -8,8 +8,8 @@ import hpoint.web as web
 class Web(unittest.TestCase):
  def setUp(self):
   self.old=database.db;self.db=sqlite3.connect(":memory:",isolation_level=None,check_same_thread=False);self.db.row_factory=sqlite3.Row
-  database.db=self.db;services.db=self.db;billing.db=self.db;web.database.db=self.db;web.db=self.db;database.init_db()
- def tearDown(self):database.db=self.old;services.db=self.old;billing.db=self.old;web.database.db=self.old;web.db=self.old;self.db.close()
+  database.db=self.db;services.db=self.db;billing.db=self.db;web.database.db=self.db;web.db=self.db;database.init_db();self.notification_patch=patch.object(web,"notify_telegram_user",return_value=False);self.notification_patch.start()
+ def tearDown(self):self.notification_patch.stop();database.db=self.old;services.db=self.old;billing.db=self.old;web.database.db=self.old;web.db=self.old;self.db.close()
  def test_web_shares_logic(self):
   database.create_user(42,"Web",None);rid=services.create_request(42,{"what":"Помочь с компьютером","place":"x","time_needed":"x","urgency":"x","details":"x"})
   self.assertEqual(database.get_request(rid)["category"],"tech")
@@ -295,6 +295,24 @@ class Web(unittest.TestCase):
    self.assertEqual(row["id"],rid);self.assertIsNone(row["lat"]);self.assertIsNone(row["lon"]);self.assertNotIn("details",row);self.assertNotEqual(row["place"],"район")
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
+ def test_public_open_feed_preserves_status_and_excludes_history_and_own_requests(self):
+  for uid in (1,2,3):database.create_user(uid,f"User {uid}",tg_user_id=uid,web_verified=True)
+  payload={"what":"Помочь с техникой","place":"Скрытый адрес","time_needed":"сегодня","urgency":"обычная","details":"Личные сведения","lat":55.75,"lon":37.62}
+  opened=services.create_request(1,payload)
+  done=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(done,3));self.assertTrue(services.complete_request(done,3))
+  active=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(active,3))
+  cancelled=services.create_request(1,payload);self.assertTrue(services.cancel_request(cancelled,1,"test"))
+  own=services.create_request(2,payload)
+  token=web.new_sess(2);server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  try:
+   for path in ("/api/requests?open=1","/api/search"):
+    request=urllib.request.Request(f"http://127.0.0.1:{server.server_port}"+path,headers={"Cookie":"hpoint_session="+token})
+    with urllib.request.urlopen(request,timeout=3) as response:rows=json.load(response)["requests"]
+    self.assertEqual([row["id"] for row in rows],[opened])
+    self.assertEqual(rows[0]["status"],"open");self.assertEqual(rows[0]["status_title"],"Ожидает помощника")
+    self.assertNotIn("details",rows[0]);self.assertIsNone(rows[0]["lat"]);self.assertIsNone(rows[0]["lon"]);self.assertNotEqual(rows[0]["place"],payload["place"])
+   self.assertEqual([database.get_request(rid)["status"] for rid in (opened,done,active,cancelled,own)],["open","done","in_progress","cancelled","open"])
+  finally:server.shutdown();thread.join(timeout=3);server.server_close()
  def test_helper_location_updates_distance_and_active_map_stays_private(self):
   database.create_user(1,"Requester");database.create_user(2,"Helper")
   rid=services.create_request(1,{"what":"Нужна дрель","place":"район","time_needed":"сегодня","urgency":"обычная","details":"Точный адрес","lat":55.75123,"lon":37.61987})
@@ -580,7 +598,7 @@ class Web(unittest.TestCase):
    def post(path,payload,cookie_value=cookie):
     return urllib.request.urlopen(urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers={"Content-Type":"application/json","Cookie":cookie_value},method="POST"),timeout=3)
    with post("/api/payments/hp",{"item_type":"pro","purchase_key":"test-hp-one"}) as response:self.assertTrue(json.load(response)["created"])
-   self.assertEqual(database.get_user(1)["balance"],820)
+   self.assertEqual(database.get_user(1)["balance"],910)
    with urllib.request.urlopen(urllib.request.Request(base+"/api/profiles",headers={"Cookie":cookie}),timeout=3) as response:self.assertEqual(len(json.load(response)["profiles"]),2)
    with post("/api/profiles/switch",{"user_id":2}) as response: switched=response.headers["Set-Cookie"].split(";",1)[0]
    with urllib.request.urlopen(urllib.request.Request(base+"/api/me",headers={"Cookie":switched+"; hpoint_device="+device}),timeout=3) as response:self.assertEqual(json.load(response)["user"]["id"],2)

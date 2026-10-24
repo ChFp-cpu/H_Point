@@ -28,6 +28,7 @@ BOT_GUIDE = (
     "🆘 <b>Мне нужна помощь</b> — ответьте на 5 коротких вопросов, чтобы создать заявку.\n"
     "🤝 <b>Хочу помочь</b> — встать в общую очередь помощников сайта и бота.\n"
     "⚡ <b>Подобрать кандидатов</b> / 👥 <b>Мои кандидаты</b> — выбрать человека для своей открытой заявки; он подтвердит участие сам.\n"
+    "📨 Отклик на вашу заявку придёт сюда с кнопками выбора и отказа; он также сохранён на сайте и в «Моих кандидатах».\n"
     "👤 <b>Мой профиль</b> — баланс HP, рейтинг, статистика и статус проверки.\n"
     "📜 <b>История</b> — завершённые и текущие заявки.\n"
     "⚙️ <b>Настройки помощи</b> — указать категории, в которых вы готовы помогать.\n"
@@ -816,7 +817,8 @@ async def _candidate_card(candidate: dict) -> str:
     score = min(100, round(float(candidate.get("score") or 0)))
     username = f" (@{escape(candidate['username'])})" if candidate.get("username") else ""
     return (
-        f"👤 <b>{escape(candidate.get('name') or 'Пользователь')}</b>{verified}{username}\n"
+        ("📨 <b>Откликнулся на вашу заявку</b>\n" if candidate.get("applied") else "")
+        + f"👤 <b>{escape(candidate.get('name') or 'Пользователь')}</b>{verified}{username}\n"
         f"⭐ {rating:.1f}/5 · {reviews} отзывов\n"
         f"📍 {distance_text}\n"
         f"🎯 Совпадение: <b>{score}%</b>"
@@ -953,6 +955,28 @@ async def cb_candidate_assign(callback: CallbackQuery, bot: Bot) -> None:
         reply_markup=candidates_navigation_kb(request_id, get_current_helper_offer(request_id)),
     )
     await notify_helper_offer(bot, request_id, candidate_id)
+
+
+@router.callback_query(F.data.startswith("ac:"))
+async def cb_application_cancel(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        _, rid, hid, token = callback.data.split(":")
+        request_id, helper_id = int(rid), int(hid)
+    except (ValueError, TypeError):
+        await callback.answer("Некорректный отклик.", show_alert=True)
+        return
+    if not cancel_request_application(request_id, helper_id, callback.from_user.id, token):
+        await callback.answer("Отклик уже изменился или помощник выбран.", show_alert=True)
+        return
+    await callback.answer("Отклик отменён")
+    await callback.message.edit_text("↩️ Отклик отменён. Сама заявка остаётся открытой.")
+    request = get_request(request_id)
+    other = get_user(request["requester_id"] if callback.from_user.id == helper_id else helper_id)
+    if other and other["tg_user_id"]:
+        try:
+            await bot.send_message(other["tg_user_id"], f"↩️ Отклик на заявку №{request_id} отозван помощником." if callback.from_user.id == helper_id else f"ℹ️ Автор отклонил ваш отклик на заявку №{request_id}.")
+        except Exception:
+            logging.exception("Не удалось уведомить об отмене отклика %s", request_id)
 
 
 @router.callback_query(F.data.startswith("offer:"))
@@ -1153,7 +1177,7 @@ async def cb_leave_queue(callback: CallbackQuery) -> None:
     if is_in_queue(callback.from_user.id):
         remove_from_queue(callback.from_user.id)
         await callback.answer("Вы вышли из очереди")
-        await callback.message.edit_text("Вы вышли из очереди помощников.")
+        await callback.message.edit_text("Вы вышли из очереди помощников. Ожидающие отклики отозваны; уже принятая помощь не отменяется.")
     else:
         await callback.answer("Вы не в очереди", show_alert=True)
 
@@ -1292,7 +1316,9 @@ async def show_billing(message: Message, state: FSMContext) -> None:
     if is_business(user["user_id"]): status.append("💼 Business активен")
     await message.answer(
         "💳 <b>H-Point+</b>\n\n"
-        "Платные возможности оплачиваются в рублях через внешний эквайринг или H-Points.\n\n"
+        "Продвижение — приоритет одной открытой заявки до её закрытия.\n"
+        "PRO — приоритет профиля и заявок в автоматическом подборе на 30 дней, без автопродления.\n"
+        "Рейтинг и Лига не продаются; отклики не гарантированы. Проверка личности бесплатна в профиле сайта.\n\n"
         + ("\n".join(status)+"\n\n" if status else "") +
         "Выберите функцию:",
         reply_markup=billing_kb(),
@@ -1366,7 +1392,7 @@ def payment_button(item_type, request_id=None):
 async def cb_buy(callback: CallbackQuery, state: FSMContext):
     item_type=callback.data.split(":",1)[1]
     if item_type not in MONETIZATION_ITEMS:
-        await callback.answer("Неизвестный товар",show_alert=True);return
+        await callback.answer("Эта функция снята с продажи. Откройте обновлённое меню H-Point+.",show_alert=True);return
     if item_type in ("boost","more_responses"):
         requests=db.execute("SELECT id,what FROM requests WHERE requester_id=? AND status=? ORDER BY id DESC LIMIT 10",(callback.from_user.id,STATUS_OPEN)).fetchall()
         if not requests:
@@ -1394,8 +1420,7 @@ async def cb_buy_request(callback: CallbackQuery):
     await callback.message.answer(
         f"Заявка №{request_id}. Выберите функцию:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"🚀 Продвижение — {PRICE_BOOST_RUB} ₽",callback_data=f"payreq:boost:{request_id}")],
-            [InlineKeyboardButton(text=f"🔥 Больше откликов — {PRICE_MORE_RESPONSES_RUB} ₽",callback_data=f"payreq:more_responses:{request_id}")]
+            [InlineKeyboardButton(text=f"🚀 Продвижение — {PRICE_BOOST_RUB} ₽",callback_data=f"payreq:boost:{request_id}")]
         ])
     )
 
@@ -1404,6 +1429,8 @@ async def cb_pay_request(callback: CallbackQuery):
     try:_,item_type,rid=callback.data.split(":");rid=int(rid)
     except:
         await callback.answer("Некорректные данные",show_alert=True);return
+    if item_type != "boost":
+        await callback.answer("Эта функция больше не продаётся. Откройте H-Point+.",show_alert=True);return
     req=get_request(rid)
     if not req or req["requester_id"]!=callback.from_user.id or req["status"]!=STATUS_OPEN:
         await callback.answer("Заявка уже недоступна.",show_alert=True);return
@@ -1415,14 +1442,8 @@ async def cb_pay_request(callback: CallbackQuery):
 
 @router.message(Billing.ad_text,F.text)
 async def billing_ad_text(message: Message,state: FSMContext):
-    text=message.text.strip()
-    if not text or len(text)>MAX_TEXT_LEN:
-        await message.answer(f"Текст должен быть от 1 до {MAX_TEXT_LEN} символов.");return
     await state.clear()
-    await message.answer(
-        f"📢 Объявление подготовлено.\nЦена: <b>{PRICE_AD_RUB} ₽</b>",
-        reply_markup=payment_button("ad")
-    )
+    await message.answer("Локальные объявления сняты с новых продаж. Уже оплаченные права сохранены. Актуальные возможности:",reply_markup=billing_kb())
 
 @router.message(Command("commercial"))
 async def commercial_start(message: Message,state: FSMContext):

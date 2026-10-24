@@ -46,6 +46,42 @@ class InvitationCore(InvitationData, unittest.TestCase):
     def tearDown(self):
         self.close()
 
+    def test_targeted_application_is_distinct_from_queue_and_prioritized(self):
+        self.assertEqual(services.get_request_applications(1), [])
+        services.set_helper_categories(2, ["shopping"])
+        self.assertEqual(services.apply_to_request(self.rid, 2), "created")
+        token = self.db.execute("SELECT offer_token FROM request_candidates WHERE request_id=? AND candidate_id=2", (self.rid,)).fetchone()["offer_token"]
+        self.assertEqual(services.apply_to_request(self.rid, 2), "applied")
+        self.assertEqual(len(services.get_request_applications(1)), 1)
+        self.assertEqual(services.get_request_applications(3), [])
+        self.assertEqual(services.get_helper_applications(2)[0]["application_token"], token)
+        match = services.smart_match(self.rid)[0]
+        self.assertEqual(match["user_id"], 2); self.assertTrue(match["applied"])
+        self.assertEqual(services.get_request_applications(1)[0]["application_token"], token)
+        self.assertEqual(database.get_request(self.rid)["status"], "open")
+        self.assertIsNone(database.get_request(self.rid)["helper_id"])
+        self.assertTrue(services.offer_helper(self.rid, 2))
+        self.assertFalse(services.cancel_request_application(self.rid, 2, 2, token))
+        self.assertEqual(services.apply_to_request(self.rid, 2), "offered")
+
+    def test_application_can_be_cancelled_by_either_party_but_not_a_stranger(self):
+        self.assertEqual(services.apply_to_request(self.rid, 2), "created")
+        token = services.get_helper_applications(2)[0]["application_token"]
+        self.assertFalse(services.cancel_request_application(self.rid, 2, 4, token))
+        self.assertFalse(services.cancel_request_application(self.rid, 2, 1, "old"))
+        self.assertTrue(services.cancel_request_application(self.rid, 2, 2, token))
+        self.assertEqual(services.get_request_applications(1), [])
+        self.assertEqual(services.apply_to_request(self.rid, 2), "created")
+        newer = services.get_helper_applications(2)[0]["application_token"]
+        self.assertNotEqual(token, newer)
+        self.assertFalse(services.cancel_request_application(self.rid, 2, 1, token))
+        self.assertTrue(services.cancel_request_application(self.rid, 2, 1, newer))
+        self.assertEqual(services.get_helper_applications(2), [])
+        self.assertEqual(database.get_request(self.rid)["status"], "open")
+        self.assertEqual(services.apply_to_request(self.rid, 1), "unavailable")
+        services.apply_to_request(self.rid, 3);services.remove_from_queue(3)
+        self.assertEqual(services.get_request_applications(1), [])
+
     def test_withdraw_is_owner_only_and_does_not_cancel_request(self):
         self.assertTrue(services.offer_helper(self.rid, 2))
         token = self.current()["offer_token"]
@@ -185,6 +221,42 @@ class InvitationAPI(InvitationData, unittest.TestCase):
         with error.exception as response:
             self.assertEqual(response.code, status)
 
+    def test_targeted_application_reaches_site_and_canonical_telegram_accounts_once(self):
+        self.db.execute("UPDATE users SET tg_user_id=? WHERE user_id=?", (1001, 1))
+        self.db.execute("UPDATE users SET tg_user_id=? WHERE user_id=?", (2002, 2))
+        payload = {"request_id": self.rid}
+        self.assertTrue(self.request(2, "/api/requests/accept", payload)["created"])
+        self.assertEqual({call.args[0] for call in self.notify.call_args_list}, {1001, 2002})
+        author_message = next(call for call in self.notify.call_args_list if call.args[0] == 1001)
+        self.assertIn("User 2", author_message.args[1]);self.assertIn("Компьютер", author_message.args[1])
+        self.assertIn(f"candidate:assign:{self.rid}:2", str(author_message.kwargs["reply_markup"]))
+        self.assertFalse(self.request(2, "/api/requests/accept", payload)["created"])
+        self.assertEqual(self.notify.call_count, 2)
+        incoming = self.request(1, "/api/sync")["applications"]
+        outgoing = self.request(2, "/api/sync")["my_applications"]
+        self.assertEqual(incoming[0]["helper_id"], 2)
+        self.assertEqual(incoming[0]["application_token"], outgoing[0]["application_token"])
+        self.assertEqual(self.request(4, "/api/sync")["applications"], [])
+        matches = self.request(1, "/api/assistant/candidates", payload)["matches"]
+        self.assertEqual(matches[0]["user_id"], 2);self.assertTrue(matches[0]["applied"])
+        self.assertEqual(database.get_request(self.rid)["status"], "open")
+        self.assertEqual(self.request(1, "/api/chats")["chats"], [])
+
+    def test_application_cancel_endpoint_checks_actor_and_stale_tokens(self):
+        self.request(2, "/api/requests/accept", {"request_id": self.rid})
+        response = self.request(1, "/api/sync")["applications"][0]
+        payload = {"request_id": self.rid, "helper_id": 2, "application_token": response["application_token"]}
+        self.assert_error(409, 4, "/api/requests/response/cancel", payload)
+        self.notify.reset_mock()
+        self.assertTrue(self.request(2, "/api/requests/response/cancel", payload)["cancelled"])
+        self.assertEqual(self.notify.call_args.args[0], 1)
+        self.assertEqual(self.request(1, "/api/sync")["applications"], [])
+        self.request(2, "/api/requests/accept", {"request_id": self.rid})
+        self.assert_error(409, 1, "/api/requests/response/cancel", payload)
+        payload["application_token"] = self.request(1, "/api/sync")["applications"][0]["application_token"]
+        self.assertTrue(self.request(1, "/api/requests/response/cancel", payload)["cancelled"])
+        self.assertEqual(self.notify.call_args.args[0], 2)
+
     def test_cancel_from_either_side_and_find_new_candidates(self):
         assign = {"request_id": self.rid, "helper_id": 2}
         self.request(1, "/api/smart-match/assign", assign)
@@ -253,6 +325,18 @@ class InvitationBot(InvitationData, unittest.IsolatedAsyncioTestCase):
         # Telegram callback.message is sent by the bot, not by the requester.
         message = SimpleNamespace(from_user=SimpleNamespace(id=999000), edit_text=AsyncMock(), answer=AsyncMock())
         return SimpleNamespace(from_user=SimpleNamespace(id=uid), data=f"offer:{action}:{self.rid}:{token}", message=message, answer=AsyncMock())
+
+    async def test_bot_reads_real_applications_and_can_decline_them(self):
+        services.apply_to_request(self.rid, 2)
+        candidate = services.smart_match(self.rid)[0]
+        self.assertIn("Откликнулся", await handlers._candidate_card(candidate))
+        token = services.get_request_applications(1)[0]["application_token"]
+        callback = self.callback(1, "cancel", token)
+        callback.data = f"ac:{self.rid}:2:{token}"
+        await handlers.cb_application_cancel(callback, self.bot)
+        self.assertEqual(services.get_request_applications(1), [])
+        self.assertEqual(self.bot.send_message.call_args.args[0], 2)
+        self.assertEqual(database.get_request(self.rid)["status"], "open")
 
     async def test_requester_can_cancel_in_bot_and_reopen_candidates(self):
         services.offer_helper(self.rid, 2)
