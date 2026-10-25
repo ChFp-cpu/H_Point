@@ -1,3 +1,4 @@
+const {openHelpTab}=require('./help_navigation.cjs');
 /* Wallet-funded help: synthetic funds, no payment provider, two participants. */
 const {chromium}=require('playwright'),assert=require('node:assert/strict'),path=require('node:path');
 const base=process.env.HPOINT_QA_URL;
@@ -76,7 +77,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await post(helper,'/api/helper/queue',{});
   const another=await post(empty,'/api/requests',{what:'Без средств на кошельке',place:'Тест',time_needed:'сегодня',urgency:'обычная',details:'test',category:'tech',reward_rub:400});
   await refresh(empty);
-  await empty.page.goto(base+'/#/help');await empty.page.locator('.helpNavigation [data-tab="match"]').click();
+  await empty.page.goto(base+'/#/help');await openHelpTab(empty.page,'match');
   await empty.page.locator('.workspaceCandidate [data-user="904"]').click();
   await empty.page.locator('.rewardReservePanel [data-ws-action="reward-reserve"]').waitFor();
   assert.equal(await empty.page.locator('[data-ws-action="reward-reserve"]').isDisabled(),true);

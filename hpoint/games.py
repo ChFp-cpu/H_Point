@@ -18,6 +18,14 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from . import database
+from .features import GAMES_ENABLED
+
+
+def _require_games_enabled():
+    if not GAMES_ENABLED:
+        raise ValueError("games_paused")
+
+
 from .game_content import (
     CONTENT_VERSION,
     LEARNING_SESSION_LENGTH,
@@ -674,6 +682,7 @@ def _public_session(row: dict, state: dict | None = None) -> dict:
 
 
 def start_game(user_id: int, game_code: str) -> dict:
+    _require_games_enabled()
     if game_code not in GAME_CATALOG:
         raise ValueError("Неизвестная игра.")
     _begin()
@@ -1200,6 +1209,7 @@ def _award_play_bonus(game_code: str, state: dict, action: dict, feedback: dict 
 
 
 def action_game(user_id: int, session_id: str, action: dict) -> dict:
+    _require_games_enabled()
     if not isinstance(action, dict):
         raise ValueError("Некорректное игровое действие.")
     _begin()
@@ -1268,6 +1278,7 @@ def action_game(user_id: int, session_id: str, action: dict) -> dict:
 
 
 def abandon_game(user_id: int, session_id: str) -> dict:
+    _require_games_enabled()
     _begin()
     try:
         row, state = _get_active_session(user_id, session_id)
@@ -1336,6 +1347,7 @@ def game_state(user_id: int | None) -> dict:
 
 
 def purchase_item(user_id: int, item_id: str, purchase_key: str) -> dict:
+    _require_games_enabled()
     if item_id not in STORE_ITEMS:
         raise ValueError("Неизвестный предмет магазина.")
     if not isinstance(purchase_key, str) or not _PURCHASE_KEY_RE.fullmatch(purchase_key):
@@ -1374,6 +1386,7 @@ def purchase_item(user_id: int, item_id: str, purchase_key: str) -> dict:
 
 
 def equip_item(user_id: int, item_id: str, equipped: bool = True) -> dict:
+    _require_games_enabled()
     item = STORE_ITEMS.get(item_id)
     if not item:
         raise ValueError("Неизвестный предмет магазина.")

@@ -1,5 +1,6 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from .config import *
+from .features import GAMES_ENABLED
 
 def main_menu_kb():
     return ReplyKeyboardMarkup(keyboard=[
@@ -7,7 +8,7 @@ def main_menu_kb():
         [KeyboardButton(text=BTN_FIND_CANDIDATES), KeyboardButton(text=BTN_MY_CANDIDATES)],
         [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_HISTORY)],
         [KeyboardButton(text=BTN_SETTINGS)],
-        [KeyboardButton(text=BTN_GAMES)],
+        *([[KeyboardButton(text=BTN_GAMES)]] if GAMES_ENABLED else []),
         [KeyboardButton(text="💳 H-Point+"), KeyboardButton(text=BTN_NAVIGATOR)],
         [KeyboardButton(text=BTN_WEBSITE)],
     ], resize_keyboard=True)
@@ -45,6 +46,7 @@ def category_kb(prefix="cat"):
 
 def profile_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏅 Достижения за помощь", callback_data="profile:achievements")],
         [InlineKeyboardButton(text=BTN_HISTORY, callback_data="profile:history")],
         [InlineKeyboardButton(text=BTN_SETTINGS, callback_data="profile:settings")],
     ])

@@ -1,4 +1,5 @@
 /* Two-sided chat handoff after explicit consent, on disposable QA data. */
+const {openHelpTab}=require('./help_navigation.cjs');
 const {chromium}=require('playwright');
 const assert=require('node:assert/strict');
 const path=require('node:path');
@@ -17,7 +18,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  async function post(actor,route,data){const res=await actor.context.request.post(base+route,{data});assert.equal(res.status(),200,await res.text());return res.json()}
  async function match(actor){
   await actor.page.goto(base+'/#/help');
-  await actor.page.locator('.helpNavigation [data-tab="match"]').click();
+  await openHelpTab(actor.page,'match');
   await actor.page.waitForFunction(()=>hpointWorkspace.state.matchLoading===false);
  }
  try{

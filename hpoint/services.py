@@ -2,6 +2,7 @@
 import json, re, secrets
 from datetime import datetime, timedelta, timezone
 from .config import *
+from .help_achievements import award_locked
 from .database import db, get_request, get_user, get_active_help, save_request_candidates, get_request_candidates, insert_id, request_identity_verification, wallet_add_entry, get_or_create_chat_for_request
 
 
@@ -541,11 +542,25 @@ def complete_request(request_id: int, helper_id: int, confirmed_by: int | None =
 def set_rating(request_id: int, user_id: int, rating: int) -> bool:
     if not 1 <= rating <= 5:
         return False
-    cur = db.execute(
-        "UPDATE requests SET rating = ?, requester_rating = ? WHERE id = ? AND requester_id = ? AND status = ? AND requester_rating IS NULL",
-        (rating, rating, request_id, user_id, STATUS_DONE),
-    )
-    return cur.rowcount == 1
+    request=get_request(request_id)
+    if not request or request["requester_id"]!=user_id or request["status"]!=STATUS_DONE or not request["helper_id"]:
+        return False
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        lock=" FOR UPDATE" if getattr(db,"is_postgres",False) else ""
+        db.execute("SELECT user_id FROM users WHERE user_id=?"+lock,(request["helper_id"],)).fetchone()
+        cur=db.execute(
+            "UPDATE requests SET rating = ?, requester_rating = ? WHERE id = ? AND requester_id = ? AND status = ? AND requester_rating IS NULL",
+            (rating,rating,request_id,user_id,STATUS_DONE))
+        if cur.rowcount!=1:
+            db.execute("ROLLBACK")
+            return False
+        award_locked(db,request["helper_id"],source_request_id=request_id)
+        db.execute("COMMIT")
+        return True
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
 
 
 def set_helper_rating(request_id: int, user_id: int, rating: int) -> bool:

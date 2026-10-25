@@ -2,6 +2,7 @@ import json
 import sqlite3
 import threading
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,9 @@ import hpoint.web as web
 
 class Games(unittest.TestCase):
     def setUp(self):
+        from hpoint import handlers,keyboards
+        self.feature_patches=[patch.object(module,"GAMES_ENABLED",True) for module in (games,web,handlers,keyboards)]
+        for item in self.feature_patches:item.start()
         self.old_database = database.db
         self.old_services = services.db
         self.old_billing = billing.db
@@ -31,6 +35,7 @@ class Games(unittest.TestCase):
         self.db.execute("UPDATE users SET balance=100 WHERE user_id=1")
 
     def tearDown(self):
+        for item in reversed(self.feature_patches):item.stop()
         database.db = self.old_database
         services.db = self.old_services
         billing.db = self.old_billing

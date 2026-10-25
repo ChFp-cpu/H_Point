@@ -1,3 +1,4 @@
+const {openHelpTab}=require('./help_navigation.cjs');
 /* Real two-sided invitation flows against the disposable local QA database. */
 const {chromium}=require('playwright');
 const assert=require('node:assert/strict');
@@ -20,7 +21,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  async function invite(helper){return post(author,'/api/smart-match/assign',{request_id:1,helper_id:helper})}
  async function match(){
   await author.page.goto(base+'/#/help');await author.page.locator('.helpNavigation').waitFor();
-  await author.page.locator('.helpNavigation [data-tab="match"]').click();
+  await openHelpTab(author.page,'match');
   await author.page.locator('[data-ws-action="match-load"]').waitFor({state:'visible'});
   await author.page.waitForFunction(()=>hpointWorkspace.state.matchLoading===false);
  }

@@ -1,3 +1,4 @@
+const {openHelpTab}=require('./help_navigation.cjs');
 /* Mobile help flows, using only the disposable run_theme_qa.py server. */
 const {chromium}=require('playwright');
 const assert=require('node:assert/strict');
@@ -26,9 +27,9 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
     assert.equal(await page.locator('#workspaceHistory').evaluate(e=>e.open),true,'Sync preserves the history fold');
     await page.locator('#workspaceHistory summary').click();
     for(const tab of ['mine','open','match','chats','preferences','map']){
-     await page.locator('.helpNavigation [data-tab="'+tab+'"]').click();
+     await openHelpTab(page,tab);
      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`${width} ${colorScheme} ${tab}`);
-     if(width<500&&tab==='mine')assert.ok(await page.locator('#hpointWorkspace').evaluate(e=>e.getBoundingClientRect().height)<1000,'Requests screen is compact');
+     if(width<500&&tab==='mine')assert.ok((await page.locator('.workspaceRequest').first().boundingBox()).y<560,'Current requests are reachable on the first screen');
      checks++;
     }
     await page.goto(base+'/#/league');await page.locator('.leagueBoard').waitFor();
@@ -62,7 +63,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await helperPage.locator('#createRequestButton').click();await helperPage.locator('#modal').waitFor({state:'hidden'});
   const own=await helper.request.get(base+'/api/sync').then(r=>r.json());
   const ownRequest=own.requests.find(r=>r.what==='Собственная заявка помощника');assert.ok(ownRequest);assert.equal(ownRequest.lat,55.75);
-  await helperPage.locator('.helpNavigation [data-tab="preferences"]').click();
+  await openHelpTab(helperPage,'preferences');
   await helperPage.locator('#wsHelperReady').check();await helperPage.locator('#wsHelperCategory_tech').check();
   await helperPage.locator('#wsHelperAvailability').fill('По будням после 18:00');
   await helperPage.evaluate(()=>hpointWorkspace.refresh());
@@ -87,9 +88,10 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await page.locator('.workspaceOfferNotice [data-accept="true"]').click();
   await page.locator('.workspaceOfferNotice').waitFor({state:'hidden'});
   assert.equal((await context.request.get(base+'/api/sync').then(r=>r.json())).requests.find(r=>r.id===ownRequest.id).status,'in_progress');
-  await page.goto(base+'/games');await page.locator('#achievements .achievementGoals summary').click();
-  assert.ok(await page.locator('#achievements .achievement.locked').count()>0);
-  assert.equal((await context.request.get(base+'/api/games/state').then(r=>r.json())).achievements.length,0,'Looking at goals does not grant rewards');
+  const beforeGoals=await context.request.get(base+'/api/help-achievements').then(r=>r.json());
+  await page.goto(base+'/#/profile');await page.locator('.workspaceAchievements details summary').click();
+  assert.ok((await context.request.get(base+'/api/help-achievements').then(r=>r.json())).items.some(item=>!item.unlocked));
+  assert.equal((await context.request.get(base+'/api/help-achievements').then(r=>r.json())).awarded_hp,beforeGoals.awarded_hp,'Looking at goals does not grant rewards');
   await helperPage.goto(base+'/#/help');await helperPage.locator('.helpNavigation').waitFor();
   await helperPage.evaluate(()=>helper());
   assert.match(await helperPage.locator('#toast').innerText(),/Сначала завершите текущую помощь/);

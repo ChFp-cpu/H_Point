@@ -543,7 +543,7 @@ class Web(unittest.TestCase):
   opener=urllib.request.build_opener(NoRedirect())
   from urllib.parse import urlencode
   try:
-   for index,(target,expected) in enumerate((("/games?game=crossing","/games?game=crossing"),("https://example.com","/"),("//example.com","/"))):
+   for index,(target,expected) in enumerate((("/games?game=crossing","/games?game=crossing" if web.GAMES_ENABLED else "/#/profile"),("https://example.com","/"),("//example.com","/"))):
     ticket=f"game-destination-{index}";database.create_web_login_ticket(1,ticket)
     with self.assertRaises(urllib.error.HTTPError) as redirect:
      opener.open(f"http://127.0.0.1:{server.server_port}/auth/telegram?"+urlencode({"ticket":ticket,"next":target}),timeout=3)
