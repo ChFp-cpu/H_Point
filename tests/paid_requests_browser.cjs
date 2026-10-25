@@ -1,3 +1,4 @@
+const {openHelpTab}=require('./help_navigation.cjs');
 /* Wallet-funded help: synthetic funds, no payment provider, two participants. */
 const {chromium}=require('playwright'),assert=require('node:assert/strict'),path=require('node:path');
 const base=process.env.HPOINT_QA_URL;
@@ -58,9 +59,9 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await refresh(helper);await helper.page.locator('.workspaceOfferNotice [data-accept="true"]').click();
   await helper.page.locator('.workspaceOfferNotice').waitFor({state:'hidden'});
   await helper.page.goto(base+'/#/help');await helper.page.locator('.helpNavigation [data-tab="mine"]').click();
-  await helper.page.locator('[data-ws-action="finish"][data-id="'+rid+'"]').click();
-  await helper.page.waitForFunction(id=>Boolean(hpointWorkspace.state.data.requests.find(row=>row.id===id)?.completion_requested_at),rid);
-  assert.equal((await get(helper,'/api/wallet')).wallet.balance_rub,0,'Reporting completion is not payout');checks++;
+  assert.equal(await helper.page.locator('[data-ws-action="finish"][data-id="'+rid+'"]').count(),0,'Only the author can finish');checks++;
+  const forbidden=await helper.context.request.post(base+'/api/requests/finish',{data:{request_id:rid}});
+  assert.equal(forbidden.status(),403);assert.equal((await get(helper,'/api/wallet')).wallet.balance_rub,0);checks++;
   await refresh(author);await author.page.locator('.paidConfirmation').waitFor();await layout(author,'confirmation');
   author.page.once('dialog',dialog=>dialog.dismiss());await author.page.locator('[data-ws-action="paid-confirm"]').click();
   assert.equal((await get(helper,'/api/wallet')).wallet.balance_rub,0);checks++;
@@ -76,7 +77,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await post(helper,'/api/helper/queue',{});
   const another=await post(empty,'/api/requests',{what:'Без средств на кошельке',place:'Тест',time_needed:'сегодня',urgency:'обычная',details:'test',category:'tech',reward_rub:400});
   await refresh(empty);
-  await empty.page.goto(base+'/#/help');await empty.page.locator('.helpNavigation [data-tab="match"]').click();
+  await empty.page.goto(base+'/#/help');await openHelpTab(empty.page,'match');
   await empty.page.locator('.workspaceCandidate [data-user="904"]').click();
   await empty.page.locator('.rewardReservePanel [data-ws-action="reward-reserve"]').waitFor();
   assert.equal(await empty.page.locator('[data-ws-action="reward-reserve"]').isDisabled(),true);

@@ -1,6 +1,8 @@
 """Database persistence with SQLite development and PostgreSQL production support."""
 import sqlite3, hashlib, re, threading, json, secrets
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from .config import REGISTRATION_BONUS_RUB
 from .config import DATABASE_URL, DB_PATH, START_BALANCE, STATUS_OPEN, STATUS_IN_PROGRESS, STATUS_DONE, ADMIN_TELEGRAM_IDS, TELEGRAM_AUTH_TTL_SECONDS, TELEGRAM_LINK_TTL_SECONDS, EMAIL_VERIFICATION_TTL_SECONDS, PHONE_VERIFICATION_TTL_SECONDS, AUTH_ATTEMPT_LIMIT, AUTH_ATTEMPT_WINDOW_SECONDS, CATEGORIES
 
 
@@ -885,20 +887,47 @@ def verify_phone_code(user_id, code, max_attempts=5):
         db.execute("ROLLBACK")
         raise
 
+@contextmanager
+def _registration_transaction():
+    # SQLite SAVEPOINT opens a transaction. PostgreSQL needs an explicit BEGIN,
+    # unless Telegram authentication already owns the surrounding transaction.
+    owns_transaction = bool(getattr(db, "is_postgres", False) and db._connection().info.transaction_status == 0)
+    if owns_transaction:
+        db.execute("BEGIN")
+    db.execute("SAVEPOINT register_user")
+    try:
+        yield
+    except Exception:
+        db.execute("ROLLBACK TO SAVEPOINT register_user")
+        db.execute("RELEASE SAVEPOINT register_user")
+        if owns_transaction:
+            db.execute("ROLLBACK")
+        raise
+    else:
+        db.execute("RELEASE SAVEPOINT register_user")
+        if owns_transaction:
+            db.execute("COMMIT")
+
+
 def create_user(user_id,name,username=None,email=None,password_hash=None,tg_user_id=None,web_verified=False):
     # Telegram registrations use the Telegram id as both the primary user id
     # and the linked Telegram identity. Web accounts are created separately
     # by create_web_user().
     actual_tg_id = user_id if tg_user_id is None else tg_user_id
     role = "admin" if actual_tg_id in ADMIN_TELEGRAM_IDS else "user"
-    db.execute("""INSERT OR IGNORE INTO users(user_id,name,username,email,password_hash,balance,helper_categories,tg_user_id,web_verified,email_verified,role)
+    with _registration_transaction():
+        created = db.execute("""INSERT OR IGNORE INTO users(user_id,name,username,email,password_hash,balance,helper_categories,tg_user_id,web_verified,email_verified,role)
                  VALUES(?,?,?,?,?,?,?,?,?,?,?)""",(user_id,name,username,email,password_hash,START_BALANCE,"",actual_tg_id,int(web_verified),0,role))
+        if created.rowcount:
+            grant_registration_bonus(user_id)
     return get_user(user_id)
 def create_web_user(name,email,password_hash):
     row=db.execute("SELECT COALESCE(MIN(user_id),0) m FROM users").fetchone()
     uid=min(-1, int(row["m"])-1)
-    db.execute("""INSERT INTO users(user_id,name,email,password_hash,balance,helper_categories,web_verified,email_verified)
+    with _registration_transaction():
+        db.execute("""INSERT INTO users(user_id,name,email,password_hash,balance,helper_categories,web_verified,email_verified)
                   VALUES(?,?,?,?,?,?,0,0)""",(uid,name,email,password_hash,START_BALANCE,""))
+        grant_registration_bonus(uid)
     return uid
 
 def detach_telegram_to_web_profile(user_id):
@@ -927,7 +956,7 @@ def detach_telegram_to_web_profile(user_id):
         db.execute("UPDATE users SET helper_availability=? WHERE user_id=?",(source["helper_availability"] or "",web_id))
         for table, column in [
             ("requests","requester_id"),("requests","helper_id"),("helper_queue","user_id"),
-            ("billing_invoices","user_id"),("subscriptions","user_id"),("web_login_tickets","user_id"),
+            ("billing_invoices","user_id"),("wallet_transactions","user_id"),("subscriptions","user_id"),("web_login_tickets","user_id"),
             ("email_verification_codes","user_id"),("phone_verification_codes","user_id"),
             ("ai_usage","user_id"),("ads","user_id"),("commercial_orders","user_id"),("community_events","creator_id"),("event_participants","user_id"),
             ("chats","user_a_id"),("chats","user_b_id"),("chat_messages","user_id"),
@@ -1252,6 +1281,24 @@ def wallet_add_entry(user_id, amount_rub, kind, description, reference, request_
     )
     return bool(getattr(result, "rowcount", 0))
 
+
+def grant_registration_bonus(user_id, amount_rub=None):
+    """Give a profile its one-time RUB test credit, including after ID migration."""
+    amount = REGISTRATION_BONUS_RUB if amount_rub is None else int(amount_rub)
+    if amount <= 0:
+        return False
+    with _registration_transaction():
+        lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
+        if not db.execute("SELECT user_id FROM users WHERE user_id=?" + lock, (user_id,)).fetchone():
+            raise ValueError("user not found")
+        if db.execute("SELECT 1 FROM wallet_transactions WHERE user_id=? AND kind='registration_bonus'", (user_id,)).fetchone():
+            return False
+        # Negative web IDs can be reused after Telegram linking. The immutable
+        # ledger reference must not collide with another, later registration.
+        return wallet_add_entry(user_id, amount, "registration_bonus",
+                                "Тестовое начисление для проверки платных функций",
+                                "registration-bonus-20261024:" + secrets.token_hex(16))
+
 def wallet_summary(user_id, limit=50):
     balance = db.execute(
         "SELECT COALESCE(SUM(amount_rub),0) amount FROM wallet_transactions WHERE user_id=?", (user_id,)
@@ -1319,7 +1366,7 @@ def link_by_code(code,tg_user_id,username=None):
             for table,col in [
                 ("requests","requester_id"),("requests","helper_id"),
                 ("helper_queue","user_id"),("billing_invoices","user_id"),
-                ("subscriptions","user_id"),
+                ("subscriptions","user_id"),("wallet_transactions","user_id"),
                 ("web_login_tickets","user_id"),("ai_usage","user_id"),
                 ("admin_audit_log","admin_user_id"),("admin_audit_log","target_user_id"),
                 ("identity_verification_requests","reviewer_id"),
@@ -1370,7 +1417,7 @@ def link_by_code(code,tg_user_id,username=None):
         # INSERT OR IGNORE first to avoid collisions, then the old rows are removed.
         for table,col in [
             ("requests","requester_id"),("requests","helper_id"),
-            ("billing_invoices","user_id"),("subscriptions","user_id"),
+            ("billing_invoices","user_id"),("wallet_transactions","user_id"),("subscriptions","user_id"),
             ("web_login_tickets","user_id"),("ads","user_id"),
             ("commercial_orders","user_id"),("chat_messages","user_id"),("community_events","creator_id")
         ]:

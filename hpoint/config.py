@@ -23,6 +23,8 @@ ADMIN_TELEGRAM_IDS = {int(value) for value in os.getenv("ADMIN_TELEGRAM_IDS", ""
 AI_REQUESTS_PER_DAY = int(os.getenv("AI_REQUESTS_PER_DAY", "20"))
 AI_TOKENS_PER_DAY = int(os.getenv("AI_TOKENS_PER_DAY", "20000"))
 START_BALANCE = 100
+# RUB campaign credit is separate from H-Points. Set 0 to stop new grants.
+REGISTRATION_BONUS_RUB = max(0, int(os.getenv("REGISTRATION_BONUS_RUB", "0")))
 REQUEST_COST = 10
 HELPER_REWARD = 20
 MAX_TEXT_LEN = 500

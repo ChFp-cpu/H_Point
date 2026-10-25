@@ -49,7 +49,7 @@ class Core(unittest.TestCase):
     def test_match_uses_reviews_of_helper_and_selected_categories(self):
         self.add(1);self.add(2);services.add_to_queue(2)
         payload={"what":"Компьютер","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test","category":"tech"}
-        done=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(done,2));self.assertTrue(services.complete_request(done,2))
+        done=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(done,2));self.assertTrue(services.complete_request(done,2,confirmed_by=1))
         self.assertTrue(services.set_rating(done,1,5));self.assertTrue(services.set_helper_rating(done,2,2))
         services.add_to_queue(2);services.set_helper_categories(2,["tech"])
         rid=services.create_request(1,payload)
@@ -102,11 +102,26 @@ class Core(unittest.TestCase):
         self.assertFalse(ok)
     def test_atomic_completion_and_reviews(self):
         self.add(1);self.add(2);rid=services.create_request(1,{"what":"test","place":"x","time_needed":"x","urgency":"x","details":"x"})
-        self.assertTrue(services.try_assign_helper(rid,2));self.assertTrue(services.complete_request(rid,2));self.assertFalse(services.complete_request(rid,2))
+        self.assertTrue(services.try_assign_helper(rid,2));self.assertTrue(services.complete_request(rid,2,confirmed_by=1));self.assertFalse(services.complete_request(rid,2))
         self.assertEqual(database.get_user(1)["balance"],90);self.assertEqual(database.get_user(2)["balance"],120)
         self.assertTrue(services.set_rating(rid,1,5));self.assertTrue(services.set_helper_rating(rid,2,4))
         self.assertTrue(services.set_review(rid,1,"Отлично","requester"))
         self.assertTrue(services.set_review(rid,2,"Хорошо","helper"))
+    def test_only_requester_can_complete_free_help_and_award_points_once(self):
+        self.add(1);self.add(2);self.add(3)
+        rid=services.create_request(1,{"what":"test","place":"x","time_needed":"x","urgency":"x","details":"x"})
+        self.assertTrue(services.try_assign_helper(rid,2))
+        for actor in (None,2,3):
+            self.assertFalse(services.complete_request(rid,2,confirmed_by=actor))
+            self.assertEqual(database.get_request(rid)["status"],"in_progress")
+            self.assertEqual([database.get_user(uid)["balance"] for uid in (1,2)],[100,100])
+        self.assertEqual(services.request_help_completion(rid,2),"unavailable")
+        self.assertTrue(services.complete_request(rid,2,confirmed_by=1))
+        self.assertFalse(services.complete_request(rid,2,confirmed_by=1))
+        self.assertEqual([database.get_user(uid)["balance"] for uid in (1,2)],[90,120])
+        event=self.db.execute("SELECT actor_id FROM request_events WHERE request_id=? AND event_type='completed'",(rid,)).fetchone()
+        self.assertEqual(event["actor_id"],1)
+
     def test_paid_request_releases_rubles_without_changing_hpoints(self):
         self.add(1, 0);self.add(2, 17)
         rid=services.create_request(1,{"what":"paid","place":"x","time_needed":"x","urgency":"x","details":"x","reward_rub":750})
@@ -200,7 +215,7 @@ class Core(unittest.TestCase):
             def complete(rid, helper):
                 try:
                     barrier.wait()
-                    outcomes.append(services.complete_request(rid, helper))
+                    outcomes.append(services.complete_request(rid, helper, confirmed_by=1))
                 finally:
                     shared.close()
             workers = [threading.Thread(target=complete, args=(rid, helper)) for rid, helper in zip(requests, (2, 3))]

@@ -46,6 +46,31 @@ class InvitationCore(InvitationData, unittest.TestCase):
     def tearDown(self):
         self.close()
 
+    def test_direct_accept_is_atomic_idempotent_and_creates_chat(self):
+        self.assertEqual(services.accept_open_request(self.rid,2),"created")
+        self.assertEqual(services.accept_open_request(self.rid,2),"existing")
+        self.assertEqual(services.accept_open_request(self.rid,3),"unavailable")
+        self.assertEqual(database.get_request(self.rid)["helper_id"],2)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM chats").fetchone()["n"],1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM request_events WHERE event_type='helper_accepted'").fetchone()["n"],1)
+
+    def test_paid_direct_accept_cannot_bypass_wallet_reserve(self):
+        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?",(self.rid,))
+        self.assertEqual(services.accept_open_request(self.rid,2),"awaiting_funds")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM chats").fetchone()["n"],0)
+        database.wallet_add_entry(1,500,"test","Synthetic","test")
+        services.reserve_request_reward(self.rid,1,400)
+        self.assertEqual(services.accept_open_request(self.rid,2),"created")
+        self.assertEqual(database.wallet_summary(2)["balance_rub"],0)
+
+    def test_author_can_accept_legacy_response_without_inviting_again(self):
+        services.apply_to_request(self.rid,2)
+        token=services.get_request_applications(1)[0]["application_token"]
+        self.assertEqual(services.accept_open_request(self.rid,2,author_id=3,application_token=token),"unavailable")
+        self.assertEqual(services.accept_open_request(self.rid,2,author_id=1,application_token="stale"),"unavailable")
+        self.assertEqual(services.accept_open_request(self.rid,2,author_id=1,application_token=token),"created")
+        self.assertIsNone(services.get_current_helper_offer(self.rid))
+
     def test_paid_invite_before_reserve_then_author_confirms_wallet_release(self):
         self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
         hp = [database.get_user(uid)["balance"] for uid in (1, 2)]
@@ -65,10 +90,7 @@ class InvitationCore(InvitationData, unittest.TestCase):
         self.assertEqual(database.wallet_summary(1)["reserved_rub"], 400)
         self.assertEqual(database.wallet_summary(2)["balance_rub"], 0)
         self.assertTrue(services.respond_to_helper_offer(self.rid, 2, True, token))
-        self.assertFalse(services.complete_request(self.rid, 2, confirmed_by=1))
-        self.assertEqual(services.request_help_completion(self.rid, 1), "unavailable")
-        self.assertEqual(services.request_help_completion(self.rid, 2), "created")
-        self.assertEqual(services.request_help_completion(self.rid, 2), "pending")
+        self.assertIsNone(database.get_request(self.rid)["completion_requested_at"])
         self.assertFalse(services.complete_request(self.rid, 2, confirmed_by=2))
         self.assertFalse(services.complete_request(self.rid, 2, confirmed_by=4))
         self.assertEqual(database.wallet_summary(2)["balance_rub"], 0)
@@ -248,6 +270,11 @@ class InvitationRace(unittest.TestCase):
         self.assertEqual(database.get_request(self.rid)["status"], "open" if cancelled else "in_progress")
         self.assertEqual(database.get_request(self.rid)["helper_id"], None if cancelled else 2)
 
+    def test_two_direct_responses_create_only_one_match_and_chat(self):
+        results=self.race(lambda:services.accept_open_request(self.rid,2),lambda:services.accept_open_request(self.rid,3))
+        self.assertEqual(sorted(results),["created","unavailable"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM chats").fetchone()["n"],1)
+
     def test_replacement_and_old_accept_cannot_both_succeed(self):
         replaced, accepted = self.race(
             lambda: services.offer_helper(self.rid, 3, self.token),
@@ -305,14 +332,23 @@ class InvitationAPI(InvitationData, unittest.TestCase):
         self.assertTrue(self.request(1, "/api/requests/reward/reserve", {"request_id":self.rid,"amount_rub":400})["created"])
         self.assertFalse(self.request(1, "/api/requests/reward/reserve", {"request_id":self.rid,"amount_rub":400})["created"])
         self.request(2, "/api/helper/offers/respond", accept)
-        self.assert_error(409, 1, "/api/requests/completion/confirm", {"request_id":self.rid})
-        self.assertTrue(self.request(2, "/api/requests/finish", {"request_id":self.rid})["awaiting_confirmation"])
+        self.assert_error(403, 2, "/api/requests/finish", {"request_id":self.rid})
         self.assertEqual(database.wallet_summary(2)["balance_rub"], 0)
-        self.assertIn("paid_done:", self.notify.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
-        self.assert_error(409, 2, "/api/requests/completion/confirm", {"request_id":self.rid})
+        self.assert_error(403, 2, "/api/requests/completion/confirm", {"request_id":self.rid})
         self.request(1, "/api/requests/completion/confirm", {"request_id":self.rid})
         self.assert_error(409, 1, "/api/requests/completion/confirm", {"request_id":self.rid})
         self.assertEqual(database.wallet_summary(2)["balance_rub"], 400)
+
+    def test_free_completion_api_is_requester_only_and_settles_once(self):
+        self.assertTrue(services.accept_open_request(self.rid,2))
+        for actor in (2,3):
+            for endpoint in ("/api/requests/finish","/api/requests/completion/confirm"):
+                self.assert_error(403,actor,endpoint,{"request_id":self.rid})
+        self.assertEqual(database.get_request(self.rid)["status"],"in_progress")
+        self.assertEqual([database.get_user(uid)["balance"] for uid in (1,2)],[100,100])
+        self.assertTrue(self.request(1,"/api/requests/finish",{"request_id":self.rid})["ok"])
+        self.assert_error(409,1,"/api/requests/finish",{"request_id":self.rid})
+        self.assertEqual([database.get_user(uid)["balance"] for uid in (1,2)],[90,120])
 
     def test_missing_merchant_does_not_create_a_ghost_reward_invoice(self):
         self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
@@ -328,21 +364,21 @@ class InvitationAPI(InvitationData, unittest.TestCase):
         self.assertEqual({call.args[0] for call in self.notify.call_args_list}, {1001, 2002})
         author_message = next(call for call in self.notify.call_args_list if call.args[0] == 1001)
         self.assertIn("User 2", author_message.args[1]);self.assertIn("Компьютер", author_message.args[1])
-        self.assertIn(f"candidate:assign:{self.rid}:2", str(author_message.kwargs["reply_markup"]))
+        self.assertIn(f"/#/help/chat/{self.rid}", str(author_message.kwargs["reply_markup"]))
         self.assertFalse(self.request(2, "/api/requests/accept", payload)["created"])
         self.assertEqual(self.notify.call_count, 2)
         incoming = self.request(1, "/api/sync")["applications"]
         outgoing = self.request(2, "/api/sync")["my_applications"]
-        self.assertEqual(incoming[0]["helper_id"], 2)
-        self.assertEqual(incoming[0]["application_token"], outgoing[0]["application_token"])
+        self.assertEqual(incoming, [])
+        self.assertEqual(outgoing, [])
         self.assertEqual(self.request(4, "/api/sync")["applications"], [])
-        matches = self.request(1, "/api/assistant/candidates", payload)["matches"]
-        self.assertEqual(matches[0]["user_id"], 2);self.assertTrue(matches[0]["applied"])
-        self.assertEqual(database.get_request(self.rid)["status"], "open")
-        self.assertEqual(self.request(1, "/api/chats")["chats"], [])
+        self.assertEqual(database.get_request(self.rid)["status"], "in_progress")
+        self.assertEqual(len(self.request(1, "/api/chats")["chats"]), 1)
+        self.assert_error(409,3,"/api/requests/accept",payload)
+        self.assertEqual(database.get_request(self.rid)["helper_id"],2)
 
     def test_application_cancel_endpoint_checks_actor_and_stale_tokens(self):
-        self.request(2, "/api/requests/accept", {"request_id": self.rid})
+        services.apply_to_request(self.rid,2)
         response = self.request(1, "/api/sync")["applications"][0]
         payload = {"request_id": self.rid, "helper_id": 2, "application_token": response["application_token"]}
         self.assert_error(409, 4, "/api/requests/response/cancel", payload)
@@ -350,7 +386,7 @@ class InvitationAPI(InvitationData, unittest.TestCase):
         self.assertTrue(self.request(2, "/api/requests/response/cancel", payload)["cancelled"])
         self.assertEqual(self.notify.call_args.args[0], 1)
         self.assertEqual(self.request(1, "/api/sync")["applications"], [])
-        self.request(2, "/api/requests/accept", {"request_id": self.rid})
+        services.apply_to_request(self.rid,2)
         self.assert_error(409, 1, "/api/requests/response/cancel", payload)
         payload["application_token"] = self.request(1, "/api/sync")["applications"][0]["application_token"]
         self.assertTrue(self.request(1, "/api/requests/response/cancel", payload)["cancelled"])
@@ -426,13 +462,35 @@ class InvitationBot(InvitationData, unittest.IsolatedAsyncioTestCase):
         callback.data = f"finish:{self.rid}"
         await handlers.cb_finish(callback,self.bot)
         self.assertEqual(database.wallet_summary(2)["balance_rub"],0)
-        self.assertNotIn("+20 HP",callback.message.answer.call_args.args[0])
+        self.assertIn("только автор",callback.answer.call_args.args[0])
+        self.assertIsNone(database.get_request(self.rid)["completion_requested_at"])
         callback = self.callback(1,"confirm","")
         callback.data = f"paid_done:{self.rid}"
         await handlers.cb_paid_completion(callback,self.bot)
         self.assertEqual(database.wallet_summary(2)["balance_rub"],400)
         await handlers.cb_paid_completion(callback,self.bot)
         self.assertEqual(database.wallet_summary(2)["balance_rub"],400)
+
+    async def test_free_bot_completion_rejects_helper_and_notifies_after_author_confirmation(self):
+        services.accept_open_request(self.rid,2)
+        await handlers.notify_match(self.bot,self.rid)
+        helper_message,author_message=self.bot.send_message.call_args_list[-2:]
+        helper_keys=helper_message.kwargs["reply_markup"].inline_keyboard
+        author_keys=author_message.kwargs["reply_markup"].inline_keyboard
+        self.assertFalse(any(key.callback_data==f"finish:{self.rid}" for row in helper_keys for key in row))
+        self.assertTrue(any(key.callback_data==f"finish:{self.rid}" for row in author_keys for key in row))
+        for uid in (2,3):
+            callback=self.callback(uid,"finish","");callback.data=f"finish:{self.rid}"
+            await handlers.cb_finish(callback,self.bot)
+            self.assertIn("только автор",callback.answer.call_args.args[0])
+        self.assertEqual(database.get_request(self.rid)["status"],"in_progress")
+        callback=self.callback(1,"finish","");callback.data=f"finish:{self.rid}"
+        await handlers.cb_finish(callback,self.bot)
+        self.assertEqual(database.get_request(self.rid)["status"],"done")
+        self.assertEqual([database.get_user(uid)["balance"] for uid in (1,2)],[90,120])
+        self.assertEqual(self.bot.send_message.call_args.args[0],2)
+        await handlers.cb_finish(callback,self.bot)
+        self.assertEqual([database.get_user(uid)["balance"] for uid in (1,2)],[90,120])
 
     def setUp(self):
         self.prepare()

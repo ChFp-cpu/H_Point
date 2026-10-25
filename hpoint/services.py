@@ -2,7 +2,7 @@
 import json, re, secrets
 from datetime import datetime, timedelta, timezone
 from .config import *
-from .database import db, get_request, get_user, get_active_help, save_request_candidates, get_request_candidates, insert_id, request_identity_verification, wallet_add_entry
+from .database import db, get_request, get_user, get_active_help, save_request_candidates, get_request_candidates, insert_id, request_identity_verification, wallet_add_entry, get_or_create_chat_for_request
 
 
 def infer_category(what: str) -> str:
@@ -86,6 +86,40 @@ def add_to_queue(user_id: int) -> None:
 def remove_from_queue(user_id: int) -> None:
     db.execute("DELETE FROM helper_queue WHERE user_id = ?", (user_id,))
     db.execute("UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE candidate_id=? AND status='applied'", (user_id,))
+
+
+def accept_open_request(request_id: int, helper_id: int, author_id: int | None = None, application_token: str | None = None) -> str:
+    """An explicit response to a published request is consent, not another application."""
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        lock = " FOR UPDATE" if getattr(db,"is_postgres",False) else ""
+        helper = db.execute("SELECT * FROM users WHERE user_id=?" + lock,(helper_id,)).fetchone()
+        request = db.execute("SELECT * FROM requests WHERE id=?" + lock,(request_id,)).fetchone()
+        if not helper or helper["is_blocked"] or not request or request["requester_id"] == helper_id:
+            db.execute("ROLLBACK");return "unavailable"
+        if author_id is not None:
+            application=db.execute("SELECT status,offer_token FROM request_candidates WHERE request_id=? AND candidate_id=?"+lock,(request_id,helper_id)).fetchone()
+            if request["requester_id"] != author_id or not application or application["status"] != "applied" or application["offer_token"] != application_token:
+                db.execute("ROLLBACK");return "unavailable"
+        if request["status"] == STATUS_IN_PROGRESS and request["helper_id"] == helper_id:
+            get_or_create_chat_for_request(request_id)
+            db.execute("COMMIT");return "existing"
+        if request["status"] != STATUS_OPEN or request["helper_id"] is not None or get_active_help(helper_id):
+            db.execute("ROLLBACK");return "unavailable"
+        if int(request["reward_rub"] or 0) > 0 and request["reward_payment_status"] != "paid":
+            db.execute("ROLLBACK");return "awaiting_funds"
+        db.execute("UPDATE requests SET helper_id=?,status=? WHERE id=?",(helper_id,STATUS_IN_PROGRESS,request_id))
+        remove_from_queue(helper_id)
+        db.execute("""INSERT INTO request_candidates(request_id,candidate_id,score,status,offer_token,updated_at)
+                      VALUES(?,?,0,'accepted',NULL,CURRENT_TIMESTAMP)
+                      ON CONFLICT(request_id,candidate_id) DO UPDATE SET status='accepted',offer_token=NULL,updated_at=CURRENT_TIMESTAMP""",(request_id,helper_id))
+        db.execute("UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND candidate_id!=? AND status IN ('pending','applied','offered')",(request_id,helper_id))
+        db.execute("UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE candidate_id=? AND request_id!=? AND status IN ('applied','offered')",(helper_id,request_id))
+        get_or_create_chat_for_request(request_id)
+        db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",(request_id,helper_id,"helper_accepted","Помощник принял опубликованную заявку. Чат создан без повторного выбора кандидата."))
+        db.execute("COMMIT");return "created"
+    except Exception:
+        db.execute("ROLLBACK");raise
 
 
 def apply_to_request(request_id: int, helper_id: int) -> str:
@@ -315,6 +349,7 @@ def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool, offer
             "WHERE candidate_id=? AND request_id!=? AND status IN ('applied','offered')",
             (helper_id, request_id),
         )
+        get_or_create_chat_for_request(request_id)
         db.execute("COMMIT")
         db.execute(
             "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
@@ -433,12 +468,12 @@ def reserve_request_reward(request_id: int, requester_id: int, expected_amount: 
 
 
 def request_help_completion(request_id: int, helper_id: int) -> str:
-    """Paid work needs the author's confirmation before any RUB transfer."""
+    """Record a helper's report only; the requester alone completes help."""
     request = get_request(request_id)
     if not request or request["status"] != STATUS_IN_PROGRESS or request["helper_id"] != helper_id:
         return "unavailable"
     if not int(request["reward_rub"] or 0):
-        return "completed" if complete_request(request_id, helper_id) else "unavailable"
+        return "unavailable"
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
@@ -459,15 +494,16 @@ def request_help_completion(request_id: int, helper_id: int) -> str:
 
 
 def complete_request(request_id: int, helper_id: int, confirmed_by: int | None = None) -> bool:
+    """Complete help only on the requester's explicit confirmation."""
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
         req = db.execute("SELECT * FROM requests WHERE id = ?" + lock, (request_id,)).fetchone()
-        if req is None or req["status"] != STATUS_IN_PROGRESS or req["helper_id"] != helper_id:
+        if req is None or req["status"] != STATUS_IN_PROGRESS or req["helper_id"] != helper_id or confirmed_by != req["requester_id"]:
             db.execute("ROLLBACK")
             return False
         paid_request = int(req["reward_rub"] or 0) > 0
-        if paid_request and (req["reward_payment_status"] != "paid" or confirmed_by != req["requester_id"] or not req["completion_requested_at"]):
+        if paid_request and req["reward_payment_status"] != "paid":
             db.execute("ROLLBACK")
             return False
         # H-Points are the incentive only for free neighbourly help.  A request
@@ -494,7 +530,7 @@ def complete_request(request_id: int, helper_id: int, confirmed_by: int | None =
             db.execute("UPDATE requests SET reward_payment_status='released' WHERE id=?", (request_id,))
         db.execute(
             "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
-            (request_id, confirmed_by if paid_request else helper_id, "completed", "Автор подтвердил помощь и выплату из резерва. Можно оставить отзыв." if paid_request else "Помощник отметил заявку как завершённую. Можно оставить отзыв."),
+            (request_id, confirmed_by, "completed", "Автор подтвердил помощь и выплату из резерва. Можно оставить отзыв." if paid_request else "Автор подтвердил выполнение помощи. Можно оставить отзыв."),
         )
         db.execute("COMMIT")
         return True

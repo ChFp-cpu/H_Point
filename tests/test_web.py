@@ -299,7 +299,7 @@ class Web(unittest.TestCase):
   for uid in (1,2,3):database.create_user(uid,f"User {uid}",tg_user_id=uid,web_verified=True)
   payload={"what":"Помочь с техникой","place":"Скрытый адрес","time_needed":"сегодня","urgency":"обычная","details":"Личные сведения","lat":55.75,"lon":37.62}
   opened=services.create_request(1,payload)
-  done=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(done,3));self.assertTrue(services.complete_request(done,3))
+  done=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(done,3));self.assertTrue(services.complete_request(done,3,confirmed_by=1))
   active=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(active,3))
   cancelled=services.create_request(1,payload);self.assertTrue(services.cancel_request(cancelled,1,"test"))
   own=services.create_request(2,payload)
@@ -521,7 +521,7 @@ class Web(unittest.TestCase):
   from hpoint import handlers
   for uid in (1,2,3):database.create_user(uid,f"Участник {uid}")
   payload={"what":"Чат заявки","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"}
-  old=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(old,2));services.complete_request(old,2)
+  old=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(old,2));services.complete_request(old,2,confirmed_by=1)
   current=services.create_request(3,payload);self.assertTrue(services.try_assign_helper(current,2))
   text="Ответ <с деталями> & второй строкой\nСпасибо!"
   message=SimpleNamespace(chat=SimpleNamespace(type="private"),from_user=SimpleNamespace(id=2),text=f"/chat #{old} {text}",answer=AsyncMock())
@@ -573,7 +573,7 @@ class Web(unittest.TestCase):
    self.assertIsNotNone(web.chat_for_request(rid))
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
- def test_helper_with_own_request_can_offer_help_without_assignment(self):
+ def test_helper_with_own_request_can_accept_another_request(self):
   database.create_user(1,"Requester");database.create_user(2,"Busy helper")
   target=services.create_request(1,{"what":"Нужна помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
   services.create_request(2,{"what":"Моя активная заявка","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
@@ -582,10 +582,10 @@ class Web(unittest.TestCase):
   try:
    base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Cookie":f"hpoint_session={token}","Content-Type":"application/json"}
    req=urllib.request.Request(base+"/api/requests/accept",data=json.dumps({"request_id":target}).encode(),headers=headers,method="POST")
-   with urllib.request.urlopen(req,timeout=3) as response:self.assertTrue(json.load(response)["queued"])
-   self.assertTrue(services.is_in_queue(2))
-   self.assertEqual(database.get_request(target)["status"],"open")
-   self.assertIsNone(database.get_request(target)["helper_id"])
+   with urllib.request.urlopen(req,timeout=3) as response:self.assertTrue(json.load(response)["matched"])
+   self.assertFalse(services.is_in_queue(2))
+   self.assertEqual(database.get_request(target)["status"],"in_progress")
+   self.assertEqual(database.get_request(target)["helper_id"],2)
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_points_purchase_and_device_profile_switching(self):

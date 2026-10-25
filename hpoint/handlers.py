@@ -28,7 +28,7 @@ BOT_GUIDE = (
     "🆘 <b>Мне нужна помощь</b> — ответьте на 5 коротких вопросов, чтобы создать заявку.\n"
     "🤝 <b>Хочу помочь</b> — встать в общую очередь помощников сайта и бота.\n"
     "⚡ <b>Подобрать кандидатов</b> / 👥 <b>Мои кандидаты</b> — выбрать человека для своей открытой заявки; он подтвердит участие сам.\n"
-    "📨 Отклик на вашу заявку придёт сюда с кнопками выбора и отказа; он также сохранён на сайте и в «Моих кандидатах».\n"
+    "📨 На сайте «Хочу помочь» в карточке заявки сразу назначает помощника и открывает чат. Уведомление с кнопкой чата придёт обоим в Telegram.\n"
     "👤 <b>Мой профиль</b> — баланс HP, рейтинг, статистика и статус проверки.\n"
     "📜 <b>История</b> — завершённые и текущие заявки.\n"
     "⚙️ <b>Настройки помощи</b> — указать категории, в которых вы готовы помогать.\n"
@@ -38,7 +38,7 @@ BOT_GUIDE = (
     "<b>Как проходит помощь</b>\n"
     "1. Создайте заявку или встаньте в очередь.\n"
     "2. Автор выбирает кандидата; помощник подтверждает согласие.\n"
-    "3. Сообщения с сайта приходят сюда целиком. Ответьте командой /chat #НОМЕР ТЕКСТ из уведомления, завершите помощь и поставьте оценки.\n\n"
+    "3. Сообщения с сайта приходят сюда целиком. Ответьте командой /chat #НОМЕР ТЕКСТ из уведомления, после выполнения автор завершает помощь, затем оба участника ставят оценки.\n\n"
     "<b>Синхронизация и безопасность</b>\n"
     "Бот и сайт используют общие профиль, заявки, историю, HP и игровые достижения. "
     "Чтобы подключить существующий сайт: сайт → «Профиль» → «Получить код Telegram», затем в боте <b>/link КОД</b>. "
@@ -115,8 +115,8 @@ async def notify_match(bot: Bot, request_id: int) -> None:
             "🤝 <b>Вы нашли, кому помочь!</b>\n\n"
             f"{request_text(req)}\n\n"
             f"<b>Кому помогаете:</b> {user_link(requester)}\n\n"
-            "Свяжитесь с человеком на сайте или отправьте /chat ТЕКСТ. Когда помощь будет оказана — нажмите «Завершить помощь».",
-            reply_markup=finish_kb(request_id),
+            "Свяжитесь с человеком на сайте или отправьте /chat ТЕКСТ. После оказания помощи заявку завершит её автор.",
+            reply_markup=request_chat_kb(request_id),
         )
     except Exception:
         logging.exception("Не удалось уведомить помощника %s по заявке %s", helper["user_id"], request_id)
@@ -127,9 +127,8 @@ async def notify_match(bot: Bot, request_id: int) -> None:
             "🎉 <b>Для вашей заявки нашёлся помощник!</b>\n\n"
             f"{request_text(req)}\n\n"
             f"<b>Ваш помощник:</b> {user_link(helper)}\n\n"
-            "Помощник свяжется с вами. Можно ответить на сайте или командой /chat ТЕКСТ. После выполнения он нажмёт «Завершить помощь», "
-            "а вас попросят оценить взаимодействие.",
-            reply_markup=main_menu_kb(),
+            "Помощник свяжется с вами. Можно ответить на сайте или командой /chat ТЕКСТ. Когда помощь будет оказана, нажмите «Завершить помощь». После этого можно оставить оценку.",
+            reply_markup=finish_kb(request_id),
         )
     except Exception:
         logging.exception("Не удалось уведомить автора %s по заявке %s", requester["user_id"], request_id)
@@ -186,8 +185,8 @@ async def check_not_busy(message: Message) -> bool:
     helping = get_active_help(user_id)
     if helping:
         await message.answer(
-            f"Вы сейчас помогаете по заявке №{helping['id']}. Завершите её.",
-            reply_markup=finish_kb(helping["id"]),
+            f"Вы сейчас помогаете по заявке №{helping['id']}. После оказания помощи заявку завершит её автор.",
+            reply_markup=request_chat_kb(helping["id"]),
         )
         return False
     return True
@@ -750,6 +749,15 @@ async def show_history(message: Message, user_id: int) -> None:
             line += f" · {'⭐' * rating}"
         chunks.append(line)
     await message.answer("\n".join(chunks), reply_markup=main_menu_kb())
+    active_own = [req for req in rows if req["requester_id"] == user_id and req["status"] == STATUS_IN_PROGRESS]
+    if active_own:
+        await message.answer(
+            "Когда помощь оказана, завершите свою заявку:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"✅ Завершить помощь №{req['id']}", callback_data=f"finish:{req['id']}")]
+                for req in active_own
+            ]),
+        )
 
 
 @router.message(Command("history"))
@@ -938,6 +946,17 @@ async def cb_candidate_assign(callback: CallbackQuery, bot: Bot) -> None:
         await _show_candidates(callback.message, request_id, actor_id=callback.from_user.id)
         return
 
+    application=db.execute("SELECT offer_token FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='applied'",(request_id,candidate_id)).fetchone()
+    if application:
+        result=accept_open_request(request_id,candidate_id,author_id=callback.from_user.id,application_token=application["offer_token"])
+        if result!="created":
+            await callback.answer("Для платной помощи сначала нужен резерв в кошельке; либо отклик уже изменился.",show_alert=True)
+            return
+        await callback.answer("Помощь подтверждена, чат создан")
+        await callback.message.answer("Отклик принят. Повторное согласие помощника не требуется.",reply_markup=request_chat_kb(request_id))
+        await safe_notify_match(bot,request_id)
+        return
+
     if not offer_helper(request_id, candidate_id):
         await callback.answer("Кандидат уже занят, вышел из очереди или заявка изменилась. Обновляю список.", show_alert=True)
         await _show_candidates(callback.message, request_id, actor_id=callback.from_user.id)
@@ -1022,7 +1041,7 @@ async def cb_helper_offer_response(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Помощь подтверждена")
         await callback.message.edit_text(
             "✅ <b>Вы подтвердили помощь.</b> Чат создан — можно связаться с человеком на сайте или командой /chat ТЕКСТ.",
-            reply_markup=finish_kb(request_id),
+            reply_markup=request_chat_kb(request_id),
         )
         await safe_notify_match(bot, request_id)
         return
@@ -1206,67 +1225,46 @@ async def cb_cancel_request(callback: CallbackQuery) -> None:
 async def cb_finish(callback: CallbackQuery, bot: Bot) -> None:
     try:
         request_id = int(callback.data.split(":")[1])
-    except ValueError:
-        await callback.answer("Некорректная заявка", show_alert=True)
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная заявка.", show_alert=True)
         return
-    req = get_request(request_id)
-    if req is None:
-        await callback.answer("Заявка не найдена.", show_alert=True); return
-    if req["helper_id"] != callback.from_user.id:
-        await callback.answer("Завершить помощь может только её помощник.", show_alert=True); return
-    result = request_help_completion(request_id, callback.from_user.id)
-    if result == "unavailable":
-        await callback.answer("Не удалось завершить: заявка уже закрыта или недостаточно HP у автора.", show_alert=True); return
-    if result in ("created", "pending"):
-        await callback.answer("Ожидается подтверждение автора")
-        await callback.message.answer("✅ Вы сообщили о выполнении. Деньги остаются в резерве до подтверждения автора; после этого поступят в ваш кошелёк H-Point.")
-        requester = get_user(req["requester_id"])
-        if result == "created" and requester and requester["tg_user_id"]:
-            try:
-                await bot.send_message(requester["tg_user_id"], f"✅ Помощник сообщил о выполнении заявки №{request_id}. Проверьте результат и подтвердите выплату {req['reward_rub']} ₽ из резерва.", reply_markup=confirm_paid_completion_kb(request_id))
-            except Exception:
-                logging.exception("Не удалось запросить подтверждение платной помощи %s", request_id)
+    request = get_request(request_id)
+    if request is None:
+        await callback.answer("Заявка не найдена.", show_alert=True)
+        return
+    if request["requester_id"] != callback.from_user.id:
+        await callback.answer("Завершить помощь может только автор заявки.", show_alert=True)
+        return
+    if not complete_request(request_id, request["helper_id"], confirmed_by=callback.from_user.id):
+        await callback.answer("Не удалось завершить: заявка уже закрыта, нет резерва или недостаточно HP у автора.", show_alert=True)
         return
     await callback.answer("Помощь завершена!")
-    await callback.message.edit_reply_markup(reply_markup=None)
-    helper = get_user(callback.from_user.id)
-    await callback.message.answer(
-        f"✅ Заявка №{request_id} завершена. Вам начислено <b>+{HELPER_REWARD} HP</b>. Баланс: <b>{helper['balance']} HP</b>.\n\n"
-        "Поставьте оценку взаимодействию:",
-        reply_markup=rating_kb(request_id, "ratehelp"),
+    paid = int(request["reward_rub"] or 0) > 0
+    requester = get_user(request["requester_id"])
+    settlement = (f"{request['reward_rub']} ₽ зачислено в кошелёк помощника. H-Points не списывались."
+                  if paid else f"Списано {REQUEST_COST} HP. Баланс: {requester['balance']} HP.")
+    await callback.message.edit_text(
+        f"✅ Вы подтвердили выполнение помощи по заявке №{request_id}. {settlement}\n\nОцените помощь:",
+        reply_markup=rating_kb(request_id),
     )
-    requester = get_user(req["requester_id"])
-    try:
-        await bot.send_message(
-            requester["user_id"],
-            f"✅ Помощь по заявке №{request_id} выполнена!\n"
-            f"С вашего баланса списано <b>{REQUEST_COST} HP</b>. Баланс: <b>{requester['balance']} HP</b>.\n\n"
-            "Пожалуйста, оцените помощь:",
-            reply_markup=rating_kb(request_id, "rate"),
-        )
-    except Exception:
-        logging.exception("Не удалось запросить оценку у пользователя %s", requester["user_id"])
+    helper = get_user(request["helper_id"])
+    if helper and helper["tg_user_id"]:
+        settlement = (f"{request['reward_rub']} ₽ поступило в ваш кошелёк H-Point."
+                      if paid else f"Вам начислено +{HELPER_REWARD} HP. Баланс: {helper['balance']} HP.")
+        try:
+            await bot.send_message(
+                helper["tg_user_id"],
+                f"✅ Автор подтвердил помощь по заявке №{request_id}. {settlement}\n\nОцените взаимодействие:",
+                reply_markup=rating_kb(request_id, "ratehelp"),
+            )
+        except Exception:
+            logging.exception("Не удалось сообщить о завершении заявки %s", request_id)
 
 
 @router.callback_query(F.data.startswith("paid_done:"))
 async def cb_paid_completion(callback: CallbackQuery, bot: Bot) -> None:
-    try:
-        request_id = int(callback.data.split(":")[1])
-    except (ValueError,IndexError):
-        await callback.answer("Некорректная заявка.", show_alert=True)
-        return
-    request = get_request(request_id)
-    if not request or not int(request["reward_rub"] or 0) or not complete_request(request_id, request["helper_id"], confirmed_by=callback.from_user.id):
-        await callback.answer("Выплата уже выполнена или подтверждение недоступно.", show_alert=True)
-        return
-    await callback.answer("Выплата из резерва выполнена")
-    await callback.message.edit_text(f"✅ Помощь по заявке №{request_id} подтверждена. {request['reward_rub']} ₽ зачислено в кошелёк помощника. H-Points не списывались.",reply_markup=rating_kb(request_id))
-    helper = get_user(request["helper_id"])
-    if helper and helper["tg_user_id"]:
-        try:
-            await bot.send_message(helper["tg_user_id"],f"💳 Автор подтвердил помощь по заявке №{request_id}. {request['reward_rub']} ₽ поступило в ваш кошелёк H-Point.",reply_markup=rating_kb(request_id,"ratehelp"))
-        except Exception:
-            logging.exception("Не удалось сообщить о выплате по заявке %s",request_id)
+    # Keep confirmation buttons in previously sent Telegram messages usable.
+    await cb_finish(callback, bot)
 
 
 async def start_review(callback: CallbackQuery, state: FSMContext, request_id: int, side: str, rating: int) -> None:

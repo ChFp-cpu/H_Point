@@ -8,6 +8,7 @@ services:
       APP_ENV: production
       TRUST_PROXY_HEADERS: "1"
       RUN_TELEGRAM_BOT: "0"
+      REGISTRATION_BONUS_RUB: ${REGISTRATION_BONUS_RUB:-500}
     depends_on:
       db:
         condition: service_healthy
@@ -37,6 +38,7 @@ services:
       APP_ENV: production
       TRUST_PROXY_HEADERS: "1"
       RUN_TELEGRAM_BOT: "1"
+      REGISTRATION_BONUS_RUB: ${REGISTRATION_BONUS_RUB:-500}
     depends_on:
       db:
         condition: service_healthy

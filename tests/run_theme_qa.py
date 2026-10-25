@@ -40,7 +40,7 @@ services.try_assign_helper(active,902)
 database.get_or_create_chat_for_request(active)
 done=services.create_request(903,{**payload,"what":"Завершённая помощь"})
 services.try_assign_helper(done,901)
-services.complete_request(done,901)
+services.complete_request(done,901,confirmed_by=903)
 services.set_rating(done,903,5)
 services.add_to_queue(904)
 if os.environ.get("HPOINT_QA_PAID_FLOW") == "1":

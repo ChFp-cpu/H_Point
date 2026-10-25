@@ -1,3 +1,4 @@
+const {openHelpTab}=require('./help_navigation.cjs');
 /* Run against a disposable local database only. Requires Playwright and Edge. */
 const {chromium}=require('playwright');
 const assert=require('node:assert/strict');
@@ -90,6 +91,7 @@ async function loadPhotos(page){
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
     await page.locator('#modal .close').click();
     await page.locator('.workspaceHeaderActions [data-route="profile"]').click();
+    if(!(await page.locator('.workspaceAccountNav [data-route="donate"]').isVisible()))await page.locator('#accountMore summary').click();
     await page.locator('.workspaceAccountNav [data-route="donate"]').click();
     await page.locator('.workspaceAccountMain #p-donate').waitFor();
     assert.equal(await page.locator('.workspaceAccountNav [data-route="donate"]').getAttribute('class'),'active');
@@ -234,7 +236,7 @@ async function loadPhotos(page){
     }
     // A small SDK double checks mounting, not third-party map rendering.
     // The same real map element and its controls must survive SPA navigation.
-    await page.locator('.helpNavigation [data-tab="map"]').click();
+    await openHelpTab(page,'map');
     await page.evaluate(()=>{
       window.ymaps={ready:callback=>callback(),Map:class{
         constructor(){this.geoObjects={add(){},remove(){}};this.container={fitToViewport(){}}}
@@ -247,7 +249,7 @@ async function loadPhotos(page){
     const mapElement=await page.locator('#workspaceMapSlot #bigMap').elementHandle();
     await page.getByRole('button',{name:/^Профиль/}).first().click();
     await page.getByRole('button',{name:'Помощь',exact:true}).click();
-    await page.locator('.helpNavigation [data-tab="map"]').click();
+    await openHelpTab(page,'map');
     assert.equal(await mapElement.evaluate(e=>e===document.querySelector('#workspaceMapSlot #bigMap')),true);
     assert.equal(await page.locator('#workspaceMapSlot #mapTools').count(),1);
     assert.equal(await page.getByRole('button',{name:'◎ Показать меня',exact:true}).isVisible(),true);

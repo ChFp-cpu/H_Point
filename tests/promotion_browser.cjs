@@ -1,3 +1,4 @@
+const {openHelpTab}=require('./help_navigation.cjs');
 /* First-party request promotion: no real users, providers, or payments. */
 const {chromium}=require('playwright');
 const assert=require('node:assert/strict');
@@ -31,7 +32,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
    }
   }
   for(const tab of ['open','match','chats','preferences']){
-   await page.locator('.helpNavigation [data-tab="'+tab+'"]').click();assert.equal(await page.locator('.workspaceRequestPromo').count(),0);checks++;
+   await openHelpTab(page,tab);assert.equal(await page.locator('.workspaceRequestPromo').count(),0);checks++;
   }
   await mine();await page.getByRole('button',{name:'Скрыть предложение H-Point+',exact:true}).click();
   assert.equal(await page.locator('.workspaceRequestPromo').count(),0);
