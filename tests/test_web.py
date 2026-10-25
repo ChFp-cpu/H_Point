@@ -543,7 +543,7 @@ class Web(unittest.TestCase):
   opener=urllib.request.build_opener(NoRedirect())
   from urllib.parse import urlencode
   try:
-   for index,(target,expected) in enumerate((("/games?game=crossing","/games?game=crossing"),("https://example.com","/"),("//example.com","/"))):
+   for index,(target,expected) in enumerate((("/games?game=crossing","/games?game=crossing" if web.GAMES_ENABLED else "/#/profile"),("https://example.com","/"),("//example.com","/"))):
     ticket=f"game-destination-{index}";database.create_web_login_ticket(1,ticket)
     with self.assertRaises(urllib.error.HTTPError) as redirect:
      opener.open(f"http://127.0.0.1:{server.server_port}/auth/telegram?"+urlencode({"ticket":ticket,"next":target}),timeout=3)
@@ -586,6 +586,7 @@ class Web(unittest.TestCase):
    self.assertFalse(services.is_in_queue(2))
    self.assertEqual(database.get_request(target)["status"],"in_progress")
    self.assertEqual(database.get_request(target)["helper_id"],2)
+   self.assertIsNotNone(web.chat_for_request(target))
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_points_purchase_and_device_profile_switching(self):

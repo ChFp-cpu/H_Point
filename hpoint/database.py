@@ -1,6 +1,7 @@
 """Database persistence with SQLite development and PostgreSQL production support."""
 import sqlite3, hashlib, re, threading, json, secrets
 from contextlib import contextmanager
+from .help_achievements import initialize_schema as initialize_help_achievements, migrate_profile_awards
 from datetime import datetime, timedelta, timezone
 from .config import REGISTRATION_BONUS_RUB
 from .config import DATABASE_URL, DB_PATH, START_BALANCE, STATUS_OPEN, STATUS_IN_PROGRESS, STATUS_DONE, ADMIN_TELEGRAM_IDS, TELEGRAM_AUTH_TTL_SECONDS, TELEGRAM_LINK_TTL_SECONDS, EMAIL_VERIFICATION_TTL_SECONDS, PHONE_VERIFICATION_TTL_SECONDS, AUTH_ATTEMPT_LIMIT, AUTH_ATTEMPT_WINDOW_SECONDS, CATEGORIES
@@ -390,6 +391,7 @@ def init_db():
         for telegram_id in ADMIN_TELEGRAM_IDS:
             db.execute("UPDATE users SET role='admin' WHERE tg_user_id=?", (telegram_id,))
     sync_legacy_subscriptions()
+    initialize_help_achievements(db)
 
 def sync_legacy_subscriptions():
     """Mirror legacy entitlement dates into the subscription ledger once."""
@@ -954,6 +956,7 @@ def detach_telegram_to_web_profile(user_id):
                    (web_id,source["name"],None,source["email"],source["password_hash"],source["balance"],source["helper_categories"],source["created_at"],
                     source["pro_until"],source["verified_until"],source["business_until"],source["favorite_slots"],0,source["email_verified"],source["full_name"],source["birth_date"],source["phone"],source["phone_verified"],source["lat"],source["lon"],source["city"],source["bio"],source["role"],source["is_blocked"],source["blocked_reason"]))
         db.execute("UPDATE users SET helper_availability=? WHERE user_id=?",(source["helper_availability"] or "",web_id))
+        migrate_profile_awards(db,user_id,web_id)
         for table, column in [
             ("requests","requester_id"),("requests","helper_id"),("helper_queue","user_id"),
             ("billing_invoices","user_id"),("wallet_transactions","user_id"),("subscriptions","user_id"),("web_login_tickets","user_id"),
@@ -1380,6 +1383,7 @@ def link_by_code(code,tg_user_id,username=None):
             db.execute("UPDATE identity_verification_requests SET user_id=? WHERE user_id=?", (canonical, web_uid))
             db.execute("UPDATE email_verification_codes SET user_id=? WHERE user_id=?", (canonical, web_uid))
             db.execute("UPDATE phone_verification_codes SET user_id=? WHERE user_id=?", (canonical, web_uid))
+            migrate_profile_awards(db,web_uid,canonical)
             db.execute("DELETE FROM users WHERE user_id=?",(web_uid,))
             db.execute("UPDATE users SET name=?,username=COALESCE(?,username),email=?,password_hash=?,balance=?,helper_categories=?,created_at=?,pro_until=?,verified_until=?,business_until=?,favorite_slots=?,verification_code=NULL,verification_code_hash=NULL,verification_code_expires_at=NULL,web_verified=1,email_verified=?,full_name=?,birth_date=?,phone=?,phone_verified=?,lat=?,lon=?,city=?,bio=? WHERE user_id=?",
                        (row["name"],username or row["username"],row["email"],row["password_hash"],row["balance"],row["helper_categories"],row["created_at"],row["pro_until"],row["verified_until"],row["business_until"],row["favorite_slots"],row["email_verified"],row["full_name"],row["birth_date"],row["phone"],row["phone_verified"],row["lat"],row["lon"],row["city"],row["bio"],canonical))
@@ -1466,6 +1470,7 @@ def link_by_code(code,tg_user_id,username=None):
 
         # Remove the old web shadow before copying its unique email/password
         # onto the canonical Telegram row. All dependent rows were migrated above.
+        migrate_profile_awards(db,web_uid,canonical)
         db.execute("DELETE FROM users WHERE user_id=?",(web_uid,))
 
         # Merge billing / profile state into the canonical Telegram row.

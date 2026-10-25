@@ -31,7 +31,8 @@ async function loadPhotos(page){
   try{
     await page.goto(base+'/auth/telegram?ticket=theme-browser-data');
     await page.locator('#hpointWorkspace').waitFor();
-    const routes=['#/home','#/help','#/rating','#/activities','#/league','#/donate','#/profile','#/profile/wallet','#/profile/billing','games'];
+    const gamesEnabled=(await context.request.get(base+'/api/sync').then(r=>r.json())).features.games;
+    const routes=['#/home','#/help','#/rating','#/activities','#/league','#/donate','#/profile','#/profile/wallet','#/profile/billing',...(gamesEnabled?['games']:[])];
     const widths=[320,360,375,390,430,768,1024,1440,1920];
     const failures=[];
     for(const colorScheme of ['light','dark']){
@@ -56,7 +57,7 @@ async function loadPhotos(page){
           checks++;
           if(audit.outside.length||audit.overlap||audit.overflow||audit.scheme!==colorScheme)failures.push({width,route,colorScheme,...audit});
           const primaryNav=page.locator(route==='games'?'.gamesPrimaryNav':'#sitePrimaryNav');
-          assert.deepEqual(await primaryNav.locator('button,a').allTextContents(),['Главная','Помощь','Игры','Активности']);
+          assert.deepEqual(await primaryNav.locator('button,a').allTextContents(),gamesEnabled?['Главная','Помощь','Игры','Активности']:['Главная','Помощь','Активности']);
           if(route!=='games'){
             assert.equal(await page.locator('#hpointWorkspace [data-route="activities"]').count(),0,'Activities are available in the primary navigation');
             assert.equal(await page.locator('#hpointWorkspace [data-route="league"]').count(),route==='#/home'?1:0,'The league opens only from the home summary');
@@ -122,6 +123,7 @@ async function loadPhotos(page){
     // emulation value. The application must follow what the browser reports.
     const nativePreference=await page.evaluate(()=>({dark:matchMedia('(prefers-color-scheme: dark)').matches,scheme:getComputedStyle(document.documentElement).colorScheme}));
     assert.equal(nativePreference.scheme,nativePreference.dark?'dark':'light');
+    if(gamesEnabled){
     await page.goto(base+'/games');
     await page.locator('.game-card').filter({has:page.getByRole('heading',{name:'H-Safety',exact:true})}).getByRole('button',{name:'Играть',exact:true}).click();
     await page.locator('#gameRoot .scenario').waitFor();
@@ -220,6 +222,7 @@ async function loadPhotos(page){
       assert.equal((await context.request.get(base+'/api/games/state').then(r=>r.json())).active_session,null,`${game} completes and saves its result`);
     }
     console.log('Gameplay passed: continuous traffic, pause, five resumable titles, endless stages and manual save');
+    }else{const paused=await context.request.get(base+'/games');assert.equal(paused.status(),503);console.log('Games are paused; stored game code is verified by the opt-in unit suite')}
     await page.goto(base+'/#/help');
     await page.locator('.helpNavigation [data-tab="chats"]').click();
     const chatButton=page.locator('.workspaceChatButton').first();
@@ -254,7 +257,7 @@ async function loadPhotos(page){
     assert.equal(await page.locator('#workspaceMapSlot #mapTools').count(),1);
     assert.equal(await page.getByRole('button',{name:'◎ Показать меня',exact:true}).isVisible(),true);
     await page.goto(base+'/#/profile');
-    await page.getByRole('button',{name:'Редактировать профиль',exact:true}).click();
+    if(!(await page.locator('#wsName').isVisible()))await page.getByRole('button',{name:'Редактировать профиль',exact:true}).click();
     await page.locator('#wsName').fill('Проверенный профиль');await page.locator('#wsCity').fill('Новый город');
     await page.locator('#wsBio').fill('Профиль сохранён через интерфейс');await page.getByRole('button',{name:'Сохранить профиль',exact:true}).click();
     await page.getByRole('heading',{name:'Проверенный профиль',exact:true}).waitFor();
@@ -408,15 +411,17 @@ async function loadPhotos(page){
     const deep=await browser.newContext(),deepPage=await deep.newPage();
     await deep.route('**/*',route=>new URL(route.request().url()).origin===base?route.continue():route.abort());
     await deepPage.goto(base+'/auth/telegram?ticket=theme-browser-game-deep&next='+encodeURIComponent('/games?game=crossing'));
+    if(gamesEnabled){
     await deepPage.locator('#crossGrid').waitFor();
     const deepSession=(await deep.request.get(base+'/api/games/state').then(r=>r.json())).active_session;
     await deepPage.locator('#backGames').click();await deepPage.locator('.game-card').first().waitFor();
     await deepPage.locator('.game-card').filter({has:deepPage.getByRole('heading',{name:'H-Crossing',exact:true})}).getByRole('button',{name:'Продолжить',exact:true}).click();
     await deepPage.locator('.pause-layer').waitFor();
     assert.equal((await deep.request.get(base+'/api/games/state').then(r=>r.json())).active_session.id,deepSession.id);
+    }else{await deepPage.locator('.workspaceAchievements').waitFor();assert.equal(new URL(deepPage.url()).hash,'#/profile')}
     await deep.close();
-    console.log('Auth passed: email registration, password validation, verification, logout/login, password reset, Telegram game deep link');
+    console.log('Auth passed: email registration, password validation, verification, logout/login, password reset, Telegram safe deep link');
     assert.deepEqual(errors,[]);
-    console.log(JSON.stringify({ok:true,checks,liveThemePreservesDraft:true,liveThemePreservesGame:true,errors,output}));
+    console.log(JSON.stringify({ok:true,checks,liveThemePreservesDraft:true,gamesEnabled,errors,output}));
   }catch(error){console.error('Browser errors:',errors);console.error(await page.locator('body').innerText().then(text=>text.slice(-2500)).catch(()=>''));await page.screenshot({path:path.join(output,'failure.png'),fullPage:true});throw error}finally{await browser.close()}
 })().catch(error=>{console.error(error);process.exitCode=1});

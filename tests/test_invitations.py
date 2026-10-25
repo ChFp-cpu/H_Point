@@ -71,6 +71,19 @@ class InvitationCore(InvitationData, unittest.TestCase):
         self.assertEqual(services.accept_open_request(self.rid,2,author_id=1,application_token=token),"created")
         self.assertIsNone(services.get_current_helper_offer(self.rid))
 
+    def test_failed_chat_creation_rolls_back_assignment(self):
+        with patch.object(services,"get_or_create_chat_for_request",side_effect=RuntimeError("chat unavailable")):
+            with self.assertRaises(RuntimeError):services.accept_open_request(self.rid,2)
+        self.assertEqual(database.get_request(self.rid)["status"],"open")
+        self.assertIsNone(database.get_request(self.rid)["helper_id"])
+        self.assertTrue(services.is_in_queue(2))
+
+    def test_direct_response_cannot_accept_own_or_blocked_help(self):
+        self.assertEqual(services.accept_open_request(self.rid,1),"unavailable")
+        self.db.execute("UPDATE users SET is_blocked=1 WHERE user_id=2")
+        self.assertEqual(services.accept_open_request(self.rid,2),"unavailable")
+        self.assertIsNone(database.get_request(self.rid)["helper_id"])
+
     def test_paid_invite_before_reserve_then_author_confirms_wallet_release(self):
         self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
         hp = [database.get_user(uid)["balance"] for uid in (1, 2)]
@@ -275,6 +288,17 @@ class InvitationRace(unittest.TestCase):
         self.assertEqual(sorted(results),["created","unavailable"])
         self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM chats").fetchone()["n"],1)
 
+    def test_one_helper_cannot_directly_accept_two_requests(self):
+        other=services.create_request(1,{"what":"Second request","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
+        results=self.race(lambda:services.accept_open_request(self.rid,2),lambda:services.accept_open_request(other,2))
+        self.assertEqual(sorted(results),["created","unavailable"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM chats").fetchone()["n"],1)
+
+    def test_direct_response_and_invitation_cannot_both_assign(self):
+        results=self.race(lambda:services.accept_open_request(self.rid,3),lambda:services.respond_to_helper_offer(self.rid,2,True,self.token))
+        self.assertEqual(sum(result in (True,"created") for result in results),1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM chats").fetchone()["n"],1)
+
     def test_replacement_and_old_accept_cannot_both_succeed(self):
         replaced, accepted = self.race(
             lambda: services.offer_helper(self.rid, 3, self.token),
@@ -390,6 +414,27 @@ class InvitationAPI(InvitationData, unittest.TestCase):
         self.assert_error(409, 1, "/api/requests/response/cancel", payload)
         payload["application_token"] = self.request(1, "/api/sync")["applications"][0]["application_token"]
         self.assertTrue(self.request(1, "/api/requests/response/cancel", payload)["cancelled"])
+
+    def test_owner_accepts_legacy_response_from_notification_without_new_invite(self):
+        services.apply_to_request(self.rid,2)
+        response=self.request(1,"/api/sync")["applications"][0]
+        payload={"request_id":self.rid,"helper_id":2,"application_token":response["application_token"]}
+        self.assert_error(409,4,"/api/requests/response/accept",payload)
+        self.assert_error(409,1,"/api/requests/response/accept",{**payload,"application_token":"old"})
+        self.assertTrue(self.request(1,"/api/requests/response/accept",payload)["matched"])
+        self.assertEqual(database.get_request(self.rid)["helper_id"],2)
+        self.assertEqual(self.request(2,"/api/helper/offers")["offers"],[])
+        self.assertEqual(len(self.request(1,"/api/chats")["chats"]),1)
+        self.assertEqual({call.args[0] for call in self.notify.call_args_list},{1,2})
+        self.assert_error(409,1,"/api/requests/response/accept",payload)
+        self.assertEqual(self.notify.call_count,2)
+
+    def test_matching_an_existing_response_accepts_it_instead_of_reinviting(self):
+        services.apply_to_request(self.rid,2)
+        result=self.request(1,"/api/smart-match/assign",{"request_id":self.rid,"helper_id":2})
+        self.assertTrue(result["matched"])
+        self.assertEqual(database.get_request(self.rid)["helper_id"],2)
+        self.assertIsNone(self.current())
         self.assertEqual(self.notify.call_args.args[0], 2)
 
     def test_cancel_from_either_side_and_find_new_candidates(self):
@@ -515,6 +560,28 @@ class InvitationBot(InvitationData, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(services.get_request_applications(1), [])
         self.assertEqual(self.bot.send_message.call_args.args[0], 2)
         self.assertEqual(database.get_request(self.rid)["status"], "open")
+
+    async def test_bot_accepts_legacy_response_and_notifies_linked_accounts(self):
+        services.apply_to_request(self.rid,2)
+        self.db.execute("UPDATE users SET tg_user_id=user_id*1000")
+        callback=self.callback(1,"accept","")
+        callback.data=f"candidate:assign:{self.rid}:2"
+        await handlers.cb_candidate_assign(callback,self.bot)
+        self.assertEqual(database.get_request(self.rid)["helper_id"],2)
+        self.assertIsNone(self.current())
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM chats").fetchone()["n"],1)
+        self.assertEqual({call.args[0] for call in self.bot.send_message.call_args_list},{1000,2000})
+        for call in self.bot.send_message.call_args_list:
+            self.assertIn(f"/#/help/chat/{self.rid}",str(call.kwargs["reply_markup"]))
+
+    async def test_bot_invitation_acceptance_creates_chat_in_one_consent(self):
+        services.offer_helper(self.rid,2)
+        callback=self.callback(2,"accept",self.current()["offer_token"])
+        await handlers.cb_helper_offer_response(callback,self.bot)
+        self.assertEqual(database.get_request(self.rid)["status"],"in_progress")
+        self.assertIsNone(self.current())
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM chats").fetchone()["n"],1)
+        self.assertEqual(self.bot.send_message.call_count,2)
 
     async def test_requester_can_cancel_in_bot_and_reopen_candidates(self):
         services.offer_helper(self.rid, 2)

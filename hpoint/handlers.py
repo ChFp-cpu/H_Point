@@ -15,6 +15,8 @@ from .keyboards import *
 from .billing import create_pending_invoice
 from . import games as game_service
 from .chat_notifications import chat_notification
+from .features import GAMES_ENABLED, GAMES_PAUSED_MESSAGE
+from . import help_achievements
 
 router = Router()
 
@@ -31,8 +33,8 @@ BOT_GUIDE = (
     "📨 На сайте «Хочу помочь» в карточке заявки сразу назначает помощника и открывает чат. Уведомление с кнопкой чата придёт обоим в Telegram.\n"
     "👤 <b>Мой профиль</b> — баланс HP, рейтинг, статистика и статус проверки.\n"
     "📜 <b>История</b> — завершённые и текущие заявки.\n"
-    "⚙️ <b>Настройки помощи</b> — указать категории, в которых вы готовы помогать.\n"
-    "🎮 <b>Игры H-Point</b> — открыть выбранную игру на сайте; достижения и HP общие.\n"
+    "⚙️ <b>Настройки помощи</b> — указать категории, в которых вы готовы помогать.\n" +
+    ("🎮 <b>Игры H-Point</b> — игры на сайте.\n" if GAMES_ENABLED else "🏅 <b>Достижения за помощь</b> — в профиле: условия, награды HP и ваш прогресс.\n") +
     "💳 <b>H-Point+</b> — платные возможности и безопасный переход к оплате.\n"
     "🌐 <b>Перейти на сайт</b> — одноразовый вход в тот же профиль без пароля.\n\n"
     "<b>Как проходит помощь</b>\n"
@@ -40,11 +42,11 @@ BOT_GUIDE = (
     "2. Автор выбирает кандидата; помощник подтверждает согласие.\n"
     "3. Сообщения с сайта приходят сюда целиком. Ответьте командой /chat #НОМЕР ТЕКСТ из уведомления, после выполнения автор завершает помощь, затем оба участника ставят оценки.\n\n"
     "<b>Синхронизация и безопасность</b>\n"
-    "Бот и сайт используют общие профиль, заявки, историю, HP и игровые достижения. "
+    "Бот и сайт используют общие профиль, заявки, историю, HP и достижения за реальную помощь. "
     "Чтобы подключить существующий сайт: сайт → «Профиль» → «Получить код Telegram», затем в боте <b>/link КОД</b>. "
     "Код вводите только в этом боте. Для отмены незавершённого действия используйте /cancel. "
     "Уточнить подбор можно командой <b>/ask НУЖНЫЙ ОПЫТ</b>; вернуть меню — /menu.\n\n"
-    "Сайт остаётся основным местом для карты, активностей, Лиги H-Point, игр, профиля, подтверждения email и платежей — бот открывает его одноразовой ссылкой."
+    "Сайт остаётся основным местом для карты, активностей, Лиги H-Point, профиля, подтверждения email и платежей — бот открывает его одноразовой ссылкой."
 )
 
 # The first reply for a returning participant remains short enough for a
@@ -56,7 +58,7 @@ BOT_START_OVERVIEW = (
     "🆘 Нужна помощь — новая заявка; 🤝 хочу помочь — очередь помощников.\n"
     "⚡ Подобрать кандидатов и 👥 Мои кандидаты — выбор и статус помощника.\n"
     "👤 профиль, 📜 история и ⚙️ настройки — ваш аккаунт и готовность помогать.\n"
-    "🎮 Игры, 💳 H-Point+ и 🌐 сайт — достижения, доступы и полный веб-интерфейс.\n"
+    "🏅 Достижения за помощь — в профиле; 💳 H-Point+ и 🌐 сайт — доступы и полный веб-интерфейс.\n"
     "ℹ️ «Как пользоваться» показывает подробный порядок действий и команды чата."
 )
 
@@ -109,29 +111,31 @@ async def notify_match(bot: Bot, request_id: int) -> None:
         logging.error("Не найдены участники заявки %s", request_id)
         return
 
-    try:
-        await bot.send_message(
-            helper["user_id"],
-            "🤝 <b>Вы нашли, кому помочь!</b>\n\n"
-            f"{request_text(req)}\n\n"
-            f"<b>Кому помогаете:</b> {user_link(requester)}\n\n"
-            "Свяжитесь с человеком на сайте или отправьте /chat ТЕКСТ. После оказания помощи заявку завершит её автор.",
-            reply_markup=request_chat_kb(request_id),
-        )
-    except Exception:
-        logging.exception("Не удалось уведомить помощника %s по заявке %s", helper["user_id"], request_id)
+    if helper["tg_user_id"]:
+        try:
+            await bot.send_message(
+                helper["tg_user_id"],
+                "🤝 <b>Вы нашли, кому помочь!</b>\n\n"
+                f"{request_text(req)}\n\n"
+                f"<b>Кому помогаете:</b> {user_link(requester)}\n\n"
+                "Свяжитесь с человеком на сайте или отправьте /chat ТЕКСТ. После оказания помощи заявку завершит её автор.",
+                reply_markup=request_chat_kb(request_id),
+            )
+        except Exception:
+            logging.exception("Не удалось уведомить помощника %s по заявке %s", helper["user_id"], request_id)
 
-    try:
-        await bot.send_message(
-            requester["user_id"],
-            "🎉 <b>Для вашей заявки нашёлся помощник!</b>\n\n"
-            f"{request_text(req)}\n\n"
-            f"<b>Ваш помощник:</b> {user_link(helper)}\n\n"
-            "Помощник свяжется с вами. Можно ответить на сайте или командой /chat ТЕКСТ. Когда помощь будет оказана, нажмите «Завершить помощь». После этого можно оставить оценку.",
-            reply_markup=finish_kb(request_id),
-        )
-    except Exception:
-        logging.exception("Не удалось уведомить автора %s по заявке %s", requester["user_id"], request_id)
+    if requester["tg_user_id"]:
+        try:
+            await bot.send_message(
+                requester["tg_user_id"],
+                "🎉 <b>Для вашей заявки нашёлся помощник!</b>\n\n"
+                f"{request_text(req)}\n\n"
+                f"<b>Ваш помощник:</b> {user_link(helper)}\n\n"
+                "Помощник свяжется с вами. Можно ответить на сайте или командой /chat ТЕКСТ. Когда помощь будет оказана, нажмите «Завершить помощь». После этого можно оставить оценку.",
+                reply_markup=finish_kb(request_id),
+            )
+        except Exception:
+            logging.exception("Не удалось уведомить автора %s по заявке %s", requester["user_id"], request_id)
 
 
 async def safe_notify_match(bot: Bot, request_id: int) -> None:
@@ -502,6 +506,8 @@ def _game_website_url(user_id=None, game=None, section=None):
 
 
 def _games_menu_kb(user_id=None) -> InlineKeyboardMarkup:
+    if not GAMES_ENABLED:
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏅 Достижения за помощь",callback_data="profile:achievements")]])
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚶 H-Crossing ↗", url=_game_website_url(user_id, "crossing")), InlineKeyboardButton(text="📍 H-Dispatch ↗", url=_game_website_url(user_id, "dispatch"))],
         [InlineKeyboardButton(text="🧩 H-Match ↗", url=_game_website_url(user_id, "match")), InlineKeyboardButton(text="🛡 H-Safety ↗", url=_game_website_url(user_id, "safety"))],
@@ -665,6 +671,9 @@ async def games_menu(message: Message, state: FSMContext) -> None:
     if message.chat.type != "private":
         await message.answer("Игры и личный прогресс доступны в личном диалоге с H-Point.")
         return
+    if not GAMES_ENABLED:
+        await message.answer(GAMES_PAUSED_MESSAGE,reply_markup=main_menu_kb())
+        return
     if not await ensure_registered(message, state):
         return
     # Entering the games intentionally leaves any unfinished text form, so a
@@ -678,6 +687,10 @@ async def game_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
     """Old game messages now lead to the same full website UI."""
     if callback.message.chat.type != "private":
         await callback.answer("Игры доступны только в личном чате.", show_alert=True)
+        return
+    if not GAMES_ENABLED:
+        await callback.answer(GAMES_PAUSED_MESSAGE,show_alert=True)
+        await callback.message.answer("Продолжить помощь и посмотреть достижения можно в профиле.",reply_markup=main_menu_kb())
         return
     user = get_user(callback.from_user.id)
     if not user or user["is_blocked"]:
@@ -714,6 +727,7 @@ async def profile(message: Message, state: FSMContext) -> None:
         return
     user = get_user(message.from_user.id)
     stats = get_user_stats(user["user_id"])
+    achievements = help_achievements.achievement_state(user["user_id"])
     categories = get_helper_categories(user["user_id"])
     identity = get_identity_verification(user["user_id"])
     identity_text = "не запрошено — /verifyme" if not identity else {
@@ -724,6 +738,7 @@ async def profile(message: Message, state: FSMContext) -> None:
     text = (
         f"👤 <b>{escape(user['name'])}</b>\n\n"
         f"💰 Баланс: <b>{user['balance']} HP</b>\n"
+        f"🏅 Достижения за помощь: <b>{achievements['unlocked_count']}/5</b> · награды <b>{achievements['awarded_hp']} HP</b>\n"
         f"🤝 Помощей оказано: <b>{stats['helped']}</b>\n"
         f"📥 Помощей получено: <b>{stats['received']}</b>\n"
         f"⭐ Оценка как помощника: <b>{stars(stats['helped_avg'])}</b>\n"
@@ -732,6 +747,32 @@ async def profile(message: Message, state: FSMContext) -> None:
         f"🛠 Категории помощи: {', '.join(CATEGORIES[c] for c in categories) if categories else 'не настроены'}"
     )
     await message.answer(text, reply_markup=profile_kb())
+
+
+async def _show_help_achievements(message: Message, user_id: int) -> None:
+    earned=help_achievements.claim_earned(user_id)
+    data=help_achievements.achievement_state(user_id)
+    lines=["🏅 <b>Достижения за помощь</b>",data["rule"]]
+    if earned:lines.append("Начислено за заслуженные достижения: <b>+"+str(sum(item["reward_hp"] for item in earned))+" HP</b>.")
+    for item in data["items"]:
+        lines.append(("✅ " if item["unlocked"] else "○ ")+"<b>"+escape(item["title"])+" · +"+str(item["reward_hp"])+" HP</b>\n"+escape(item["description"])+"\n"+("Награда уже начислена" if item["unlocked"] else escape(item["progress_text"])))
+    lines.append("Баланс: <b>"+str(get_user(user_id)["balance"])+" HP</b>. Награды общие с сайтом.")
+    await message.answer("\n\n".join(lines),reply_markup=profile_kb())
+
+
+@router.message(Command("achievements"))
+async def help_achievements_menu(message: Message, state: FSMContext) -> None:
+    if await ensure_registered(message,state):await _show_help_achievements(message,message.from_user.id)
+
+
+@router.callback_query(F.data == "profile:achievements")
+async def help_achievements_callback(callback: CallbackQuery) -> None:
+    user=get_user(callback.from_user.id)
+    if not user or user["is_blocked"]:
+        await callback.answer("Сначала откройте свой профиль.",show_alert=True)
+        return
+    await callback.answer()
+    await _show_help_achievements(callback.message,user["user_id"])
 
 
 async def show_history(message: Message, user_id: int) -> None:
@@ -1292,7 +1333,9 @@ async def cb_rate(callback: CallbackQuery, state: FSMContext) -> None:
     req = get_request(request_id)
     if req and req["helper_id"]:
         try:
-            await callback.bot.send_message(req["helper_id"], f"Ваша помощь по заявке №{request_id} получила оценку {'⭐' * rating} ({rating}/5).")
+            helper=get_user(req["helper_id"])
+            if helper and helper["tg_user_id"]:
+                await callback.bot.send_message(helper["tg_user_id"], f"Ваша помощь по заявке №{request_id} получила оценку {'⭐' * rating} ({rating}/5)."+help_achievements.reward_notice(req["helper_id"],request_id))
         except Exception:
             logging.exception("Не удалось сообщить помощнику оценку")
 

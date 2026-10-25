@@ -45,6 +45,18 @@ services.set_rating(done,903,5)
 services.add_to_queue(904)
 if os.environ.get("HPOINT_QA_PAID_FLOW") == "1":
     database.wallet_add_entry(901,500,"test","Synthetic wallet funds","paid-browser-seed")
+if os.environ.get("HPOINT_QA_HELP_AWARDS") == "1":
+    # Historical reviewed help, predating achievements; synthetic local DB only.
+    legacy=services.create_request(903,{**payload,"what":"Synthetic historical help"})
+    services.accept_open_request(legacy,905)
+    services.complete_request(legacy,905)
+    database.db.execute("UPDATE requests SET requester_rating=5,rating=5 WHERE id=?",(legacy,))
+    # Preserve an archived game while all running web game endpoints are paused.
+    from hpoint import games
+    games.GAMES_ENABLED=True
+    games.start_game(904,"crossing")
+    games.GAMES_ENABLED=False
+    database.db.execute("INSERT INTO game_achievements(user_id,achievement_id) VALUES(904,'first_steps')")
 database.create_web_login_ticket(901,"theme-browser-data")
 database.create_web_login_ticket(905,"theme-browser-empty")
 database.create_web_login_ticket(905,"theme-browser-game-deep")

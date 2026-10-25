@@ -62,13 +62,15 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await page.reload();await page.locator('#hpointWorkspace').waitFor();
   assert.equal(await page.locator('.homePaidOptions').count(),0);checks++;
   await page.evaluate(()=>localStorage.removeItem('hpoint:home-promo:901'));
-  await page.evaluate(()=>hpointWorkspace.refresh());
+  await page.reload();await page.locator('.homePaidOptions').waitFor({state:'visible'});
   for(const colorScheme of ['light','dark']){
    await page.emulateMedia({colorScheme});
    for(const width of [320,390,768,1440]){
     await page.setViewportSize({width,height:844});
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
-    assert.ok((await page.locator('.homePaidOptions').boundingBox()).height<=200);
+    // Read dimensions in one DOM operation: periodic sync may replace the card.
+    const promoHeight=await page.locator('.homePaidOptions').evaluate(element=>element.getBoundingClientRect().height);
+    assert.ok(promoHeight>0&&promoHeight<=200);
     if(width===390)await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,`paid-home-${colorScheme}-${width}.png`),fullPage:true});
     checks++;
    }
