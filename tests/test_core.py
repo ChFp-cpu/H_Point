@@ -87,6 +87,7 @@ class Core(unittest.TestCase):
         self.assertFalse(database.auth_is_rate_limited("login_ip","127.0.0.2",3))
     def test_telegram_link_code_is_hashed_and_single_use(self):
         uid=database.create_web_user("Web","secure-link@example.com","hash")
+        self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=?",(uid,))
         code=database.create_link_code(uid)
         row=database.get_user(uid)
         self.assertEqual(len(code),32)
@@ -97,8 +98,10 @@ class Core(unittest.TestCase):
         self.assertFalse(database.link_by_code(code,557,"user557")[0])
     def test_expired_telegram_link_code_cannot_link_account(self):
         uid=database.create_web_user("Web","expired@example.com","hash")
-        self.db.execute("UPDATE users SET verification_code='EXPIRED',verification_code_expires_at=? WHERE user_id=?",((datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat(),uid))
-        ok,_=database.link_by_code("EXPIRED",555,"user555")
+        self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=?",(uid,))
+        code=database.create_link_code(uid)
+        self.db.execute("UPDATE users SET verification_code_expires_at=? WHERE user_id=?",((datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat(),uid))
+        ok,_=database.link_by_code(code,555,"user555")
         self.assertFalse(ok)
     def test_atomic_completion_and_reviews(self):
         self.add(1);self.add(2);rid=services.create_request(1,{"what":"test","place":"x","time_needed":"x","urgency":"x","details":"x"})
@@ -230,14 +233,15 @@ class Core(unittest.TestCase):
             shared.close()
             database.db, services.db = old_db, old_service_db
             temp.cleanup()
-    def test_link_migrates_web_account_to_telegram_id(self):
+    def test_link_preserves_email_profile_id_and_existing_details(self):
         uid=database.create_web_user("Web","web@example.com","hash")
+        self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=?",(uid,))
         self.db.execute("UPDATE users SET helper_availability='По вечерам' WHERE user_id=?",(uid,))
         self.db.execute("UPDATE users SET verification_code='ABCD1234',verification_code_expires_at=? WHERE user_id=?",((datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat(),uid))
         ok,msg=database.link_by_code("ABCD1234",555,"user555");self.assertTrue(ok)
-        u=database.get_user(555);self.assertIsNotNone(u);self.assertEqual(u["name"],"Web");self.assertEqual(u["tg_user_id"],555)
-        self.assertIsNone(database.get_user(uid))
-        self.assertEqual(database.get_user(555)["helper_availability"],"По вечерам")
+        u=database.get_user(uid);self.assertIsNotNone(u);self.assertEqual(u["name"],"Web");self.assertEqual(u["tg_user_id"],555)
+        self.assertIsNone(database.get_user(555))
+        self.assertEqual(database.get_user(uid)["helper_availability"],"По вечерам")
     def test_identity_verification_requires_manual_admin_review(self):
         self.add(1);self.add(99)
         self.db.execute("UPDATE users SET role='admin' WHERE user_id=99")

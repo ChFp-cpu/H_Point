@@ -32,9 +32,11 @@ class Games(unittest.TestCase):
         web.db = self.db
         database.init_db()
         database.create_user(1, "Игрок", None)
-        self.db.execute("UPDATE users SET balance=100 WHERE user_id=1")
+        self.db.execute("UPDATE users SET balance=100,email='synthetic@example.test',email_verified=1 WHERE user_id=1")
+        self.handler_db_patch=patch.object(handlers,"db",self.db);self.handler_db_patch.start()
 
     def tearDown(self):
+        self.handler_db_patch.stop()
         for item in reversed(self.feature_patches):item.stop()
         database.db = self.old_database
         services.db = self.old_services
@@ -312,13 +314,12 @@ class Games(unittest.TestCase):
 
         menu_buttons = [button for row in _games_menu_kb(1).inline_keyboard for button in row]
         from urllib.parse import urlparse, parse_qs
-        destinations = [parse_qs(urlparse(button.url).query)["next"][0] for button in menu_buttons]
+        destinations = [urlparse(button.url).path+("?"+urlparse(button.url).query if urlparse(button.url).query else "") for button in menu_buttons]
         self.assertIn("/games?game=crossing", destinations)
         self.assertIn("/games?game=mission", destinations)
         self.assertTrue(all(button.callback_data is None for button in menu_buttons))
-        ticket = parse_qs(urlparse(menu_buttons[0].url).query)["ticket"][0]
-        self.assertEqual(database.consume_web_login_ticket(ticket),1)
-        self.assertIsNone(database.consume_web_login_ticket(ticket))
+        self.assertTrue(all("ticket" not in parse_qs(urlparse(button.url).query) for button in menu_buttons))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM web_login_tickets").fetchone()["n"],0)
         self.assertTrue(any("Игры H-Point" in button.text for row in main_menu_kb().keyboard for button in row))
         session = games.start_game(1, "match")
         callbacks = [button.callback_data for row in _match_kb(session).inline_keyboard for button in row]
@@ -345,7 +346,8 @@ class Games(unittest.TestCase):
         self.assertIn("Мои кандидаты", BOT_START_OVERVIEW)
         self.assertIn("H-Point+", BOT_START_OVERVIEW)
         self.assertIn("Как пользоваться", BOT_START_OVERVIEW)
-        self.assertIn("Как вас зовут?", onboarding_text())
+        self.assertIn("только по email", onboarding_text())
+        self.assertNotIn("Как вас зовут?", onboarding_text())
 
     def test_old_bot_play_button_opens_website_without_starting_a_text_game(self):
         import asyncio
@@ -360,7 +362,9 @@ class Games(unittest.TestCase):
             asyncio.run(handlers.game_callbacks(callback,state))
             start.assert_not_called()
         button=message.edit_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0]
-        self.assertIn("next=%2Fgames%3Fgame%3Dcrossing",button.url)
+        self.assertTrue(button.url.endswith("/games?game=crossing"))
+        self.assertNotIn("auth/telegram",button.url)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM web_login_tickets").fetchone()["n"],0)
 
     def test_games_page_and_http_api_access_controls(self):
         self.assertIn("H-Point Games", web.GAMES_PAGE)

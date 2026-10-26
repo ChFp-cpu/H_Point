@@ -3,6 +3,7 @@ import json, re, secrets
 from datetime import datetime, timedelta, timezone
 from .config import *
 from .help_achievements import award_locked
+from . import reliability, workflow
 from .database import db, get_request, get_user, get_active_help, save_request_candidates, get_request_candidates, insert_id, request_identity_verification, wallet_add_entry, get_or_create_chat_for_request
 
 
@@ -30,6 +31,24 @@ def get_helper_categories(user_id: int) -> list[str]:
         return []
 
 
+def normalize_schedule(value):
+    if value in (None,""):return None
+    try:
+        value=datetime.fromisoformat(str(value).replace("Z","+00:00"))
+        if value.tzinfo is None:raise ValueError("timezone required")
+        return value.astimezone(timezone.utc).isoformat()
+    except (TypeError,ValueError):raise ValueError("Укажите дату и время с часовым поясом.")
+
+
+def matches_helper_preferences(request, helper, distance):
+    radius=int(helper["helper_radius_km"] or 0)
+    if radius and helper["lat"] is not None and (request["lat"] is None or distance>radius):return False
+    at=request["scheduled_at"] or datetime.now(timezone.utc).isoformat()
+    if helper["helper_available_from"] and request["scheduled_at"] and at<helper["helper_available_from"]:return False
+    if helper["helper_available_until"] and at>helper["helper_available_until"]:return False
+    return True
+
+
 def create_request(user_id: int, data: dict) -> int:
     category = data.get("category") or infer_category(data["what"])
     hours = max(1, min(int(data.get("expires_in_hours", 48)), 168))
@@ -39,10 +58,10 @@ def create_request(user_id: int, data: dict) -> int:
         raise ValueError("reward_rub")
     request_id = insert_id(
         """INSERT INTO requests
-        (requester_id, category, what, place, time_needed, urgency, details, status, priority_boost, lat, lon, expires_at, reward_rub)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
+        (requester_id, category, what, place, time_needed, urgency, details, status, priority_boost, lat, lon, expires_at, reward_rub, scheduled_at, reserve_deadline_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)""",
         (user_id, category, data["what"], data["place"], data["time_needed"], data["urgency"], data["details"], STATUS_OPEN,
-         data.get("lat"), data.get("lon"), expires_at, reward),
+         data.get("lat"), data.get("lon"), expires_at, reward, normalize_schedule(data.get("scheduled_at")),workflow.reserve_deadline() if reward else None),
     )
     db.execute(
         "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
@@ -51,29 +70,20 @@ def create_request(user_id: int, data: dict) -> int:
     return request_id
 
 def expire_open_requests() -> None:
-    """Close only unassigned requests whose chosen publication term ended."""
-    expired = db.execute(
-        "SELECT id,requester_id,reward_rub,reward_payment_status FROM requests WHERE status=? AND expires_at IS NOT NULL AND expires_at<=?",
-        (STATUS_OPEN, datetime.now(timezone.utc).isoformat()),
-    ).fetchall()
-    if not expired:
-        return
-    ids = [row["id"] for row in expired]
-    marks = ",".join("?" for _ in ids)
-    db.execute(
-        f"UPDATE requests SET status=?,cancel_reason=?,cancelled_at=CURRENT_TIMESTAMP WHERE id IN ({marks})",
-        (STATUS_CANCELLED, "Срок публикации истёк", *ids),
-    )
-    for row in expired:
-        request_id = row["id"]
-        if row["reward_payment_status"] == "paid" and int(row["reward_rub"] or 0) > 0:
-            amount = int(row["reward_rub"])
-            wallet_add_entry(row["requester_id"], amount, "reward_refund", "Вознаграждение возвращено в кошелёк: срок заявки истёк", f"request:{request_id}:expiry-refund", request_id)
-            db.execute("UPDATE requests SET reward_payment_status='wallet_refunded' WHERE id=?", (request_id,))
-        db.execute(
-            "INSERT INTO request_events(request_id,event_type,message) VALUES(?,?,?)",
-            (request_id, "expired", "Срок публикации истёк. Заявка закрыта."),
-        )
+    cutoff=datetime.now(timezone.utc).isoformat()
+    ids=[r["id"] for r in db.execute("SELECT id FROM requests WHERE status=? AND ((expires_at IS NOT NULL AND expires_at<=?) OR (reward_rub>0 AND reward_payment_status='none' AND reserve_deadline_at IS NOT NULL AND reserve_deadline_at<=?))",(STATUS_OPEN,cutoff,cutoff)).fetchall()]
+    for rid in ids:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            lock=" FOR UPDATE" if getattr(db,"is_postgres",False) else ""
+            row=db.execute("SELECT * FROM requests WHERE id=?"+lock,(rid,)).fetchone()
+            if row and row["status"]==STATUS_OPEN:
+                reserve_expired=bool(row["reward_rub"] and row["reward_payment_status"]=="none" and row["reserve_deadline_at"] and row["reserve_deadline_at"]<=cutoff)
+                if reserve_expired or (row["expires_at"] and row["expires_at"]<=cutoff):
+                    reliability.close_locked_request(db,row,None,"Резерв не создан за 5 минут" if reserve_expired else "Срок публикации истёк","reserve_expired" if reserve_expired else "expired",wallet_add_entry)
+            db.execute("COMMIT")
+        except Exception:
+            db.execute("ROLLBACK");raise
 
 
 def is_in_queue(user_id: int) -> bool:
@@ -94,8 +104,8 @@ def accept_open_request(request_id: int, helper_id: int, author_id: int | None =
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db,"is_postgres",False) else ""
-        helper = db.execute("SELECT * FROM users WHERE user_id=?" + lock,(helper_id,)).fetchone()
         request = db.execute("SELECT * FROM requests WHERE id=?" + lock,(request_id,)).fetchone()
+        helper = db.execute("SELECT * FROM users WHERE user_id=?" + (" FOR NO KEY UPDATE" if lock else ""),(helper_id,)).fetchone()
         if not helper or helper["is_blocked"] or not request or request["requester_id"] == helper_id:
             db.execute("ROLLBACK");return "unavailable"
         if author_id is not None:
@@ -128,8 +138,8 @@ def apply_to_request(request_id: int, helper_id: int) -> str:
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
-        helper = db.execute("SELECT * FROM users WHERE user_id=?" + lock, (helper_id,)).fetchone()
         request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
+        helper = db.execute("SELECT * FROM users WHERE user_id=?" + (" FOR NO KEY UPDATE" if lock else ""), (helper_id,)).fetchone()
         if not helper or helper["is_blocked"] or not request or request["status"] != STATUS_OPEN or request["requester_id"] == helper_id or get_active_help(helper_id):
             db.execute("ROLLBACK")
             return "unavailable"
@@ -172,8 +182,8 @@ def cancel_request_application(request_id: int, helper_id: int, actor_id: int, t
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
-        if lock: db.execute("SELECT user_id FROM users WHERE user_id=? FOR UPDATE", (helper_id,)).fetchone()
         request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
+        if lock: db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (helper_id,)).fetchone()
         application = db.execute("SELECT * FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='applied'" + lock, (request_id, helper_id)).fetchone()
         if not request or request["status"] != STATUS_OPEN or actor_id not in (helper_id, request["requester_id"]) or not application or (application["offer_token"] or "") != token:
             db.execute("ROLLBACK")
@@ -206,7 +216,7 @@ def get_helper_offers(helper_id: int, limit: int = 20):
     """Offers awaiting a helper's answer; used by both the site and the bot."""
     return db.execute(
         """SELECT rc.request_id, rc.updated_at, rc.offer_token, r.category, r.what, r.place,
-                  r.time_needed, r.urgency, r.details, r.requester_id, r.reward_rub, r.reward_payment_status,
+                  r.time_needed, r.urgency, r.details, r.requester_id, r.reward_rub, r.reward_test_rub, r.reward_payment_status,
                   requester.name requester_name, requester.username requester_username
            FROM request_candidates rc
            JOIN requests r ON r.id = rc.request_id
@@ -222,12 +232,12 @@ def offer_helper(request_id: int, helper_id: int, replace_offer_token: str | Non
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
-        if lock:
-            db.execute("SELECT user_id FROM users WHERE user_id=? FOR UPDATE", (helper_id,)).fetchone()
         request = db.execute("SELECT * FROM requests WHERE id = ?" + lock, (request_id,)).fetchone()
-        available = db.execute("SELECT 1 FROM helper_queue q JOIN users u ON u.user_id=q.user_id WHERE q.user_id=? AND u.is_blocked=0" + lock, (helper_id,)).fetchone()
+        if lock:
+            db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (helper_id,)).fetchone()
+        available = db.execute("SELECT 1 FROM helper_queue q JOIN users u ON u.user_id=q.user_id WHERE q.user_id=? AND u.is_blocked=0", (helper_id,)).fetchone()
         busy = db.execute(
-            "SELECT 1 FROM requests WHERE helper_id = ? AND status = ?" + lock,
+            "SELECT 1 FROM requests WHERE helper_id = ? AND status = ?",
             (helper_id, STATUS_IN_PROGRESS),
         ).fetchone()
         categories = get_helper_categories(helper_id)
@@ -274,9 +284,9 @@ def withdraw_helper_offer(request_id: int, requester_id: int, helper_id: int, of
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
-        if lock:
-            db.execute("SELECT user_id FROM users WHERE user_id=? FOR UPDATE", (helper_id,)).fetchone()
         request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
+        if lock:
+            db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (helper_id,)).fetchone()
         offer = db.execute(
             "SELECT * FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='offered'" + lock,
             (request_id, helper_id),
@@ -298,9 +308,9 @@ def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool, offer
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
-        if lock:
-            db.execute("SELECT user_id FROM users WHERE user_id=? FOR UPDATE", (helper_id,)).fetchone()
         request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
+        if lock:
+            db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (helper_id,)).fetchone()
         offer = db.execute(
             "SELECT * FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='offered'" + lock,
             (request_id, helper_id),
@@ -351,11 +361,11 @@ def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool, offer
             (helper_id, request_id),
         )
         get_or_create_chat_for_request(request_id)
-        db.execute("COMMIT")
         db.execute(
             "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
             (request_id, helper_id, "helper_accepted", "Помощник подтвердил участие. Заявка в работе."),
         )
+        db.execute("COMMIT")
         return True
     except Exception:
         db.execute("ROLLBACK")
@@ -363,13 +373,8 @@ def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool, offer
 
 
 def find_best_open_request_for(helper_id: int):
-    rows = db.execute(
-        "SELECT * FROM requests WHERE status = ? AND requester_id != ? ORDER BY id ASC LIMIT 50",
-        (STATUS_OPEN, helper_id),
-    ).fetchall()
-    if not rows:
-        return None
-    return max(rows, key=lambda row: match_score(row, helper_id))
+    rows=smart_requests_for_helper(helper_id,limit=1)
+    return rows[0]["request"] if rows else None
 
 
 def find_best_queued_helper(request):
@@ -392,8 +397,9 @@ def try_assign_helper(request_id: int, helper_id: int) -> bool:
     try:
         db.execute("BEGIN IMMEDIATE")
         if getattr(db, "is_postgres", False):
+            db.execute("SELECT id FROM requests WHERE id=? FOR UPDATE",(request_id,)).fetchone()
             # Serialize assignments for one helper across distinct requests.
-            if not db.execute("SELECT user_id FROM users WHERE user_id=? FOR UPDATE", (helper_id,)).fetchone():
+            if not db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (helper_id,)).fetchone():
                 db.execute("ROLLBACK")
                 return False
         cur = db.execute(
@@ -408,11 +414,11 @@ def try_assign_helper(request_id: int, helper_id: int) -> bool:
         )
         if cur.rowcount == 1:
             remove_from_queue(helper_id)
-            db.execute("COMMIT")
             db.execute(
                 "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
                 (request_id, helper_id, "helper_assigned", "Помощник назначен. Заявка в работе."),
             )
+            db.execute("COMMIT")
             return True
         db.execute("ROLLBACK")
         return False
@@ -422,14 +428,14 @@ def try_assign_helper(request_id: int, helper_id: int) -> bool:
 
 
 def request_reward_note(request) -> str:
-    amount = int(request["reward_rub"] or 0)
-    if not amount:
-        return ""
-    if request["reward_payment_status"] == "released":
-        return f"{amount} ₽ зачислено помощнику в кошелёк H-Point."
-    if request["reward_payment_status"] == "paid":
-        return f"{amount} ₽ зарезервировано в кошельке H-Point. Выплата — после помощи и подтверждения автора."
-    return f"{amount} ₽ через кошелёк H-Point после помощи. Сумма пока не зарезервирована: перед началом автор должен создать резерв."
+    amount=int(request["reward_rub"] or 0)
+    if not amount:return "Бесплатная помощь, расчёт в H-Points."
+    test=int(request["reward_test_rub"] or 0) if "reward_test_rub" in request.keys() else 0
+    fee,net=workflow.split_reward(amount)
+    label=f"{amount} тестовых ₽, помощнику {net} после комиссии {fee} (15%)" if test==amount else f"{amount} ₽"
+    if request["reward_payment_status"]=="released":return f"Помощник получил {net if test==amount else amount} {'тестовых ' if test==amount else ''}₽ в кошелёк."
+    if request["reward_payment_status"]=="paid":return label+" в резерве. Выплата после подтверждения автором."
+    return f"{amount} тестовых ₽ за помощь. Создайте резерв в течение 5 минут. Комиссия проекта — 15%."
 
 
 def reserve_request_reward(request_id: int, requester_id: int, expected_amount: int) -> bool:
@@ -437,9 +443,9 @@ def reserve_request_reward(request_id: int, requester_id: int, expected_amount: 
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
+        request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
         if lock:
             db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (requester_id,)).fetchone()
-        request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
         if not request or request["requester_id"] != requester_id or request["status"] != STATUS_OPEN:
             raise ValueError("request unavailable")
         amount = int(request["reward_rub"] or 0)
@@ -454,12 +460,14 @@ def reserve_request_reward(request_id: int, requester_id: int, expected_amount: 
         invoices = db.execute("SELECT metadata FROM billing_invoices WHERE user_id=? AND item_type='request_reward' AND status='pending' AND provider_payment_id IS NOT NULL", (requester_id,)).fetchall()
         if any(json.loads(row["metadata"] or "{}").get("request_id") == request_id for row in invoices):
             raise ValueError("external payment pending")
-        balance = db.execute("SELECT COALESCE(SUM(amount_rub),0) amount FROM wallet_transactions WHERE user_id=?", (requester_id,)).fetchone()["amount"]
+        if request["reserve_deadline_at"] and request["reserve_deadline_at"]<=datetime.now(timezone.utc).isoformat():raise ValueError("reserve deadline expired")
+        balance = db.execute("SELECT COALESCE(SUM(test_amount_rub),0) amount FROM wallet_transactions WHERE user_id=?", (requester_id,)).fetchone()["amount"]
         if int(balance or 0) < amount:
             raise ValueError("insufficient wallet")
-        if not wallet_add_entry(requester_id, -amount, "reward_reserve", "Вознаграждение зарезервировано до подтверждения помощи автором", f"request:{request_id}:reserve", request_id):
+        if not wallet_add_entry(requester_id, -amount, "reward_reserve", "Тестовое вознаграждение зарезервировано до подтверждения помощи автором", f"request:{request_id}:reserve", request_id, test_amount_rub=-amount):
             raise ValueError("reserve already recorded")
-        db.execute("UPDATE requests SET reward_payment_status='paid' WHERE id=?", (request_id,))
+        reserve=db.execute("SELECT test_amount_rub FROM wallet_transactions WHERE reference=?",(f"request:{request_id}:reserve",)).fetchone()
+        db.execute("UPDATE requests SET reward_payment_status='paid',reward_test_rub=? WHERE id=?", (-int(reserve["test_amount_rub"]),request_id))
         db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)", (request_id, requester_id, "reward_reserved", f"В кошельке зарезервировано {amount} ₽. Выплата — после помощи и подтверждения автора."))
         db.execute("COMMIT")
         return True
@@ -500,7 +508,7 @@ def complete_request(request_id: int, helper_id: int, confirmed_by: int | None =
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
         req = db.execute("SELECT * FROM requests WHERE id = ?" + lock, (request_id,)).fetchone()
-        if req is None or req["status"] != STATUS_IN_PROGRESS or req["helper_id"] != helper_id or confirmed_by != req["requester_id"]:
+        if req is None or req["status"] != STATUS_IN_PROGRESS or req["helper_id"] != helper_id or confirmed_by != req["requester_id"] or req["dispute_status"]=="open":
             db.execute("ROLLBACK")
             return False
         paid_request = int(req["reward_rub"] or 0) > 0
@@ -511,27 +519,35 @@ def complete_request(request_id: int, helper_id: int, confirmed_by: int | None =
         # with a RUB reward is settled exclusively through the wallet ledger.
         # Loading and checking point balances for such requests used to make a
         # RUB job fail or alter HP despite the advertised payment method.
+        settle_hp = False
         if not paid_request:
             user_rows = db.execute(
-                "SELECT user_id,balance FROM users WHERE user_id IN (?,?) ORDER BY user_id" + lock,
+                "SELECT user_id,balance FROM users WHERE user_id IN (?,?) ORDER BY user_id" + (" FOR NO KEY UPDATE" if lock else ""),
                 (req["requester_id"], helper_id),
             ).fetchall()
             balances = {row["user_id"]: row["balance"] for row in user_rows}
             requester_balance = balances.get(req["requester_id"])
-            if requester_balance is None or helper_id not in balances or requester_balance < REQUEST_COST:
+            settle_hp=reliability.pair_reward_available(db,req["requester_id"],helper_id)
+            if requester_balance is None or helper_id not in balances or (settle_hp and requester_balance < REQUEST_COST):
                 db.execute("ROLLBACK")
                 return False
-        db.execute("UPDATE requests SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?", (STATUS_DONE, request_id))
-        if not paid_request:
+        db.execute("UPDATE requests SET status=?,completed_at=?,hp_settled=? WHERE id=?",(STATUS_DONE,datetime.now(timezone.utc).isoformat(),int(settle_hp),request_id))
+        if settle_hp:
             db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (REQUEST_COST, req["requester_id"]))
             db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (HELPER_REWARD, helper_id))
         if req["reward_payment_status"] == "paid" and int(req["reward_rub"] or 0) > 0:
             amount = int(req["reward_rub"])
-            wallet_add_entry(helper_id, amount, "reward_earned", "Вознаграждение за завершённую заявку", f"request:{request_id}:earned", request_id)
+            if int(req["reward_test_rub"] or 0)==amount:
+                fee,net=workflow.record_commission(db,request_id,amount)
+                wallet_add_entry(helper_id, net, "reward_earned", "Тестовое вознаграждение за помощь после комиссии 15%", f"request:{request_id}:earned", request_id, test_amount_rub=net)
+                db.execute("UPDATE requests SET commission_rub=?,helper_reward_rub=? WHERE id=?",(fee,net,request_id))
+            else:
+                # Preserve obligations for any historical real reserves.
+                wallet_add_entry(helper_id, amount, "reward_earned", "Вознаграждение за завершённую заявку", f"request:{request_id}:earned", request_id, test_amount_rub=int(req["reward_test_rub"] or 0))
             db.execute("UPDATE requests SET reward_payment_status='released' WHERE id=?", (request_id,))
         db.execute(
             "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
-            (request_id, confirmed_by, "completed", "Автор подтвердил помощь и выплату из резерва. Можно оставить отзыв." if paid_request else "Автор подтвердил выполнение помощи. Можно оставить отзыв."),
+            (request_id, confirmed_by, "completed", "Автор подтвердил помощь и выплату из резерва. Можно оставить отзыв." if paid_request else ("Автор подтвердил выполнение помощи. Можно оставить отзыв." if settle_hp else "Автор подтвердил помощь. За повторную помощь между этой парой в течение 24 часов HP не списываются и не начисляются.")),
         )
         db.execute("COMMIT")
         return True
@@ -587,37 +603,17 @@ def set_review(request_id: int, user_id: int, review: str, side: str) -> bool:
 
 
 def cancel_request(request_id: int, user_id: int, reason: str = "") -> bool:
-    reason = str(reason).strip()[:300] or "Отменено автором заявки"
+    reason=str(reason).strip()[:300] or "Отменено автором заявки"
+    db.execute("BEGIN IMMEDIATE")
     try:
-        db.execute("BEGIN IMMEDIATE")
-        request = db.execute("SELECT requester_id,reward_rub,reward_payment_status FROM requests WHERE id=?", (request_id,)).fetchone()
-        if not request or request["requester_id"] != user_id or request["reward_payment_status"] not in ("none", "paid", "wallet_refunded"):
-            db.execute("ROLLBACK")
-            return False
-        cur = db.execute(
-            "UPDATE requests SET status=?,cancel_reason=?,cancelled_at=CURRENT_TIMESTAMP WHERE id=? AND requester_id=? AND status=?",
-            (STATUS_CANCELLED, reason, request_id, user_id, STATUS_OPEN),
-        )
-        if cur.rowcount != 1:
-            db.execute("ROLLBACK")
-            return False
-        db.execute(
-            "UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND status IN ('pending','applied','offered')",
-            (request_id,),
-        )
-        if request["reward_payment_status"] == "paid" and int(request["reward_rub"] or 0) > 0:
-            amount = int(request["reward_rub"])
-            wallet_add_entry(user_id, amount, "reward_refund", "Вознаграждение возвращено в кошелёк после отмены заявки", f"request:{request_id}:cancel-refund", request_id)
-            db.execute("UPDATE requests SET reward_payment_status='wallet_refunded' WHERE id=?", (request_id,))
-        db.execute(
-            "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
-            (request_id, user_id, "cancelled", f"Автор отменил заявку. Причина: {reason}"),
-        )
-        db.execute("COMMIT")
-        return True
+        lock=" FOR UPDATE" if getattr(db,"is_postgres",False) else ""
+        row=db.execute("SELECT * FROM requests WHERE id=?"+lock,(request_id,)).fetchone()
+        if not row or user_id not in (row["requester_id"],row["helper_id"]) or row["status"] not in (STATUS_OPEN,STATUS_IN_PROGRESS):
+            db.execute("ROLLBACK");return False
+        reliability.close_locked_request(db,row,user_id,reason,"cancelled",wallet_add_entry)
+        db.execute("COMMIT");return True
     except Exception:
-        db.execute("ROLLBACK")
-        raise
+        db.execute("ROLLBACK");raise
 
 
 # --- Monetization / billing business logic ---
@@ -742,6 +738,7 @@ def smart_match(request_id, limit=20, query=""):
         if cats and req["category"] not in cats and u["user_id"] not in applied_ids: continue
         category_bonus=100 if (not cats or req["category"] in cats) else 0
         distance=haversine_km(req["lat"],req["lon"],u["lat"],u["lon"])
+        if not matches_helper_preferences(req,u,distance):continue
         stats=db.execute("""SELECT AVG(requester_rating) avg,COUNT(*) n FROM requests
                             WHERE helper_id=? AND status=? AND requester_rating IS NOT NULL""",(u["user_id"],STATUS_DONE)).fetchone()
         rating=float(stats["avg"]) if stats["avg"] is not None else 0.0
@@ -781,12 +778,19 @@ def get_candidates_for_request(request_id, limit=20):
     return smart_match(request_id, limit=limit)
 
 def smart_requests_for_helper(helper_id, limit=20):
-    rows=db.execute("SELECT * FROM requests WHERE status=? AND requester_id!=? ORDER BY created_at DESC LIMIT 100",(STATUS_OPEN,helper_id)).fetchall()
+    expire_open_requests()
+    helper=get_user(helper_id)
+    if not helper or helper["is_blocked"]:return []
+    categories=get_helper_categories(helper_id)
+    sql="SELECT * FROM requests WHERE status=? AND requester_id!=? AND (reward_rub=0 OR reward_payment_status='paid')"
+    args=[STATUS_OPEN,helper_id]
+    if categories:
+        sql+=" AND category IN ("+",".join("?" for _ in categories)+")";args+=categories
     result=[]
-    for r in rows:
-        distance=haversine_km(r["lat"],r["lon"],get_user(helper_id)["lat"],get_user(helper_id)["lon"])
-        score=match_score(r,helper_id)
-        if distance<999: score += max(0,30-distance*3)
-        result.append((score,r,distance))
-    result.sort(key=lambda x:x[0],reverse=True)
-    return [{"request":dict(r),"score":round(score,1),"distance_km":round(d,2) if d<999 else None} for score,r,d in result[:limit]]
+    for row in db.execute(sql,args).fetchall():
+        distance=haversine_km(row["lat"],row["lon"],helper["lat"],helper["lon"])
+        if not matches_helper_preferences(row,helper,distance):continue
+        score=match_score(row,helper_id)+(max(0,30-distance*3) if distance<999 else 0)
+        result.append((score,row,distance))
+    result.sort(key=lambda item:(item[0],item[1]["created_at"]),reverse=True)
+    return [{"request":dict(row),"score":round(score,1),"distance_km":round(distance,2) if distance<999 else None} for score,row,distance in result[:max(1,min(int(limit),100))]]

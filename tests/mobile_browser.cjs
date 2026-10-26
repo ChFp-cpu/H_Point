@@ -94,7 +94,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   assert.equal((await context.request.get(base+'/api/help-achievements').then(r=>r.json())).awarded_hp,beforeGoals.awarded_hp,'Looking at goals does not grant rewards');
   await helperPage.goto(base+'/#/help');await helperPage.locator('.helpNavigation').waitFor();
   await helperPage.evaluate(()=>helper());
-  assert.match(await helperPage.locator('#toast').innerText(),/Сначала завершите текущую помощь/);
+  assert.match(await helperPage.locator('#toast').innerText(),/Дождитесь, пока автор завершит текущую заявку/);
   assert.equal(await helperPage.locator('#modal').isVisible(),false,'An API rejection is not misreported as a GPS failure');
   await helperPage.evaluate(()=>{window.loadBigMap=async()=>{throw Error('test map failure')}});
   await helperPage.evaluate(()=>mapLocateMe());

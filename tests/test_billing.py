@@ -12,6 +12,13 @@ class Billing(unittest.TestCase):
   rid=self.request()
   iid,payload,amount=create_pending_invoice(1,"boost",{"request_id":rid})
   row=database.get_invoice(iid);self.assertEqual(row["currency"],"RUB");self.assertEqual(row["amount_rub"],49);self.assertTrue(payload.startswith("hpoint:v2:"))
+ def test_hidden_real_funds_cannot_pay_for_hpoint_plus(self):
+  database.wallet_add_entry(1,1000,"payment","Historical real credit","hidden-real-credit",test_amount_rub=0)
+  with self.assertRaisesRegex(ValueError,"insufficient_wallet"):
+   billing.purchase_with_wallet(1,"pro",{},"test-only-purchase")
+  self.assertIsNone(database.get_user(1)["pro_until"])
+  self.assertEqual(database.wallet_summary(1)["balance_rub"],1000)
+  self.assertEqual(database.wallet_summary(1)["test_balance_rub"],0)
  def test_catalog(self):
   from hpoint.config import MONETIZATION_ITEMS
   self.assertEqual(set(MONETIZATION_ITEMS),{"boost","pro"})
@@ -35,7 +42,7 @@ class Billing(unittest.TestCase):
    for purchase in [lambda:create_pending_invoice(1,item),lambda:billing.purchase_with_points(1,item,{},"hp-"+item),lambda:billing.purchase_with_wallet(1,item,{},"rub-"+item)]:
     with self.assertRaises(ValueError):purchase()
   self.assertEqual(database.get_user(1)["balance"],1000)
-  self.assertEqual(database.wallet_summary(1)["balance_rub"],2000)
+  self.assertEqual(database.wallet_summary(1)["test_balance_rub"],2000)
   self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM billing_invoices").fetchone()["n"],0)
  def test_legacy_paid_invoices_still_fulfill_at_original_amounts(self):
   from hpoint.config import LEGACY_MONETIZATION_ITEMS
@@ -74,7 +81,7 @@ class Billing(unittest.TestCase):
   invoice,_=billing.purchase_with_wallet(1,"pro",{},"pro-wallet")
   until=datetime.fromisoformat(database.get_user(1)["pro_until"])
   self.assertEqual(database.get_invoice(invoice)["amount_rub"],149)
-  self.assertEqual(database.wallet_summary(1)["balance_rub"],351)
+  self.assertEqual(database.wallet_summary(1)["test_balance_rub"],351)
   self.assertEqual(services.match_score(database.get_request(rid),2),before_score+10)
   self.assertEqual(next(row for row in services.smart_match(helper_request) if row["user_id"]==1)["score"],before_candidate+8)
   billing.purchase_with_wallet(1,"pro",{},"pro-renew")

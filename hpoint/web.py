@@ -6,7 +6,7 @@ from email.message import EmailMessage
 import asyncio, json, logging, os, secrets, hashlib, hmac, datetime as dt, re, smtplib, ssl, base64, binascii, threading, time
 from pathlib import Path
 from html import escape
-from . import database
+from . import database, services, workflow, commercial, media
 from . import games, help_achievements
 from .features import GAMES_ENABLED, GAMES_PAUSED_MESSAGE
 from .database import db, get_user, get_user_by_email, create_web_user, get_request, get_user_stats, get_active_own_request, get_history, get_billing_history, is_user_blocked, admin_summary, set_user_blocked
@@ -215,7 +215,7 @@ def new_sess(uid, device_id=None):
     t=secrets.token_urlsafe(32)
     e=(now()+dt.timedelta(seconds=SESSION_TTL)).isoformat()
     db.execute("DELETE FROM sessions WHERE expires_at<=?", (now().isoformat(),))
-    db.execute("INSERT INTO sessions(token,user_id,expires_at,device_id) VALUES(?,?,?,?)",(session_token_hash(t),uid,e,device_id))
+    db.execute("INSERT INTO sessions(token,user_id,expires_at,device_id,auth_method) VALUES(?,?,?,?,'email')",(session_token_hash(t),uid,e,device_id))
     database.touch_user_activity(uid)
     return t
 
@@ -254,7 +254,7 @@ def email_verification_user(h):
 
 def email_challenge(h, user, pending=True):
     if not email_delivery_configured():
-        return reply(h, {"ok": False, "error": "Отправка писем временно недоступна. Попробуйте позже или войдите через Telegram."}, 503)
+        return reply(h, {"ok": False, "error": "Отправка писем временно недоступна. Попробуйте позже или повторите попытку позже или обратитесь в поддержку."}, 503)
     uid = user["user_id"]
     if not database.reserve_auth_attempts(("email_resend", str(uid), 3)):
         return reply(h, {"ok": False, "error": "Слишком много кодов. Повторите через 15 минут."}, 429)
@@ -262,7 +262,7 @@ def email_challenge(h, user, pending=True):
     if not send_email_verification_code(user["email"], code):
         db.execute("DELETE FROM email_verification_codes WHERE user_id=? AND code_hash=?",
                    (uid, hashlib.sha256(code.encode()).hexdigest()))
-        return reply(h, {"ok": False, "error": "Не удалось отправить код. Вход не выполнен. Повторите попытку или войдите через Telegram."}, 503)
+        return reply(h, {"ok": False, "error": "Не удалось отправить код. Вход не выполнен. Повторите попытку или повторите попытку позже или обратитесь в поддержку."}, 503)
     headers = None
     if pending:
         previous = cookie_value(h, "hpoint_verification")
@@ -365,12 +365,12 @@ def auth(h):
     return u
 
 def account_is_verified(u):
-    return bool(u["tg_user_id"] or u["email_verified"])
+    return bool(u["email"] and u["email_verified"])
 
 def verified_community_account(h, u):
     if account_is_verified(u):
         return True
-    reply(h, {"ok": False, "error": "Подтвердите email кодом из письма или привяжите Telegram, прежде чем пользоваться заявками."}, 403)
+    reply(h, {"ok": False, "error": "Подтвердите email кодом из письма, прежде чем пользоваться заявками."}, 403)
     return False
 
 def admin_auth(h):
@@ -406,10 +406,10 @@ def user_payload(u):
     telegram = None
     if u["tg_user_id"]:
         telegram = {"name": u["name"], "username": u["username"] or "", "avatar_url": None}
-    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"role":u["role"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"email_verified":bool(u["email_verified"]),"account_verified":account_is_verified(u),"email_delivery_configured":email_delivery_configured(),"sms_delivery_configured":sms_delivery_configured(),"full_name":u["full_name"] or "","birth_date":u["birth_date"] or "","phone":u["phone"] or "","phone_verified":bool(u["phone_verified"]),"contacts_verified":contacts_ready,"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram":telegram,"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code_available":code_valid,"pro_until":u["pro_until"],"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats,"helper_categories":get_helper_categories(u["user_id"]),"helper_availability":u["helper_availability"] or "","helper_ready":is_in_queue(u["user_id"])}
+    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"role":u["role"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"email_verified":bool(u["email_verified"]),"account_verified":account_is_verified(u),"email_delivery_configured":email_delivery_configured(),"sms_delivery_configured":sms_delivery_configured(),"full_name":u["full_name"] or "","birth_date":u["birth_date"] or "","phone":u["phone"] or "","phone_verified":bool(u["phone_verified"]),"contacts_verified":contacts_ready,"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram":telegram,"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code_available":code_valid,"pro_until":u["pro_until"],"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats,"helper_categories":get_helper_categories(u["user_id"]),"saved_location":u["saved_location"] or "","helper_radius_km":u["helper_radius_km"],"helper_available_from":u["helper_available_from"],"helper_available_until":u["helper_available_until"],"helper_availability":u["helper_availability"] or "","helper_ready":is_in_queue(u["user_id"])}
 
 def request_payload(r):
-    d=dict(r); d["category_name"]=CATEGORIES.get(r["category"],"Другое"); d["status_title"]=STATUS_TITLES.get(r["status"],r["status"]); return d
+    d=dict(r); d["requester_name"]=(get_user(r["requester_id"]) or {"name":"Участник"})["name"]; d["photos"]=media.request_photo_metadata(db,r["id"]); d["category_name"]=CATEGORIES.get(r["category"],"Другое"); d["status_title"]=STATUS_TITLES.get(r["status"],r["status"]); return d
 
 def public_request_payload(r):
     """Discovery and map records never disclose address details or exact coordinates."""
@@ -421,8 +421,11 @@ def public_request_payload(r):
             "place": "Район уточняется после назначения", "lat": None, "lon": None, "views": r["views"] if "views" in r.keys() else 0,
             "reward_rub": int(r["reward_rub"] or 0) if "reward_rub" in r.keys() else 0,
             "reward_payment_status": r["reward_payment_status"] if "reward_payment_status" in r.keys() else "none",
+            "reward_test_rub": int(r["reward_test_rub"] or 0), "scheduled_at": r["scheduled_at"],
             # Used only to open the already access-controlled public profile;
             # it is never rendered as an identifier or paired with contacts.
+            "requester_name":(get_user(r["requester_id"]) or {"name":"Участник"})["name"],
+            "photos":media.request_photo_metadata(db,r["id"]),
             "author_profile_id": int(r["requester_id"])}
 
 def record_request_view(request_id, viewer_id):
@@ -758,9 +761,13 @@ function adminDate(value,withTime=true){if(!value)return 'нет данных';l
 function adminMetric(value,label){return '<div class="adminMetric"><b>'+Number(value||0).toLocaleString('ru-RU')+'</b><span>'+esc(label)+'</span></div>'}
 function adminChart(series,key,label){let values=series.map(function(point){return Number(point[key]||0)}),max=Math.max(1,...values);return '<div class="adminCard"><h3>'+esc(label)+'</h3><div class="adminChart">'+series.map(function(point){let value=Number(point[key]||0),height=Math.max(4,Math.round(value/max*100));return '<div class="adminBar" title="'+esc(point.date)+': '+value+'"><i style="height:'+height+'%"></i><b>'+value+'</b></div>'}).join('')+'</div><div class="adminChartLabels"><span>'+esc(series[0]?.date?.slice(5)||'')+'</span><span>'+esc(series.at(-1)?.date?.slice(5)||'')+'</span></div></div>'}
 function adminUserRow(user){let states=(user.telegram_linked?'<span class="badge ok">Telegram</span>':'')+(user.email_verified?'<span class="badge ok">email</span>':'')+(user.blocked?'<span class="badge warn">заблокирован</span>':'')+(user.role==='admin'?'<span class="badge">админ</span>':'');let safety=user.role==='admin'?'':user.blocked?'<button class="btn light" onclick="adminSetBlock('+Number(user.id)+',false)">Разблокировать</button>':'<button class="btn danger" onclick="adminSetBlock('+Number(user.id)+',true)">Ограничить</button>';return '<div class="adminUser"><div class="avatar">'+esc((user.name||'?')[0])+'</div><div class="adminUserCopy"><b>'+esc(user.name)+'</b><span>'+esc(user.email||'Email не указан')+' · '+esc(user.city||'Город не указан')+'</span><span>Последняя активность: '+esc(adminDate(user.last_seen_at))+' · заявок: '+Number(user.request_count||0)+' · активных: '+Number(user.active_request_count||0)+'</span><div class="adminState">'+states+'</div></div><div class="adminUserActions">'+safety+'</div></div>'}
-function adminTicketRow(ticket){return '<article class="adminTicket"><h4>#'+Number(ticket.id)+' · '+esc(ticket.subject)+'</h4><small>'+esc(ticket.user_name)+' · '+esc(ticket.user_email||'без email')+' · '+esc(adminDate(ticket.created_at))+'</small><p>'+esc(ticket.message)+'</p>'+(ticket.admin_reply?'<p><b>Ваш ответ:</b> '+esc(ticket.admin_reply)+'</p>':'')+'<textarea id="adminReply'+Number(ticket.id)+'" class="input textarea" maxlength="2000" placeholder="Ответ пользователю">'+esc(ticket.admin_reply||'')+'</textarea><button class="btn grad" onclick="replySupport('+Number(ticket.id)+',true)">Сохранить ответ</button></article>'}
+function openRequestDispute(id){$('modal').style.display='flex';$('modalbody').innerHTML='<h2>Проблема по заявке №'+Number(id)+'</h2><p>Обращение приостановит завершение и выплату до решения поддержки. Чат останется доступен.</p><textarea id="disputeMessage" class="input textarea" maxlength="2000" placeholder="Опишите проблему"></textarea><button class="btn grad" id="disputeSubmit" onclick="submitRequestDispute('+Number(id)+')">Отправить обращение</button>'}
+async function submitRequestDispute(id){let button=$('disputeSubmit');button.disabled=true;try{await api('/api/requests/dispute',{method:'POST',body:JSON.stringify({request_id:id,message:$('disputeMessage').value})});closeModal();toast('Обращение создано. Завершение и выплата приостановлены.');await window.hpointWorkspace?.refresh()}catch(error){toast(error.message)}finally{button.disabled=false}}
+async function decideRequestDispute(id,ticket,cancel){let note=$('adminReply'+ticket).value.trim();if(!note){toast('Укажите решение поддержки');return}if(!confirm(cancel?'Отменить заявку и вернуть резерв автору?':'Разрешить автору подтвердить помощь и выплату?'))return;try{await api(cancel?'/api/admin/requests/cancel':'/api/admin/requests/dispute/resolve',{method:'POST',body:JSON.stringify({request_id:id,reason:note,note})});await openAdminSupport()}catch(error){toast(error.message)}}
+function adminFunnel(data){let f=data.funnel||{};return '<section class="adminCard"><h3>Путь заявки · '+Number(f.days||14)+' дней</h3><div class="adminMetrics">'+adminMetric(f.requests,'Создано заявок')+adminMetric(f.acceptance_percent,'Приняты помощником, %')+adminMetric(f.completion_percent,'Завершены, %')+adminMetric(f.repeat_requester_percent,'Авторы повторных заявок, %')+adminMetric((data.platform_income||{}).earned_test_rub,'Ваш доход · тест. ₽')+'</div><p>Среднее время до согласия помощника: '+(f.average_acceptance_minutes===null?'пока нет данных':Number(f.average_acceptance_minutes||0)+' мин')+'. Показатели по заявкам, созданным за выбранный период.</p></section>'}
+function adminTicketRow(ticket){return '<article class="adminTicket"><h4>#'+Number(ticket.id)+' · '+esc(ticket.subject)+'</h4><small>'+esc(ticket.user_name)+' · '+esc(ticket.user_email||'без email')+' · '+esc(adminDate(ticket.created_at))+'</small><p>'+esc(ticket.message)+'</p>'+(ticket.admin_reply?'<p><b>Ваш ответ:</b> '+esc(ticket.admin_reply)+'</p>':'')+'<textarea id="adminReply'+Number(ticket.id)+'" class="input textarea" maxlength="2000" placeholder="Ответ пользователю">'+esc(ticket.admin_reply||'')+'</textarea><button class="btn grad" onclick="replySupport('+Number(ticket.id)+',true)">Сохранить ответ</button>'+(ticket.request_id&&['open','answered'].includes(ticket.status)?'<div class="workspaceActions"><button class="btn light" onclick="decideRequestDispute('+Number(ticket.request_id)+','+Number(ticket.id)+',false)">Разрешить завершение</button><button class="btn danger" onclick="decideRequestDispute('+Number(ticket.request_id)+','+Number(ticket.id)+',true)">Отменить и вернуть резерв</button></div>':'')+'</article>'}
 function adminActivityRow(item){let action=item.kind==='request'&&['open','in_progress'].includes(item.status)?'<button class="btn light" onclick="adminCancelRequest('+Number(item.target_id)+')">Закрыть</button>':'';return '<div class="adminActivityItem"><i class="adminActivityDot"></i><div class="grow"><b>'+esc(item.title)+'</b><span>'+esc(item.meta)+' · '+esc(adminDate(item.at))+'</span></div>'+action+'</div>'}
-function renderAdminDashboard(data){let summary=data.summary||{},series=data.series||[],users=data.users||[],tickets=data.tickets||[],activities=data.activities||[];$('modal').style.display='flex';$('modalbody').className='box adminWorkspace';$('modalbody').innerHTML='<div class="adminTop"><div><p class="adminKicker">H·POINT · ADMIN</p><h2>Управление сообществом</h2><p class="adminSub">Статистика, обращения и доступ пользователей. Обновлено: '+esc(adminDate(new Date().toISOString()))+'</p></div><button class="btn light adminRefresh" onclick="openAdminSupport()">Обновить</button></div><div class="adminMetrics">'+adminMetric(summary.users,'Всего пользователей')+adminMetric(summary.active_24h,'Активны за 24 часа')+adminMetric(summary.active_7d,'Активны за 7 дней')+adminMetric((summary.requests||{}).open,'Открытые заявки')+adminMetric((summary.support||{}).open,'Ожидают ответа')+'</div><div class="adminGrid"><section class="adminCard"><h3>Динамика за 14 дней</h3><div class="adminGrid">'+adminChart(series,'users','Регистрации')+adminChart(series,'requests','Новые заявки')+'</div></section><section class="adminCard"><h3>Последняя активность</h3><div class="adminActivity">'+(activities.map(adminActivityRow).join('')||'<p class="adminEmpty">Событий пока нет.</p>')+'</div></section><section class="adminCard"><h3>Пользователи</h3><div class="adminSearch"><input id="adminUserSearch" class="input" maxlength="80" placeholder="Имя или email"><button class="btn light" onclick="adminSearchUsers()">Найти</button></div><div class="adminTable">'+(users.map(adminUserRow).join('')||'<p class="adminEmpty">Пользователи не найдены.</p>')+'</div></section><section class="adminCard"><h3>Обращения в поддержку</h3><div class="adminTickets">'+(tickets.map(adminTicketRow).join('')||'<p class="adminEmpty">Обращений пока нет.</p>')+'</div></section></div>';}
+function renderAdminDashboard(data){let summary=data.summary||{},series=data.series||[],users=data.users||[],tickets=data.tickets||[],activities=data.activities||[];$('modal').style.display='flex';$('modalbody').className='box adminWorkspace';$('modalbody').innerHTML='<div class="adminTop"><div><p class="adminKicker">H·POINT · ADMIN</p><h2>Управление сообществом</h2><p class="adminSub">Статистика, обращения и доступ пользователей. Обновлено: '+esc(adminDate(new Date().toISOString()))+'</p></div><button class="btn light adminRefresh" onclick="openAdminSupport()">Обновить</button></div><div class="adminMetrics">'+adminMetric(summary.users,'Всего пользователей')+adminMetric(summary.active_24h,'Активны за 24 часа')+adminMetric(summary.active_7d,'Активны за 7 дней')+adminMetric((summary.requests||{}).open,'Открытые заявки')+adminMetric((summary.support||{}).open,'Ожидают ответа')+'</div>'+adminFunnel(data)+'<div class="adminGrid"><section class="adminCard"><h3>Динамика за 14 дней</h3><div class="adminGrid">'+adminChart(series,'users','Регистрации')+adminChart(series,'requests','Новые заявки')+'</div></section><section class="adminCard"><h3>Последняя активность</h3><div class="adminActivity">'+(activities.map(adminActivityRow).join('')||'<p class="adminEmpty">Событий пока нет.</p>')+'</div></section><section class="adminCard"><h3>Пользователи</h3><div class="adminSearch"><input id="adminUserSearch" class="input" maxlength="80" placeholder="Имя или email"><button class="btn light" onclick="adminSearchUsers()">Найти</button></div><div class="adminTable">'+(users.map(adminUserRow).join('')||'<p class="adminEmpty">Пользователи не найдены.</p>')+'</div></section><section class="adminCard"><h3>Обращения в поддержку</h3><div class="adminTickets">'+(tickets.map(adminTicketRow).join('')||'<p class="adminEmpty">Обращений пока нет.</p>')+'</div></section></div>';}
 function closeAdminPanel(){$('modalbody').className='box';closeModal()}
 async function openAdminSupport(query){try{let suffix=query?'?q='+encodeURIComponent(query):'';let data=await api('/api/admin/dashboard'+suffix);renderAdminDashboard(data)}catch(e){toast(e.message||'Не удалось открыть панель администратора')}}
 async function adminSearchUsers(){return openAdminSupport(($('adminUserSearch')?.value||'').trim())}
@@ -773,7 +780,7 @@ ADMIN_MODAL_FIXES=r'''
 const hpointBaseCloseModal=window.closeModal;
 window.closeModal=function(){let modal=$('modal'),shell=modal&&modal.firstElementChild;if(modal)modal.classList.remove('adminModal');if(shell)shell.className='box';let body=$('modalbody');if(body)body.className='';return hpointBaseCloseModal()}
 function closeAdminPanel(){closeModal()}
-function renderAdminDashboard(data){let summary=data.summary||{},series=data.series||[],users=data.users||[],tickets=data.tickets||[],activities=data.activities||[],modal=$('modal'),shell=modal.firstElementChild,body=$('modalbody');modal.classList.add('adminModal');shell.className='box adminShell';body.className='adminWorkspace';modal.style.display='flex';body.innerHTML='<div class="adminTop"><div><p class="adminKicker">H·POINT · ADMIN</p><h2>Управление сообществом</h2><p class="adminSub">Статистика, обращения и доступ пользователей. Обновлено: '+esc(adminDate(new Date().toISOString()))+'</p></div><button class="btn light adminRefresh" onclick="openAdminSupport()">Обновить</button></div><div class="adminMetrics">'+adminMetric(summary.users,'Всего пользователей')+adminMetric(summary.active_24h,'Активны за 24 часа')+adminMetric(summary.active_7d,'Активны за 7 дней')+adminMetric((summary.requests||{}).open,'Открытые заявки')+adminMetric((summary.support||{}).open,'Ожидают ответа')+'</div><div class="adminGrid"><section class="adminCard"><h3>Динамика за 14 дней</h3><div class="adminCharts">'+adminChart(series,'users','Регистрации')+adminChart(series,'requests','Новые заявки')+'</div></section><section class="adminCard"><h3>Последняя активность</h3><div class="adminActivity">'+(activities.map(adminActivityRow).join('')||'<p class="adminEmpty">Событий пока нет.</p>')+'</div></section><section class="adminCard"><h3>Пользователи</h3><div class="adminSearch"><input id="adminUserSearch" class="input" maxlength="80" placeholder="Имя или email"><button class="btn light" onclick="adminSearchUsers()">Найти</button></div><div class="adminTable">'+(users.map(adminUserRow).join('')||'<p class="adminEmpty">Пользователи не найдены.</p>')+'</div></section><section class="adminCard"><h3>Обращения в поддержку</h3><div class="adminTickets">'+(tickets.map(adminTicketRow).join('')||'<p class="adminEmpty">Обращений пока нет.</p>')+'</div></section></div>'}
+function renderAdminDashboard(data){let summary=data.summary||{},series=data.series||[],users=data.users||[],tickets=data.tickets||[],activities=data.activities||[],modal=$('modal'),shell=modal.firstElementChild,body=$('modalbody');modal.classList.add('adminModal');shell.className='box adminShell';body.className='adminWorkspace';modal.style.display='flex';body.innerHTML='<div class="adminTop"><div><p class="adminKicker">H·POINT · ADMIN</p><h2>Управление сообществом</h2><p class="adminSub">Статистика, обращения и доступ пользователей. Обновлено: '+esc(adminDate(new Date().toISOString()))+'</p></div><button class="btn light adminRefresh" onclick="openAdminSupport()">Обновить</button></div><div class="adminMetrics">'+adminMetric(summary.users,'Всего пользователей')+adminMetric(summary.active_24h,'Активны за 24 часа')+adminMetric(summary.active_7d,'Активны за 7 дней')+adminMetric((summary.requests||{}).open,'Открытые заявки')+adminMetric((summary.support||{}).open,'Ожидают ответа')+'</div>'+adminFunnel(data)+'<div class="adminGrid"><section class="adminCard"><h3>Динамика за 14 дней</h3><div class="adminCharts">'+adminChart(series,'users','Регистрации')+adminChart(series,'requests','Новые заявки')+'</div></section><section class="adminCard"><h3>Последняя активность</h3><div class="adminActivity">'+(activities.map(adminActivityRow).join('')||'<p class="adminEmpty">Событий пока нет.</p>')+'</div></section><section class="adminCard"><h3>Пользователи</h3><div class="adminSearch"><input id="adminUserSearch" class="input" maxlength="80" placeholder="Имя или email"><button class="btn light" onclick="adminSearchUsers()">Найти</button></div><div class="adminTable">'+(users.map(adminUserRow).join('')||'<p class="adminEmpty">Пользователи не найдены.</p>')+'</div></section><section class="adminCard"><h3>Обращения в поддержку</h3><div class="adminTickets">'+(tickets.map(adminTicketRow).join('')||'<p class="adminEmpty">Обращений пока нет.</p>')+'</div></section></div>'}
 '''
 
 CONTACT_VERIFICATION_UI=r'''
@@ -885,18 +892,19 @@ async function requestFindAddress(submitAfter){let address=(($('qp')||{}).value|
 async function createReq(){if(window.hpointRequestSubmitting)return;let note=$('rqerr');if(!$('qw').value.trim()||!$('qp').value.trim()){if(note)note.textContent='Укажите задачу и адрес.';return}window.hpointRequestSubmitting=true;let button=$('createRequestButton');if(button)button.disabled=true;try{let point=window.hpointRequestPoint;if(!point){await requestFindAddress(true)}else await sendReq(point.lat,point.lon)}finally{window.hpointRequestSubmitting=false;if(button&&button.isConnected)button.disabled=false}}
 async function helperByAddress(requestId){let field=$('helperAddress'),address=((field||{}).value||'').trim();if(!address){toast('Введите адрес или ориентир.');return}try{let point=await hpointGeocodeAddress(address);hpointPickerPoint('helperPicker',point);window.hpointHelperPoint=point;await joinHelper(point,requestId)}catch(error){toast(error.message||'Не удалось найти адрес.')}}
 function requestForm(){
-  window.hpointRequestPoint=null;window.hpointRequestStep=0;window.hpointRequestSubmitting=false;
+  window.hpointRequestPoint=window.hpointWorkspace?.state?.data?.user?.lat!=null?{lat:window.hpointWorkspace.state.data.user.lat,lon:window.hpointWorkspace.state.data.user.lon}:null;window.hpointRequestStep=0;window.hpointRequestSubmitting=false;
   $('modal').style.display='flex';
   $('modalbody').innerHTML='<div class="requestWizard"><h2>Нужна помощь</h2><p id="requestStepLabel" class="muted">Шаг 1 из 3 · Задача</p><div class="requestSteps" aria-hidden="true"><i class="active"></i><i></i><i></i></div><div class="form">'+
   '<section class="requestStep" data-request-step="0"><label>Что нужно сделать?<input id="qw" class="input" maxlength="160" placeholder="Например, настроить компьютер"></label><label>Направление<select id="qc" class="input"><option value="other">Другое</option><option value="carry">Перенос / переезд</option><option value="shopping">Покупки</option><option value="snow">Снег / уборка</option><option value="tools">Инструменты</option><option value="transport">Транспорт</option><option value="tech">Техника</option><option value="study">Учёба</option></select></label><label>Когда?<input id="qt" class="input" maxlength="120" placeholder="Сегодня после 18:00" value="По договорённости"></label><select id="qu" class="input" aria-label="Срочность"><option>🕊 Не срочно</option><option>⏳ В течение дня</option><option>🔥 Очень срочно</option></select></section>'+
-  '<section class="requestStep" data-request-step="1" hidden><label>Город, адрес или ориентир<input id="qp" class="input" maxlength="180" autocomplete="street-address" placeholder="Город, улица и дом"></label><button type="button" class="btn light" onclick="requestDeviceLocation(false)">◎ Определить моё местоположение</button><p class="muted">Точный адрес увидит помощник после согласия. Если GPS недоступен, достаточно адреса.</p><details id="requestMapDetails" class="workspaceFold"><summary>Указать точку на карте</summary><div id="requestPicker" class="map"></div><button type="button" class="btn light" onclick="requestFindAddress(false)">Найти адрес на карте</button></details></section>'+
-  '<section class="requestStep" data-request-step="2" hidden><label>Подробности<textarea id="qd" class="input textarea" maxlength="1000" placeholder="Что нужно знать помощнику? Необязательно"></textarea></label><details class="workspaceFold"><summary>Срок публикации и вознаграждение</summary><label>Срок: <b id="requestDuration">2 дня</b><input id="requestHours" type="range" min="1" max="168" value="48" oninput="this.previousElementSibling.textContent=this.value+&quot; ч.&quot;"></label><label>Вознаграждение: <b id="rewardValue">0 ₽</b><input id="rewardRub" type="range" min="0" max="10000" step="100" value="0" oninput="this.previousElementSibling.textContent=this.value+&quot; ₽&quot;"></label></details><p class="muted">По умолчанию помощь бесплатная, публикация на 2 дня. Для вознаграждения: сначала подбор, затем резерв в кошельке, выплата после помощи и подтверждения автора.</p></section>'+
+  '<section class="requestStep" data-request-step="1" hidden><label>Город, адрес или ориентир<input id="qp" class="input" maxlength="180" autocomplete="street-address" placeholder="Город, улица и дом"></label><p id="savedLocationHint" class="muted">Проверьте сохранённое место. Если вы переехали, измените адрес или точку на карте.</p><p class="muted">Точный адрес увидит помощник после согласия. Если GPS недоступен, достаточно адреса.</p><details id="requestMapDetails" class="workspaceFold"><summary>Указать точку на карте</summary><div id="requestPicker" class="map"></div><button type="button" class="btn light" onclick="requestFindAddress(false)">Найти адрес на карте</button></details></section>'+
+  '<section class="requestStep" data-request-step="2" hidden><label>Подробности<textarea id="qd" class="input textarea" maxlength="1000" placeholder="Что нужно знать помощнику? Необязательно"></textarea></label><details class="workspaceFold"><summary>Срок публикации и вознаграждение</summary><label>Срок: <b id="requestDuration">2 дня</b><input id="requestHours" type="range" min="1" max="168" value="48" oninput="this.previousElementSibling.textContent=this.value+&quot; ч.&quot;"></label><label>Вознаграждение: <b id="rewardValue">0 ₽</b><input id="rewardRub" type="range" min="0" max="10000" step="100" value="0" oninput="this.previousElementSibling.textContent=this.value+&quot; ₽&quot;"></label></details><label>Точная дата и время (необязательно)<input class="input" id="requestScheduledAt" type="datetime-local"></label><p class="muted">По умолчанию помощь бесплатная, публикация на 2 дня. Для тестового вознаграждения сразу создайте резерв. Без резерва за 5 минут помощь будет отменена. Комиссия проекта — 15%.</p></section>'+
   '<div id="rqerr" class="eventFormError" role="status" aria-live="polite"></div><div class="requestWizardActions"><button id="requestBack" type="button" class="btn light" onclick="requestWizardStep(-1)" hidden>Назад</button><button id="requestNext" type="button" class="btn grad" onclick="requestWizardStep(1)">Далее →</button><button id="createRequestButton" type="button" class="btn grad" onclick="createReq()" hidden>Опубликовать</button></div></div></div>';
+  $('qp').value=window.hpointWorkspace?.state?.data?.user?.saved_location||window.hpointWorkspace?.state?.data?.user?.city||'';
   $('qp').addEventListener('input',function(){window.hpointRequestPoint=null});
   $('requestMapDetails').addEventListener('toggle',function(){if(this.open&&!window.hpointLocationPickers?.requestPicker?.map?.container?.getElement?.()?.isConnected)locationPicker('requestPicker',function(point){window.hpointRequestPoint=point;$('rqerr').textContent='Точка выбрана.'})});
 }
 function requestWizardStep(delta){let step=window.hpointRequestStep||0,note=$('rqerr');if(delta>0&&step===0&&$('qw').value.trim().length<3){note.textContent='Опишите задачу: минимум 3 символа.';return}if(delta>0&&step===1&&$('qp').value.trim().length<2){note.textContent='Укажите адрес или ориентир.';return}step=Math.max(0,Math.min(2,step+delta));window.hpointRequestStep=step;document.querySelectorAll('[data-request-step]').forEach(node=>node.hidden=Number(node.dataset.requestStep)!==step);document.querySelectorAll('.requestSteps i').forEach((node,index)=>node.classList.toggle('active',index<=step));$('requestStepLabel').textContent='Шаг '+(step+1)+' из 3 · '+['Задача','Место','Публикация'][step];$('requestBack').hidden=step===0;$('requestNext').hidden=step===2;$('createRequestButton').hidden=step!==2;note.textContent='';$('modalbody').closest('.box').scrollTop=0}
-async function sendReq(lat,lon){let error=$('rqerr');try{let reward=Number(($('rewardRub')||{}).value||0),hours=Number(($('requestHours')||{}).value||48),data=await api('/api/requests',{method:'POST',body:JSON.stringify({what:$('qw').value,place:$('qp').value,time_needed:$('qt').value,urgency:$('qu').value,details:$('qd').value.trim()||'Без дополнительных деталей',category:$('qc').value,lat:lat,lon:lon,expires_in_hours:hours,reward_rub:reward})});if(window.hpointWorkspace){hpointWorkspace.state.matchRequestId=data.request_id;hpointWorkspace.state.matches=null}closeModal();await requests();if(window.hpointWorkspace)await hpointWorkspace.refresh();toast('Заявка #'+data.request_id+' создана');go('match')}catch(exception){if(error)error.textContent=exception.message||'Не удалось создать заявку'}}
+async function sendReq(lat,lon){let error=$('rqerr');try{let reward=Number(($('rewardRub')||{}).value||0),hours=Number(($('requestHours')||{}).value||48),data=await api('/api/requests',{method:'POST',body:JSON.stringify({what:$('qw').value,place:$('qp').value,time_needed:$('qt').value,urgency:$('qu').value,details:$('qd').value.trim()||'Без дополнительных деталей',category:$('qc').value,lat:lat,lon:lon,expires_in_hours:hours,reward_rub:reward,scheduled_at:$("requestScheduledAt")?.value?new Date($("requestScheduledAt").value).toISOString():null,photos:window.HPointMedia?.requestPhotos()||[]})});if(window.hpointWorkspace){hpointWorkspace.state.matchRequestId=data.request_id;hpointWorkspace.state.matches=null}closeModal();await requests();if(window.hpointWorkspace)await hpointWorkspace.refresh();toast('Помощь опубликована');go('match');if(reward>0)window.hpointCreatedRequest?.(data.request_id)}catch(exception){if(error)error.textContent=exception.message||'Не удалось создать заявку'}}
 ensureProgressPanel();loadDonation();
 '''
 
@@ -1205,10 +1213,10 @@ WORKSPACE_SHELL_UI=r'''
   function renderPrimaryNav(user){document.querySelector('.nav')?.classList.remove('guestHeader');let spacer=document.querySelector('.nav .sp'),actions=$('nav');if(!spacer||!actions)return;let top=state.route==='rating'?'help':['wallet','billing','donate'].includes(state.route)?'profile':state.route;let destinations=[['home','Главная'],['help','Помощь'],...(window.hpointGamesEnabled?[['games','Игры']]:[]),['activities','Активности']];spacer.innerHTML='<nav id="sitePrimaryNav" aria-label="Основная навигация">'+destinations.map(([route,label])=>route==='games'?'<a href="/games" title="'+label+'">'+label+'</a>':'<button class="'+(top===route?'active':'')+'" type="button" data-ws-action="route" data-route="'+route+'" title="'+label+'"'+(top===route?' aria-current="page"':'')+'>'+label+'</button>').join('')+'</nav>';if(user){let wallet=state.data&&state.data.wallet||{},rating=user.stats&&user.stats.helped_avg;actions.innerHTML='<div class="workspaceHeaderActions"><button class="workspaceBalance" type="button" data-ws-action="route" data-route="wallet" title="Открыть кошелёк"><span>HP</span><b>'+number(user.balance)+'</b><i>'+money(wallet.balance_rub)+'</i></button><button class="btn light" type="button" data-ws-action="support">Поддержка</button><button class="btn light" type="button" data-ws-action="route" data-route="profile">Профиль'+(rating?' · ★ '+Number(rating).toFixed(1):'')+'</button><button class="btn grad" type="button" data-ws-action="request">+ Заявка</button></div>'}else{actions.innerHTML='<div class="workspaceHeaderActions"><button class="btn light" type="button" onclick="authForm(false)">Войти</button><button class="btn grad" type="button" onclick="authForm(true)">Регистрация</button></div>'}}
   function pageHead(title,description,mark){return '<div class="workspaceTopbar"><div><h1 class="workspaceTitle">'+esc(title)+'</h1>'+(description?'<p class="workspaceSubtitle">'+esc(description)+'</p>':'')+'</div></div>'}
   function metric(label,value){return '<article class="workspaceMetric"><span>'+esc(label)+'</span><b>'+value+'</b></article>'}
-  function requestActionMarkup(row,mine){let id=Number(row.id),actions=[];if(mine){actions.push('<button class="btn light" type="button" data-ws-action="track" data-id="'+id+'">Детали</button>');if(row.status==='open')actions.push('<button class="btn grad" type="button" data-ws-action="help-tab" data-tab="match" data-id="'+id+'">Подбор</button>');if(row.status==='in_progress')actions.push('<button class="btn light" type="button" data-ws-action="chat" data-id="'+id+'">Чат</button>');if(row.status==='in_progress'&&Number(row.requester_id)===Number(state.data.current_user_id))actions.push('<button class="btn grad" type="button" data-ws-action="finish" data-id="'+id+'">'+(Number(row.reward_rub)?'Завершить и выплатить '+money(row.reward_rub):'Завершить помощь')+'</button>');if(row.status==='done'&&((Number(row.requester_id)===Number(state.data.current_user_id)&&!row.requester_rating)||(Number(row.helper_id)===Number(state.data.current_user_id)&&!row.helper_rating)))actions.push('<button class="btn grad" type="button" data-ws-action="review" data-id="'+id+'" data-side="'+(Number(row.requester_id)===Number(state.data.current_user_id)?'requester':'helper')+'">Оценить</button>')}else{actions.push('<button class="btn grad" type="button" data-ws-action="join" data-id="'+id+'">Хочу помочь</button>')}return actions.join('')}
+  function requestActionMarkup(row,mine){let id=Number(row.id),actions=[];if(mine){actions.push('<button class="btn light" type="button" data-ws-action="track" data-id="'+id+'">Детали</button>');if(row.status==='open'&&Number(row.reward_rub)>0&&row.reward_payment_status==='none')actions.push('<button class="btn grad" type="button" onclick="hpointCreatedRequest('+id+')">Создать резерв</button>');if(['open','in_progress'].includes(row.status))actions.push('<button class="btn light" type="button" onclick="hpointCancelRequest('+id+')">Отменить</button>');if(row.status==='open')actions.push('<button class="btn grad" type="button" data-ws-action="help-tab" data-tab="match" data-id="'+id+'">Подбор</button>');if(row.status==='in_progress')actions.push('<button class="btn light" type="button" data-ws-action="chat" data-id="'+id+'">Чат</button>');if(row.status==='in_progress'&&row.dispute_status!=='open'&&Number(row.requester_id)===Number(state.data.current_user_id))actions.push('<button class="btn grad" type="button" data-ws-action="finish" data-id="'+id+'">'+(Number(row.reward_rub)?'Завершить и выплатить '+money(row.reward_rub):'Завершить помощь')+'</button>');if(row.status==='in_progress')actions.push(row.dispute_status==='open'?'<span class="workspaceTag">На рассмотрении поддержки · выплата приостановлена</span>':'<button class="btn light" type="button" data-ws-action="dispute" data-id="'+id+'">Есть проблема</button>');if(row.status==='done'&&row.helper_id!=null&&((Number(row.requester_id)===Number(state.data.current_user_id)&&!row.requester_rating)||(Number(row.helper_id)===Number(state.data.current_user_id)&&!row.helper_rating)))actions.push('<button class="btn grad" type="button" data-ws-action="review" data-id="'+id+'" data-side="'+(Number(row.requester_id)===Number(state.data.current_user_id)?'requester':'helper')+'">Оценить</button>')}else{actions.push('<button class="btn grad" type="button" data-ws-action="join" data-id="'+id+'">Хочу помочь</button>')}return actions.join('')}
   function responseCancelButton(response,label){return '<button class="btn light" type="button" data-ws-action="response-cancel" data-id="'+Number(response.request_id)+'" data-user="'+Number(response.helper_id)+'" data-token="'+esc(response.application_token)+'">'+label+'</button>'}
   function responseActionMarkup(row,mine){let html=requestActionMarkup(row,mine);if(mine&&row.status==='open'){let count=(state.data.applications||[]).filter(item=>Number(item.request_id)===Number(row.id)).length;if(count)html=html.replace('>Подбор</button>','>Отклики · '+number(count)+'</button>')}if(!mine){let response=(state.data.my_applications||[]).find(item=>Number(item.request_id)===Number(row.id));if(response)return responseCancelButton(response,'Отозвать отклик')}return html}
-  function requestCard(row,mine){let reward=Number(row.reward_rub||0)>0?' · '+money(row.reward_rub):'',place=mine&&row.place?' · '+esc(row.place):'';return '<article class="workspaceRequest"><div class="workspaceRequestMain"><b>#'+Number(row.id)+' · '+esc(compact(row.what))+'</b><div class="workspaceRequestMeta">'+esc(row.category_name||'Другое')+' · '+esc(row.urgency||'без срочности')+place+reward+'</div><span class="workspaceTag '+statusClass(row)+'">'+esc(statusLabel(row))+'</span>'+(Number(row.reward_rub)?'<p class="muted">'+esc(rewardNote(row))+'</p>':'')+'</div><div class="workspaceRequestActions">'+responseActionMarkup(row,mine)+'</div></article>'}
+  function requestCard(row,mine){let reward=Number(row.reward_rub||0)>0?' · '+rewardNote(row):'',place=mine&&row.place?' · '+esc(row.place):'';return '<article class="workspaceRequest"><div class="workspaceRequestMain"><b>'+esc(compact(row.what))+'</b><span class="workspaceRequestAuthor">Запрашивает: '+esc(row.requester_name||'Участник')+'</span><div class="workspaceRequestMeta">'+esc(row.category_name||'Другое')+' · '+esc(row.urgency||'без срочности')+place+reward+'</div><span class="workspaceTag '+statusClass(row)+'">'+esc(statusLabel(row))+'</span>'+(Number(row.reward_rub)?'<p class="muted">'+esc(rewardNote(row))+'</p>':'')+'</div><div class="workspaceRequestActions">'+responseActionMarkup(row,mine)+'</div></article>'}
   function applicationNotices(){
     let incoming=state.data.applications||[],sent=state.data.my_applications||[];
     return (incoming.length?'<details class="workspaceFold requestResponses"><summary>Отклики на ваши заявки · '+number(incoming.length)+'</summary>'+incoming.map(response=>'<article class="workspacePendingInvite"><div><b>'+esc(response.helper_name)+' хочет помочь</b><p>№'+Number(response.request_id)+' · '+esc(compact(response.what))+'</p></div><div class="workspaceActions"><button class="btn grad" type="button" data-ws-action="application-accept" data-id="'+Number(response.request_id)+'" data-user="'+Number(response.helper_id)+'" data-token="'+esc(response.application_token)+'">Принять помощь и открыть чат</button>'+responseCancelButton(response,'Отклонить')+'</div></article>').join('')+'</details>':'')+(sent.length?'<details class="workspaceFold sentResponses"><summary>Ваши отклики · '+number(sent.length)+'</summary>'+sent.map(response=>'<article class="workspacePendingInvite"><div><b>Отклик отправлен · '+esc(response.requester_name)+'</b><p>№'+Number(response.request_id)+' · '+esc(compact(response.what))+'</p></div><div class="workspaceActions">'+responseCancelButton(response,'Отозвать отклик')+'</div></article>').join('')+'</details>':'');
@@ -1230,11 +1238,11 @@ WORKSPACE_SHELL_UI=r'''
   function ownRequestsPane(){let rows=ownRequests();return rows.length?'<div class="workspaceRequestList">'+rows.map(row=>requestCard(row,true)).join('')+'</div>':'<div class="workspaceEmpty"><b>У вас ещё нет заявок.</b><br>Опишите задачу — адрес и контакты не будут показаны до взаимного подтверждения.</div><div class="workspaceActions"><button class="btn grad" type="button" data-ws-action="request">Создать заявку</button></div>'}
   function openRequestsPane(){let rows=state.data.open||[];return rows.length?'<div class="workspaceRequestList">'+rows.map(row=>requestCard(row,false)).join('')+'</div>':'<div class="workspaceEmpty"><b>Открытых заявок сейчас нет.</b><br>Можно встать в общую очередь — авторы увидят вас в подборе.</div><div class="workspaceActions"><button class="btn grad" type="button" data-ws-action="queue">Встать в очередь</button></div>'}
   function cancelInvitationButton(offer){return '<button class="btn light" type="button" data-ws-action="offer-cancel" data-id="'+Number(offer.request_id)+'" data-user="'+Number(offer.helper_id)+'" data-offer-token="'+esc(offer.offer_token||'')+'">Отменить приглашение</button>'}
-  function rewardNote(row){if(!Number(row.reward_rub))return '';return money(row.reward_rub)+(row.reward_payment_status==='released'?' · зачислено в кошелёк помощника':row.reward_payment_status==='paid'?' · в резерве, выплата после подтверждения помощи':' · через кошелёк после помощи; перед началом нужен резерв')}
+  function rewardNote(row){if(!Number(row.reward_rub))return '';let amount=Number(row.reward_rub),fee=Math.round(amount*.15),net=amount-fee;return money(amount)+' тест. · помощнику '+money(net)+' · комиссия '+money(fee)+' (15%)'+(row.reward_payment_status==='released'?' · выплачено':row.reward_payment_status==='paid'?' · в резерве':' · создайте резерв за 5 минут')}
   function rewardReservePanel(row,waiting){
     if(!row||!Number(row.reward_rub))return '';
-    let funded=row.reward_payment_status==='paid',balance=Number((state.data.wallet||{}).balance_rub||0),amount=Number(row.reward_rub);
-    return '<div class="workspaceAppNotice rewardReservePanel"><b>'+esc(rewardNote(row))+'</b><p>'+(funded?'Деньги пока не выплачены помощнику. После выполнения вы подтвердите результат и выплату.':waiting?'Выбран помощник: '+esc(waiting.helper_name||'участник')+'. Зарезервируйте сумму до начала помощи. Выплата — только после её подтверждения.':'Кандидатов можно найти и пригласить без оплаты. После выбора создайте резерв; выплата — после помощи и вашего подтверждения.')+'</p>'+(!funded&&waiting?'<div class="workspaceActions"><button class="btn grad" type="button" data-ws-action="reward-reserve" data-id="'+Number(row.id)+'" '+(balance<amount?'disabled':'')+'>Зарезервировать '+money(amount)+'</button><button class="btn light" type="button" data-ws-action="route" data-route="wallet">Кошелёк · '+money(balance)+'</button></div>'+(balance<amount?'<p>Для резерва не хватает '+money(amount-balance)+'. '+(state.data.reward_checkout_available?'<button class="workspacePromoLink" type="button" data-ws-action="reward-card" data-id="'+Number(row.id)+'">Оплатить и зарезервировать картой</button>':'Пополнение картой пока не подключено. Приглашение сохранено; ничего не списано.')+'</p>':'') :'')+(waiting?'<div class="workspaceActions">'+cancelInvitationButton(waiting)+'</div>':'')+'</div>';
+    let funded=row.reward_payment_status==='paid',balance=Number((state.data.wallet||{}).available_total_rub||0),amount=Number(row.reward_rub);
+    return '<div class="workspaceAppNotice rewardReservePanel"><b>'+esc(rewardNote(row))+'</b><p>'+(funded?'Деньги пока не выплачены помощнику. После выполнения вы подтвердите результат и выплату.':waiting?'Выбран помощник: '+esc(waiting.helper_name||'участник')+'. Зарезервируйте сумму до начала помощи. Выплата — только после её подтверждения.':'Кандидатов можно найти и пригласить без оплаты. Сразу создайте тестовый резерв. Без резерва в течение 5 минут помощь отменится. Комиссия проекта — 15%.')+'</p>'+(!funded?'<div class="workspaceActions"><button class="btn grad" type="button" data-ws-action="reward-reserve" data-id="'+Number(row.id)+'" '+(balance<amount?'disabled':'')+'>Зарезервировать '+money(amount)+'</button><button class="btn light" type="button" data-ws-action="route" data-route="wallet">Кошелёк · '+money(balance)+'</button></div>'+(balance<amount?'<p>Для резерва не хватает '+money(amount-balance)+'. '+(state.data.reward_checkout_available?'<button class="workspacePromoLink" type="button" data-ws-action="reward-card" data-id="'+Number(row.id)+'">Оплатить и зарезервировать картой</button>':'Пополнение картой пока не подключено. Приглашение сохранено; ничего не списано.')+'</p>':'') :'')+(waiting?'<div class="workspaceActions">'+cancelInvitationButton(waiting)+'</div>':'')+'</div>';
   }
   async function handleRewardAction(button){
     let id=Number(button.dataset.id),row=ownRequests().find(item=>Number(item.id)===id);if(!row||button.disabled)return;
@@ -1247,7 +1255,7 @@ WORKSPACE_SHELL_UI=r'''
       if(result.wallet)state.wallet=result.wallet;await refresh();toast(confirming?'Помощь подтверждена. Вознаграждение зачислено помощнику.':'Сумма в резерве. Помощник может подтвердить участие.');
     }catch(error){toast(error.message);await refresh()}finally{button.disabled=false}
   }
-  function completionNotices(){let rows=ownRequests().filter(row=>Number(row.requester_id)===Number(state.data.current_user_id)&&row.status==='in_progress'&&Number(row.reward_rub)>0);return rows.map(row=>'<section class="workspaceAppNotice paidConfirmation"><b>Подтвердите помощь после выполнения · №'+Number(row.id)+'</b><p>Проверьте результат. После вашего подтверждения '+money(row.reward_rub)+' поступит из резерва в кошелёк помощника.</p><div class="workspaceActions"><button class="btn grad" type="button" data-ws-action="paid-confirm" data-id="'+Number(row.id)+'">Подтвердить помощь и выплатить '+money(row.reward_rub)+'</button><button class="btn light" type="button" data-ws-action="chat" data-id="'+Number(row.id)+'">Обсудить в чате</button><button class="btn light" type="button" data-ws-action="support">Есть проблема</button></div></section>').join('')}
+  function completionNotices(){let rows=ownRequests().filter(row=>Number(row.requester_id)===Number(state.data.current_user_id)&&row.status==='in_progress'&&row.dispute_status!=='open'&&Number(row.reward_rub)>0);return rows.map(row=>'<section class="workspaceAppNotice paidConfirmation"><b>Подтвердите помощь · '+esc(compact(row.what))+'</b><p>Проверьте результат. После вашего подтверждения '+money(row.reward_rub)+' поступит из резерва в кошелёк помощника.</p><div class="workspaceActions"><button class="btn grad" type="button" data-ws-action="paid-confirm" data-id="'+Number(row.id)+'">Подтвердить помощь и выплатить '+money(row.reward_rub)+'</button><button class="btn light" type="button" data-ws-action="chat" data-id="'+Number(row.id)+'">Обсудить в чате</button><button class="btn light" type="button" data-ws-action="dispute" data-id="'+Number(row.id)+'">Есть проблема</button></div></section>').join('')}
   function matchPane(){
     let requests=openOwnRequests(),selected=state.matchRequestId&&requests.some(row=>Number(row.id)===Number(state.matchRequestId))?state.matchRequestId:(requests[0]&&requests[0].id||'');
     if(!requests.length)return '<div class="workspaceEmpty"><b>Нет открытой заявки для подбора.</b><br>Подбор станет доступен после публикации вашей заявки.</div><div class="workspaceActions"><button class="btn grad" type="button" data-ws-action="request">Создать заявку</button></div>';
@@ -1255,17 +1263,18 @@ WORKSPACE_SHELL_UI=r'''
     let candidates=state.matches,matches=(candidates&&candidates.matches||[]).filter(candidate=>!waiting||Number(candidate.user_id)!==Number(waiting.helper_id));
     let notice=waiting?'<div class="workspaceAppNotice workspacePendingInvite"><div><b>Ждём ответ: '+esc(waiting.helper_name||'помощник')+'.</b><p>Можно посмотреть других кандидатов или отменить приглашение. Сама заявка останется открытой.</p></div><div class="workspaceActions">'+cancelInvitationButton(waiting)+'</div></div>':'';
     let result=state.matchLoading?'<div class="workspaceLoading" role="status">Ищем помощников…</div>':matches.length?'<div class="workspaceRequestList">'+matches.map(candidate=>'<article class="workspaceCandidate"><i class="workspaceCandidateAvatar">'+esc((candidate.name||'?').slice(0,1).toUpperCase())+'</i><div class="workspaceCandidateCopy"><b>'+esc(candidate.name||'Участник')+(candidate.verified?' ✓':'')+'</b><span>'+(candidate.rating?'★ '+Number(candidate.rating).toFixed(1)+' · ':'')+(candidate.distance_km===null||candidate.distance_km===undefined?'геопозиция не указана':number(candidate.distance_km)+' км')+' · '+number(candidate.reviews)+' отзывов</span><span>'+esc(candidate.availability||'По договорённости')+'</span><span>'+esc((candidate.reasons||[]).join(' · ')||'подходит по параметрам заявки')+'</span></div><button class="btn grad" type="button" data-ws-action="assign" data-id="'+Number(selected)+'" data-user="'+Number(candidate.user_id)+'">'+(waiting?'Пригласить вместо него':'Выбрать')+'</button></article>').join('')+'</div>':waiting&&Number(selectedRow?.reward_rub)&&selectedRow.reward_payment_status!=='paid'?'':candidates?'<div class="workspaceEmpty">'+(waiting?'Других подходящих свободных помощников пока нет. Можно дождаться ответа или отменить приглашение.':'Подходящих свободных помощников пока нет. Попробуйте позже или уточните задачу.')+'</div>':'';
-    return '<div class="workspaceMatchForm"><label>Ваша заявка<select id="wsMatchRequest" class="input" '+(state.matchLoading?'disabled':'')+'>'+requests.map(row=>'<option value="'+Number(row.id)+'" '+(Number(row.id)===Number(selected)?'selected':'')+'>#'+Number(row.id)+' · '+esc(compact(row.what))+'</option>').join('')+'</select></label><input id="wsMatchQuestion" class="input" maxlength="500" value="'+esc(state.matchQuestion)+'" placeholder="Необязательно: уточните нужный опыт"><button class="btn grad" type="button" data-ws-action="match-load" '+(state.matchLoading?'disabled':'')+'>Найти кандидатов</button></div>'+notice+rewardReservePanel(selectedRow,waiting)+result;
+    return '<div class="workspaceMatchForm"><label>Ваша заявка<select id="wsMatchRequest" class="input" '+(state.matchLoading?'disabled':'')+'>'+requests.map(row=>'<option value="'+Number(row.id)+'" '+(Number(row.id)===Number(selected)?'selected':'')+'>'+esc(compact(row.what))+'</option>').join('')+'</select></label><input id="wsMatchQuestion" class="input" maxlength="500" value="'+esc(state.matchQuestion)+'" placeholder="Необязательно: уточните нужный опыт"><button class="btn grad" type="button" data-ws-action="match-load" '+(state.matchLoading?'disabled':'')+'>Найти кандидатов</button></div>'+notice+rewardReservePanel(selectedRow,waiting)+result;
   }
-  function chatsPane(){let chats=state.data.chats||[];return chats.length?'<div class="workspaceChatList">'+chats.map(chat=>'<button class="workspaceChatButton" type="button" data-ws-action="chat" data-id="'+Number(chat.request_id)+'"><b>'+esc(chat.other_name||'Участник')+' · заявка #'+Number(chat.request_id)+'</b><span>'+esc(compact(chat.last_message||'Новый чат'))+'</span></button>').join('')+'</div>':'<div class="workspaceEmpty">Чат появляется только после того, как помощник подтвердил участие в заявке.</div>'}
-  function offersPane(offers=state.data.offers||[]){if(!offers.length)return '<div class="workspaceEmpty">Предложений от авторов пока нет.</div>';return offers.map(offer=>'<article class="workspaceRequest"><div class="workspaceRequestMain"><b>#'+Number(offer.request_id)+' · '+esc(compact(offer.what))+'</b><div class="workspaceRequestMeta">'+esc(offer.requester_name||'Автор заявки')+' · '+esc(offer.time_needed||'время уточняется')+'</div>'+(Number(offer.reward_rub)?'<p class="muted">'+esc(rewardNote(offer))+'</p>':'')+'</div><div class="workspaceRequestActions"><button class="btn grad" type="button" data-ws-action="offer" data-id="'+Number(offer.request_id)+'" data-offer-token="'+esc(offer.offer_token||'')+'" data-accept="true" '+(Number(offer.reward_rub)>0&&offer.reward_payment_status!=='paid'?'disabled':'')+'>'+(Number(offer.reward_rub)>0&&offer.reward_payment_status!=='paid'?'Ждём резерв в кошельке':'Помогу')+'</button><button class="btn light" type="button" data-ws-action="offer" data-id="'+Number(offer.request_id)+'" data-offer-token="'+esc(offer.offer_token||'')+'" data-accept="false">Отклонить</button></div></article>').join('')}
-  function chatPanel(){let chat=state.chat;if(!state.chatId)return '';if(!chat)return '<section class="workspaceCard workspaceChatPanel"><div class="workspaceLoading">ОТКРЫВАЕМ ЧАТ…</div></section>';let messages=chat.messages||[];return '<section class="workspaceCard workspaceChatPanel"><h3>Чат · '+esc(chat.other_name||'Участник')+'</h3><div class="workspaceMessages">'+(messages.length?messages.map(message=>'<article class="workspaceMessage '+(message.mine?'mine':'')+'">'+esc(message.text)+'<small>'+esc(message.author_name||'Участник')+' · '+stamp(message.created_at)+'</small></article>').join(''):'<div class="workspaceEmpty">Сообщений ещё нет. Напишите первым.</div>')+'</div><div class="workspaceChatForm"><input id="wsChatText" class="input" maxlength="1000" placeholder="Напишите сообщение"><button class="btn grad" type="button" data-ws-action="chat-send">Отправить</button></div></section>'}
+  function chatsPane(){let chats=state.data.chats||[];return chats.length?'<div class="workspaceChatList">'+chats.map(chat=>'<button class="workspaceChatButton" type="button" data-ws-action="chat" data-id="'+Number(chat.request_id)+'"><b>'+esc(chat.what||'Помощь')+' · '+esc(chat.other_name||'Участник')+'</b><span>'+esc(compact(chat.last_message||'Новый чат'))+'</span></button>').join('')+'</div>':'<div class="workspaceEmpty">Чат появляется только после того, как помощник подтвердил участие в заявке.</div>'}
+  function offersPane(offers=state.data.offers||[]){if(!offers.length)return '<div class="workspaceEmpty">Предложений от авторов пока нет.</div>';return offers.map(offer=>'<article class="workspaceRequest"><div class="workspaceRequestMain"><b>'+esc(compact(offer.what))+'</b><div class="workspaceRequestMeta">'+esc(offer.requester_name||'Автор заявки')+' · '+esc(offer.time_needed||'время уточняется')+'</div>'+(Number(offer.reward_rub)?'<p class="muted">'+esc(rewardNote(offer))+'</p>':'')+'</div><div class="workspaceRequestActions"><button class="btn grad" type="button" data-ws-action="offer" data-id="'+Number(offer.request_id)+'" data-offer-token="'+esc(offer.offer_token||'')+'" data-accept="true" '+(Number(offer.reward_rub)>0&&offer.reward_payment_status!=='paid'?'disabled':'')+'>'+(Number(offer.reward_rub)>0&&offer.reward_payment_status!=='paid'?'Ждём резерв в кошельке':'Помогу')+'</button><button class="btn light" type="button" data-ws-action="offer" data-id="'+Number(offer.request_id)+'" data-offer-token="'+esc(offer.offer_token||'')+'" data-accept="false">Отклонить</button></div></article>').join('')}
+  function chatPanel(){let chat=state.chat;if(!state.chatId)return '';if(!chat)return '<section class="workspaceCard workspaceChatPanel"><div class="workspaceLoading">ОТКРЫВАЕМ ЧАТ…</div></section>';let messages=chat.messages||[];return '<section class="workspaceCard workspaceChatPanel"><h3>'+esc(chat.what||'Помощь')+' · '+esc(chat.other_name||'Участник')+'</h3><div class="workspaceMessages">'+(messages.length?messages.map(message=>'<article class="workspaceMessage '+(message.mine?'mine':'')+'">'+esc(message.text)+'<small>'+esc(message.author_name||'Участник')+' · '+stamp(message.created_at)+'</small></article>').join(''):'<div class="workspaceEmpty">Сообщений ещё нет. Напишите первым.</div>')+'</div><div class="workspaceChatForm"><input id="wsChatText" class="input" maxlength="1000" placeholder="Напишите сообщение"><button class="btn grad" type="button" data-ws-action="chat-send">Отправить</button></div></section>'}
+  function localDateInput(value){if(!value)return '';let date=new Date(value);return new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16)}
   function helperPreferences(){
     let user=state.data.user,categories=user.helper_categories||[],choices=[['carry','Перенос / переезд'],['shopping','Покупки'],['snow','Уборка'],['tools','Инструменты'],['transport','Транспорт'],['tech','Техника'],['study','Учёба'],['other','Другое']];
-    return '<section class="workspaceCard helperPreferences"><h2>Как я готов помогать</h2><p class="muted">Ваша собственная заявка не мешает помогать другим.</p><div class="workspaceForm"><label class="helperReady"><input id="wsHelperReady" type="checkbox" '+(user.helper_ready?'checked':'')+'> Готов получать предложения сейчас</label><fieldset class="helperCategories"><legend>В каких сферах</legend>'+choices.map(([id,label])=>'<label><input type="checkbox" id="wsHelperCategory_'+id+'" name="helperCategory" value="'+id+'" '+(categories.includes(id)?'checked':'')+'>'+label+'</label>').join('')+'</fieldset><p class="muted">Если ничего не выбрано — подходят все категории. При отключении готовности ожидающие отклики отзываются; уже принятая помощь сохраняется.</p><label>Когда вам удобно<input id="wsHelperAvailability" class="input" maxlength="240" placeholder="Например, по будням после 18:00" value="'+esc(user.helper_availability||'')+'"></label><button type="button" class="btn grad" data-ws-action="helper-preferences-save">Сохранить настройки</button><p id="helperPreferencesStatus" class="muted" role="status"></p></div></section>';
+    return '<section class="workspaceCard helperPreferences"><h2>Как я готов помогать</h2><p class="muted">Ваша собственная заявка не мешает помогать другим.</p><div class="workspaceForm"><label class="helperReady"><input id="wsHelperReady" type="checkbox" '+(user.helper_ready?'checked':'')+'> Готов получать предложения сейчас</label><fieldset class="helperCategories"><legend>В каких сферах</legend>'+choices.map(([id,label])=>'<label><input type="checkbox" id="wsHelperCategory_'+id+'" name="helperCategory" value="'+id+'" '+(categories.includes(id)?'checked':'')+'>'+label+'</label>').join('')+'</fieldset><p class="muted">Если ничего не выбрано — подходят все категории. При отключении готовности ожидающие отклики отзываются; уже принятая помощь сохраняется.</p><label>Радиус помощи, км (0 — без ограничения)<input id="wsHelperRadius" class="input" type="number" min="0" max="1000" value="'+Number(user.helper_radius_km||0)+'"></label><label>Доступен с<input id="wsHelperFrom" class="input" type="datetime-local" value="'+localDateInput(user.helper_available_from)+'"></label><label>Доступен до<input id="wsHelperUntil" class="input" type="datetime-local" value="'+localDateInput(user.helper_available_until)+'"></label><p class="muted">Для радиуса укажите геопозицию в профиле. Заявки без точного времени остаются по договорённости; прошедшее окно доступности исключает новые предложения.</p><label>Комментарий о времени<input id="wsHelperAvailability" class="input" maxlength="240" placeholder="Например, по будням после 18:00" value="'+esc(user.helper_availability||'')+'"></label><button type="button" class="btn grad" data-ws-action="helper-preferences-save">Сохранить настройки</button><p id="helperPreferencesStatus" class="muted" role="status"></p></div></section>';
   }
   async function saveHelperPreferences(button){
-    let status=$('helperPreferencesStatus'),payload={categories:[...document.querySelectorAll('[name="helperCategory"]:checked')].map(input=>input.value),availability:$('wsHelperAvailability').value.trim(),ready:$('wsHelperReady').checked};
+    let status=$('helperPreferencesStatus'),payload={categories:[...document.querySelectorAll('[name="helperCategory"]:checked')].map(input=>input.value),availability:$('wsHelperAvailability').value.trim(),ready:$('wsHelperReady').checked,radius_km:Number($('wsHelperRadius').value),available_from:$('wsHelperFrom').value?new Date($('wsHelperFrom').value).toISOString():null,available_until:$('wsHelperUntil').value?new Date($('wsHelperUntil').value).toISOString():null};
     button.disabled=true;try{await api('/api/helper/preferences',{method:'POST',body:JSON.stringify(payload)});toast('Настройки помощи сохранены');await refresh()}catch(error){if(status)status.textContent=error.message;toast(error.message)}finally{button.disabled=false}
   }
   function helpBody(){
@@ -1307,7 +1316,7 @@ WORKSPACE_SHELL_UI=r'''
     return '<p class="muted">'+esc(data.rule||'Завершённая бесплатная помощь с оценкой автора 4–5. Каждая награда выдаётся один раз.')+'</p>'+visible.map(card).join('')+(rest.length?'<details class="workspaceFold"><summary>Все достижения · '+number(earned.length)+'/'+number(items.length)+'</summary>'+rest.map(card).join('')+'</details>':'')+(data.claimable_hp?'<button class="btn grad" type="button" data-ws-action="help-achievements-claim">Получить +'+number(data.claimable_hp)+' HP за прошлую помощь</button>':'');
   }
   function profileTabs(){return ''}
-  function accountShell(body){let items=[['profile','Мой профиль'],['wallet','Кошелёк'],['billing','H-Point+']];return '<div class="workspaceAccountLayout"><nav class="workspaceAccountNav" aria-label="Личный кабинет"><b>Личный кабинет</b>'+items.map(item=>'<button type="button" data-ws-action="route" data-route="'+item[0]+'" class="'+(state.route===item[0]?'active':'')+'">'+item[1]+'</button>').join('')+'<details id="accountMore" class="workspaceAccountMore" '+(!window.matchMedia('(max-width:700px)').matches||state.accountMoreOpen?'open':'')+'><summary>Ещё настройки</summary><div><button type="button" onclick="openProfiles()">Сменить аккаунт</button>'+(state.data.user.role==='admin'?'<button type="button" onclick="openAdminSupport()">Панель администратора</button>':'')+'<button type="button" data-ws-action="route" data-route="donate" class="'+(state.route==='donate'?'active':'')+'">Поддержать проект</button><button type="button" data-ws-action="account-menu">Управление аккаунтом</button><button class="workspaceLogout" type="button" onclick="logout()">Выйти из аккаунта</button></div></details></nav><div class="workspaceAccountMain">'+body+'</div></div>'}
+  function accountShell(body){let items=[['profile','Мой профиль'],['wallet','Кошелёк'],['billing','H-Point+']];return '<div class="workspaceAccountLayout"><nav class="workspaceAccountNav" aria-label="Личный кабинет"><b>Личный кабинет</b>'+items.map(item=>'<button type="button" data-ws-action="route" data-route="'+item[0]+'" class="'+(state.route===item[0]?'active':'')+'">'+item[1]+'</button>').join('')+'<button type="button" onclick="hpointCommercial.open()">Коммерческий кабинет</button><details id="accountMore" class="workspaceAccountMore" '+(!window.matchMedia('(max-width:700px)').matches||state.accountMoreOpen?'open':'')+'><summary>Ещё настройки</summary><div><button type="button" onclick="openProfiles()">Сменить аккаунт</button>'+(state.data.user.role==='admin'?'<button type="button" onclick="openAdminSupport()">Панель администратора</button>':'')+'<button type="button" data-ws-action="route" data-route="donate" class="'+(state.route==='donate'?'active':'')+'">Поддержать проект</button><button type="button" data-ws-action="account-menu">Управление аккаунтом</button><button class="workspaceLogout" type="button" onclick="logout()">Выйти из аккаунта</button></div></details></nav><div class="workspaceAccountMain">'+body+'</div></div>'}
   function profileBody(){
     let user=state.data.user,stats=user.stats||{},details=state.profileDetails?'<section class="workspaceCard" style="margin-top:16px"><h3>Проверка контактов</h3><p class="muted">Эти данные не показываются в заявках. Они нужны для доступа к действиям, которые требуют подтверждения.</p><div class="workspaceForm"><label>Имя и фамилия<input id="wsFullName" class="input" maxlength="120" value="'+esc(user.full_name||'')+'" autocomplete="name"></label><label>Дата рождения<input id="wsBirth" class="input" type="date" value="'+esc(user.birth_date||'')+'"></label><label>Телефон (необязательно)<input id="wsPhone" class="input" maxlength="20" value="'+esc(user.phone||'')+'" autocomplete="tel"></label><div class="workspaceActions"><button class="btn grad" type="button" data-ws-action="contacts-save">Сохранить контакты</button>'+(user.email_verified?'<span class="workspaceTag open">Email подтверждён</span>':'<button class="btn light" type="button" data-ws-action="email-send">Получить код email</button>')+(user.phone_verified?'<span class="workspaceTag open">Телефон подтверждён</span>':user.sms_delivery_configured?'<button class="btn light" type="button" data-ws-action="phone-send">Получить SMS-код</button>':'')+'</div>'+(!user.email_verified?'<label>Код из email<input id="wsEmailCode" class="input" inputmode="numeric" maxlength="10" placeholder="Введите код"></label><button class="btn light" type="button" data-ws-action="email-verify">Подтвердить email</button>':'')+(user.sms_delivery_configured&&!user.phone_verified?'<label>Код из SMS<input id="wsPhoneCode" class="input" inputmode="numeric" maxlength="10" placeholder="Введите код"></label><button class="btn light" type="button" data-ws-action="phone-verify">Подтвердить телефон</button>':'')+'</div></section>':'';
     let achievements=state.data.help_achievements||{items:[]},recent=ownRequests().slice(0,4);
@@ -1319,12 +1328,12 @@ WORKSPACE_SHELL_UI=r'''
     '<section class="workspaceStats">'+metric('H-POINTS',number(user.balance))+metric('ПОМОЩЕЙ ОКАЗАНО',number(stats.helped))+metric('ПОМОЩЕЙ ПОЛУЧЕНО',number(stats.received))+metric('РЕЙТИНГ',stats.helped_avg?'★ '+Number(stats.helped_avg).toFixed(1):'—')+'</section>'+
     '<div class="workspaceProfileGrid"><div><section class="workspaceCard"><h3>Достижения за помощь</h3><div class="workspaceAchievements">'+awards+'</div></section><section class="workspaceCard" style="margin-top:16px"><h3>Недавняя активность</h3><div class="workspaceMiniList">'+activity+'</div></section></div><aside class="workspaceCard"><h3>О себе</h3><div class="workspaceProfileInfo"><div class="workspaceInfoRow"><span>Город</span><b>'+esc(user.city||'не указан')+'</b></div><div class="workspaceInfoRow"><span>Email</span><b>'+esc(user.email||'не указан')+'</b></div><div class="workspaceInfoRow"><span>Вход</span><b>'+esc([user.email_verified?'Email':'',user.tg_linked?'Telegram':''].filter(Boolean).join(' · ')||'подтвердите email')+'</b></div></div><p class="muted">'+esc(user.bio||'Информация ещё не заполнена.')+'</p><div class="workspaceActions">'+(user.tg_linked?(user.telegram_url?'<a class="btn light" href="'+esc(user.telegram_url)+'" target="_blank" rel="noopener">Открыть бот</a>':'<span class="workspaceTag open">Сайт и бот связаны</span>'):'<button class="btn grad" type="button" data-ws-action="link-code">Получить код Telegram</button>')+'</div>'+(state.linkCode?'<p class="workspaceAppNotice">В боте отправьте /link '+esc(state.linkCode)+'. Код одноразовый.</p>':'')+'</aside></div>'+editor;
   }
-  function walletBody(){let wallet=state.wallet||state.data.wallet||{},rows=wallet.transactions||[];let transactions=rows.length?rows.map(row=>'<article class="workspaceTransaction"><div><b>'+esc(row.description||row.kind||'Операция')+'</b><span>'+stamp(row.created_at)+(row.request_id?' · заявка #'+Number(row.request_id):'')+'</span></div><b class="workspaceTransactionAmount">'+(Number(row.amount_rub)>=0?'+':'−')+money(Math.abs(Number(row.amount_rub||0)))+'</b></article>').join(''):'<div class="workspaceEmpty">Операций пока нет. Подтверждённые вознаграждения отобразятся здесь.</div>';return pageHead('Кошелёк','Состояние вознаграждений и история операций по вашим заявкам.','ФИНАНСЫ')+profileTabs()+'<section class="workspaceWalletGrid"><article class="workspaceWalletAmount"><span>ДОСТУПНО</span><b>'+money(wallet.balance_rub)+'</b></article><article class="workspaceWalletAmount"><span>ЗАРЕЗЕРВИРОВАНО</span><b>'+money(wallet.reserved_rub)+'</b></article><article class="workspaceWalletAmount"><span>ОЖИДАЕТСЯ ЗА ПОМОЩЬ</span><b>'+money(wallet.incoming_rub)+'</b></article></section><section class="workspaceGrid"><article class="workspaceCard"><h2>Операции</h2><div class="workspaceTransactions">'+transactions+'</div></article><aside class="workspaceCard"><h3>Как это работает</h3><p class="muted">Подбор и приглашение — без оплаты. Автор резервирует сумму из кошелька до начала помощи. После выполнения и подтверждения автором резерв переводится помощнику; при отмене открытой заявки возвращается автору. Пополнение и вывод картой пока не подключены.</p></aside></section>'}
+  function walletBody(){let w=state.wallet||state.data.wallet||{};return pageHead('Тестовый кошелёк','Используйте тестовые средства для помощи и возможностей H-Point.','ТЕСТОВЫЙ РЕЖИМ')+profileTabs()+'<section class="workspaceWalletGrid">'+metric('ДОСТУПНО · ТЕСТ. ₽',number(w.test_balance_rub))+metric('В РЕЗЕРВЕ · ТЕСТ. ₽',number(w.test_reserved_rub))+metric('ЗА ПОМОЩЬ · ТЕСТ. ₽',number(w.test_incoming_rub))+'</section><section class="workspaceCard"><h2>История</h2><div class="workspaceTransactions">'+((w.transactions||[]).map(row=>'<article class="workspaceTransaction"><div><b>'+esc(row.description||'Операция')+'</b><span>'+stamp(row.created_at)+'</span></div><b>'+money(row.amount_rub)+' тест.</b></article>').join('')||'<p class="muted">Операций пока нет.</p>')+'</div><p class="muted">При регистрации начисляется 500 тестовых ₽. Резерв на помощь создаётся в течение 5 минут; после подтверждения автором помощник получает 85%, комиссия проекта — 15%. Тестовые средства не являются настоящими деньгами.</p></section>'}
   function billingBody(){
     let billing=state.billing||{},history=billing.history||[],user=state.data.user,catalog=state.data.paid_catalog||{};
     let productCards=Object.entries(catalog).map(([key,item])=>'<article class="workspaceProduct"><h3>'+esc(item.title)+'</h3><p>'+esc(key==='boost'?'Выше в ленте: одна открытая заявка.':'Приоритет профиля и заявок в автоматическом подборе.')+'</p><p class="muted">'+esc(item.term)+'</p><details class="workspaceProductDetails"><summary>Что даёт и кому подойдёт</summary><p>'+esc(item.description)+'</p><ul>'+(item.benefits||[]).map(text=>'<li>'+esc(text)+'</li>').join('')+'</ul></details><div class="workspaceProductPrice">'+money(item.rub)+' · '+number(item.hp)+' HP</div>'+(key==='boost'?'<label>Ваша заявка<select id="wsBoostRequest" class="input"><option value="">Выберите открытую заявку</option>'+openOwnRequests().filter(row=>promotionRequest(row.id)).map(row=>'<option value="'+Number(row.id)+'">№'+Number(row.id)+' · '+esc(compact(row.what))+'</option>').join('')+'</select></label>':'')+'<div class="workspaceProductActions"><button class="btn grad" type="button" data-ws-action="buy" data-promo-item="'+esc(key)+'" data-item="'+esc(key)+'" data-method="wallet">Оплатить ₽</button><button class="btn light" type="button" data-ws-action="buy" data-promo-item="'+esc(key)+'" data-item="'+esc(key)+'" data-method="hp">HP</button></div></article>').join('');
     let paid=history.length?'<div class="workspaceTransactions">'+history.map(row=>'<article class="workspaceTransaction"><div><b>'+esc(row.item_title||catalog[row.item_type]?.title||row.item_type||'Покупка')+'</b><span>'+stamp(row.created_at)+' · '+esc(row.status||'')+'</span></div><b class="workspaceTransactionAmount">'+number(row.amount_rub)+' '+esc(row.currency==='HP'?'HP':'₽')+'</b></article>').join('')+'</div>':'<div class="workspaceEmpty">Покупок пока нет.</div>';
-    return pageHead('H-Point+','Два понятных способа добавить приоритет. Публикация, отклики, подбор и чаты остаются бесплатными.','ВОЗМОЖНОСТИ')+profileTabs()+'<section class="workspaceGrid"><article class="workspaceCard"><h2>Ваш доступ</h2><div class="workspaceProfileInfo"><div class="workspaceInfoRow"><span>PRO до</span><b>'+(user.pro_until?stamp(user.pro_until):'не подключён')+'</b></div><div class="workspaceInfoRow"><span>Проверка личности · бесплатно</span><b>'+(user.identity_verified?'подтверждена':user.identity_verification?.status==='pending'?'на проверке':'в настройках профиля')+'</b></div>'+(user.business_until?'<div class="workspaceInfoRow"><span>Ранее оплаченный Business до</span><b>'+stamp(user.business_until)+'</b></div>':'')+'</div><div class="workspaceAppNotice">PRO не повышает рейтинг и место в Лиге, не подтверждает личность и не гарантирует отклик. Покупки разовые; автоматических списаний нет.</div></article><aside class="workspaceCard"><h3>История платежей</h3>'+paid+'</aside></section><section class="workspaceCard" style="margin-top:16px"><h2>Выберите нужный приоритет</h2><div class="workspaceBillingGrid" style="margin-top:16px">'+productCards+'</div><details class="workspaceProductDetails"><summary>Куда делись прежние функции?</summary><p>Business, Business Pro, Избранное+ и локальные объявления сняты с новых продаж: отдельного готового сценария для них пока нет. «Больше откликов» объединено с продвижением. Проверка личности доступна бесплатно в профиле. Ранее оплаченные сроки, права и счета сохранены.</p></details></section>';
+    return '<section class="workspaceCard"><h2>Коммерческий кабинет</h2><p>Для тренеров, организаций, прорабов и специалистов: услуги, клиенты и расписание. Первые 7 дней бесплатно, затем 490 тестовых ₽ в месяц.</p><button class="btn grad" onclick="hpointCommercial.open()">Открыть кабинет</button></section>'+pageHead('H-Point+','Два понятных способа добавить приоритет. Публикация, отклики, подбор и чаты остаются бесплатными.','ВОЗМОЖНОСТИ')+profileTabs()+'<section class="workspaceGrid"><article class="workspaceCard"><h2>Ваш доступ</h2><div class="workspaceProfileInfo"><div class="workspaceInfoRow"><span>PRO до</span><b>'+(user.pro_until?stamp(user.pro_until):'не подключён')+'</b></div><div class="workspaceInfoRow"><span>Проверка личности · бесплатно</span><b>'+(user.identity_verified?'подтверждена':user.identity_verification?.status==='pending'?'на проверке':'в настройках профиля')+'</b></div>'+(user.business_until?'<div class="workspaceInfoRow"><span>Ранее оплаченный Business до</span><b>'+stamp(user.business_until)+'</b></div>':'')+'</div><div class="workspaceAppNotice">PRO не повышает рейтинг и место в Лиге, не подтверждает личность и не гарантирует отклик. Покупки разовые; автоматических списаний нет.</div></article><aside class="workspaceCard"><h3>История платежей</h3>'+paid+'</aside></section><section class="workspaceCard" style="margin-top:16px"><h2>Выберите нужный приоритет</h2><div class="workspaceBillingGrid" style="margin-top:16px">'+productCards+'</div><details class="workspaceProductDetails"><summary>Куда делись прежние функции?</summary><p>Business, Business Pro, Избранное+ и локальные объявления сняты с новых продаж: отдельного готового сценария для них пока нет. «Больше откликов» объединено с продвижением. Проверка личности доступна бесплатно в профиле. Ранее оплаченные сроки, права и счета сохранены.</p></details></section>';
   }
   function takeMap(){let map=$('bigMap'),tools=$('mapTools'),holder=$('workspaceMapSlot'),out=state.parkedMap||{map:null,tools:null};if(map&&holder&&holder.contains(map)){$('workspaceLegacyStorage').appendChild(map);out.map=map}if(tools&&holder&&holder.contains(tools)){$('workspaceLegacyStorage').appendChild(tools);out.tools=tools}state.parkedMap=out;return out}
   function attachMap(parked){if(state.route!=='help')return;let holder=$('workspaceMapSlot');if(!holder)return;if(!window.L&&!window.ymaps){holder.innerHTML='<div class="workspaceEmpty">Карта временно недоступна. Заявки и чат продолжают работать.<br><button class="btn light" type="button" data-ws-action="map-retry">Повторить загрузку карты</button></div>';return}let map=parked.map||$('bigMap');if(!map)return;holder.replaceChildren(map);if(parked.tools)holder.insertBefore(parked.tools,map);if(typeof window.hpointSetupMapPanel==='function')window.hpointSetupMapPanel();let tools=$('mapTools');if(tools)holder.insertBefore(tools,map);state.parkedMap={map:map,tools:tools};setTimeout(function(){if(typeof window.loadBigMap==='function')window.loadBigMap()},70)}
@@ -1360,12 +1369,12 @@ WORKSPACE_SHELL_UI=r'''
       const newlyAccepted=state.lastStatuses?(sync.requests||[]).filter(row=>row.status==='in_progress'&&(state.lastStatuses[row.id]==='open'||(state.lastOfferIds||[]).includes(row.id))).map(row=>Number(row.id)):[];
       state.pendingChats=[...new Set([...(state.pendingChats||[]),...newlyAccepted])].filter(id=>(sync.requests||[]).some(row=>Number(row.id)===id&&row.status==='in_progress'));
       let accepted=(sync.requests||[]).find(row=>state.pendingChats.includes(Number(row.id))&&(results[2].chats||[]).some(chat=>Number(chat.request_id)===Number(row.id)));
-      if(accepted)toast('Помощь по заявке №'+accepted.id+' подтверждена. Открываем чат.');
+      if(accepted)toast('Помощь «'+accepted.what+'» подтверждена. Открываем чат.');
       if(state.lastOfferIds&&offers.some(offer=>!state.lastOfferIds.includes(offer.request_id)))toast('Вас просят помочь — подтвердите предложение.');
       if(state.lastApplicationKeys&&applicationKeys.some(key=>!state.lastApplicationKeys.includes(key)))toast('Новый отклик на вашу заявку — откройте «Отклики».');
       state.lastStatuses=statuses;state.lastOfferIds=offers.map(offer=>offer.request_id);state.lastApplicationKeys=applicationKeys;
       state.data={...sync,open:results[1].requests||[],chats:results[2].chats||[],offers,games:results[4],progress:results[5]};
-      if(changed)state.matches=null;if(!state.wallet)state.wallet=sync.wallet||{};render();
+      if(changed)state.matches=null;state.wallet=sync.wallet||{};render();
       let deepChat=location.hash.match(/^#\/help\/chat\/(\d+)$/);if(deepChat&&Number(state.chatId)!==Number(deepChat[1])){await openWorkspaceChat(Number(deepChat[1]));return}
       if(accepted){state.pendingChats=state.pendingChats.filter(id=>id!==Number(accepted.id));state.matches=null;state.matchRequestId=null;if(state.helpTab!=='chats'||Number(state.chatId)!==Number(accepted.id))await openWorkspaceChat(accepted.id);return}
       if(state.route==='help'&&state.helpTab==='chats'&&state.chatId)await refreshWorkspaceChat();
@@ -1408,7 +1417,7 @@ WORKSPACE_SHELL_UI=r'''
       else toast('Предложение отклонено');
     }catch(error){toast(error.message)}finally{button.disabled=false}
   }
-  async function handleAction(button){if(button.disabled)return;let action=button.dataset.wsAction,id=Number(button.dataset.id||0);if(action==='help-achievements-claim'){await postAndRefresh('/api/help-achievements/claim',{},'Достижения обновлены, заслуженные HP зачислены');return}if(['reward-reserve','reward-card','paid-confirm'].includes(action)){await handleRewardAction(button);return}if(action==='application-accept'){button.disabled=true;try{await api('/api/requests/response/accept',{method:'POST',body:JSON.stringify({request_id:id,helper_id:Number(button.dataset.user),application_token:button.dataset.token})});await refresh();await openWorkspaceChat(id)}catch(error){toast(error.message);await refresh()}finally{button.disabled=false}return}if(action==='offer-cancel'){await cancelInvitation(button);return}if(action==='helper-preferences-save'){await saveHelperPreferences(button);return}if(action==='account-menu'){openProfileMenu();return}if(action==='unlink-telegram'){unlinkTelegram();return}if(action==='map-retry'){retryMap();return}if(action==='account-settings'){state.profileDetails=true;setRoute('profile');return}if(action==='request-filter'){state.requestQuery=($('wsRequestQuery')||{}).value||'';state.requestStatus=($('wsRequestStatus')||{}).value||'';render();return}if(action==='route'){setRoute(button.dataset.route);if(button.dataset.route==='wallet')refreshWallet();if(button.dataset.route==='billing')refreshBilling();return}if(action==='help-tab'){state.helpTab=button.dataset.tab||'mine';if(button.dataset.id)state.matchRequestId=id;state.matches=null;setRoute('help');render();if(state.helpTab==='match')await loadMatches();window.scrollTo({top:0,behavior:'auto'});return}if(action==='request'){requestForm();return}if(action==='support'){openSupport();return}if(action==='track'){openRequestTracking(id);return}if(action==='chat'){openWorkspaceChat(id);return}if(action==='chat-send'){sendWorkspaceChat();return}if(action==='match-load'){loadMatches();return}if(action==='assign'){button.disabled=true;try{await assignCandidate(id,Number(button.dataset.user))}finally{button.disabled=false}return}if(action==='finish'){let row=ownRequests().find(item=>Number(item.id)===id);if(!row||Number(row.requester_id)!==Number(state.data.current_user_id))return;if(!window.confirm('Подтверждаете, что помощь выполнена? '+(Number(row.reward_rub)?money(row.reward_rub)+' будет переведено из резерва помощнику.':'После завершения будут списаны HP и начислена награда помощнику.')))return;button.disabled=true;try{await postAndRefresh('/api/requests/finish',{request_id:id},'Помощь завершена')}finally{button.disabled=false}return}if(action==='review'){review(id,button.dataset.side);return}if(action==='join'||action==='queue'){if(typeof window.helper==='function')window.helper(action==='join'?id:undefined);setTimeout(refresh,900);return}if(action==='offer'){await respondWorkspaceOffer(button);return}if(action==='profile-save'){saveProfile();return}if(action==='profile-details'){state.profileDetails=!state.profileDetails;render();return}if(action==='link-code'){linkCode();return}if(action==='contacts-save'){saveContacts();return}if(action==='email-send'){postAndRefresh('/api/auth/email/resend',{},'Код отправлен на email');return}if(action==='email-verify'){postAndRefresh('/api/auth/email/verify',{code:(($('wsEmailCode')||{}).value||'').trim()},'Email подтверждён');return}if(action==='phone-send'){postAndRefresh('/api/profile/phone/send-code',{},'SMS-код отправлен');return}if(action==='phone-verify'){postAndRefresh('/api/profile/phone/verify',{code:(($('wsPhoneCode')||{}).value||'').trim()},'Телефон подтверждён');return}if(action==='identity'){postAndRefresh('/api/identity-verification',{},'Запрос на проверку создан');return}if(action==='buy'){if(typeof window.buy==='function')window.buy(button.dataset.item,button.dataset.method);return}}
+  async function handleAction(button){if(button.disabled)return;let action=button.dataset.wsAction,id=Number(button.dataset.id||0);if(action==='help-achievements-claim'){await postAndRefresh('/api/help-achievements/claim',{},'Достижения обновлены, заслуженные HP зачислены');return}if(['reward-reserve','reward-card','paid-confirm'].includes(action)){await handleRewardAction(button);return}if(action==='application-accept'){button.disabled=true;try{await api('/api/requests/response/accept',{method:'POST',body:JSON.stringify({request_id:id,helper_id:Number(button.dataset.user),application_token:button.dataset.token})});await refresh();await openWorkspaceChat(id)}catch(error){toast(error.message);await refresh()}finally{button.disabled=false}return}if(action==='offer-cancel'){await cancelInvitation(button);return}if(action==='helper-preferences-save'){await saveHelperPreferences(button);return}if(action==='account-menu'){openProfileMenu();return}if(action==='unlink-telegram'){unlinkTelegram();return}if(action==='map-retry'){retryMap();return}if(action==='account-settings'){state.profileDetails=true;setRoute('profile');return}if(action==='request-filter'){state.requestQuery=($('wsRequestQuery')||{}).value||'';state.requestStatus=($('wsRequestStatus')||{}).value||'';render();return}if(action==='route'){setRoute(button.dataset.route);if(button.dataset.route==='wallet')refreshWallet();if(button.dataset.route==='billing')refreshBilling();return}if(action==='help-tab'){state.helpTab=button.dataset.tab||'mine';if(button.dataset.id)state.matchRequestId=id;state.matches=null;setRoute('help');render();if(state.helpTab==='match')await loadMatches();window.scrollTo({top:0,behavior:'auto'});return}if(action==='request'){requestForm();return}if(action==='support'){openSupport();return}if(action==='dispute'){openRequestDispute(id);return}if(action==='track'){openRequestTracking(id);return}if(action==='chat'){openWorkspaceChat(id);return}if(action==='chat-send'){sendWorkspaceChat();return}if(action==='match-load'){loadMatches();return}if(action==='assign'){button.disabled=true;try{await assignCandidate(id,Number(button.dataset.user))}finally{button.disabled=false}return}if(action==='finish'){let row=ownRequests().find(item=>Number(item.id)===id);if(!row||Number(row.requester_id)!==Number(state.data.current_user_id))return;if(!window.confirm('Подтверждаете, что помощь выполнена? '+(Number(row.reward_rub)?money(row.reward_rub)+' будет переведено из резерва помощнику.':'После завершения будут списаны HP и начислена награда помощнику.')))return;button.disabled=true;try{await postAndRefresh('/api/requests/finish',{request_id:id},'Помощь завершена')}finally{button.disabled=false}return}if(action==='review'){review(id,button.dataset.side);return}if(action==='join'||action==='queue'){if(typeof window.helper==='function')window.helper(action==='join'?id:undefined);setTimeout(refresh,900);return}if(action==='offer'){await respondWorkspaceOffer(button);return}if(action==='profile-save'){saveProfile();return}if(action==='profile-details'){state.profileDetails=!state.profileDetails;render();return}if(action==='link-code'){linkCode();return}if(action==='contacts-save'){saveContacts();return}if(action==='email-send'){postAndRefresh('/api/auth/email/resend',{},'Код отправлен на email');return}if(action==='email-verify'){postAndRefresh('/api/auth/email/verify',{code:(($('wsEmailCode')||{}).value||'').trim()},'Email подтверждён');return}if(action==='phone-send'){postAndRefresh('/api/profile/phone/send-code',{},'SMS-код отправлен');return}if(action==='phone-verify'){postAndRefresh('/api/profile/phone/verify',{code:(($('wsPhoneCode')||{}).value||'').trim()},'Телефон подтверждён');return}if(action==='identity'){postAndRefresh('/api/identity-verification',{},'Запрос на проверку создан');return}if(action==='buy'){if(typeof window.buy==='function')window.buy(button.dataset.item,button.dataset.method);return}}
   function install(){let target=app();if(!target)return false;target.classList.add('workspaceApp');if(!root()){let shell=document.createElement('section');shell.id='hpointWorkspace';shell.setAttribute('aria-live','polite');target.prepend(shell)}state.installed=true;return true}
   function renderGuestHeader(){let spacer=document.querySelector('.nav .sp'),actions=$('nav');if(!spacer||!actions)return;document.querySelector('.nav')?.classList.add('guestHeader');spacer.replaceChildren();actions.replaceChildren();let paid=$('prices')?.closest('section');if(paid)paid.hidden=true}
   document.addEventListener('click',function(event){let button=event.target.closest('[data-ws-action]');if(!button)return;if(button.dataset.wsAction==='response-cancel'){handleResponseAction(button);return}if(['request-promo','request-promo-dismiss'].includes(button.dataset.wsAction)||button.dataset.promoItem){handlePromotion(button);return}if(button.dataset.wsAction==='help-tab')state.helpMoreOpen=['match','preferences','map'].includes(button.dataset.tab);handleAction(button)});
@@ -1452,9 +1461,25 @@ _page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRI
 
 PAGE = PAGE.replace("</head>", SYSTEM_THEME_META + "<script>window.hpointGamesEnabled="+json.dumps(GAMES_ENABLED)+";document.documentElement.dataset.gamesEnabled=String(window.hpointGamesEnabled);</script><style>@media(max-width:700px){html[data-games-enabled=false] #sitePrimaryNav{grid-template-columns:repeat(3,minmax(0,1fr))}}</style></head>", 1)
 
+ASSETS.update({name:(Path(__file__).resolve().parent.parent/"assets"/name,"application/javascript;charset=utf-8") for name in ("hpoint-workflows.js","hpoint-media.js","hpoint-commercial.js")})
+PAGE=PAGE.replace("</body>",'<script src="/assets/hpoint-workflows.js?v=20261025"></script><script src="/assets/hpoint-media.js?v=20261025"></script><script src="/assets/hpoint-commercial.js?v=20261025"></script></body>')
+
+
 def games_document():
     if GAMES_ENABLED:return GAMES_PAGE
     return '<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'+SYSTEM_THEME_META+'<title>H-Point — помощь рядом</title><style>'+SYSTEM_THEME_CSS+'body{margin:0;padding:24px;min-height:85vh;display:grid;place-items:center;font:16px Manrope,Arial,sans-serif;background:var(--hp-bg);color:var(--hp-ink)}main{max-width:480px}img{width:150px}a{display:inline-block;margin-top:18px;padding:14px 20px;border-radius:14px;background:#b8f36b;color:#172417;text-decoration:none;font-weight:800}p{line-height:1.6}</style></head><body><main><img src="/assets/hpoint-logo.png" alt="H-Point"><h1>Игры пока на паузе</h1><p>Ваш игровой прогресс сохранён. Сейчас H-Point сосредоточен на помощи людям. За добрые дела доступны достижения и награды HP.</p><a href="/#/profile">К профилю и достижениям</a></main></body></html>'
+
+
+def public_wallet_summary(user_id,limit=50):
+    return workflow.test_wallet_summary(database.wallet_summary(user_id,limit))
+
+
+def health_status():
+    try:
+        healthy=database.db.execute("SELECT 1 AS ok").fetchone()["ok"]==1
+    except Exception:
+        healthy=False
+    return {"ok":healthy,"database":healthy},200 if healthy else 503
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1497,8 +1522,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200 if GAMES_ENABLED else 503);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(size));self.end_headers()
             return
         if p.path == "/api/health":
-            b = json.dumps({"ok":True,"database":True}).encode()
-            self.send_response(200);self.send_header("Content-Type","application/json;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("Content-Length",str(len(b)));self.end_headers()
+            payload,status=health_status()
+            b = json.dumps(payload).encode()
+            self.send_response(status);self.send_header("Content-Type","application/json;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("Content-Length",str(len(b)));self.end_headers()
             return
         self.send_response(405);self.send_header("Allow","GET, POST, HEAD");self.send_header("Content-Length","0");self.end_headers()
     def do_GET(self):
@@ -1507,6 +1533,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path.startswith("/assets/"):
                 return self.asset(p.path.rsplit("/",1)[-1])
             if p.path=="/auth/telegram":
+                return self._text("Вход через Telegram отключён. Войдите на сайте по email.",410)
                 ticket=parse_qs(p.query).get("ticket",[""])[0]
                 uid=database.consume_web_login_ticket(ticket)
                 if uid is None:return self._text("Ссылка входа недействительна или устарела.",403)
@@ -1521,7 +1548,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if p.path in ("/","/index.html","/payment/result"): return self.html()
             if p.path in ("/games","/games/"): return self.games_html()
-            if p.path=="/api/health": return reply(self,{"ok":True,"database":True})
+            if p.path=="/api/health":
+                payload,status=health_status()
+                return reply(self,payload,status)
             if p.path=="/api/games/state":
                 u=get_sess(self)
                 if u and u["is_blocked"]:
@@ -1530,6 +1559,7 @@ class Handler(BaseHTTPRequestHandler):
                 return reply(self,games.game_state(u["user_id"] if u else None))
             if p.path=="/api/public-config": return reply(self,{"ok":True,"donation_url":DONATION_URL,"donation_title":DONATION_TITLE})
             if p.path=="/api/auth/telegram/complete":
+                return reply(self,{"ok":False,"error":"Вход доступен только по email."},410)
                 ticket=parse_qs(p.query).get("ticket",[""])[0]
                 uid=database.consume_telegram_auth_ticket(ticket)
                 if uid is None:return reply(self,{"ok":False,"pending":True},202)
@@ -1552,7 +1582,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/dashboard":
                 u=auth(self)
                 if not u:return
-                return reply(self,{"ok":True,"user":user_payload(u),"wallet":database.wallet_summary(u["user_id"], limit=5)})
+                return reply(self,{"ok":True,"user":user_payload(u),"wallet":public_wallet_summary(u["user_id"], limit=5)})
             if p.path=="/api/progress":
                 # Aggregate-only data is intentionally public: no account data,
                 # contacts or precise locations leave the server here.
@@ -1591,7 +1621,7 @@ class Handler(BaseHTTPRequestHandler):
                 offers=db.execute("""SELECT rc.request_id,rc.candidate_id helper_id,rc.offer_token,u.name helper_name FROM request_candidates rc
                     JOIN requests r ON r.id=rc.request_id JOIN users u ON u.user_id=rc.candidate_id
                     WHERE r.requester_id=? AND r.status=? AND rc.status='offered'""",(u["user_id"],STATUS_OPEN)).fetchall()
-                return reply(self,{"ok":True,"user":user_payload(u),"wallet":database.wallet_summary(u["user_id"], limit=5),"help_achievements":help_achievements.achievement_state(u["user_id"]),"features":{"games":GAMES_ENABLED},"current_user_id":u["user_id"],"requests":[request_payload(r) for r in rs],"outgoing_offers":[dict(row) for row in offers],"applications":[dict(row) for row in get_request_applications(u["user_id"])],"my_applications":[dict(row) for row in get_helper_applications(u["user_id"])],"request_promotion":{"item_type":"boost",**MONETIZATION_ITEMS["boost"]},"paid_catalog":MONETIZATION_ITEMS,"reward_checkout_available":bool(ROBOKASSA_MERCHANT_LOGIN and ROBOKASSA_PASSWORD_1 and ROBOKASSA_PASSWORD_2)})
+                return reply(self,{"ok":True,"user":user_payload(u),"wallet":public_wallet_summary(u["user_id"], limit=5),"help_achievements":help_achievements.achievement_state(u["user_id"]),"features":{"games":GAMES_ENABLED},"current_user_id":u["user_id"],"requests":[request_payload(r) for r in rs],"outgoing_offers":[dict(row) for row in offers],"applications":[dict(row) for row in get_request_applications(u["user_id"])],"my_applications":[dict(row) for row in get_helper_applications(u["user_id"])],"request_promotion":{"item_type":"boost",**MONETIZATION_ITEMS["boost"]},"paid_catalog":MONETIZATION_ITEMS,"reward_checkout_available":False})
             if p.path=="/api/requests/mine":
                 u=auth(self)
                 if not u:return
@@ -1623,6 +1653,24 @@ class Handler(BaseHTTPRequestHandler):
                     ).fetchall()
                     candidates=[dict(row) for row in candidate_rows]
                 return reply(self,{"ok":True,"request":request_payload(request_row),"events":[dict(row) for row in events],"candidates":candidates})
+            if p.path=="/api/commercial":
+                u=auth(self)
+                if not u:return
+                return reply(self,{"ok":True,"commercial":commercial.dashboard(db,u["user_id"])})
+            if p.path=="/api/photos":
+                u=auth(self)
+                if not u:return
+                try:mime,payload=media.photo_for_user(db,parse_qs(p.query).get("id",[""])[0],u["user_id"])
+                except PermissionError:return reply(self,{"ok":False,"error":"Нет доступа к фотографии."},403)
+                except (LookupError,ValueError):return self.send_error(404)
+                self.send_response(200);self.send_header("Content-Type",mime);self.send_header("Cache-Control","private, no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("Content-Length",str(len(payload)));self.end_headers();self.wfile.write(payload);return
+            if p.path=="/api/events/participants":
+                u=auth(self)
+                if not u:return
+                try:result=media.event_participants(db,int(parse_qs(p.query).get("id",[0])[0]),u["user_id"])
+                except (ValueError,LookupError):return reply(self,{"ok":False,"error":"Мероприятие не найдено."},404)
+                except PermissionError:return reply(self,{"ok":False,"error":"Нет доступа."},403)
+                return reply(self,{"ok":True,**result})
             if p.path=="/api/events/image":
                 u=auth(self)
                 if not u:return
@@ -1687,7 +1735,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not u:return
                 expire_open_requests()
                 q=parse_qs(p.query).get("q",[""])[0].strip().lower();cat=parse_qs(p.query).get("category",[""])[0]
-                rows=db.execute("SELECT * FROM requests WHERE status=? ORDER BY priority_boost DESC,created_at DESC LIMIT 100",(STATUS_OPEN,)).fetchall();out=[]
+                rows=db.execute("SELECT * FROM requests WHERE status=? ORDER BY priority_boost DESC,created_at DESC",(STATUS_OPEN,)).fetchall();out=[]
                 for r in rows:
                     if r["requester_id"]==u["user_id"]: continue
                     if cat and r["category"]!=cat: continue
@@ -1700,7 +1748,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not u:return
                 expire_open_requests()
                 if parse_qs(p.query).get("open",[""])[0]:
-                    rs=db.execute("SELECT * FROM requests WHERE status=? AND requester_id!=? ORDER BY priority_boost DESC,created_at DESC LIMIT 100",(STATUS_OPEN,u["user_id"])).fetchall()
+                    rs=[item["request"] for item in smart_requests_for_helper(u["user_id"],limit=100)]
                     for row in rs: record_request_view(row["id"],u["user_id"])
                     return reply(self,{"ok":True,"requests":[public_request_payload(r) for r in rs]})
                 return reply(self,{"ok":True,"requests":[request_payload(r) for r in get_history(u["user_id"],HISTORY_LIMIT)]})
@@ -1723,7 +1771,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not c:return reply(self,{"ok":True,"chats":[]})
                     msgs=db.execute("SELECT m.*,u.name author_name FROM chat_messages m JOIN users u ON u.user_id=m.user_id WHERE m.chat_id=? ORDER BY m.id DESC LIMIT 100",(c["id"],)).fetchall()[::-1]
                     other=get_user(c["user_b_id"] if c["user_a_id"]==u["user_id"] else c["user_a_id"])
-                    return reply(self,{"ok":True,"chats":[{"request_id":rid,"other_name":other["name"] if other else "Пользователь","messages":[{**dict(m),"mine":m["user_id"]==u["user_id"]} for m in msgs]}]})
+                    return reply(self,{"ok":True,"chats":[{"request_id":rid,"what":get_request(rid)["what"],"other_name":other["name"] if other else "Пользователь","messages":[{**dict(m),"mine":m["user_id"]==u["user_id"]} for m in media.messages_with_photos(db,msgs)]}]})
                 cs=db.execute("SELECT c.*,r.what,u.name other_name,(SELECT text FROM chat_messages m WHERE m.chat_id=c.id ORDER BY m.id DESC LIMIT 1) last_message FROM chats c JOIN requests r ON r.id=c.request_id JOIN users u ON u.user_id=CASE WHEN c.user_a_id=? THEN c.user_b_id ELSE c.user_a_id END WHERE c.user_a_id=? OR c.user_b_id=? ORDER BY c.id DESC",(u["user_id"],u["user_id"],u["user_id"])).fetchall()
                 return reply(self,{"ok":True,"chats":[dict(c) for c in cs]})
             if p.path=="/api/billing":
@@ -1733,7 +1781,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/wallet":
                 u=auth(self)
                 if not u:return
-                return reply(self,{"ok":True,"wallet":database.wallet_summary(u["user_id"])})
+                return reply(self,{"ok":True,"wallet":public_wallet_summary(u["user_id"])})
             if p.path=="/api/profiles":
                 u=auth(self)
                 if not u:return
@@ -1765,7 +1813,7 @@ class Handler(BaseHTTPRequestHandler):
                 logging.exception("Payment callback failed")
                 return self._text("payment callback failed",500)
         if not valid_origin(self): return reply(self,{"ok":False,"error":"invalid_origin"},403)
-        try:d=read(self, EVENT_JSON_BODY if p.path=="/api/events" else MAX_JSON_BODY)
+        try:d=read(self, EVENT_JSON_BODY if p.path=="/api/events" else (14*1024*1024 if p.path in ("/api/requests","/api/chats/send") else MAX_JSON_BODY))
         except:return reply(self,{"ok":False,"error":"Некорректный JSON"},400)
         try:
             if p.path.startswith("/api/games/"):
@@ -1816,6 +1864,7 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     return reply(self,{"ok":False,"error":str(exc)},409)
             if p.path=="/api/auth/telegram/start":
+                return reply(self,{"ok":False,"error":"Вход и регистрация доступны только по email."},410)
                 if not _telegram_username:return reply(self,{"ok":False,"error":"telegram_login_unavailable"},503)
                 subject=client_key(self)
                 if not database.reserve_auth_attempts(("telegram_start",subject,AUTH_ATTEMPT_LIMIT)):return reply(self,{"ok":False,"error":"Слишком много попыток. Повторите через 15 минут."},429)
@@ -1837,7 +1886,7 @@ class Handler(BaseHTTPRequestHandler):
                         return email_challenge(self,existing)
                     return reply(self,{"ok":False,"error":"Этот email уже используется. Войдите или восстановите пароль."},409)
                 if not email_delivery_configured():
-                    return reply(self,{"ok":False,"error":"Отправка писем временно недоступна. Попробуйте позже или войдите через Telegram."},503)
+                    return reply(self,{"ok":False,"error":"Отправка писем временно недоступна. Попробуйте позже или повторите попытку позже или обратитесь в поддержку."},503)
                 try:
                     uid=create_web_user(n,e,ph(pw))
                 except Exception:
@@ -1974,6 +2023,27 @@ class Handler(BaseHTTPRequestHandler):
                     return reply(self,{"ok":False,"error":messages.get(status,"Не удалось подтвердить номер.")},400)
                 database.clear_auth_failures("phone_verify",subject)
                 return reply(self,{"ok":True,"verified":True})
+            if p.path.startswith("/api/commercial/"):
+                u=auth(self)
+                if not u:return
+                if not verified_community_account(self,u):return
+                try:result=commercial.post_action(db,u["user_id"],p.path,d,database.wallet_add_entry)
+                except PermissionError as error:return reply(self,{"ok":False,"error":str(error)},403)
+                except (ValueError,LookupError) as error:return reply(self,{"ok":False,"error":str(error)},409)
+                return reply(self,{"ok":True,"result":result})
+            if p.path=="/api/profile/location":
+                u=auth(self)
+                if not u:return
+                location=str(d.get("location","")).strip()[:180]
+                if len(location)<2:return reply(self,{"ok":False,"error":"Укажите город, адрес или ориентир."},400)
+                try:lat,lon=coordinates_from_payload(d)
+                except ValueError:return reply(self,{"ok":False,"error":"Некорректная точка."},400)
+                if lat is None:
+                    try:
+                        point=geocode_address(location);lat,lon=point["lat"],point["lon"]
+                    except (ValueError,RuntimeError):pass
+                db.execute("UPDATE users SET saved_location=?,lat=?,lon=? WHERE user_id=?",(location,lat,lon,u["user_id"]))
+                return reply(self,{"ok":True,"user":user_payload(get_user(u["user_id"]))})
             if p.path=="/api/profile":
                 u=auth(self)
                 if not u:return
@@ -2032,7 +2102,7 @@ class Handler(BaseHTTPRequestHandler):
                 except (TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректное обращение."},400)
                 message=str(d.get("message","")).strip()[:2000]
                 if not message:return reply(self,{"ok":False,"error":"Введите ответ."},400)
-                changed=db.execute("UPDATE support_tickets SET admin_reply=?,replied_by=?,replied_at=CURRENT_TIMESTAMP,status='answered' WHERE id=?",(message,admin["user_id"],ticket_id)).rowcount
+                changed=db.execute("UPDATE support_tickets SET admin_reply=?,replied_by=?,replied_at=CURRENT_TIMESTAMP,status=CASE WHEN status='resolved' THEN 'resolved' ELSE 'answered' END WHERE id=?",(message,admin["user_id"],ticket_id)).rowcount
                 if not changed:return reply(self,{"ok":False,"error":"Обращение не найдено."},404)
                 database.record_admin_action(admin["user_id"],"support_replied",None,{"ticket_id":ticket_id})
                 return reply(self,{"ok":True})
@@ -2084,7 +2154,18 @@ class Handler(BaseHTTPRequestHandler):
                 if reward_rub == 0 and u["balance"]<REQUEST_COST:return reply(self,{"ok":False,"error":f"Нужно {REQUEST_COST} HP."},400)
                 f["category"]=str(d.get("category","other"))
                 if f["category"] not in CATEGORIES:return reply(self,{"ok":False,"error":"Некорректная категория."},400)
-                rid=create_request(u["user_id"],{**f,"lat":lat,"lon":lon,"expires_in_hours":expires_in_hours,"reward_rub":reward_rub})
+                try:scheduled_at=services.normalize_schedule(d.get("scheduled_at"))
+                except ValueError as error:return reply(self,{"ok":False,"error":str(error)},400)
+                try:photos=media.prepare_photos(d.get("photos"))
+                except ValueError as error:return reply(self,{"ok":False,"error":str(error)},400)
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    rid=create_request(u["user_id"],{**f,"lat":lat,"lon":lon,"expires_in_hours":expires_in_hours,"reward_rub":reward_rub,"scheduled_at":scheduled_at})
+                    media.attach_request_photos(db,rid,u["user_id"],photos)
+                    db.execute("UPDATE users SET saved_location=?,lat=?,lon=? WHERE user_id=?",(f["place"],lat,lon,u["user_id"]))
+                    db.execute("COMMIT")
+                except Exception:
+                    db.execute("ROLLBACK");raise
                 if lat is not None:
                     db.execute("UPDATE users SET lat=?,lon=? WHERE user_id=?",(lat,lon,u["user_id"]))
                 req=get_request(rid)
@@ -2106,6 +2187,13 @@ class Handler(BaseHTTPRequestHandler):
                     return reply(self,{"ok":False,"error":"Проверьте категории и время помощи."},400)
                 if ready and get_active_help(u["user_id"]):
                     return reply(self,{"ok":False,"error":"Дождитесь, пока автор завершит текущую заявку."},409)
+                try:
+                    radius=int(d.get("radius_km",u["helper_radius_km"] or 0))
+                    start=normalize_schedule(d.get("available_from",u["helper_available_from"]))
+                    end=normalize_schedule(d.get("available_until",u["helper_available_until"]))
+                    if radius<0 or radius>1000 or (start and end and start>=end):raise ValueError("Проверьте радиус и интервал доступности.")
+                except (TypeError,ValueError) as error:return reply(self,{"ok":False,"error":str(error)},400)
+                db.execute("UPDATE users SET helper_radius_km=?,helper_available_from=?,helper_available_until=? WHERE user_id=?",(radius,start,end,u["user_id"]))
                 set_helper_categories(u["user_id"],list(dict.fromkeys(categories)))
                 db.execute("UPDATE users SET helper_availability=? WHERE user_id=?",(availability.strip(),u["user_id"]))
                 if ready:add_to_queue(u["user_id"])
@@ -2281,8 +2369,24 @@ class Handler(BaseHTTPRequestHandler):
                 except (KeyError,TypeError,ValueError): return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
                 reason=str(d.get("reason","")).strip()[:300]
                 if not cancel_request(rid,u["user_id"],reason):
-                    return reply(self,{"ok":False,"error":"Отменить можно только свою заявку, пока она ожидает помощника."},409)
+                    return reply(self,{"ok":False,"error":"Отменить текущую заявку могут её участники. Завершённую помощь отменить нельзя."},409)
                 return reply(self,{"ok":True,"request_id":rid})
+            if p.path=="/api/requests/dispute":
+                u=auth(self)
+                if not u:return
+                try:
+                    rid=int(d.get("request_id"))
+                    ticket=database.create_request_dispute(rid,u["user_id"],d.get("message",""))
+                except (TypeError,ValueError) as error:return reply(self,{"ok":False,"error":str(error)},409)
+                return reply(self,{"ok":True,"ticket_id":ticket})
+            if p.path=="/api/admin/requests/dispute/resolve":
+                u=admin_auth(self)
+                if not u:return
+                try:rid=int(d.get("request_id"))
+                except (TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная заявка."},400)
+                if not database.resolve_request_dispute(u["user_id"],rid,d.get("note",d.get("message",""))):
+                    return reply(self,{"ok":False,"error":"Укажите решение для открытого обращения."},409)
+                return reply(self,{"ok":True})
             if p.path in ("/api/requests/finish", "/api/requests/completion/confirm"):
                 u=auth(self)
                 if not u:return
@@ -2293,11 +2397,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not request or request["requester_id"]!=u["user_id"]:
                     return reply(self,{"ok":False,"error":"Завершить помощь может только автор заявки."},403)
                 if not complete_request(rid,request["helper_id"],confirmed_by=u["user_id"]):
-                    return reply(self,{"ok":False,"error":"Завершение недоступно: заявка уже закрыта, нет резерва или недостаточно HP."},409)
+                    return reply(self,{"ok":False,"error":"Завершение недоступно: открыто обращение в поддержку, заявка закрыта, нет резерва или недостаточно HP."},409)
                 paid=int(request["reward_rub"] or 0)>0
                 helper=get_user(request["helper_id"])
                 if helper and helper["tg_user_id"]:
-                    settlement=(f"{request['reward_rub']} ₽ зачислено в ваш кошелёк H-Point." if paid else f"Вам начислено +{HELPER_REWARD} HP.")
+                    settled=get_request(rid)
+                    settlement=(f"{settled['helper_reward_rub'] or request['reward_rub']} тестовых ₽ зачислено в ваш кошелёк. Комиссия проекта: {settled['commission_rub']} тестовых ₽." if paid else f"Вам начислено +{HELPER_REWARD} HP." if get_request(rid)["hp_settled"] else "За повторную помощь между этой парой за 24 часа HP не начисляются.")
+                    if paid and request["reward_test_rub"]:settlement+=f" Из них {request['reward_test_rub']} ₽ — тестовые."
                     notify_telegram_user(helper["tg_user_id"],f"✅ Автор подтвердил помощь по заявке №{rid}. {settlement}",reply_markup=rating_kb(rid,"ratehelp"))
                 return reply(self,{"ok":True,"paid_from_reserve":paid,"awaiting_confirmation":False})
             if p.path=="/api/requests/reward/reserve":
@@ -2315,8 +2421,9 @@ class Handler(BaseHTTPRequestHandler):
                 offer=get_current_helper_offer(rid)
                 if created and offer and offer["tg_user_id"]:
                     notify_telegram_user(offer["tg_user_id"],f"💳 По заявке №{rid} зарезервировано {amount} ₽. Теперь можно подтвердить участие. Выплата — после помощи и подтверждения автора.",reply_markup=helper_offer_kb(rid,offer["offer_token"] or ""))
-                return reply(self,{"ok":True,"created":created,"wallet":database.wallet_summary(u["user_id"])})
+                return reply(self,{"ok":True,"created":created,"wallet":public_wallet_summary(u["user_id"])})
             if p.path=="/api/requests/reward/pay":
+                return reply(self,{"ok":False,"error":"Реальные платежи отключены. Создайте резерв из тестового кошелька."},409)
                 u=auth(self)
                 if not u:return
                 if not all((ROBOKASSA_MERCHANT_LOGIN,ROBOKASSA_PASSWORD_1,ROBOKASSA_PASSWORD_2)):
@@ -2348,18 +2455,27 @@ class Handler(BaseHTTPRequestHandler):
                 try:rid=int(d["request_id"])
                 except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректный request_id."},400)
                 text=str(d.get("text","")).strip()[:1000]
-                if not text:return reply(self,{"ok":False,"error":"Сообщение пустое."},400)
+                try:photos=media.prepare_photos(d.get("photos"))
+                except ValueError as error:return reply(self,{"ok":False,"error":str(error)},400)
+                if not text and not photos:return reply(self,{"ok":False,"error":"Добавьте текст или фото."},400)
                 cid=chat_for_request(rid)
                 if not cid:return reply(self,{"ok":False,"error":"Чат доступен после назначения помощника."},409)
                 c=db.execute("SELECT * FROM chats WHERE id=? AND (user_a_id=? OR user_b_id=?)",(cid,u["user_id"],u["user_id"])).fetchone()
                 if not c:return reply(self,{"ok":False,"error":"Нет доступа к чату."},403)
-                db.execute("INSERT INTO chat_messages(chat_id,user_id,text) VALUES(?,?,?)",(cid,u["user_id"],text))
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    mid=database.insert_id("INSERT INTO chat_messages(chat_id,user_id,text) VALUES(?,?,?)",(cid,u["user_id"],text))
+                    media.attach_message_photos(db,mid,u["user_id"],photos)
+                    db.execute("COMMIT")
+                except Exception:
+                    db.execute("ROLLBACK");raise
                 other=get_user(c["user_b_id"] if c["user_a_id"]==u["user_id"] else c["user_a_id"])
                 if other and other["tg_user_id"]:
-                    notify_telegram_user(other["tg_user_id"],chat_notification(rid,u["name"],text))
+                    notify_telegram_user(other["tg_user_id"],chat_notification(rid,u["name"],text,get_request(rid)["what"]))
                 msgs=db.execute("SELECT m.*,u.name author_name FROM chat_messages m JOIN users u ON u.user_id=m.user_id WHERE m.chat_id=? ORDER BY m.id DESC LIMIT 100",(cid,)).fetchall()[::-1]
-                return reply(self,{"ok":True,"messages":[{**dict(m),"mine":m["user_id"]==u["user_id"]} for m in msgs]})
+                return reply(self,{"ok":True,"messages":[{**dict(m),"mine":m["user_id"]==u["user_id"]} for m in media.messages_with_photos(db,msgs)]})
             if p.path=="/api/payments/create":
+                return reply(self,{"ok":False,"error":"Реальные платежи отключены. Используйте тестовый кошелёк."},409)
                 u=auth(self)
                 if not u:return
                 item=str(d.get("item_type",""));meta=d.get("metadata") or {}
@@ -2406,7 +2522,7 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     errors={"request already promoted":"Эта заявка уже продвинута. Повторная оплата не нужна.","request reward unpaid":"Сначала оплатите вознаграждение по заявке.","unknown billing item":"Эта функция больше не продаётся. Откройте актуальный каталог.","item is no longer sold":"Эта функция больше не продаётся.","insufficient_wallet":"Недостаточно средств в кошельке.","request_id required":"Для этой функции нужна открытая заявка.","request is unavailable":"Заявка недоступна для продвижения.","telegram link required":"Сначала привяжите Telegram.","ad_text required":"Введите текст объявления."}
                     return reply(self,{"ok":False,"error":errors.get(str(exc),"Не удалось выполнить покупку.")},409)
-                return reply(self,{"ok":True,"invoice_id":invoice_id,"created":created,"wallet":database.wallet_summary(u["user_id"])})
+                return reply(self,{"ok":True,"invoice_id":invoice_id,"created":created,"wallet":public_wallet_summary(u["user_id"])})
             self.send_error(404)
         except Exception:
             logging.exception("Web request failed: %s", p.path)
@@ -2414,7 +2530,21 @@ class Handler(BaseHTTPRequestHandler):
 
 def create_server():
     database.init_db()
-    return ThreadingHTTPServer((WEB_HOST, WEB_PORT), Handler)
+    server=ThreadingHTTPServer((WEB_HOST,WEB_PORT),Handler)
+    if APP_ENV in {"production","prod"}:
+        stopped=threading.Event()
+        def maintain():
+            while not stopped.wait(10):
+                try:expire_open_requests()
+                except Exception:logging.exception("Request expiry maintenance failed")
+                finally:database.db.close()
+        worker=threading.Thread(target=maintain,name="hpoint-request-expiry",daemon=True)
+        worker.start()
+        original_close=server.server_close
+        def close():
+            stopped.set();worker.join(timeout=2);original_close()
+        server.server_close=close
+    return server
 
 def run():
     s=create_server();print(f"H-Point website: http://{WEB_HOST}:{WEB_PORT}")

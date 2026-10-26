@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from .help_achievements import initialize_schema as initialize_help_achievements, migrate_profile_awards
 from datetime import datetime, timedelta, timezone
 from .config import REGISTRATION_BONUS_RUB
+from . import reliability, workflow, media, commercial
 from .config import DATABASE_URL, DB_PATH, START_BALANCE, STATUS_OPEN, STATUS_IN_PROGRESS, STATUS_DONE, ADMIN_TELEGRAM_IDS, TELEGRAM_AUTH_TTL_SECONDS, TELEGRAM_LINK_TTL_SECONDS, EMAIL_VERIFICATION_TTL_SECONDS, PHONE_VERIFICATION_TTL_SECONDS, AUTH_ATTEMPT_LIMIT, AUTH_ATTEMPT_WINDOW_SECONDS, CATEGORIES
 
 
@@ -93,7 +94,7 @@ db=db_connect()
 
 def _columns(table):
     if getattr(db, "is_postgres", False):
-        rows = db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=?", (table,)).fetchall()
+        rows = db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=?", (table,)).fetchall()
         return {r["column_name"] for r in rows}
     return {r["name"] for r in db.execute(f"PRAGMA table_info({table})").fetchall()}
 def _add_column(table,name,definition):
@@ -373,6 +374,28 @@ def init_db():
       ("game_daily_rewards","result_hp","INTEGER NOT NULL DEFAULT 0")
       ,("sessions","device_id","TEXT")
     ]: _add_column(t,n,d)
+    for table, name, definition in [
+        ("wallet_transactions", "test_amount_rub", "INTEGER NOT NULL DEFAULT 0"),
+        ("requests", "reward_test_rub", "INTEGER NOT NULL DEFAULT 0"),
+        ("requests", "hp_settled", "INTEGER NOT NULL DEFAULT 1"),
+        ("requests", "dispute_status", "TEXT NOT NULL DEFAULT 'none'"),
+        ("requests", "scheduled_at", "TEXT"),
+        ("requests", "reserve_deadline_at", "TEXT"),
+        ("requests", "commission_rub", "INTEGER NOT NULL DEFAULT 0"),
+        ("requests", "helper_reward_rub", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "saved_location", "TEXT NOT NULL DEFAULT ''"),
+        ("sessions", "auth_method", "TEXT NOT NULL DEFAULT 'legacy'"),
+        ("users", "helper_radius_km", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "helper_available_from", "TEXT"),
+        ("users", "helper_available_until", "TEXT"),
+        ("support_tickets", "request_id", "INTEGER"),
+    ]:
+        _add_column(table, name, definition)
+    workflow.initialize_schema(db)
+    media.initialize_schema(db)
+    commercial.initialize_schema(db)
+    reliability.migrate_wallet_sources(db)
+    reliability.reconcile_closed_reserves(db, wallet_add_entry)
     # Legacy payment columns remain for backwards-compatible data, but new code never uses them.
     db.execute("CREATE INDEX IF NOT EXISTS idx_requests_geo ON requests(status,lat,lon)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_requests_expires ON requests(status,expires_at)")
@@ -480,29 +503,10 @@ def create_telegram_auth_ticket(token):
     db.execute("DELETE FROM telegram_auth_tickets WHERE expires_at<=?", (now.isoformat(),))
     db.execute("INSERT INTO telegram_auth_tickets(token_hash,expires_at) VALUES(?,?)", (token_hash, expires))
 
-def complete_telegram_auth_ticket(token, tg_user_id, name, username=None):
-    """Bind a one-time browser ticket to the Telegram identity that opened it."""
-    if not token:
-        return False
-    token_hash = _ticket_hash(token)
-    now = datetime.now(timezone.utc).isoformat()
-    db.execute("BEGIN IMMEDIATE")
-    try:
-        ticket = db.execute("SELECT user_id FROM telegram_auth_tickets WHERE token_hash=? AND expires_at>?", (token_hash, now)).fetchone()
-        if not ticket or ticket["user_id"] is not None:
-            db.execute("ROLLBACK")
-            return False
-        user = get_user_by_tg(tg_user_id) or get_user(tg_user_id)
-        if user is None:
-            create_user(tg_user_id, name[:50] or "Пользователь", username, tg_user_id=tg_user_id, web_verified=True)
-        else:
-            db.execute("UPDATE users SET tg_user_id=?,username=COALESCE(?,username),web_verified=1 WHERE user_id=?", (tg_user_id, username, user["user_id"]))
-        db.execute("UPDATE telegram_auth_tickets SET user_id=? WHERE token_hash=? AND user_id IS NULL", (tg_user_id, token_hash))
-        db.execute("COMMIT")
-        return True
-    except Exception:
-        db.execute("ROLLBACK")
-        raise
+def complete_telegram_auth_ticket(ticket,tg_user_id,name,username=None):
+    """Legacy Telegram authentication is disabled, including old bot tickets."""
+    return False
+
 
 def consume_telegram_auth_ticket(token):
     if not token:
@@ -933,53 +937,11 @@ def create_web_user(name,email,password_hash):
     return uid
 
 def detach_telegram_to_web_profile(user_id):
-    """Split a linked Telegram account into an independent website profile.
+    source=get_user(user_id)
+    if not source or not source["tg_user_id"] or not source["email_verified"]:return None
+    db.execute("UPDATE users SET tg_user_id=NULL,username=NULL WHERE user_id=?",(user_id,))
+    return user_id
 
-    Website data and active sessions move to a new negative id; the former
-    Telegram id stays as a clean bot profile.  This is reversible by linking
-    the profiles again with a new code.
-    """
-    source = get_user(user_id)
-    if not source or not source["tg_user_id"]:
-        return None
-    telegram_id = source["tg_user_id"]
-    row = db.execute("SELECT COALESCE(MIN(user_id),0) m FROM users").fetchone()
-    web_id = min(-1, int(row["m"]) - 1)
-    db.execute("BEGIN IMMEDIATE")
-    try:
-        # Email is unique and must move from the Telegram row before the
-        # independent website record can be inserted.
-        db.execute("UPDATE users SET email=NULL WHERE user_id=?", (user_id,))
-        db.execute("""INSERT INTO users(user_id,name,username,email,password_hash,balance,helper_categories,created_at,
-                   pro_until,verified_until,business_until,favorite_slots,web_verified,email_verified,full_name,birth_date,phone,phone_verified,lat,lon,city,bio,role,is_blocked,blocked_reason)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                   (web_id,source["name"],None,source["email"],source["password_hash"],source["balance"],source["helper_categories"],source["created_at"],
-                    source["pro_until"],source["verified_until"],source["business_until"],source["favorite_slots"],0,source["email_verified"],source["full_name"],source["birth_date"],source["phone"],source["phone_verified"],source["lat"],source["lon"],source["city"],source["bio"],source["role"],source["is_blocked"],source["blocked_reason"]))
-        db.execute("UPDATE users SET helper_availability=? WHERE user_id=?",(source["helper_availability"] or "",web_id))
-        migrate_profile_awards(db,user_id,web_id)
-        for table, column in [
-            ("requests","requester_id"),("requests","helper_id"),("helper_queue","user_id"),
-            ("billing_invoices","user_id"),("wallet_transactions","user_id"),("subscriptions","user_id"),("web_login_tickets","user_id"),
-            ("email_verification_codes","user_id"),("phone_verification_codes","user_id"),
-            ("ai_usage","user_id"),("ads","user_id"),("commercial_orders","user_id"),("community_events","creator_id"),("event_participants","user_id"),
-            ("chats","user_a_id"),("chats","user_b_id"),("chat_messages","user_id"),
-            ("request_candidates","candidate_id"),("sessions","user_id"),
-            ("admin_audit_log","admin_user_id"),("admin_audit_log","target_user_id")]:
-            db.execute(f"UPDATE {table} SET {column}=? WHERE {column}=?", (web_id, user_id))
-        db.execute("UPDATE favorites SET user_id=? WHERE user_id=?", (web_id, user_id))
-        db.execute("UPDATE favorites SET favorite_user_id=? WHERE favorite_user_id=?", (web_id, user_id))
-        db.execute("UPDATE identity_verification_requests SET user_id=? WHERE user_id=?", (web_id, user_id))
-        db.execute("UPDATE identity_verification_requests SET reviewer_id=? WHERE reviewer_id=?", (web_id, user_id))
-        # Keep the Telegram primary id available for a fresh, isolated bot profile.
-        db.execute("""UPDATE users SET email=NULL,password_hash=NULL,balance=?,helper_categories='',pro_until=NULL,
-                    verified_until=NULL,business_until=NULL,favorite_slots=3,web_verified=1,verification_code=NULL,verification_code_hash=NULL,
-                   verification_code_expires_at=NULL,email_verified=0,full_name='',birth_date=NULL,phone=NULL,phone_verified=0,lat=NULL,lon=NULL,city='',bio='',tg_user_id=? WHERE user_id=?""",
-                   (START_BALANCE, telegram_id, user_id))
-        db.execute("COMMIT")
-        return web_id
-    except Exception:
-        db.execute("ROLLBACK")
-        raise
 
 def create_link_code(user_id):
     # This code authorizes merging a Telegram identity into a web account.
@@ -1096,30 +1058,65 @@ def record_admin_action(admin_user_id, action, target_user_id=None, details=None
     )
 
 def admin_cancel_request(admin_user_id, request_id, reason=""):
-    """Cancel only unfinished requests and leave an auditable operator trail."""
-    admin = get_user(admin_user_id)
-    request = get_request(request_id)
-    if not admin or admin["role"] != "admin" or not request:
-        return False, None
-    if request["status"] not in (STATUS_OPEN, STATUS_IN_PROGRESS):
-        return False, request
-    clean_reason = str(reason).strip()[:300] or "Заявка закрыта поддержкой"
-    changed = db.execute(
-        "UPDATE requests SET status='cancelled',cancel_reason=?,cancelled_at=CURRENT_TIMESTAMP WHERE id=? AND status IN (?,?)",
-        (clean_reason, request_id, STATUS_OPEN, STATUS_IN_PROGRESS),
-    ).rowcount
-    if not changed:
-        return False, get_request(request_id)
-    if request["reward_payment_status"] == "paid" and int(request["reward_rub"] or 0) > 0:
-        amount = int(request["reward_rub"])
-        wallet_add_entry(request["requester_id"], amount, "reward_refund", "Вознаграждение возвращено в кошелёк: заявка закрыта поддержкой", f"request:{request_id}:admin-refund", request_id)
-        db.execute("UPDATE requests SET reward_payment_status='wallet_refunded' WHERE id=?", (request_id,))
-    db.execute(
-        "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
-        (request_id, admin_user_id, "admin_cancelled", f"Заявка закрыта поддержкой. Причина: {clean_reason}"),
-    )
-    record_admin_action(admin_user_id, "request_cancelled", request["requester_id"], {"request_id": request_id, "reason": str(reason).strip()[:300]})
-    return True, request
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        admin = get_user(admin_user_id)
+        lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
+        request = db.execute("SELECT * FROM requests WHERE id=?"+lock,(request_id,)).fetchone()
+        if not admin or admin["role"] != "admin" or not request or request["status"] not in (STATUS_OPEN, STATUS_IN_PROGRESS):
+            db.execute("ROLLBACK")
+            return False, request
+        clean_reason = str(reason).strip()[:300] or "Заявка закрыта поддержкой"
+        reliability.close_locked_request(db, request, admin_user_id, clean_reason, "admin_cancelled", wallet_add_entry)
+        record_admin_action(admin_user_id,"request_cancelled",request["requester_id"],{"request_id":request_id,"reason":clean_reason})
+        db.execute("COMMIT")
+        return True, request
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def create_request_dispute(request_id, user_id, message):
+    message = str(message).strip()[:2000]
+    if len(message) < 5:
+        raise ValueError("Опишите проблему подробнее.")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        lock = " FOR UPDATE" if getattr(db,"is_postgres",False) else ""
+        request = db.execute("SELECT * FROM requests WHERE id=?"+lock,(request_id,)).fetchone()
+        if not request or user_id not in (request["requester_id"],request["helper_id"]) or request["status"] != STATUS_IN_PROGRESS:
+            raise ValueError("Обращение доступно участникам текущей заявки.")
+        existing=db.execute("SELECT id FROM support_tickets WHERE request_id=? AND status IN ('open','answered') ORDER BY id DESC LIMIT 1",(request_id,)).fetchone()
+        if existing:
+            db.execute("COMMIT")
+            return existing["id"]
+        ticket=insert_id("INSERT INTO support_tickets(user_id,request_id,subject,message) VALUES(?,?,?,?)",(user_id,request_id,f"Проблема по заявке №{request_id}",message))
+        db.execute("UPDATE requests SET dispute_status='open' WHERE id=?",(request_id,))
+        db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",(request_id,user_id,"dispute_opened","Открыто обращение в поддержку. Завершение и выплата приостановлены до решения."))
+        db.execute("COMMIT")
+        return ticket
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def resolve_request_dispute(admin_id, request_id, note):
+    admin=get_user(admin_id)
+    if not admin or admin["role"]!="admin" or not str(note).strip():return False
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        lock=" FOR UPDATE" if getattr(db,"is_postgres",False) else ""
+        row=db.execute("SELECT * FROM requests WHERE id=?"+lock,(request_id,)).fetchone()
+        if not row or row["dispute_status"]!="open" or row["status"]!=STATUS_IN_PROGRESS:
+            db.execute("ROLLBACK");return False
+        db.execute("UPDATE requests SET dispute_status='resolved' WHERE id=?",(request_id,))
+        db.execute("UPDATE support_tickets SET status='resolved',admin_reply=?,replied_by=?,replied_at=CURRENT_TIMESTAMP WHERE request_id=? AND status IN ('open','answered')",(str(note)[:2000],admin_id,request_id))
+        db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",(request_id,admin_id,"dispute_resolved","Поддержка сняла ограничение завершения: "+str(note)[:300]))
+        record_admin_action(admin_id,"dispute_resolved",row["requester_id"],{"request_id":request_id})
+        db.execute("COMMIT");return True
+    except Exception:
+        db.execute("ROLLBACK");raise
+
 
 def admin_dashboard(days=14, user_limit=100, user_query=""):
     """Return privacy conscious operational data for an authenticated admin."""
@@ -1206,6 +1203,8 @@ def admin_dashboard(days=14, user_limit=100, user_query=""):
             "blocked_users": sum(1 for row in all_users if row["is_blocked"]),
             "requests": request_counts, "support": support_counts, "views_total": views_total,
         },
+        "funnel": reliability.funnel_metrics(db,days),
+        "platform_income": workflow.platform_income(db),
         "series": list(series.values()), "users": user_payloads,
         "tickets": [dict(row) for row in tickets], "activities": activities[:30],
     }
@@ -1271,18 +1270,22 @@ def record_billing_event(invoice_id,event_type,provider_event_id=None,payload="{
     db.execute("INSERT OR IGNORE INTO billing_events(invoice_id,event_type,provider_event_id,payload) VALUES(?,?,?,?)",(invoice_id,event_type,provider_event_id,payload))
 def get_billing_history(uid,limit=20): return db.execute("SELECT * FROM billing_invoices WHERE user_id=? ORDER BY id DESC LIMIT ?",(uid,limit)).fetchall()
 
-def wallet_add_entry(user_id, amount_rub, kind, description, reference, request_id=None, invoice_id=None):
-    """Append an idempotent RUB wallet ledger entry. Amounts are integer kopeck-free RUB."""
-    amount = int(amount_rub)
-    if not amount:
-        return False
-    result = db.execute(
-        """INSERT OR IGNORE INTO wallet_transactions
-           (user_id,amount_rub,kind,description,request_id,invoice_id,reference)
-           VALUES(?,?,?,?,?,?,?)""",
-        (user_id, amount, str(kind)[:64], str(description)[:300], request_id, invoice_id, str(reference)[:160]),
-    )
-    return bool(getattr(result, "rowcount", 0))
+def wallet_add_entry(user_id, amount_rub, kind, description, reference, request_id=None, invoice_id=None, test_amount_rub=None):
+    """Record a total and its test portion; spending requires an enclosing user lock."""
+    amount=int(amount_rub)
+    if not amount:return False
+    if test_amount_rub is None:
+        if kind in ("registration_bonus","test","test_credit"):test_amount_rub=amount
+        elif amount<0:
+            _,available_test=reliability.wallet_balances(db,user_id)
+            test_amount_rub=-min(-amount,max(0,available_test))
+        else:test_amount_rub=0
+    test_amount_rub=int(test_amount_rub)
+    if not min(0,amount)<=test_amount_rub<=max(0,amount):raise ValueError("invalid test portion")
+    result=db.execute("""INSERT OR IGNORE INTO wallet_transactions
+        (user_id,amount_rub,test_amount_rub,kind,description,request_id,invoice_id,reference)
+        VALUES(?,?,?,?,?,?,?,?)""",(user_id,amount,test_amount_rub,str(kind)[:64],str(description)[:300],request_id,invoice_id,str(reference)[:160]))
+    return bool(getattr(result,"rowcount",0))
 
 
 def grant_registration_bonus(user_id, amount_rub=None):
@@ -1303,192 +1306,37 @@ def grant_registration_bonus(user_id, amount_rub=None):
                                 "registration-bonus-20261024:" + secrets.token_hex(16))
 
 def wallet_summary(user_id, limit=50):
-    balance = db.execute(
-        "SELECT COALESCE(SUM(amount_rub),0) amount FROM wallet_transactions WHERE user_id=?", (user_id,)
-    ).fetchone()["amount"]
-    reserved = db.execute(
-        """SELECT COALESCE(SUM(reward_rub),0) amount FROM requests
-           WHERE requester_id=? AND reward_payment_status='paid' AND status IN (?,?)""",
-        (user_id, STATUS_OPEN, STATUS_IN_PROGRESS),
-    ).fetchone()["amount"]
-    incoming = db.execute(
-        """SELECT COALESCE(SUM(reward_rub),0) amount FROM requests
-           WHERE helper_id=? AND reward_payment_status='paid' AND status=?""",
-        (user_id, STATUS_IN_PROGRESS),
-    ).fetchone()["amount"]
-    rows = db.execute(
-        "SELECT amount_rub,kind,description,request_id,invoice_id,created_at FROM wallet_transactions WHERE user_id=? ORDER BY id DESC LIMIT ?",
-        (user_id, limit),
-    ).fetchall()
-    return {"balance_rub": int(balance or 0), "reserved_rub": int(reserved or 0), "incoming_rub": int(incoming or 0), "transactions": [dict(row) for row in rows]}
+    total,test=reliability.wallet_balances(db,user_id)
+    reserved=db.execute("SELECT COALESCE(SUM(reward_rub),0) total,COALESCE(SUM(reward_test_rub),0) test FROM requests WHERE requester_id=? AND reward_payment_status='paid' AND status IN (?,?)",(user_id,STATUS_OPEN,STATUS_IN_PROGRESS)).fetchone()
+    incoming=db.execute("SELECT COALESCE(SUM(reward_rub),0) total,COALESCE(SUM(reward_test_rub),0) test FROM requests WHERE helper_id=? AND reward_payment_status='paid' AND status=?",(user_id,STATUS_IN_PROGRESS)).fetchone()
+    rows=db.execute("SELECT amount_rub,test_amount_rub,kind,description,request_id,invoice_id,created_at FROM wallet_transactions WHERE user_id=? ORDER BY id DESC LIMIT ?",(user_id,limit)).fetchall()
+    return {"balance_rub":total-test,"test_balance_rub":test,"available_total_rub":total,
+            "reserved_rub":int(reserved["total"])-int(reserved["test"]),"test_reserved_rub":int(reserved["test"]),
+            "incoming_rub":int(incoming["total"])-int(incoming["test"]),"test_incoming_rub":int(incoming["test"]),
+            "test_incoming_net_rub":sum(workflow.split_reward(int(row["reward_rub"]))[1] for row in db.execute("SELECT reward_rub FROM requests WHERE helper_id=? AND reward_payment_status='paid' AND status=? AND reward_test_rub=reward_rub",(user_id,STATUS_IN_PROGRESS)).fetchall()),
+            "transactions":[dict(row) for row in rows]}
+
 
 def link_by_code(code,tg_user_id,username=None):
-    """Link a Telegram identity to the existing web account and merge prior activity.
-
-    Both clients use the same users/requests tables. If Telegram was used before
-    linking, that Telegram-only account is merged into the web account instead of
-    being rejected or leaving two separate histories. The Telegram user id is kept
-    as the canonical user_id because Telegram handlers address users by that id.
-    """
-    code = str(code or "").strip().upper()
-    if not re.fullmatch(r"(?:[A-F0-9]{8}|[A-F0-9]{32})", code):
-        return False,"Код не найден или уже использован."
-    if not reserve_auth_attempts(("telegram_link", str(tg_user_id), AUTH_ATTEMPT_LIMIT)):
-        return False,"Слишком много попыток. Повторите через 15 минут."
-    now=datetime.now(timezone.utc).isoformat()
-    # ``verification_code`` is retained only as a short migration bridge for
-    # codes issued before this update. Every newly issued code is hashed.
-    row=db.execute("SELECT * FROM users WHERE (verification_code_hash=? OR verification_code=?) AND verification_code_expires_at>?",(_ticket_hash(code),code,now)).fetchone()
-    if not row:
-        return False,"Код не найден или уже использован."
-
-    web_uid=row["user_id"]
-    if row["tg_user_id"] and row["tg_user_id"] != tg_user_id:
-        return False,"Этот аккаунт уже привязан к другому Telegram."
-
-    # Older bot registrations may have user_id=tg_user_id but a NULL
-    # tg_user_id column. Treat that row as the same Telegram identity too.
-    tg_row=get_user_by_tg(tg_user_id) or get_user(tg_user_id)
-    if tg_row and tg_row["user_id"] == web_uid:
-        db.execute("UPDATE users SET username=COALESCE(?,username),web_verified=1,verification_code=NULL,verification_code_hash=NULL,verification_code_expires_at=NULL WHERE user_id=?",
-                   (username,web_uid))
-        clear_auth_failures("telegram_link", str(tg_user_id))
-        return True,"linked"
-
+    """Attach the bot to a verified email account without changing its ID."""
+    code=str(code or "").strip().upper()
+    if not re.fullmatch(r"(?:[A-F0-9]{8}|[A-F0-9]{32})",code):return False,"Код не найден или уже использован."
+    if not reserve_auth_attempts(("telegram_link",str(tg_user_id),AUTH_ATTEMPT_LIMIT)):return False,"Слишком много попыток."
+    db.execute("BEGIN IMMEDIATE")
     try:
-        db.execute("BEGIN IMMEDIATE")
-
-        # No Telegram profile yet: keep the old behaviour, but migrate every FK
-        # first so the primary-key change remains safe with foreign_keys=ON.
-        if tg_row is None:
-            canonical=tg_user_id
-            admin_role = "admin" if tg_user_id in ADMIN_TELEGRAM_IDS else "user"
-            db.execute("""INSERT INTO users(user_id,name,username,balance,helper_categories,tg_user_id,web_verified,role)
-                VALUES(?,?,?,?,?,?,1,?)""", (canonical,row["name"],username,row["balance"],row["helper_categories"],tg_user_id,admin_role))
-            db.execute("UPDATE users SET helper_availability=? WHERE user_id=?",(row["helper_availability"] or "",canonical))
-            for table,col in [
-                ("requests","requester_id"),("requests","helper_id"),
-                ("helper_queue","user_id"),("billing_invoices","user_id"),
-                ("subscriptions","user_id"),("wallet_transactions","user_id"),
-                ("web_login_tickets","user_id"),("ai_usage","user_id"),
-                ("admin_audit_log","admin_user_id"),("admin_audit_log","target_user_id"),
-                ("identity_verification_requests","reviewer_id"),
-                ("ads","user_id"),("commercial_orders","user_id"),("community_events","creator_id"),("event_participants","user_id"),
-                ("chats","user_a_id"),("chats","user_b_id"),("chat_messages","user_id"),("request_candidates","candidate_id")
-            ]:
-                db.execute(f"UPDATE {table} SET {col}=? WHERE {col}=?",(canonical,web_uid))
-            db.execute("UPDATE favorites SET user_id=? WHERE user_id=?",(canonical,web_uid))
-            db.execute("UPDATE favorites SET favorite_user_id=? WHERE favorite_user_id=?",(canonical,web_uid))
-            db.execute("UPDATE sessions SET user_id=? WHERE user_id=?",(canonical,web_uid))
-            db.execute("UPDATE identity_verification_requests SET user_id=? WHERE user_id=?", (canonical, web_uid))
-            db.execute("UPDATE email_verification_codes SET user_id=? WHERE user_id=?", (canonical, web_uid))
-            db.execute("UPDATE phone_verification_codes SET user_id=? WHERE user_id=?", (canonical, web_uid))
-            migrate_profile_awards(db,web_uid,canonical)
-            db.execute("DELETE FROM users WHERE user_id=?",(web_uid,))
-            db.execute("UPDATE users SET name=?,username=COALESCE(?,username),email=?,password_hash=?,balance=?,helper_categories=?,created_at=?,pro_until=?,verified_until=?,business_until=?,favorite_slots=?,verification_code=NULL,verification_code_hash=NULL,verification_code_expires_at=NULL,web_verified=1,email_verified=?,full_name=?,birth_date=?,phone=?,phone_verified=?,lat=?,lon=?,city=?,bio=? WHERE user_id=?",
-                       (row["name"],username or row["username"],row["email"],row["password_hash"],row["balance"],row["helper_categories"],row["created_at"],row["pro_until"],row["verified_until"],row["business_until"],row["favorite_slots"],row["email_verified"],row["full_name"],row["birth_date"],row["phone"],row["phone_verified"],row["lat"],row["lon"],row["city"],row["bio"],canonical))
-            db.execute("COMMIT")
-            clear_auth_failures("telegram_link", str(tg_user_id))
-            return True,"linked"
-
-        # Telegram was already used before the site account was linked. Merge
-        # both identities into the Telegram id and preserve all activity.
-        tg_uid=tg_row["user_id"]
-        canonical=tg_uid
-
-        # Prefer explicitly entered web profile data where it exists.
-        merged_name=row["name"] or tg_row["name"]
-        merged_email=tg_row["email"] or row["email"]
-        merged_email_verified=tg_row["email_verified"] if tg_row["email"] else row["email_verified"]
-        merged_password=tg_row["password_hash"] or row["password_hash"]
-        merged_username=username or tg_row["username"] or row["username"]
-        merged_categories=tg_row["helper_categories"] or row["helper_categories"]
-        merged_city=tg_row["city"] or row["city"]
-        merged_bio=tg_row["bio"] or row["bio"]
-        merged_lat=tg_row["lat"] if tg_row["lat"] is not None else row["lat"]
-        merged_lon=tg_row["lon"] if tg_row["lon"] is not None else row["lon"]
-        merged_full_name=tg_row["full_name"] or row["full_name"]
-        merged_birth_date=tg_row["birth_date"] or row["birth_date"]
-        merged_phone=tg_row["phone"] or row["phone"]
-        merged_phone_verified=tg_row["phone_verified"] if tg_row["phone"] else row["phone_verified"]
-        merged_balance=max(int(tg_row["balance"] or 0),int(row["balance"] or 0))
-        merged_favorite_slots=max(int(tg_row["favorite_slots"] or 0),int(row["favorite_slots"] or 0))
-        merged_pro=max(x for x in (tg_row["pro_until"],row["pro_until"]) if x is not None) if (tg_row["pro_until"] or row["pro_until"]) else None
-        merged_verified=max(x for x in (tg_row["verified_until"],row["verified_until"]) if x is not None) if (tg_row["verified_until"] or row["verified_until"]) else None
-        merged_business=max(x for x in (tg_row["business_until"],row["business_until"]) if x is not None) if (tg_row["business_until"] or row["business_until"]) else None
-
-        # Merge FK-backed activity. Tables with composite primary keys need
-        # INSERT OR IGNORE first to avoid collisions, then the old rows are removed.
-        for table,col in [
-            ("requests","requester_id"),("requests","helper_id"),
-            ("billing_invoices","user_id"),("wallet_transactions","user_id"),("subscriptions","user_id"),
-            ("web_login_tickets","user_id"),("ads","user_id"),
-            ("commercial_orders","user_id"),("chat_messages","user_id"),("community_events","creator_id")
-        ]:
-            db.execute(f"UPDATE {table} SET {col}=? WHERE {col}=?",(canonical,web_uid))
-
-        db.execute("INSERT OR IGNORE INTO request_candidates(request_id,candidate_id,score,status,offer_token,seen_at,updated_at) SELECT request_id,?,score,status,offer_token,seen_at,updated_at FROM request_candidates WHERE candidate_id=?",(canonical,web_uid))
-        db.execute("DELETE FROM request_candidates WHERE candidate_id=?",(web_uid,))
-        db.execute("INSERT INTO ai_usage(user_id,request_count,token_count,period_start,updated_at) SELECT ?,request_count,token_count,period_start,updated_at FROM ai_usage WHERE user_id=? ON CONFLICT(user_id,period_start) DO UPDATE SET request_count=ai_usage.request_count+excluded.request_count,token_count=ai_usage.token_count+excluded.token_count",(canonical,web_uid))
-        db.execute("DELETE FROM ai_usage WHERE user_id=?",(web_uid,))
-        db.execute("UPDATE admin_audit_log SET admin_user_id=? WHERE admin_user_id=?",(canonical,web_uid))
-        db.execute("UPDATE admin_audit_log SET target_user_id=? WHERE target_user_id=?",(canonical,web_uid))
-
-        source_identity = get_identity_verification(web_uid)
-        target_identity = get_identity_verification(canonical)
-        if source_identity:
-            if target_identity is None:
-                db.execute("UPDATE identity_verification_requests SET user_id=? WHERE user_id=?", (canonical, web_uid))
-            elif source_identity["status"] == "approved" and target_identity["status"] != "approved":
-                db.execute("""UPDATE identity_verification_requests
-                              SET status=?,submitted_at=?,reviewed_at=?,reviewer_id=?,note=? WHERE user_id=?""",
-                           (source_identity["status"], source_identity["submitted_at"], source_identity["reviewed_at"],
-                            source_identity["reviewer_id"], source_identity["note"], canonical))
-                db.execute("DELETE FROM identity_verification_requests WHERE user_id=?", (web_uid,))
-            else:
-                db.execute("DELETE FROM identity_verification_requests WHERE user_id=?", (web_uid,))
-        db.execute("UPDATE identity_verification_requests SET reviewer_id=? WHERE reviewer_id=?", (canonical, web_uid))
-
-        db.execute("UPDATE chats SET user_a_id=? WHERE user_a_id=?",(canonical,web_uid))
-        db.execute("UPDATE chats SET user_b_id=? WHERE user_b_id=?",(canonical,web_uid))
-
-        db.execute("INSERT OR IGNORE INTO helper_queue(user_id,joined_at) SELECT ?,joined_at FROM helper_queue WHERE user_id=?",(canonical,web_uid))
-        db.execute("DELETE FROM helper_queue WHERE user_id=?",(web_uid,))
-
-        db.execute("INSERT OR IGNORE INTO event_participants(event_id,user_id,joined_at) SELECT event_id,?,joined_at FROM event_participants WHERE user_id=?", (canonical, web_uid))
-        db.execute("DELETE FROM event_participants WHERE user_id=?", (web_uid,))
-
-        db.execute("INSERT OR IGNORE INTO favorites(user_id,favorite_user_id,created_at) SELECT ?,favorite_user_id,created_at FROM favorites WHERE user_id=?",(canonical,web_uid))
-        db.execute("INSERT OR IGNORE INTO favorites(user_id,favorite_user_id,created_at) SELECT user_id,?,created_at FROM favorites WHERE favorite_user_id=?",(canonical,web_uid))
-        db.execute("DELETE FROM favorites WHERE user_id=? OR favorite_user_id=?",(web_uid,web_uid))
-
-        # Website sessions now follow the canonical Telegram-backed account, so
-        # the already-open browser remains logged in after linking.
-        db.execute("UPDATE sessions SET user_id=? WHERE user_id=?",(canonical,web_uid))
-        db.execute("DELETE FROM email_verification_codes WHERE user_id=?", (web_uid,))
-        db.execute("DELETE FROM phone_verification_codes WHERE user_id=?", (web_uid,))
-
-        # Remove the old web shadow before copying its unique email/password
-        # onto the canonical Telegram row. All dependent rows were migrated above.
-        migrate_profile_awards(db,web_uid,canonical)
-        db.execute("DELETE FROM users WHERE user_id=?",(web_uid,))
-
-        # Merge billing / profile state into the canonical Telegram row.
-        db.execute("""UPDATE users SET
-            name=?,username=?,email=?,password_hash=?,balance=?,helper_categories=?,
-            pro_until=?,verified_until=?,business_until=?,favorite_slots=?,
-            tg_user_id=?,web_verified=1,verification_code=NULL,verification_code_hash=NULL,verification_code_expires_at=NULL,email_verified=?,full_name=?,birth_date=?,phone=?,phone_verified=?,lat=?,lon=?,city=?,bio=?
-            WHERE user_id=?""",
-            (merged_name,merged_username,merged_email,merged_password,merged_balance,merged_categories,
-             merged_pro,merged_verified,merged_business,merged_favorite_slots,tg_user_id,
-             merged_email_verified,merged_full_name,merged_birth_date,merged_phone,merged_phone_verified,merged_lat,merged_lon,merged_city,merged_bio,canonical))
-
-        db.execute("UPDATE users SET helper_availability=? WHERE user_id=?",
-                   (tg_row["helper_availability"] or row["helper_availability"] or "", canonical))
+        lock=" FOR NO KEY UPDATE" if getattr(db,"is_postgres",False) else ""
+        row=db.execute("SELECT * FROM users WHERE (verification_code_hash=? OR verification_code=?) AND verification_code_expires_at>?"+lock,(_ticket_hash(code),code,datetime.now(timezone.utc).isoformat())).fetchone()
+        if not row or not row["email"] or not row["email_verified"]:
+            db.execute("ROLLBACK");return False,"Сначала зарегистрируйтесь на сайте и подтвердите email."
+        linked=get_user_by_tg(tg_user_id)
+        if linked and linked["user_id"]!=row["user_id"]:
+            db.execute("ROLLBACK");return False,"Telegram уже привязан к другому профилю."
+        if row["tg_user_id"] and row["tg_user_id"]!=tg_user_id:
+            db.execute("ROLLBACK");return False,"К профилю уже привязан другой Telegram."
+        db.execute("UPDATE users SET tg_user_id=?,username=COALESCE(?,username),verification_code=NULL,verification_code_hash=NULL,verification_code_expires_at=NULL WHERE user_id=?",(tg_user_id,username,row["user_id"]))
+        if tg_user_id in ADMIN_TELEGRAM_IDS:db.execute("UPDATE users SET role='admin' WHERE user_id=?",(row["user_id"],))
         db.execute("COMMIT")
-        clear_auth_failures("telegram_link", str(tg_user_id))
+        clear_auth_failures("telegram_link",str(tg_user_id))
         return True,"linked"
     except Exception:
-        db.execute("ROLLBACK")
-        raise
-
+        db.execute("ROLLBACK");raise

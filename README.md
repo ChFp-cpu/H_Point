@@ -1,3 +1,5 @@
+> Current mode: verified-email registration/login and test money only. Telegram is an optional linked client. Paid help reserves within5minutes and pays the helper85% after requester confirmation. Commercial workspaces have7free days, then490test RUB per30days. See [release behaviour and checks](RELIABILITY_QA.md).
+
 # H-Point
 
 **H-Point — сервис взаимопомощи с веб-сайтом и Telegram-ботом.**

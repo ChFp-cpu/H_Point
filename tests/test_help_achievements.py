@@ -24,8 +24,8 @@ class Fixtures:
         for item in self.patches:item.start()
         database.init_db()
         for uid in (1,2,3,4,5,6):
-            database.create_user(uid,"Synthetic "+str(uid),tg_user_id=uid,web_verified=True)
-            self.db.execute("UPDATE users SET balance=1000 WHERE user_id=?",(uid,))
+            database.create_user(uid,"Synthetic "+str(uid),email=f"awards{uid}@example.test",password_hash="synthetic-unused",tg_user_id=uid,web_verified=True)
+            self.db.execute("UPDATE users SET balance=1000,email_verified=1 WHERE user_id=?",(uid,))
 
     def close(self):
         for item in reversed(self.patches):item.stop()
@@ -74,7 +74,10 @@ class HelpAwards(Fixtures,unittest.TestCase):
 
     def test_five_milestones_have_bounded_unique_rewards(self):
         before=self.balance()
-        for index in range(10):self.completed(owner=(1,3,4,5,6)[index%5],category=("tech","shopping","carry")[index%3],rating=5)
+        for index in range(10):
+            # Two rounds of legitimate help on separate days.
+            if index==5:self.db.execute("UPDATE requests SET completed_at='2020-01-01T00:00:00+00:00'")
+            self.completed(owner=(1,3,4,5,6)[index%5],category=("tech","shopping","carry")[index%3],rating=5)
         state=awards.achievement_state(2)
         self.assertEqual((state["unlocked_count"],state["awarded_hp"]),(5,135))
         self.assertEqual(self.balance(),before+10*services.HELPER_REWARD+135)
@@ -105,27 +108,42 @@ class HelpAwards(Fixtures,unittest.TestCase):
         self.assertEqual(self.balance(),before)
         self.assertEqual(awards.achievement_state(2)["unlocked_count"],0)
 
-    def test_awards_survive_unlink_and_merge_without_reissue(self):
-        self.completed(rating=5)
-        moved=database.detach_telegram_to_web_profile(2)
-        self.assertIsNotNone(moved)
-        self.assertEqual(awards.achievement_state(moved)["awarded_hp"],10)
-        self.assertEqual(awards.claim_earned(moved),[])
-        before=max(self.balance(moved),self.balance(2))
-        code=database.create_link_code(moved)
-        self.assertEqual(database.link_by_code(code,2),(True,"linked"))
+    def test_awards_survive_stable_unlink_and_relink_without_reissue(self):
+        rid=self.completed(rating=5)
+        before=self.balance(2)
+        self.assertEqual(database.detach_telegram_to_web_profile(2),2)
+        self.assertIsNone(database.get_user(2)["tg_user_id"])
+        self.assertEqual(awards.achievement_state(2)["awarded_hp"],10)
+        self.assertEqual(awards.claim_earned(2),[])
+        self.assertEqual(database.link_by_code(database.create_link_code(2),2),(True,"linked"))
         self.assertEqual(self.balance(2),before)
+        self.assertEqual(database.get_request(rid)["helper_id"],2)
         self.assertEqual(awards.claim_earned(2),[])
         self.assertEqual(awards.achievement_state(2)["unlocked_count"],1)
 
-    def test_awards_follow_first_telegram_link(self):
+    def test_awards_stay_on_email_account_after_first_telegram_link(self):
         uid=database.create_web_user("Synthetic","synthetic@example.test","hash")
-        self.completed(helper=uid,rating=5)
+        self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=?",(uid,))
+        rid=self.completed(helper=uid,rating=5)
         before=self.balance(uid)
         self.assertEqual(database.link_by_code(database.create_link_code(uid),777),(True,"linked"))
-        self.assertEqual(self.balance(777),before)
-        self.assertEqual(awards.claim_earned(777),[])
-        self.assertEqual(awards.achievement_state(777)["awarded_hp"],10)
+        self.assertEqual(database.get_user(uid)["tg_user_id"],777)
+        self.assertIsNone(database.get_user(777))
+        self.assertEqual(database.get_request(rid)["helper_id"],uid)
+        self.assertEqual(self.balance(uid),before)
+        self.assertEqual(awards.claim_earned(uid),[])
+        self.assertEqual(awards.achievement_state(uid)["awarded_hp"],10)
+
+    def test_link_cannot_merge_achievements_from_another_email_profile(self):
+        self.completed(rating=5)
+        uid=database.create_web_user("Other","other@example.test","hash")
+        self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=?",(uid,))
+        self.completed(helper=uid,rating=5)
+        before=(self.balance(2),self.balance(uid))
+        self.assertFalse(database.link_by_code(database.create_link_code(uid),2)[0])
+        self.assertEqual((self.balance(2),self.balance(uid)),before)
+        self.assertEqual(awards.achievement_state(2)["awarded_hp"],10)
+        self.assertEqual(awards.achievement_state(uid)["awarded_hp"],10)
 
     def test_blocked_helper_cannot_claim_unclaimed_rewards(self):
         rid=self.completed();self.db.execute("UPDATE requests SET requester_rating=5 WHERE id=?",(rid,))

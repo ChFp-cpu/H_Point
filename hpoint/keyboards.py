@@ -66,17 +66,17 @@ def settings_categories_kb(selected: set[str]):
 
 def billing_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{item['title']} — {item['rub']} ₽" + (" / 30 дней" if key == "pro" else ""), callback_data=f"buy:{key}")]
+        [InlineKeyboardButton(text=f"{item['title']} — {item['rub']} тестовых ₽" + (" / 30 дней" if key == "pro" else ""), callback_data=f"buy:{key}")]
         for key, item in MONETIZATION_ITEMS.items()
     ])
 
 def choose_request_kb(requests):
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"№{r['id']} — {r['what'][:28]}", callback_data=f"buyreq:{r['id']}")] for r in requests])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=r["what"][:48], callback_data=f"buyreq:{r['id']}")] for r in requests])
 
 
 def choose_match_request_kb(requests, prefix="matchreq"):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"№{r['id']} — {r['what'][:32]}", callback_data=f"{prefix}:{r['id']}")]
+        [InlineKeyboardButton(text=r["what"][:48], callback_data=f"{prefix}:{r['id']}")]
         for r in requests
     ])
 

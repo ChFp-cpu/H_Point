@@ -26,6 +26,7 @@ class InvitationData:
         database.init_db()
         for uid in (1, 2, 3, 4):
             database.create_user(uid, f"User {uid}", tg_user_id=uid, web_verified=True)
+            self.db.execute("UPDATE users SET email=?,email_verified=1 WHERE user_id=?",(f"user{uid}@example.test",uid))
             if uid != 1:
                 services.add_to_queue(uid)
         self.rid = services.create_request(1, {"what": "Компьютер", "category": "tech", "place": "центр", "time_needed": "сегодня", "urgency": "обычная", "details": "test"})
@@ -61,7 +62,7 @@ class InvitationCore(InvitationData, unittest.TestCase):
         database.wallet_add_entry(1,500,"test","Synthetic","test")
         services.reserve_request_reward(self.rid,1,400)
         self.assertEqual(services.accept_open_request(self.rid,2),"created")
-        self.assertEqual(database.wallet_summary(2)["balance_rub"],0)
+        self.assertEqual(database.wallet_summary(2)["test_balance_rub"],0)
 
     def test_author_can_accept_legacy_response_without_inviting_again(self):
         services.apply_to_request(self.rid,2)
@@ -99,18 +100,19 @@ class InvitationCore(InvitationData, unittest.TestCase):
             services.reserve_request_reward(self.rid, 1, 399)
         self.assertTrue(services.reserve_request_reward(self.rid, 1, 400))
         self.assertFalse(services.reserve_request_reward(self.rid, 1, 400))
-        self.assertEqual(database.wallet_summary(1)["balance_rub"], 100)
-        self.assertEqual(database.wallet_summary(1)["reserved_rub"], 400)
-        self.assertEqual(database.wallet_summary(2)["balance_rub"], 0)
+        self.assertEqual(database.wallet_summary(1)["test_balance_rub"], 100)
+        self.assertEqual(database.wallet_summary(1)["test_reserved_rub"], 400)
+        self.assertEqual(database.wallet_summary(2)["test_balance_rub"], 0)
         self.assertTrue(services.respond_to_helper_offer(self.rid, 2, True, token))
         self.assertIsNone(database.get_request(self.rid)["completion_requested_at"])
         self.assertFalse(services.complete_request(self.rid, 2, confirmed_by=2))
         self.assertFalse(services.complete_request(self.rid, 2, confirmed_by=4))
-        self.assertEqual(database.wallet_summary(2)["balance_rub"], 0)
+        self.assertEqual(database.wallet_summary(2)["test_balance_rub"], 0)
         self.assertTrue(services.complete_request(self.rid, 2, confirmed_by=1))
         self.assertFalse(services.complete_request(self.rid, 2, confirmed_by=1))
-        self.assertEqual(database.wallet_summary(1)["reserved_rub"], 0)
-        self.assertEqual(database.wallet_summary(2)["balance_rub"], 400)
+        self.assertEqual(database.wallet_summary(1)["test_reserved_rub"], 0)
+        self.assertEqual(database.wallet_summary(2)["test_balance_rub"], 340)
+        self.assertEqual(self.db.execute("SELECT SUM(commission_test_rub) total FROM platform_commissions").fetchone()["total"],60)
         self.assertEqual([database.get_user(uid)["balance"] for uid in (1, 2)], hp)
 
     def test_paid_reserve_is_returned_once_if_open_request_is_cancelled(self):
@@ -119,8 +121,8 @@ class InvitationCore(InvitationData, unittest.TestCase):
         services.reserve_request_reward(self.rid, 1, 400)
         self.assertTrue(services.cancel_request(self.rid, 1))
         self.assertFalse(services.cancel_request(self.rid, 1))
-        self.assertEqual(database.wallet_summary(1)["balance_rub"], 500)
-        self.assertEqual(database.wallet_summary(1)["reserved_rub"], 0)
+        self.assertEqual(database.wallet_summary(1)["test_balance_rub"], 500)
+        self.assertEqual(database.wallet_summary(1)["test_reserved_rub"], 0)
 
     def test_targeted_application_is_distinct_from_queue_and_prioritized(self):
         self.assertEqual(services.get_request_applications(1), [])
@@ -214,7 +216,7 @@ class InvitationCore(InvitationData, unittest.TestCase):
 
 class InvitationRace(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(prefix="hpoint-invitations-")
+        self.directory = tempfile.TemporaryDirectory(prefix="hpoint-invitations-",dir=Path.cwd())
         self.db = database.SQLiteConnection(str(Path(self.directory.name) / "race.db"))
         self.patches = [patch.object(module, "db", self.db) for module in (database, services)]
         for item in self.patches:
@@ -250,8 +252,8 @@ class InvitationRace(unittest.TestCase):
         database.wallet_add_entry(1,600,"test","Synthetic","test")
         results=self.race(lambda:services.reserve_request_reward(self.rid,1,400),lambda:services.reserve_request_reward(self.rid,1,400))
         self.assertEqual(sorted(results),[False,True])
-        self.assertEqual(database.wallet_summary(1)["balance_rub"],200)
-        self.assertEqual(database.wallet_summary(1)["reserved_rub"],400)
+        self.assertEqual(database.wallet_summary(1)["test_balance_rub"],200)
+        self.assertEqual(database.wallet_summary(1)["test_reserved_rub"],400)
 
     def test_two_reserves_cannot_overdraw_one_wallet(self):
         self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
@@ -262,7 +264,7 @@ class InvitationRace(unittest.TestCase):
             except ValueError as error:return str(error)
         results=self.race(lambda:reserve(self.rid),lambda:reserve(other))
         self.assertIn(True,results);self.assertIn("insufficient wallet",results)
-        self.assertEqual(database.wallet_summary(1)["balance_rub"],200)
+        self.assertEqual(database.wallet_summary(1)["test_balance_rub"],200)
 
     def test_simultaneous_confirmation_cannot_pay_helper_twice(self):
         self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
@@ -272,7 +274,7 @@ class InvitationRace(unittest.TestCase):
         self.assertEqual(services.request_help_completion(self.rid,2),"created")
         results=self.race(lambda:services.complete_request(self.rid,2,confirmed_by=1),lambda:services.complete_request(self.rid,2,confirmed_by=1))
         self.assertEqual(sorted(results),[False,True])
-        self.assertEqual(database.wallet_summary(2)["balance_rub"],400)
+        self.assertEqual(database.wallet_summary(2)["test_balance_rub"],340)
 
     def test_cancel_and_accept_cannot_both_succeed(self):
         cancelled, accepted = self.race(
@@ -357,11 +359,11 @@ class InvitationAPI(InvitationData, unittest.TestCase):
         self.assertFalse(self.request(1, "/api/requests/reward/reserve", {"request_id":self.rid,"amount_rub":400})["created"])
         self.request(2, "/api/helper/offers/respond", accept)
         self.assert_error(403, 2, "/api/requests/finish", {"request_id":self.rid})
-        self.assertEqual(database.wallet_summary(2)["balance_rub"], 0)
+        self.assertEqual(database.wallet_summary(2)["test_balance_rub"], 0)
         self.assert_error(403, 2, "/api/requests/completion/confirm", {"request_id":self.rid})
         self.request(1, "/api/requests/completion/confirm", {"request_id":self.rid})
         self.assert_error(409, 1, "/api/requests/completion/confirm", {"request_id":self.rid})
-        self.assertEqual(database.wallet_summary(2)["balance_rub"], 400)
+        self.assertEqual(database.wallet_summary(2)["test_balance_rub"], 340)
 
     def test_free_completion_api_is_requester_only_and_settles_once(self):
         self.assertTrue(services.accept_open_request(self.rid,2))
@@ -374,10 +376,10 @@ class InvitationAPI(InvitationData, unittest.TestCase):
         self.assert_error(409,1,"/api/requests/finish",{"request_id":self.rid})
         self.assertEqual([database.get_user(uid)["balance"] for uid in (1,2)],[90,120])
 
-    def test_missing_merchant_does_not_create_a_ghost_reward_invoice(self):
+    def test_real_acquiring_is_disabled_without_creating_a_reward_invoice(self):
         self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
         with patch.object(web,"ROBOKASSA_MERCHANT_LOGIN",""),patch.object(web,"ROBOKASSA_PASSWORD_1",""),patch.object(web,"ROBOKASSA_PASSWORD_2",""):
-            self.assert_error(503,1,"/api/requests/reward/pay",{"request_id":self.rid})
+            self.assert_error(409,1,"/api/requests/reward/pay",{"request_id":self.rid})
         self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM billing_invoices WHERE item_type='request_reward'").fetchone()["n"],0)
 
     def test_targeted_application_reaches_site_and_canonical_telegram_accounts_once(self):
@@ -506,15 +508,15 @@ class InvitationBot(InvitationData, unittest.IsolatedAsyncioTestCase):
         callback = self.callback(2,"finish","")
         callback.data = f"finish:{self.rid}"
         await handlers.cb_finish(callback,self.bot)
-        self.assertEqual(database.wallet_summary(2)["balance_rub"],0)
+        self.assertEqual(database.wallet_summary(2)["test_balance_rub"],0)
         self.assertIn("только автор",callback.answer.call_args.args[0])
         self.assertIsNone(database.get_request(self.rid)["completion_requested_at"])
         callback = self.callback(1,"confirm","")
         callback.data = f"paid_done:{self.rid}"
         await handlers.cb_paid_completion(callback,self.bot)
-        self.assertEqual(database.wallet_summary(2)["balance_rub"],400)
+        self.assertEqual(database.wallet_summary(2)["test_balance_rub"],340)
         await handlers.cb_paid_completion(callback,self.bot)
-        self.assertEqual(database.wallet_summary(2)["balance_rub"],400)
+        self.assertEqual(database.wallet_summary(2)["test_balance_rub"],340)
 
     async def test_free_bot_completion_rejects_helper_and_notifies_after_author_confirmation(self):
         services.accept_open_request(self.rid,2)

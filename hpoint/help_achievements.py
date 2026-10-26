@@ -46,7 +46,7 @@ def _metrics(db, user_id):
         COUNT(DISTINCT category) categories,
         COUNT(DISTINCT CASE WHEN requester_rating=5 THEN requester_id END) thanks
         FROM requests WHERE helper_id=? AND requester_id!=? AND status=?
-        AND requester_rating>=4 AND COALESCE(reward_rub,0)=0""",(user_id,user_id,STATUS_DONE)).fetchone()
+        AND requester_rating>=4 AND COALESCE(reward_rub,0)=0 AND hp_settled=1""",(user_id,user_id,STATUS_DONE)).fetchone()
     return {name:int(row[name] or 0) for name in ("completed","people","categories","thanks")}
 
 

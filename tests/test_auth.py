@@ -146,15 +146,28 @@ class EmailActivation(unittest.TestCase):
         self.assertEqual(self.request("/api/auth/logout", {}, pending)[0], 200)
         self.assertEqual(self.request("/api/auth/email/resend", {}, pending)[0], 401)
 
-    def test_telegram_session_keeps_working_without_email_and_cannot_be_unlinked_unsafely(self):
+    def test_telegram_only_session_cannot_access_email_only_accounts(self):
         database.create_user(42, "Telegram", tg_user_id=42)
         session = "hpoint_session=" + web.new_sess(42)
-        self.assertEqual(self.request("/api/me", cookie=session)[0], 200)
-        self.assertEqual(self.request("/api/profile/telegram/unlink", {}, session)[0], 409)
+        self.assertEqual(self.request("/api/me", cookie=session)[0], 401)
+        self.assertEqual(self.request("/api/profile/telegram/unlink", {}, session)[0], 401)
         self.assertEqual(database.get_user(42)["tg_user_id"], 42)
 
+    def test_linked_profile_uses_verified_email_login_and_keeps_its_identity(self):
+        uid=database.create_web_user("Linked email member","linked@example.test",web.ph("Ab1234"))
+        self.db.execute("UPDATE users SET email_verified=1,tg_user_id=77 WHERE user_id=?",(uid,))
+        status,_,headers=self.request("/api/auth/login",{"email":"linked@example.test","password":"Ab1234"})
+        self.assertEqual(status,200)
+        status,result,_=self.request("/api/me",cookie=self.cookie(headers,"hpoint_session"))
+        self.assertEqual(status,200)
+        self.assertEqual(result["user"]["id"],uid)
+        self.assertEqual(result["user"]["email"],"linked@example.test")
+        self.assertEqual(database.get_user_by_tg(77)["user_id"],uid)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM users").fetchone()[0],1)
+
     def test_profile_switch_does_not_bypass_confirmation(self):
-        database.create_user(42, "Telegram", tg_user_id=42)
+        database.create_user(42, "Email member", email="member@example.test", password_hash=web.ph("Ab1234"), tg_user_id=42)
+        self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=42")
         uid = database.create_web_user("Pending", "switch@example.test", web.ph("Ab1234"))
         first = web.new_sess(42, "device-test")
         web.new_sess(uid, "device-test")

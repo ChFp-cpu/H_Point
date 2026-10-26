@@ -265,7 +265,7 @@ async function loadPhotos(page){
     assert.equal(await page.getByRole('button',{name:'Панель администратора',exact:true}).count(),1);
     assert.equal(await page.getByRole('button',{name:'Сменить аккаунт',exact:true}).count(),1);
     assert.equal(await page.getByRole('button',{name:'Выйти из аккаунта',exact:true}).count(),1);
-    await page.getByRole('button',{name:'Панель администратора',exact:true}).click();await page.locator('.adminMetrics').waitFor();
+    await page.getByRole('button',{name:'Панель администратора',exact:true}).click();await page.locator('.adminMetrics').first().waitFor();
     for(const colorScheme of ['light','dark']){
       await page.emulateMedia({colorScheme});
       for(const width of [390,1440]){

@@ -3,7 +3,7 @@ import logging
 import secrets
 from urllib.parse import urlencode, urlparse
 from html import escape
-from aiogram import Bot, F, Router
+from aiogram import Bot, F, Router, BaseMiddleware
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -17,8 +17,46 @@ from . import games as game_service
 from .chat_notifications import chat_notification
 from .features import GAMES_ENABLED, GAMES_PAUSED_MESSAGE
 from . import help_achievements
+from .email_access import has_verified_email, link_owner_has_verified_email
 
 router = Router()
+
+
+def resolve_profile_id(telegram_user_id):
+    row=db.execute("SELECT user_id FROM users WHERE tg_user_id=?",(telegram_user_id,)).fetchone()
+    return row["user_id"] if row else telegram_user_id
+
+
+def email_access_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Войти или зарегистрироваться по email",url=WEB_PUBLIC_URL.rstrip("/")+"/")]])
+
+
+EMAIL_ACCESS_NOTICE = (
+    "Регистрация и вход в H-Point доступны только по email на сайте. "
+    "Подтвердите email, затем в профиле получите код привязки Telegram и отправьте сюда /link КОД. "
+    "Бот используется для уведомлений и общения по уже созданному email-аккаунту."
+)
+
+
+class EmailOnlyBotMiddleware(BaseMiddleware):
+    async def __call__(self,handler,event,data):
+        sender=getattr(event,"from_user",None)
+        if sender is None:return
+        user=get_user(resolve_profile_id(sender.id))
+        if has_verified_email(user) and not user["is_blocked"]:
+            return await handler(event,data)
+        text=str(getattr(event,"text","") or "")
+        command=text.split(maxsplit=1)[0].split("@",1)[0] if text else ""
+        if isinstance(event,Message) and (command in {"/start","/help","/website","/cancel","/link"} or text==BTN_WEBSITE):
+            return await handler(event,data)
+        if isinstance(event,CallbackQuery):
+            await event.answer("Войдите по email на сайте и привяжите этот бот в профиле.",show_alert=True)
+        else:
+            await event.answer(EMAIL_ACCESS_NOTICE,reply_markup=email_access_keyboard())
+
+
+router.message.outer_middleware(EmailOnlyBotMiddleware())
+router.callback_query.outer_middleware(EmailOnlyBotMiddleware())
 
 
 # The bot deliberately stays focused on the help flow.  This guide makes every
@@ -36,17 +74,18 @@ BOT_GUIDE = (
     "⚙️ <b>Настройки помощи</b> — указать категории, в которых вы готовы помогать.\n" +
     ("🎮 <b>Игры H-Point</b> — игры на сайте.\n" if GAMES_ENABLED else "🏅 <b>Достижения за помощь</b> — в профиле: условия, награды HP и ваш прогресс.\n") +
     "💳 <b>H-Point+</b> — платные возможности и безопасный переход к оплате.\n"
-    "🌐 <b>Перейти на сайт</b> — одноразовый вход в тот же профиль без пароля.\n\n"
+    "🌐 <b>Перейти на сайт</b> — открыть сайт и войти по email.\n\n"
     "<b>Как проходит помощь</b>\n"
     "1. Создайте заявку или встаньте в очередь.\n"
     "2. Автор выбирает кандидата; помощник подтверждает согласие.\n"
-    "3. Сообщения с сайта приходят сюда целиком. Ответьте командой /chat #НОМЕР ТЕКСТ из уведомления, после выполнения автор завершает помощь, затем оба участника ставят оценки.\n\n"
+    "3. Сообщения с сайта приходят сюда целиком. Ответьте командой /chat ТЕКСТ или откройте чат с названием помощи на сайте, после выполнения автор завершает помощь, затем оба участника ставят оценки.\n\n"
+    "При проблеме нажмите «Есть проблема» в карточке помощи на сайте. Завершение и выплата приостановятся до решения поддержки. HP за одну пару участников начисляются не чаще раза в 24 часа.\n\n"
     "<b>Синхронизация и безопасность</b>\n"
     "Бот и сайт используют общие профиль, заявки, историю, HP и достижения за реальную помощь. "
     "Чтобы подключить существующий сайт: сайт → «Профиль» → «Получить код Telegram», затем в боте <b>/link КОД</b>. "
     "Код вводите только в этом боте. Для отмены незавершённого действия используйте /cancel. "
     "Уточнить подбор можно командой <b>/ask НУЖНЫЙ ОПЫТ</b>; вернуть меню — /menu.\n\n"
-    "Сайт остаётся основным местом для карты, активностей, Лиги H-Point, профиля, подтверждения email и платежей — бот открывает его одноразовой ссылкой."
+    "Сайт остаётся основным местом для карты, активностей, Лиги H-Point, профиля, подтверждения email и платежей — вход на сайт выполняется только по email."
 )
 
 # The first reply for a returning participant remains short enough for a
@@ -64,12 +103,17 @@ BOT_START_OVERVIEW = (
 
 
 def onboarding_text() -> str:
-    return (
-        "👋 <b>H-Point — помощь рядом.</b>\n\n"
-        "Сначала создадим ваш профиль, а затем откроется понятное главное меню.\n\n"
-        + BOT_GUIDE
-        + "\n\n<b>Как вас зовут?</b>"
-    )
+    return "👋 <b>H-Point — помощь рядом.</b>\n\n" + EMAIL_ACCESS_NOTICE
+
+
+def request_title(request_id):
+    request=get_request(request_id)
+    return escape(str(request["what"])) if request else "Помощь"
+
+
+def request_author_name(request):
+    user=get_user(request["requester_id"])
+    return escape(str(user["name"])) if user else "Участник"
 
 
 def user_link(user) -> str:
@@ -88,7 +132,8 @@ def stars(value) -> str:
 def request_text(req) -> str:
     category = CATEGORIES.get(req["category"], CATEGORIES["other"])
     return (
-        f"📋 <b>Заявка №{req['id']}</b>\n"
+        f"📋 <b>{escape(req['what'])}</b>\n"
+        f"<b>Кому нужна помощь:</b> {request_author_name(req)}\n"
         f"<b>Категория:</b> {escape(category)}\n"
         f"<b>Какая помощь нужна:</b> {escape(req['what'])}\n"
         f"<b>Где:</b> {escape(req['place'])}\n"
@@ -171,60 +216,68 @@ async def show_main_menu(message: Message, text: str = "Главное меню.
 
 
 async def check_not_busy(message: Message) -> bool:
-    user_id = message.from_user.id
+    user_id = resolve_profile_id(message.from_user.id)
     unrated_request = get_unrated_request(user_id)
     if unrated_request:
         await message.answer(
-            f"Сначала оцените помощь по заявке №{unrated_request['id']} (1–5):",
+            f"Сначала оцените помощь по задаче «{request_title(unrated_request['id'])}» (1–5):",
             reply_markup=rating_kb(unrated_request["id"], "rate"),
         )
         return False
     unrated_help = get_unrated_help(user_id)
     if unrated_help:
         await message.answer(
-            f"Пожалуйста, оцените взаимодействие по заявке №{unrated_help['id']} (1–5):",
+            f"Пожалуйста, оцените взаимодействие по задаче «{request_title(unrated_help['id'])}» (1–5):",
             reply_markup=rating_kb(unrated_help["id"], "ratehelp"),
         )
         return False
     helping = get_active_help(user_id)
     if helping:
         await message.answer(
-            f"Вы сейчас помогаете по заявке №{helping['id']}. После оказания помощи заявку завершит её автор.",
+            f"Вы сейчас помогаете по задаче «{request_title(helping['id'])}». После оказания помощи заявку завершит её автор.",
             reply_markup=request_chat_kb(helping["id"]),
         )
         return False
     return True
 
 
+@router.message(Command("problem"))
+async def report_request_problem(message: Message) -> None:
+    description=(message.text or "").partition(" ")[2].strip()
+    first,separator,rest=description.partition(" ")
+    actor=resolve_profile_id(message.from_user.id)
+    # Previously delivered commands still work; new messages use the task title.
+    if first.startswith("#") and first[1:].isascii() and first[1:].isdigit():
+        request=get_request(int(first[1:]));description=rest.strip()
+    else:
+        request=get_active_own_request(actor)
+        if not request or request["status"]!=STATUS_IN_PROGRESS:request=get_active_help(actor)
+    if not request or len(description)<5:
+        await message.answer("Откройте текущую помощь на сайте и нажмите «Есть проблема» или отправьте /problem описание проблемы.")
+        return
+    try:create_request_dispute(request["id"],actor,description)
+    except ValueError as error:
+        await message.answer(escape(str(error)))
+        return
+    await message.answer(f"Обращение по задаче «{request_title(request['id'])}» создано. Завершение и выплата приостановлены до решения поддержки. Чат остаётся доступен.")
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    payload = (message.text or "").partition(" ")[2].strip()
-    if payload.startswith("login_"):
-        ticket = payload.removeprefix("login_")
-        if complete_telegram_auth_ticket(ticket, message.from_user.id, message.from_user.full_name, message.from_user.username):
-            await message.answer(
-                "✅ <b>Telegram подтверждён.</b> Вернитесь в браузер: сайт автоматически откроет ваш общий профиль.",
-                reply_markup=main_menu_kb(),
-            )
-        else:
-            await message.answer("Эта ссылка уже использована или истекла. Вернитесь на сайт и начните вход заново.")
+    if (message.text or "").partition(" ")[2].strip().startswith("login_"):
+        await message.answer(EMAIL_ACCESS_NOTICE,reply_markup=email_access_keyboard())
         return
-    user = get_user(message.from_user.id)
-    if user is None:
-        await state.set_state(Registration.name)
-        await message.answer(onboarding_text())
-        return
-    await show_main_menu(
-        message,
-        f"С возвращением, {escape(user['name'])}!\n\n" + BOT_START_OVERVIEW,
-    )
-    if payload == "profile":
-        await profile(message, state)
+    if not await ensure_registered(message,state):return
+    user=get_user(resolve_profile_id(message.from_user.id))
+    await show_main_menu(message,f"С возвращением, {escape(user['name'])}!\n\n"+BOT_START_OVERVIEW)
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
+    if not has_verified_email(get_user(resolve_profile_id(message.from_user.id))):
+        await message.answer(EMAIL_ACCESS_NOTICE,reply_markup=email_access_keyboard())
+        return
     await message.answer(BOT_GUIDE, reply_markup=main_menu_kb())
 
 
@@ -248,7 +301,7 @@ async def cmd_ask(message: Message, state: FSMContext) -> None:
         return
     if not await ensure_registered(message, state):
         return
-    request = get_active_own_request(message.from_user.id)
+    request = get_active_own_request(resolve_profile_id(message.from_user.id))
     if not request or request["status"] != STATUS_OPEN:
         await message.answer("Сначала создайте открытую заявку через «🆘 Мне нужна помощь». Затем напишите, например: /ask нужен человек с опытом техники.")
         return
@@ -282,7 +335,7 @@ async def cmd_chat(message: Message, state: FSMContext, bot: Bot) -> None:
     if not text:
         await message.answer("Отправьте сообщение так: <b>/chat ТЕКСТ</b>")
         return
-    user_id = message.from_user.id
+    user_id = resolve_profile_id(message.from_user.id)
     request = get_request(target_id) if target_id is not None else get_active_own_request(user_id)
     if target_id is None and (not request or request["status"] != STATUS_IN_PROGRESS):
         request = get_active_help(user_id)
@@ -300,16 +353,16 @@ async def cmd_chat(message: Message, state: FSMContext, bot: Bot) -> None:
         try:
             await bot.send_message(
                 other["tg_user_id"],
-                chat_notification(request["id"], get_user(user_id)["name"], text),
+                chat_notification(request["id"], get_user(user_id)["name"], text, request["what"]),
             )
         except Exception:
             logging.exception("Не удалось отправить уведомление о сообщении в Telegram")
-    await message.answer(f"💬 Сообщение отправлено в общий чат заявки №{request['id']}.")
+    await message.answer(f"💬 Сообщение отправлено в общий чат помощи «{request_title(request['id'])}».")
 
 
 @router.message(Command("admin"))
 async def cmd_admin(message: Message) -> None:
-    admin = get_user(message.from_user.id)
+    admin = get_user(resolve_profile_id(message.from_user.id))
     if not admin or admin["role"] != "admin":
         await message.answer("Команда доступна только администратору.")
         return
@@ -328,7 +381,7 @@ async def cmd_admin(message: Message) -> None:
 @router.message(Command("block"))
 @router.message(Command("unblock"))
 async def cmd_user_block(message: Message) -> None:
-    admin = get_user(message.from_user.id)
+    admin = get_user(resolve_profile_id(message.from_user.id))
     if not admin or admin["role"] != "admin":
         await message.answer("Команда доступна только администратору.")
         return
@@ -342,10 +395,10 @@ async def cmd_user_block(message: Message) -> None:
         return
     blocked = parts[0].split("@", 1)[0] == "/block"
     reason = parts[2] if len(parts) > 2 and blocked else ""
-    if target_id == message.from_user.id:
+    if target_id == resolve_profile_id(message.from_user.id):
         await message.answer("Нельзя изменить собственный доступ.")
         return
-    if not set_user_blocked(message.from_user.id, target_id, blocked, reason):
+    if not set_user_blocked(resolve_profile_id(message.from_user.id), target_id, blocked, reason):
         await message.answer("Пользователь не найден.")
         return
     await message.answer("Пользователь заблокирован." if blocked else "Доступ пользователя восстановлен.")
@@ -353,7 +406,7 @@ async def cmd_user_block(message: Message) -> None:
 
 @router.message(Command("verifications"))
 async def cmd_verifications(message: Message) -> None:
-    admin = get_user(message.from_user.id)
+    admin = get_user(resolve_profile_id(message.from_user.id))
     if not admin or admin["role"] != "admin":
         await message.answer("Команда доступна только администратору.")
         return
@@ -374,7 +427,7 @@ async def cmd_verifications(message: Message) -> None:
 @router.message(Command("verify"))
 @router.message(Command("rejectverify"))
 async def cmd_review_identity(message: Message, bot: Bot) -> None:
-    admin = get_user(message.from_user.id)
+    admin = get_user(resolve_profile_id(message.from_user.id))
     if not admin or admin["role"] != "admin":
         await message.answer("Команда доступна только администратору.")
         return
@@ -389,7 +442,7 @@ async def cmd_review_identity(message: Message, bot: Bot) -> None:
         return
     approved = parts[0].split("@", 1)[0] == "/verify"
     note = parts[2] if len(parts) > 2 and not approved else ""
-    ok, status = review_identity_verification(message.from_user.id, target_id, approved, note)
+    ok, status = review_identity_verification(resolve_profile_id(message.from_user.id), target_id, approved, note)
     if not ok:
         await message.answer("Заявка не найдена, уже обработана или доступ запрещён.")
         return
@@ -409,7 +462,7 @@ async def cmd_review_identity(message: Message, bot: Bot) -> None:
 async def cmd_request_identity_verification(message: Message, state: FSMContext) -> None:
     if not await ensure_registered(message, state):
         return
-    ok, status = request_identity_verification(message.from_user.id)
+    ok, status = request_identity_verification(resolve_profile_id(message.from_user.id))
     if not ok:
         await message.answer("Сначала откройте бот в личном чате и завершите привязку Telegram.")
         return
@@ -425,56 +478,27 @@ async def cmd_request_identity_verification(message: Message, state: FSMContext)
 @router.message(Command("website"))
 @router.message(StateFilter(None), F.text == BTN_WEBSITE)
 async def website(message: Message, state: FSMContext) -> None:
-    if not await ensure_registered(message, state):
-        return
-    public_url = urlparse(WEB_PUBLIC_URL)
-    if public_url.scheme not in {"http", "https"} or public_url.hostname in {None, "0.0.0.0", "::"}:
-        await message.answer(
-            "Ссылка на сайт ещё не настроена. Укажите публичный адрес в WEB_PUBLIC_URL и перезапустите бота."
-        )
-        return
-    token = secrets.token_urlsafe(32)
-    create_web_login_ticket(message.from_user.id, token)
-    url = WEB_PUBLIC_URL.rstrip("/") + "/auth/telegram?" + urlencode({"ticket": token})
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Открыть мой профиль на сайте", url=url)
-    ]])
-    await message.answer(
-        "Войти на сайт в ваш профиль H-Point можно по одноразовой ссылке. "
-        "Она действует 5 минут.",
-        reply_markup=keyboard,
-    )
+    await state.clear()
+    await message.answer("Откройте H-Point и войдите по email.",reply_markup=email_access_keyboard())
 
 
 @router.message(Registration.name, F.text)
 async def reg_name(message: Message, state: FSMContext) -> None:
-    name = message.text.strip()
-    if name.startswith("/") or name in (BTN_NEED_HELP, BTN_WANT_HELP, BTN_FIND_CANDIDATES, BTN_MY_CANDIDATES, BTN_PROFILE, BTN_HISTORY, BTN_SETTINGS, BTN_WEBSITE, BTN_GAMES, BTN_NAVIGATOR, BTN_CANCEL, "💳 H-Point+"):
-        await message.answer("Пожалуйста, напишите своё имя обычным текстом.")
-        return
-    if not name or len(name) > MAX_NAME_LEN:
-        await message.answer(f"Имя должно быть от 1 до {MAX_NAME_LEN} символов.")
-        return
-    create_user(message.from_user.id, name, message.from_user.username)
+    # Old conversations may still hold this state after the release.
     await state.clear()
-    await show_main_menu(
-        message,
-        f"✅ Регистрация завершена, {escape(name)}! Вам начислено <b>{START_BALANCE} HP</b>.\n\n"
-        "Нажмите «🌐 Перейти на сайт», чтобы открыть этот же профиль в браузере, "
-        "или «ℹ️ Как пользоваться», чтобы увидеть назначение всех кнопок.",
-    )
+    await message.answer(EMAIL_ACCESS_NOTICE,reply_markup=email_access_keyboard())
 
 
 @router.message(Registration.name)
 async def reg_name_invalid(message: Message) -> None:
-    await message.answer("Пожалуйста, отправьте имя текстовым сообщением.")
+    await message.answer(EMAIL_ACCESS_NOTICE,reply_markup=email_access_keyboard())
 
 
 async def ensure_registered(message: Message, state: FSMContext) -> bool:
-    user = get_user(message.from_user.id)
-    if user is None:
-        await state.set_state(Registration.name)
-        await message.answer("Сначала давайте познакомимся. Как вас зовут?")
+    user=get_user(resolve_profile_id(message.from_user.id))
+    if not has_verified_email(user):
+        await state.clear()
+        await message.answer(EMAIL_ACCESS_NOTICE,reply_markup=email_access_keyboard())
         return False
     if user["is_blocked"]:
         await message.answer("Доступ к аккаунту ограничен. Обратитесь в поддержку.")
@@ -498,11 +522,8 @@ def _game_website_url(user_id=None, game=None, section=None):
         target += "?" + urlencode({"game": game})
     elif section in {"store", "achievements"}:
         target += "#" + section
-    if user_id is None:
-        return WEB_PUBLIC_URL.rstrip("/") + target
-    token = secrets.token_urlsafe(32)
-    create_web_login_ticket(user_id, token)
-    return WEB_PUBLIC_URL.rstrip("/") + "/auth/telegram?" + urlencode({"ticket": token, "next": target})
+    return WEB_PUBLIC_URL.rstrip("/") + target
+
 
 
 def _games_menu_kb(user_id=None) -> InlineKeyboardMarkup:
@@ -679,7 +700,7 @@ async def games_menu(message: Message, state: FSMContext) -> None:
     # Entering the games intentionally leaves any unfinished text form, so a
     # later answer cannot be misinterpreted as a request or review field.
     await state.clear()
-    await message.answer("🎮 <b>Игры H-Point — на сайте</b>\n\nВыберите игру: откроется её полный интерфейс в вашем профиле. HP, рекорды и достижения общие с ботом.\n\nЛичная ссылка действует 5 минут. Чтобы получить новую, снова нажмите «Игры H-Point».", reply_markup=_games_menu_kb(message.from_user.id))
+    await message.answer("🎮 <b>Игры H-Point — на сайте</b>\n\nВыберите игру: откроется её полный интерфейс в вашем профиле. HP, рекорды и достижения общие с ботом.\n\nВход на сайт выполняется по email.", reply_markup=_games_menu_kb(resolve_profile_id(message.from_user.id)))
 
 
 @router.callback_query(F.data.startswith("g:"))
@@ -692,7 +713,7 @@ async def game_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer(GAMES_PAUSED_MESSAGE,show_alert=True)
         await callback.message.answer("Продолжить помощь и посмотреть достижения можно в профиле.",reply_markup=main_menu_kb())
         return
-    user = get_user(callback.from_user.id)
+    user = get_user(resolve_profile_id(callback.from_user.id))
     if not user or user["is_blocked"]:
         await callback.answer("Сначала откройте личный диалог с H-Point.", show_alert=True)
         return
@@ -701,14 +722,14 @@ async def game_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
     game = parts[2] if len(parts) > 2 and parts[1] == "start" and parts[2] in game_service.GAME_CATALOG else None
     if game is None and len(parts) > 2 and parts[1] in {"restart", "view", "move", "vol", "assign", "pick", "swap", "hint", "answer", "choose"}:
         try:
-            game = game_service.game_session(callback.from_user.id, parts[2])["game"]
+            game = game_service.game_session(resolve_profile_id(callback.from_user.id), parts[2])["game"]
         except ValueError:
             pass
     await callback.answer("Полная версия игры — на сайте")
     await callback.message.edit_text(
         "🎮 Игры теперь открываются на сайте: с игровым полем, анимацией и удобным управлением. Ваш прогресс сохранён.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Играть на сайте ↗", url=_game_website_url(callback.from_user.id, game, "store" if len(parts) > 1 and parts[1] in {"shop", "item", "buy", "use"} else None))
+            InlineKeyboardButton(text="Играть на сайте ↗", url=_game_website_url(resolve_profile_id(callback.from_user.id), game, "store" if len(parts) > 1 and parts[1] in {"shop", "item", "buy", "use"} else None))
         ]]),
     )
 
@@ -725,7 +746,7 @@ async def cancel_action(message: Message, state: FSMContext) -> None:
 async def profile(message: Message, state: FSMContext) -> None:
     if not await ensure_registered(message, state):
         return
-    user = get_user(message.from_user.id)
+    user = get_user(resolve_profile_id(message.from_user.id))
     stats = get_user_stats(user["user_id"])
     achievements = help_achievements.achievement_state(user["user_id"])
     categories = get_helper_categories(user["user_id"])
@@ -762,12 +783,12 @@ async def _show_help_achievements(message: Message, user_id: int) -> None:
 
 @router.message(Command("achievements"))
 async def help_achievements_menu(message: Message, state: FSMContext) -> None:
-    if await ensure_registered(message,state):await _show_help_achievements(message,message.from_user.id)
+    if await ensure_registered(message,state):await _show_help_achievements(message,resolve_profile_id(message.from_user.id))
 
 
 @router.callback_query(F.data == "profile:achievements")
 async def help_achievements_callback(callback: CallbackQuery) -> None:
-    user=get_user(callback.from_user.id)
+    user=get_user(resolve_profile_id(callback.from_user.id))
     if not user or user["is_blocked"]:
         await callback.answer("Сначала откройте свой профиль.",show_alert=True)
         return
@@ -785,7 +806,7 @@ async def show_history(message: Message, user_id: int) -> None:
         role = "🙋 Вы просили помощь" if req["requester_id"] == user_id else "🤝 Вы помогали"
         status = STATUS_TITLES.get(req["status"], req["status"])
         rating = req["requester_rating"] if req["requester_id"] == user_id else req["helper_rating"]
-        line = f"\n<b>№{req['id']}</b> — {escape(req['what'])}\n{role} · {status}"
+        line = f"\n<b>{escape(req['what'])}</b> · {request_author_name(req)}\n{role} · {status}"
         if rating is not None:
             line += f" · {'⭐' * rating}"
         chunks.append(line)
@@ -795,7 +816,7 @@ async def show_history(message: Message, user_id: int) -> None:
         await message.answer(
             "Когда помощь оказана, завершите свою заявку:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=f"✅ Завершить помощь №{req['id']}", callback_data=f"finish:{req['id']}")]
+                [InlineKeyboardButton(text=f"✅ {req['what'][:36]}", callback_data=f"finish:{req['id']}")]
                 for req in active_own
             ]),
         )
@@ -806,13 +827,13 @@ async def show_history(message: Message, user_id: int) -> None:
 async def history(message: Message, state: FSMContext) -> None:
     if not await ensure_registered(message, state):
         return
-    await show_history(message, message.from_user.id)
+    await show_history(message, resolve_profile_id(message.from_user.id))
 
 
 @router.callback_query(F.data == "profile:history")
 async def cb_profile_history(callback: CallbackQuery) -> None:
     await callback.answer()
-    await show_history(callback.message, callback.from_user.id)
+    await show_history(callback.message, resolve_profile_id(callback.from_user.id))
 
 
 @router.message(Command("settings"))
@@ -820,7 +841,7 @@ async def cb_profile_history(callback: CallbackQuery) -> None:
 async def settings(message: Message, state: FSMContext) -> None:
     if not await ensure_registered(message, state):
         return
-    selected = set(get_helper_categories(message.from_user.id))
+    selected = set(get_helper_categories(resolve_profile_id(message.from_user.id)))
     await message.answer(
         "⚙️ <b>Настройки помощи</b>\n\nВыберите категории, в которых готовы помогать. "
         "Если ничего не выбрать, вы сможете помочь с любой заявкой.",
@@ -830,7 +851,7 @@ async def settings(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "profile:settings")
 async def cb_profile_settings(callback: CallbackQuery) -> None:
-    selected = set(get_helper_categories(callback.from_user.id))
+    selected = set(get_helper_categories(resolve_profile_id(callback.from_user.id)))
     await callback.answer()
     await callback.message.answer(
         "⚙️ <b>Настройки помощи</b>\n\nВыберите категории, в которых готовы помогать.",
@@ -841,7 +862,7 @@ async def cb_profile_settings(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("setcat:"))
 async def cb_set_category(callback: CallbackQuery) -> None:
     action = callback.data.split(":", 1)[1]
-    selected = set(get_helper_categories(callback.from_user.id))
+    selected = set(get_helper_categories(resolve_profile_id(callback.from_user.id)))
     if action == "save":
         await callback.answer("Настройки сохранены")
         await callback.message.edit_text("✅ Настройки помощи сохранены. Чем больше совпадение категорий, тем выше приоритет при подборе.")
@@ -853,7 +874,7 @@ async def cb_set_category(callback: CallbackQuery) -> None:
         selected.remove(action)
     else:
         selected.add(action)
-    set_helper_categories(callback.from_user.id, list(selected))
+    set_helper_categories(resolve_profile_id(callback.from_user.id), list(selected))
     await callback.answer("Изменено")
     await callback.message.edit_reply_markup(reply_markup=settings_categories_kb(selected))
 
@@ -880,7 +901,7 @@ async def _show_candidates(message: Message, request_id: int, *, edit: bool = Fa
     if not req:
         await message.answer("Заявка не найдена.")
         return
-    if req["requester_id"] != (actor_id if actor_id is not None else message.from_user.id):
+    if req["requester_id"] != (actor_id if actor_id is not None else resolve_profile_id(message.from_user.id)):
         await message.answer("Эта заявка принадлежит другому пользователю.")
         return
     if req["status"] != STATUS_OPEN:
@@ -908,7 +929,7 @@ async def _show_candidates(message: Message, request_id: int, *, edit: bool = Fa
         return
 
     header = (
-        f"⚡ <b>Кандидаты для заявки №{request_id}</b>\n\n"
+        f"⚡ <b>Кандидаты для помощи «{request_title(request_id)}»</b>\n\n"
         f"{escape(req['what'])}\n\n"
         f"Найдено: <b>{len(matches)}</b>. Это люди, которые сейчас готовы помочь. Выберите одного — он подтвердит согласие сам.{waiting}"
     )
@@ -928,7 +949,7 @@ async def _show_candidates(message: Message, request_id: int, *, edit: bool = Fa
 async def _choose_candidate_request(message: Message, state: FSMContext) -> bool:
     if not await ensure_registered(message, state) or not await check_not_busy(message):
         return False
-    active = get_active_own_request(message.from_user.id)
+    active = get_active_own_request(resolve_profile_id(message.from_user.id))
     if not active:
         await message.answer(
             "У вас нет активной заявки. Сначала создайте её через «🆘 Мне нужна помощь».\n\n"
@@ -945,7 +966,7 @@ async def _choose_candidate_request(message: Message, state: FSMContext) -> bool
 async def find_candidates(message: Message, state: FSMContext) -> None:
     if not await _choose_candidate_request(message, state):
         return
-    active = get_active_own_request(message.from_user.id)
+    active = get_active_own_request(resolve_profile_id(message.from_user.id))
     await _show_candidates(message, active["id"])
 
 
@@ -953,7 +974,7 @@ async def find_candidates(message: Message, state: FSMContext) -> None:
 async def my_candidates(message: Message, state: FSMContext) -> None:
     if not await _choose_candidate_request(message, state):
         return
-    active = get_active_own_request(message.from_user.id)
+    active = get_active_own_request(resolve_profile_id(message.from_user.id))
     await _show_candidates(message, active["id"])
 
 
@@ -967,13 +988,13 @@ async def cb_candidate_assign(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     req = get_request(request_id)
-    if not req or req["requester_id"] != callback.from_user.id:
+    if not req or req["requester_id"] != resolve_profile_id(callback.from_user.id):
         await callback.answer("Заявка недоступна.", show_alert=True)
         return
     if req["status"] != STATUS_OPEN:
         await callback.answer("Эта заявка уже получила помощника или закрыта.", show_alert=True)
         return
-    if candidate_id == callback.from_user.id:
+    if candidate_id == resolve_profile_id(callback.from_user.id):
         await callback.answer("Нельзя выбрать себя.", show_alert=True)
         return
 
@@ -984,12 +1005,12 @@ async def cb_candidate_assign(callback: CallbackQuery, bot: Bot) -> None:
 
     if get_current_helper_offer(request_id):
         await callback.answer("Сначала отмените текущее приглашение, затем выберите другого помощника.", show_alert=True)
-        await _show_candidates(callback.message, request_id, actor_id=callback.from_user.id)
+        await _show_candidates(callback.message, request_id, actor_id=resolve_profile_id(callback.from_user.id))
         return
 
     application=db.execute("SELECT offer_token FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='applied'",(request_id,candidate_id)).fetchone()
     if application:
-        result=accept_open_request(request_id,candidate_id,author_id=callback.from_user.id,application_token=application["offer_token"])
+        result=accept_open_request(request_id,candidate_id,author_id=resolve_profile_id(callback.from_user.id),application_token=application["offer_token"])
         if result!="created":
             await callback.answer("Для платной помощи сначала нужен резерв в кошельке; либо отклик уже изменился.",show_alert=True)
             return
@@ -1000,7 +1021,7 @@ async def cb_candidate_assign(callback: CallbackQuery, bot: Bot) -> None:
 
     if not offer_helper(request_id, candidate_id):
         await callback.answer("Кандидат уже занят, вышел из очереди или заявка изменилась. Обновляю список.", show_alert=True)
-        await _show_candidates(callback.message, request_id, actor_id=callback.from_user.id)
+        await _show_candidates(callback.message, request_id, actor_id=resolve_profile_id(callback.from_user.id))
         return
 
     await callback.answer("Предложение отправлено")
@@ -1026,16 +1047,16 @@ async def cb_application_cancel(callback: CallbackQuery, bot: Bot) -> None:
     except (ValueError, TypeError):
         await callback.answer("Некорректный отклик.", show_alert=True)
         return
-    if not cancel_request_application(request_id, helper_id, callback.from_user.id, token):
+    if not cancel_request_application(request_id, helper_id, resolve_profile_id(callback.from_user.id), token):
         await callback.answer("Отклик уже изменился или помощник выбран.", show_alert=True)
         return
     await callback.answer("Отклик отменён")
     await callback.message.edit_text("↩️ Отклик отменён. Сама заявка остаётся открытой.")
     request = get_request(request_id)
-    other = get_user(request["requester_id"] if callback.from_user.id == helper_id else helper_id)
+    other = get_user(request["requester_id"] if resolve_profile_id(callback.from_user.id) == helper_id else helper_id)
     if other and other["tg_user_id"]:
         try:
-            await bot.send_message(other["tg_user_id"], f"↩️ Отклик на заявку №{request_id} отозван помощником." if callback.from_user.id == helper_id else f"ℹ️ Автор отклонил ваш отклик на заявку №{request_id}.")
+            await bot.send_message(other["tg_user_id"], f"↩️ Отклик на помощь «{request_title(request_id)}» отозван помощником." if resolve_profile_id(callback.from_user.id) == helper_id else f"ℹ️ Автор отклонил ваш отклик на помощь «{request_title(request_id)}».")
         except Exception:
             logging.exception("Не удалось уведомить об отмене отклика %s", request_id)
 
@@ -1054,16 +1075,16 @@ async def cb_helper_offer_response(callback: CallbackQuery, bot: Bot) -> None:
         return
     if action == "cancel":
         offer = get_current_helper_offer(request_id)
-        if not offer or not withdraw_helper_offer(request_id, callback.from_user.id, offer["candidate_id"], token):
+        if not offer or not withdraw_helper_offer(request_id, resolve_profile_id(callback.from_user.id), offer["candidate_id"], token):
             await callback.answer("Приглашение уже изменилось или помощь подтверждена.", show_alert=True)
             return
         await callback.answer("Приглашение отменено, заявка остаётся открытой")
         if offer["tg_user_id"]:
             try:
-                await bot.send_message(offer["tg_user_id"], f"↩️ Автор отменил приглашение по заявке №{request_id}. Подтверждать его больше не нужно; вы можете помогать другим.")
+                await bot.send_message(offer["tg_user_id"], f"↩️ Автор отменил приглашение по задаче «{request_title(request_id)}». Подтверждать его больше не нужно; вы можете помогать другим.")
             except Exception:
                 logging.exception("Не удалось уведомить об отмене приглашения %s", request_id)
-        await _show_candidates(callback.message, request_id, edit=True, actor_id=callback.from_user.id)
+        await _show_candidates(callback.message, request_id, edit=True, actor_id=resolve_profile_id(callback.from_user.id))
         return
     if action not in ("accept", "decline"):
         await callback.answer("Некорректное действие.", show_alert=True)
@@ -1071,10 +1092,10 @@ async def cb_helper_offer_response(callback: CallbackQuery, bot: Bot) -> None:
     accepted = action == "accept"
     request = get_request(request_id)
     offer = get_current_helper_offer(request_id)
-    if accepted and offer and offer["candidate_id"] == callback.from_user.id and (offer["offer_token"] or "") == token and int(request["reward_rub"] or 0) > 0 and request["reward_payment_status"] != "paid":
+    if accepted and offer and offer["candidate_id"] == resolve_profile_id(callback.from_user.id) and (offer["offer_token"] or "") == token and int(request["reward_rub"] or 0) > 0 and request["reward_payment_status"] != "paid":
         await callback.answer("Автор ещё не создал резерв в кошельке H-Point. До резерва не начинайте помощь.", show_alert=True)
         return
-    if not respond_to_helper_offer(request_id, callback.from_user.id, accepted, token):
+    if not respond_to_helper_offer(request_id, resolve_profile_id(callback.from_user.id), accepted, token):
         await callback.answer("Предложение уже неактуально.", show_alert=True)
         return
     request = get_request(request_id)
@@ -1093,7 +1114,7 @@ async def cb_helper_offer_response(callback: CallbackQuery, bot: Bot) -> None:
         try:
             await bot.send_message(
                 requester["tg_user_id"],
-                f"ℹ️ Помощник отклонил предложение по заявке №{request_id}. Откройте «⚡ Подобрать кандидатов» и выберите другого.",
+                f"ℹ️ Помощник отклонил предложение по задаче «{request_title(request_id)}». Откройте «⚡ Подобрать кандидатов» и выберите другого.",
                 reply_markup=main_menu_kb(),
             )
         except Exception:
@@ -1108,11 +1129,11 @@ async def cb_candidate_refresh(callback: CallbackQuery) -> None:
         await callback.answer("Некорректная заявка.", show_alert=True)
         return
     req = get_request(request_id)
-    if not req or req["requester_id"] != callback.from_user.id:
+    if not req or req["requester_id"] != resolve_profile_id(callback.from_user.id):
         await callback.answer("Заявка недоступна.", show_alert=True)
         return
     await callback.answer("Подбор обновлён")
-    await _show_candidates(callback.message, request_id, edit=True, actor_id=callback.from_user.id)
+    await _show_candidates(callback.message, request_id, edit=True, actor_id=resolve_profile_id(callback.from_user.id))
 
 
 @router.callback_query(F.data.startswith("candidate:back:"))
@@ -1123,7 +1144,7 @@ async def cb_candidate_back(callback: CallbackQuery) -> None:
         await callback.answer("Некорректная заявка.", show_alert=True)
         return
     req = get_request(request_id)
-    if not req or req["requester_id"] != callback.from_user.id:
+    if not req or req["requester_id"] != resolve_profile_id(callback.from_user.id):
         await callback.answer("Заявка недоступна.", show_alert=True)
         return
     await callback.answer()
@@ -1134,7 +1155,7 @@ async def cb_candidate_back(callback: CallbackQuery) -> None:
 async def need_help_start(message: Message, state: FSMContext) -> None:
     if not await ensure_registered(message, state) or not await check_not_busy(message):
         return
-    user_id = message.from_user.id
+    user_id = resolve_profile_id(message.from_user.id)
     open_count = db.execute("SELECT COUNT(*) n FROM requests WHERE requester_id=? AND status=?", (user_id, STATUS_OPEN)).fetchone()["n"]
     if int(open_count or 0) >= 10:
         await message.answer("Одновременно можно опубликовать до 10 открытых заявок. Закройте или отмените одну из текущих.")
@@ -1208,7 +1229,7 @@ async def q_details(message: Message, state: FSMContext, bot: Bot) -> None:
         text = "Нет дополнительных деталей"
     data = await state.update_data(details=text)
     await state.clear()
-    user_id = message.from_user.id
+    user_id = resolve_profile_id(message.from_user.id)
     open_count = db.execute("SELECT COUNT(*) n FROM requests WHERE requester_id=? AND status=?", (user_id, STATUS_OPEN)).fetchone()["n"]
     if int(open_count or 0) >= 10:
         await show_main_menu(message, "Одновременно можно опубликовать до 10 открытых заявок. Новая не создана.")
@@ -1227,7 +1248,7 @@ async def q_details(message: Message, state: FSMContext, bot: Bot) -> None:
 async def want_help(message: Message, state: FSMContext, bot: Bot) -> None:
     if not await ensure_registered(message, state) or not await check_not_busy(message):
         return
-    user_id = message.from_user.id
+    user_id = resolve_profile_id(message.from_user.id)
     if is_in_queue(user_id):
         await message.answer("Вы уже в очереди помощников.", reply_markup=leave_queue_kb())
         return
@@ -1240,8 +1261,8 @@ async def want_help(message: Message, state: FSMContext, bot: Bot) -> None:
 
 @router.callback_query(F.data == "leave_queue")
 async def cb_leave_queue(callback: CallbackQuery) -> None:
-    if is_in_queue(callback.from_user.id):
-        remove_from_queue(callback.from_user.id)
+    if is_in_queue(resolve_profile_id(callback.from_user.id)):
+        remove_from_queue(resolve_profile_id(callback.from_user.id))
         await callback.answer("Вы вышли из очереди")
         await callback.message.edit_text("Вы вышли из очереди помощников. Ожидающие отклики отозваны; уже принятая помощь не отменяется.")
     else:
@@ -1255,9 +1276,9 @@ async def cb_cancel_request(callback: CallbackQuery) -> None:
     except ValueError:
         await callback.answer("Некорректная заявка", show_alert=True)
         return
-    if cancel_request(request_id, callback.from_user.id):
+    if cancel_request(request_id, resolve_profile_id(callback.from_user.id)):
         await callback.answer("Заявка отменена")
-        await callback.message.edit_text(f"🗑 Заявка №{request_id} отменена.")
+        await callback.message.edit_text(f"🗑 Помощь «{request_title(request_id)}» отменена.")
     else:
         await callback.answer("Заявку уже нельзя отменить.", show_alert=True)
 
@@ -1273,29 +1294,32 @@ async def cb_finish(callback: CallbackQuery, bot: Bot) -> None:
     if request is None:
         await callback.answer("Заявка не найдена.", show_alert=True)
         return
-    if request["requester_id"] != callback.from_user.id:
+    if request["requester_id"] != resolve_profile_id(callback.from_user.id):
         await callback.answer("Завершить помощь может только автор заявки.", show_alert=True)
         return
-    if not complete_request(request_id, request["helper_id"], confirmed_by=callback.from_user.id):
-        await callback.answer("Не удалось завершить: заявка уже закрыта, нет резерва или недостаточно HP у автора.", show_alert=True)
+    if not complete_request(request_id, request["helper_id"], confirmed_by=resolve_profile_id(callback.from_user.id)):
+        await callback.answer("Не удалось завершить: заявка уже закрыта, открыто обращение, нет резерва или недостаточно HP у автора.", show_alert=True)
         return
     await callback.answer("Помощь завершена!")
+    request = get_request(request_id)
     paid = int(request["reward_rub"] or 0) > 0
     requester = get_user(request["requester_id"])
-    settlement = (f"{request['reward_rub']} ₽ зачислено в кошелёк помощника. H-Points не списывались."
-                  if paid else f"Списано {REQUEST_COST} HP. Баланс: {requester['balance']} HP.")
+    fee=int(request["commission_rub"] or 0) if "commission_rub" in request.keys() else 0
+    net=int(request["helper_reward_rub"] or 0) if fee else int(request["reward_rub"] or 0)
+    settlement = (f"{net} тестовых ₽ зачислено помощнику; комиссия платформы — {fee} тестовых ₽. H-Points не списывались."
+                  if paid else (f"Списано {REQUEST_COST} HP. Баланс: {requester['balance']} HP." if request["hp_settled"] else "Повторная помощь за 24 часа: HP не списывались и не начислялись."))
     await callback.message.edit_text(
-        f"✅ Вы подтвердили выполнение помощи по заявке №{request_id}. {settlement}\n\nОцените помощь:",
+        f"✅ Вы подтвердили выполнение помощи по задаче «{request_title(request_id)}». {settlement}\n\nОцените помощь:",
         reply_markup=rating_kb(request_id),
     )
     helper = get_user(request["helper_id"])
     if helper and helper["tg_user_id"]:
-        settlement = (f"{request['reward_rub']} ₽ поступило в ваш кошелёк H-Point."
-                      if paid else f"Вам начислено +{HELPER_REWARD} HP. Баланс: {helper['balance']} HP.")
+        settlement = (f"{net} тестовых ₽ поступило в ваш кошелёк H-Point после комиссии {fee} тестовых ₽."
+                      if paid else (f"Вам начислено +{HELPER_REWARD} HP. Баланс: {helper['balance']} HP." if request["hp_settled"] else "Повторная помощь за 24 часа: HP не списывались и не начислялись."))
         try:
             await bot.send_message(
                 helper["tg_user_id"],
-                f"✅ Автор подтвердил помощь по заявке №{request_id}. {settlement}\n\nОцените взаимодействие:",
+                f"✅ Автор подтвердил помощь по задаче «{request_title(request_id)}». {settlement}\n\nОцените взаимодействие:",
                 reply_markup=rating_kb(request_id, "ratehelp"),
             )
         except Exception:
@@ -1325,7 +1349,7 @@ async def cb_rate(callback: CallbackQuery, state: FSMContext) -> None:
         request_id, rating = int(request_id_str), int(rating_str)
     except ValueError:
         await callback.answer("Некорректные данные.", show_alert=True); return
-    if not set_rating(request_id, callback.from_user.id, rating):
+    if not set_rating(request_id, resolve_profile_id(callback.from_user.id), rating):
         await callback.answer("Оценка уже поставлена или недоступна.", show_alert=True); return
     await callback.answer("Спасибо за оценку!")
     await callback.message.edit_reply_markup(reply_markup=None)
@@ -1335,7 +1359,7 @@ async def cb_rate(callback: CallbackQuery, state: FSMContext) -> None:
         try:
             helper=get_user(req["helper_id"])
             if helper and helper["tg_user_id"]:
-                await callback.bot.send_message(helper["tg_user_id"], f"Ваша помощь по заявке №{request_id} получила оценку {'⭐' * rating} ({rating}/5)."+help_achievements.reward_notice(req["helper_id"],request_id))
+                await callback.bot.send_message(helper["tg_user_id"], f"Ваша помощь по задаче «{request_title(request_id)}» получила оценку {'⭐' * rating} ({rating}/5)."+help_achievements.reward_notice(req["helper_id"],request_id))
         except Exception:
             logging.exception("Не удалось сообщить помощнику оценку")
 
@@ -1347,7 +1371,7 @@ async def cb_rate_help(callback: CallbackQuery, state: FSMContext) -> None:
         request_id, rating = int(request_id_str), int(rating_str)
     except ValueError:
         await callback.answer("Некорректные данные.", show_alert=True); return
-    if not set_helper_rating(request_id, callback.from_user.id, rating):
+    if not set_helper_rating(request_id, resolve_profile_id(callback.from_user.id), rating):
         await callback.answer("Оценка уже поставлена или недоступна.", show_alert=True); return
     await callback.answer("Спасибо за оценку!")
     await callback.message.edit_reply_markup(reply_markup=None)
@@ -1367,7 +1391,7 @@ async def finish_review(message: Message, state: FSMContext, side: str) -> None:
     if not review or len(review) > MAX_TEXT_LEN:
         await message.answer(f"Отзыв должен быть от 1 до {MAX_TEXT_LEN} символов.")
         return
-    set_review(request_id, message.from_user.id, review, side)
+    set_review(request_id, resolve_profile_id(message.from_user.id), review, side)
     await state.clear()
     await show_main_menu(message, "Спасибо за отзыв! Диалог завершён. Главное меню:")
 
@@ -1388,7 +1412,7 @@ async def helper_review(message: Message, state: FSMContext) -> None:
 async def show_billing(message: Message, state: FSMContext) -> None:
     if not await ensure_registered(message, state):
         return
-    user=get_user(message.from_user.id)
+    user=get_user(resolve_profile_id(message.from_user.id))
     status=[]
     if is_pro(user["user_id"]): status.append("⭐ PRO активен")
     if is_verified(user["user_id"]): status.append("✓ Верификация активна")
@@ -1399,7 +1423,7 @@ async def show_billing(message: Message, state: FSMContext) -> None:
         "PRO — приоритет профиля и заявок в автоматическом подборе на 30 дней, без автопродления.\n"
         "Рейтинг и Лига не продаются; отклики не гарантированы. Проверка личности бесплатна в профиле сайта.\n\n"
         + ("\n".join(status)+"\n\n" if status else "") +
-        "Выберите функцию:",
+        "Используются только тестовые ₽. Для вознаграждений за помощь действует комиссия 15%. Выберите функцию:",
         reply_markup=billing_kb(),
     )
 
@@ -1412,8 +1436,9 @@ async def billing_menu(message: Message, state: FSMContext):
 async def terms(message: Message):
     await message.answer(
         "<b>Условия покупок H-Point</b>\n\n"
-        "Оплата цифровых функций производится в рублях через внешний эквайринг. "
-        "После подтверждения платежа функция активируется автоматически.\n\n"
+        "Сейчас используются только тестовые средства. Оплата и вывод реальных денег отключены. "
+        "Вознаграждение за помощь: комиссия платформы 15%, помощнику поступает 85%. "
+        "Тестовые средства нельзя вывести.\n\n"
         "Поддержка платежей: /paysupport"
     )
 
@@ -1421,8 +1446,8 @@ async def terms(message: Message):
 async def paysupport(message: Message):
     await message.answer(
         "💬 <b>Поддержка платежей H-Point</b>\n\n"
-        "Если платёж прошёл, но функция не активировалась, укажите номер счёта H-Point. "
-        "Не отправляйте пароль или данные банковской карты."
+        "Если тестовые средства списались, но функция не включилась, откройте поддержку на сайте и опишите действие. "
+        "Не отправляйте пароль от аккаунта."
     )
 
 @router.message(Command("link"))
@@ -1431,10 +1456,13 @@ async def link_account(message: Message):
     if len(parts)!=2:
         await message.answer("🔐 Чтобы привязать Telegram к сайту, отправьте:\n\n<b>/link КОД</b>\n\nКод находится в разделе «Профиль» на сайте.")
         return
+    if not link_owner_has_verified_email(db,parts[1]):
+        await message.answer("Сначала подтвердите email в профиле сайта и получите новый код привязки.",reply_markup=email_access_keyboard())
+        return
     ok,msg=link_by_code(parts[1].strip().upper(),message.from_user.id,message.from_user.username)
     if not ok:
         await message.answer("❌ "+msg); return
-    user=get_user(message.from_user.id)
+    user=get_user(resolve_profile_id(message.from_user.id))
     await message.answer(
         "✅ <b>Telegram успешно привязан!</b>\n\n"
         f"Профиль: <b>{escape(user['name'])}</b>\n"
@@ -1446,11 +1474,11 @@ async def link_account(message: Message):
 @router.message(Command("unlink"))
 async def unlink_account(message: Message):
     """Detach the current Telegram identity so it can be linked to another site profile."""
-    source=get_user(message.from_user.id)
+    source=get_user(resolve_profile_id(message.from_user.id))
     if not source or not source["tg_user_id"]:
-        await message.answer("Telegram уже используется как отдельный профиль. Для привязки к сайту получите код в разделе «Профиль» и отправьте /link КОД.")
+        await message.answer("Telegram не привязан. Войдите по email на сайте, получите код в профиле и отправьте /link КОД.")
         return
-    detached=detach_telegram_to_web_profile(message.from_user.id)
+    detached=detach_telegram_to_web_profile(resolve_profile_id(message.from_user.id))
     if detached is None:
         await message.answer("Не удалось отвязать профиль. Попробуйте позже.")
         return
@@ -1464,7 +1492,7 @@ def web_payment_url(item_type, request_id=None):
 
 def payment_button(item_type, request_id=None):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Перейти к оплате в рублях", url=web_payment_url(item_type,request_id))]
+        [InlineKeyboardButton(text="Открыть тестовую оплату на сайте", url=web_payment_url(item_type,request_id))]
     ])
 
 @router.callback_query(F.data.startswith("buy:"))
@@ -1473,7 +1501,7 @@ async def cb_buy(callback: CallbackQuery, state: FSMContext):
     if item_type not in MONETIZATION_ITEMS:
         await callback.answer("Эта функция снята с продажи. Откройте обновлённое меню H-Point+.",show_alert=True);return
     if item_type in ("boost","more_responses"):
-        requests=db.execute("SELECT id,what FROM requests WHERE requester_id=? AND status=? ORDER BY id DESC LIMIT 10",(callback.from_user.id,STATUS_OPEN)).fetchall()
+        requests=db.execute("SELECT id,what FROM requests WHERE requester_id=? AND status=? ORDER BY id DESC LIMIT 10",(resolve_profile_id(callback.from_user.id),STATUS_OPEN)).fetchall()
         if not requests:
             await callback.answer("Нет открытых заявок для продвижения.",show_alert=True);return
         await callback.answer()
@@ -1497,7 +1525,7 @@ async def cb_buy_request(callback: CallbackQuery):
         await callback.answer("Некорректная заявка",show_alert=True);return
     await callback.answer()
     await callback.message.answer(
-        f"Заявка №{request_id}. Выберите функцию:",
+        f"Помощь «{request_title(request_id)}». Выберите функцию:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"🚀 Продвижение — {PRICE_BOOST_RUB} ₽",callback_data=f"payreq:boost:{request_id}")]
         ])
@@ -1511,7 +1539,7 @@ async def cb_pay_request(callback: CallbackQuery):
     if item_type != "boost":
         await callback.answer("Эта функция больше не продаётся. Откройте H-Point+.",show_alert=True);return
     req=get_request(rid)
-    if not req or req["requester_id"]!=callback.from_user.id or req["status"]!=STATUS_OPEN:
+    if not req or req["requester_id"]!=resolve_profile_id(callback.from_user.id) or req["status"]!=STATUS_OPEN:
         await callback.answer("Заявка уже недоступна.",show_alert=True);return
     await callback.answer()
     await callback.message.answer(
@@ -1527,26 +1555,20 @@ async def billing_ad_text(message: Message,state: FSMContext):
 @router.message(Command("commercial"))
 async def commercial_start(message: Message,state: FSMContext):
     if not await ensure_registered(message,state):return
-    await state.set_state(Billing.commercial_title)
-    await message.answer("💼 Коммерческий заказ. Напишите название/описание заказа.")
+    await state.clear()
+    await message.answer(
+        "💼 Коммерческий кабинет для тренеров, организаций, прорабов и специалистов: услуги, клиенты и расписание. "
+        "7 дней бесплатно, затем 490 тестовых ₽ за 30 дней, без автоматических списаний. "
+        "Войдите по email и откройте «Коммерческий кабинет» в профиле сайта.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть профиль на сайте",url=WEB_PUBLIC_URL.rstrip("/")+"/#/profile")]]),
+    )
+
 
 @router.message(Billing.commercial_title,F.text)
 async def commercial_title(message: Message,state: FSMContext):
-    title=message.text.strip()
-    if not title or len(title)>MAX_TEXT_LEN:
-        await message.answer(f"Название должно быть от 1 до {MAX_TEXT_LEN} символов.");return
-    await state.update_data(commercial_title=title);await state.set_state(Billing.commercial_amount)
-    await message.answer("Укажите сумму заказа в рублях.")
+    await commercial_start(message,state)
+
 
 @router.message(Billing.commercial_amount,F.text)
 async def commercial_amount(message: Message,state: FSMContext):
-    try:amount=int(message.text.strip())
-    except:
-        await message.answer("Введите целое число рублей.");return
-    if amount<=0:
-        await message.answer("Сумма должна быть положительной.");return
-    data=await state.get_data();state_id=create_commercial_order(message.from_user.id,data["commercial_title"],amount)
-    await state.clear()
-    order=get_commercial_order(state_id)
-    await message.answer(f"💼 Заказ №{state_id} создан.\nСумма: <b>{amount} ₽</b>\nКомиссия H-Point: <b>{order['commission_amount']} ₽</b>.")
-
+    await commercial_start(message,state)

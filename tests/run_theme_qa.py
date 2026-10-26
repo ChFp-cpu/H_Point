@@ -23,13 +23,13 @@ def main():
                    BOT_TOKEN="", BOT_USERNAME="", RUN_TELEGRAM_BOT="0", SESSION_COOKIE_SECURE="0",
                    SMTP_HOST="", SMTP_PASSWORD="", BREVO_API_KEY="", YANDEX_MAPS_API_KEY="browser-qa-placeholder",
                    HPOINT_QA_URL=base, HPOINT_QA_OUTPUT=str(output), APP_ENV="development",
-                   HPOINT_QA_MAIL=str(Path(task_dir) / "mail.json"))
+                   HPOINT_QA_MAIL=str(Path(task_dir) / "mail.json"),REGISTRATION_BONUS_RUB="0")
         seed = '''
-from hpoint import database, services
+from hpoint import database, services, web
 import os
 database.init_db()
 for uid, name in [(901,"Тестовый участник"),(902,"Тестовый помощник"),(903,"Автор заявки"),(904,"Кандидат"),(905,"Новый участник")]:
-    database.create_user(uid,name,tg_user_id=uid,web_verified=True)
+    database.create_user(uid,name,email=f"qa{uid}@example.test",password_hash=web.ph("SyntheticQa1"),tg_user_id=uid,web_verified=True)
     database.db.execute("UPDATE users SET email_verified=1,city='Тестовый город' WHERE user_id=?",(uid,))
 database.db.execute("UPDATE users SET role='admin' WHERE user_id=901")
 payload={"what":"Настроить домашнюю технику","place":"Тестовый район","time_needed":"сегодня","urgency":"В течение дня","details":"Только тестовые данные","category":"tech"}
@@ -43,13 +43,15 @@ services.try_assign_helper(done,901)
 services.complete_request(done,901,confirmed_by=903)
 services.set_rating(done,903,5)
 services.add_to_queue(904)
+if os.environ.get("HPOINT_QA_TEST_FUNDS") == "1":
+    database.grant_registration_bonus(901,500)
 if os.environ.get("HPOINT_QA_PAID_FLOW") == "1":
     database.wallet_add_entry(901,500,"test","Synthetic wallet funds","paid-browser-seed")
 if os.environ.get("HPOINT_QA_HELP_AWARDS") == "1":
     # Historical reviewed help, predating achievements; synthetic local DB only.
     legacy=services.create_request(903,{**payload,"what":"Synthetic historical help"})
     services.accept_open_request(legacy,905)
-    services.complete_request(legacy,905)
+    services.complete_request(legacy,905,confirmed_by=903)
     database.db.execute("UPDATE requests SET requester_rating=5,rating=5 WHERE id=?",(legacy,))
     # Preserve an archived game while all running web game endpoints are paused.
     from hpoint import games
