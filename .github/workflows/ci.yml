@@ -30,7 +30,7 @@ jobs:
       - name: Run tests
         run: python -m unittest discover -s tests -v
       - name: Validate production Compose file
-        run: docker compose --env-file .env.example config --quiet
+        run: ENV_FILE=.env.example docker compose --env-file .env.example config --quiet
 
   dependency-audit:
     runs-on: ubuntu-latest
