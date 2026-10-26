@@ -7,6 +7,7 @@ import unittest
 import uuid
 
 from hpoint import database, services, billing, reliability, workflow
+from scripts.set_test_balances import set_test_balances
 from test_reliability import Scenarios
 
 
@@ -116,6 +117,54 @@ class Postgres(Scenarios, unittest.TestCase):
         result=self.race(lambda:reserve(first),lambda:reserve(second))
         self.assertEqual(sum(result),1)
         self.assertEqual(reliability.wallet_balances(self.db,1),(100,100))
+
+    def test_balance_batch_sets_exact_test_target_and_replay_preserves_spending(self):
+        reserved = self.funded()
+        database.wallet_add_entry(1,700,"payment","Synthetic real history","balance-real",test_amount_rub=0)
+        database.wallet_add_entry(2,12000,"test","Synthetic test history","balance-above",test_amount_rub=12000)
+        database.wallet_add_entry(3,10000,"test","Synthetic test history","balance-equal",test_amount_rub=10000)
+        self.db.execute("UPDATE users SET is_blocked=1 WHERE user_id=4")
+        history = self.db.execute("SELECT * FROM wallet_transactions ORDER BY id").fetchall()
+        reserve_before = dict(database.get_request(reserved))
+
+        result = set_test_balances(self.db,database.wallet_add_entry,target=10000,batch_key="synthetic-exact")
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["users_count"],4)
+        self.assertEqual(result["adjusted_count"],3)
+        self.assertEqual([reliability.wallet_balances(self.db,uid) for uid in (1,2,3,4)],
+                         [(10700,10000),(10000,10000),(10000,10000),(10000,10000)])
+        self.assertEqual(self.db.execute("SELECT * FROM wallet_transactions ORDER BY id LIMIT ?",(len(history),)).fetchall(),history)
+        self.assertEqual(dict(database.get_request(reserved)),reserve_before)
+        self.assertEqual(database.wallet_summary(1)["test_reserved_rub"],400)
+
+        spent = self.request(reward=400)
+        self.assertTrue(services.reserve_request_reward(spent,1,400))
+        database.create_user(5,"Synthetic later participant",web_verified=True)
+        after_spending = self.db.execute("SELECT * FROM wallet_transactions ORDER BY id").fetchall()
+        replay = set_test_balances(self.db,database.wallet_add_entry,target=10000,batch_key="synthetic-exact")
+        self.assertTrue(replay["already_applied"])
+        self.assertFalse(replay["applied"])
+        self.assertEqual(reliability.wallet_balances(self.db,1),(10300,9600))
+        self.assertEqual(reliability.wallet_balances(self.db,5),(0,0))
+        self.assertEqual(self.db.execute("SELECT * FROM wallet_transactions ORDER BY id").fetchall(),after_spending)
+
+    def test_race_balance_batch_and_reserve_has_a_serial_outcome(self):
+        database.grant_registration_bonus(1,500)
+        database.wallet_add_entry(1,700,"payment","Synthetic real history","race-balance-real",test_amount_rub=0)
+        rid = self.request(reward=400)
+        result = self.race(
+            lambda:set_test_balances(self.db,database.wallet_add_entry,target=10000,batch_key="synthetic-race"),
+            lambda:services.reserve_request_reward(rid,1,400))
+        self.assertTrue(result[0]["applied"])
+        self.assertTrue(result[1])
+        total,test = reliability.wallet_balances(self.db,1)
+        # Reset before spending leaves 9600; spending before reset leaves 10000.
+        self.assertIn(test,(9600,10000))
+        self.assertEqual(total-test,700)
+        self.assertEqual(database.get_request(rid)["reward_payment_status"],"paid")
+        self.assertEqual(database.get_request(rid)["reward_test_rub"],400)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM wallet_transactions WHERE request_id=? AND kind='reward_reserve'",(rid,)).fetchone()["n"],1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM test_balance_batches").fetchone()["n"],1)
 
     def test_race_expiry_and_acceptance_never_refunds_active_help(self):
         rid=self.funded()

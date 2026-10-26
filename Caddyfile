@@ -8,7 +8,18 @@
         Referrer-Policy "same-origin"
         Permissions-Policy "geolocation=(self), camera=(), microphone=()"
     }
-    request_body {
+    @photo_uploads path /api/requests /api/chats/send
+    request_body @photo_uploads {
+        max_size 14680064
+    }
+    @event_uploads path /api/events
+    request_body @event_uploads {
+        max_size 1610000
+    }
+    @small_requests {
+        not path /api/requests /api/chats/send /api/events
+    }
+    request_body @small_requests {
         max_size 32KB
     }
     reverse_proxy app:8080 {

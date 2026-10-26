@@ -147,5 +147,40 @@ class Commercial(unittest.TestCase):
         for table in ("commercial_profiles","commercial_services","commercial_clients","commercial_bookings","commercial_renewals"):
             self.assertEqual(self.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0],0)
 
+    def test_summary_is_empty_until_profile_exists(self):
+        self.assertEqual(commercial.summary(self.db,1),{"exists":False})
+        self.profile(2)
+        self.assertEqual(commercial.summary(self.db,1),{"exists":False})
+
+    def test_summary_only_exposes_own_counts_and_next_three_appointments(self):
+        self.profile();self.profile(2)
+        client=self.client();service=self.service()
+        for index in range(5):
+            self.booking(client=client,service=service)
+        self.booking(uid=2,client=self.client(2),service=self.service(2))
+        data=commercial.summary(self.db,1)
+        self.assertTrue(data["exists"])
+        self.assertEqual((data["title"],data["kind"]),("Synthetic Studio","trainer"))
+        self.assertEqual((data["metrics"]["clients"],data["metrics"]["services"],data["metrics"]["planned"]),(1,1,5))
+        self.assertEqual(len(data["next_appointments"]),3)
+        self.assertTrue(all(set(row)=={"id","title","starts_at","client_name"} for row in data["next_appointments"]))
+        self.assertNotIn("Private note",str(data))
+        self.assertNotIn("Contact provided",str(data))
+        self.assertNotIn("@example.test",str(data))
+
+    def test_summary_omits_past_and_cancelled_appointments_but_keeps_expired_profile(self):
+        self.profile();client=self.client();service=self.service()
+        past=self.booking(client=client,service=service)
+        self.db.execute("UPDATE commercial_bookings SET starts_at='2020-01-01T00:00:00+00:00' WHERE id=?",(past,))
+        cancelled=self.booking(client=client,service=service)
+        commercial.set_booking_status(self.db,1,cancelled,"cancelled")
+        self.expire()
+        data=commercial.summary(self.db,1)
+        self.assertTrue(data["exists"])
+        self.assertFalse(data["active"])
+        self.assertEqual(data["next_appointments"],[])
+        self.db.execute("UPDATE users SET email_verified=0 WHERE user_id=1")
+        with self.assertRaisesRegex(ValueError,"email"):commercial.summary(self.db,1)
+
 
 if __name__=="__main__":unittest.main()

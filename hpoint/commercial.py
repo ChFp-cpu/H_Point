@@ -299,6 +299,35 @@ def dashboard(db,uid):
             "metrics":{"clients":sum(bool(c["active"]) for c in clients),"services":sum(bool(s["active"]) for s in services),"planned":int(totals["planned"]),"completed":int(totals["completed"]),"revenue_test_rub":int(totals["revenue"])}}
 
 
+def summary(db,uid):
+    """Small private home-page overview; contacts and notes never leave here."""
+    _user(db,uid)
+    profile=_profile(db,uid)
+    if not profile:
+        return {"exists":False}
+    now=_now()
+    end=_until(profile)
+    counts=db.execute("""SELECT
+        (SELECT COUNT(*) FROM commercial_clients WHERE owner_id=? AND active=1) clients,
+        (SELECT COUNT(*) FROM commercial_services WHERE owner_id=? AND active=1) services,
+        (SELECT COUNT(*) FROM commercial_bookings WHERE owner_id=? AND status='planned') planned,
+        (SELECT COUNT(*) FROM commercial_bookings WHERE owner_id=? AND status='completed') completed,
+        (SELECT COALESCE(SUM(price_rub),0) FROM commercial_bookings WHERE owner_id=? AND status='completed') revenue
+        """,(uid,uid,uid,uid,uid)).fetchone()
+    upcoming=db.execute("""SELECT b.id,b.title,b.starts_at,c.name client_name
+        FROM commercial_bookings b JOIN commercial_clients c ON c.id=b.client_id
+        WHERE b.owner_id=? AND b.status='planned' AND b.starts_at>=?
+        ORDER BY b.starts_at,b.id LIMIT 3""",(uid,now.isoformat())).fetchall()
+    return {"exists":True,"title":profile["title"],"kind":profile["kind"],
+        "kind_title":KINDS.get(profile["kind"],"Специалист"),"active":end>now,
+        "trial_active":_date(profile["trial_until"])>now,"access_until":end.isoformat(),
+        "days_remaining":max(0,int((end-now).total_seconds()+86399)//86400),
+        "metrics":{"clients":int(counts["clients"]),"services":int(counts["services"]),
+            "planned":int(counts["planned"]),"completed":int(counts["completed"]),
+            "revenue_test_rub":int(counts["revenue"])},
+        "next_appointments":[dict(row) for row in upcoming]}
+
+
 def post_action(db,uid,path,data,add_wallet_entry=None):
     """Small adapter for authenticated web routes; raises ValueError on input errors."""
     if not isinstance(data,dict):raise ValueError("Проверьте данные формы.")

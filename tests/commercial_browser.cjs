@@ -12,7 +12,9 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await emailLogin(page,'theme-browser-data');
   await page.waitForFunction(()=>Boolean(window.hpointCommercial));
   await page.evaluate(()=>hpointCommercial.open());
+  await page.waitForURL('**/#/work');
   const host=page.locator('#commercialWorkspace');
+  assert.equal(await page.locator('#commercialOverlay').count(),0);assert.equal(await page.locator('#hpointWorkPage').getAttribute('aria-labelledby'),'commercialTitle');checks+=2;
   const profile=host.locator('[data-commercial-form="profile"]');
   await profile.waitFor();await profile.locator('[name="kind"]').selectOption('trainer');
   await profile.locator('[name="title"]').fill('Тестовая студия движения');
@@ -52,17 +54,17 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await page.waitForFunction(async()=>{let d=await fetch('/api/commercial').then(r=>r.json());return d.commercial.renewals.length===1});
   const renewed=(await get('/api/commercial')).commercial,walletAfter=(await get('/api/wallet')).wallet;
   assert.equal(walletBefore.test_balance_rub-walletAfter.test_balance_rub,490);assert.equal(renewed.renewals[0].price_rub,490);checks+=2;
-  // Reopening preserves data; the modal supports both themes and narrow phones.
+  // The dedicated page supports both themes and narrow phones.
   for(const colorScheme of ['light','dark']){
    await page.emulateMedia({colorScheme});
    const colors=await host.evaluate(el=>{const s=getComputedStyle(el);return {text:s.color,background:s.backgroundColor}});
    const luminance=color=>{let rgb=color.match(/[\d.]+/g).slice(0,3).map(Number).map(c=>{c/=255;return c<=.04045?c/12.92:Math.pow((c+.055)/1.055,2.4)});return rgb[0]*.2126+rgb[1]*.7152+rgb[2]*.0722};
    const a=luminance(colors.text),b=luminance(colors.background);assert.ok((Math.max(a,b)+.05)/(Math.min(a,b)+.05)>=4.5,'Readable commercial workspace in '+colorScheme);checks++;
-   for(const width of [320,390,768,1440]){await page.setViewportSize({width,height:844});assert.equal(await page.locator('#commercialOverlay').evaluate(el=>el.scrollWidth<=el.clientWidth),true);checks++}
+   for(const width of [320,390,768,1440]){await page.setViewportSize({width,height:844});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);checks++}
    await page.setViewportSize({width:390,height:844});await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,'commercial-'+colorScheme+'.png'),fullPage:false});
   }
-  await host.getByRole('button',{name:'Закрыть',exact:true}).click();await page.locator('#commercialOverlay').waitFor({state:'detached'});
-  await page.evaluate(()=>hpointCommercial.open());await host.getByRole('heading',{name:'Тестовая студия движения',exact:true}).waitFor();checks++;
+  await page.goto(base+'/#/home');await page.evaluate(()=>hpointWorkspace.refresh());await page.locator('.homeWorkSummary').waitFor();assert.match(await page.locator('.homeWorkSummary').innerText(),/Тестовая студия движения/);checks++;
+  await page.locator('.homeWorkSummary').getByRole('button',{name:'Открыть «Для работы» →',exact:true}).click();await host.getByRole('heading',{name:'Тестовая студия движения',exact:true}).waitFor();checks++;
   assert.deepEqual(errors,[]);console.log(JSON.stringify({ok:true,checks,errors,commercialTrialAndRenewal:true,servicesClientsBookings:true}));
  }catch(error){console.error('Commercial UI:',await page.locator('#commercialWorkspace').innerText().catch(()=>''));console.error('Browser errors:',errors);await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,'commercial-failure.png'),fullPage:true}).catch(()=>{});throw error}finally{await context.close();await browser.close()}
 })().catch(error=>{console.error(error.stack);process.exitCode=1});

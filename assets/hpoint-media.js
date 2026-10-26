@@ -4,8 +4,8 @@
   if (window.HPointMedia) return;
   const $ = id => document.getElementById(id);
   const escape = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-  let requestFiles = [], requestField = null, enhancementQueued = false;
-  const chatFiles = new Map(), sendingChats = new Set();
+  let requestFiles = [], requestField = null, enhancementQueued = false, mediaOwner = null;
+  const chatFiles = new Map();
   const currentChat = () => Number(window.hpointWorkspace?.state?.chatId || 0);
   const notify = message => typeof window.toast === 'function' ? window.toast(message) : console.warn(message);
 
@@ -83,6 +83,8 @@
   }
 
   function enhance() {
+    const owner=String(window.hpointWorkspace?.state?.data?.current_user_id||'');
+    if(owner!==mediaOwner){chatFiles.clear();requestFiles=[];requestField=null;mediaOwner=owner}
     const field = $('qw');
     if (field && field !== requestField) { requestField = field; requestFiles = []; }
     if (!field && requestField && !requestField.isConnected) { requestField = null; requestFiles = []; }
@@ -111,15 +113,10 @@
   }
 
   async function sendAttachedMessage(button) {
-    const id = currentChat(), photos = chatFiles.get(id) || [], input = $('wsChatText');
-    if (!id || !photos.length || button.disabled || sendingChats.has(id)) return;
-    sendingChats.add(id); button.disabled = true;
-    try {
-      await api('/api/chats/send', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({request_id:id, text:(input?.value || '').trim(), photos})});
-      chatFiles.delete(id); if (input) input.value = '';
-      await window.hpointWorkspace?.openChat(id);
-    } catch (error) { notify(error.message); }
-    finally { sendingChats.delete(id); button.disabled = false; }
+    const id=currentChat(),photos=(chatFiles.get(id)||[]).slice();
+    if(!id||!photos.length||button.disabled)return;
+    if(typeof window.hpointWorkspace?.sendChat!=='function'){notify('Обновите страницу, чтобы отправить фото.');return}
+    await window.hpointWorkspace.sendChat(photos);
   }
 
   async function showParticipants(id) {
@@ -163,7 +160,11 @@
     requestPhotos:() => requestFiles.slice(),
     clearRequestPhotos:() => { requestFiles = []; },
     chatPhotos:() => (chatFiles.get(currentChat()) || []).slice(),
-    clearChatPhotos:() => chatFiles.delete(currentChat()),
+    clearChatPhotos:(id=currentChat(),form=null) => {
+      chatFiles.delete(Number(id));
+      const source=form||document.querySelector('.workspaceChatForm[data-chat-id="'+Number(id)+'"]'),widget=source?.querySelector('.hpointPhotoPicker');
+      if(widget){preview(widget,[]);const status=widget.querySelector('[role="status"]');if(status)status.textContent='';const input=widget.querySelector('input[type="file"]');if(input)input.value=''}
+    },
     gallery, showParticipants, enhance
   };
   new MutationObserver(() => {

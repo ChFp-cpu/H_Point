@@ -33,6 +33,17 @@ class RegistrationBonus(unittest.TestCase):
             self.assertFalse(database.grant_registration_bonus(user_id))
             self.assertEqual(self.balance(user_id),500)
 
+    def test_ten_thousand_campaign_is_test_only_and_does_not_refill_on_retry(self):
+        with patch.object(database, "REGISTRATION_BONUS_RUB", 10000):
+            uid=database.create_web_user("Campaign", "campaign@example.test", "hash")
+            self.assertEqual(self.balance(uid),10000)
+            self.assertEqual(database.wallet_summary(uid)["balance_rub"],0)
+            self.assertEqual(database.get_user(uid)["balance"],database.START_BALANCE)
+            database.wallet_add_entry(uid,-700,"test","Synthetic spending","campaign-spend",test_amount_rub=-700)
+            self.assertFalse(database.grant_registration_bonus(uid))
+            self.assertEqual(self.balance(uid),9300)
+            self.assertEqual(self.db.execute("SELECT COUNT(*) FROM wallet_transactions WHERE user_id=? AND kind='registration_bonus'",(uid,)).fetchone()[0],1)
+
     def test_purchase_and_retry_do_not_reissue_credit(self):
         database.create_user(100, "Telegram")
         invoice, created = billing.purchase_with_wallet(100, "pro", {}, "test-bonus-pro")

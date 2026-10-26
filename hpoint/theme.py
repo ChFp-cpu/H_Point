@@ -230,6 +230,19 @@ body{font-family:Manrope,Arial,sans-serif}.muted{color:var(--hp-text-secondary)}
   .modal{padding:10px}.box{max-height:calc(100dvh - 20px);overscroll-behavior:contain}.close{min-width:44px;min-height:44px}
   .toast{bottom:calc(82px + env(safe-area-inset-bottom,0px));left:16px;right:16px;max-width:none;font-size:14px}
 }
+/* Homepage: current step + promotion, recent tasks, then community League. */
+.homeTasks{align-items:start}
+.homeCurrentColumn{display:grid;gap:16px;align-content:start;min-width:0}
+.homePromoSlot:empty{display:none}
+.homePromoSlot .homePaidOptions{margin:0}
+.homeTasks>.homeRecentCard{align-self:stretch}
+@media(max-width:700px){
+  .homeTasks>.homeRecentCard{display:block}
+  #hpointWorkspace[data-route="home"]>.homeWorkSummary{order:1}
+  #hpointWorkspace[data-route="home"]>.homeLeague{order:3;margin:0 0 16px}
+  #hpointWorkspace[data-route="home"]>.homeTogether{order:4}
+}
+
 '''
 
 GAME_THEME_CSS = r'''

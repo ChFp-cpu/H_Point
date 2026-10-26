@@ -36,4 +36,18 @@ No real payment or real withdrawal is offered or performed. Test emails are inte
 
 ## Release procedure
 
-Commit and push the exact source, archive the commit, verify source checksums and back up code/images/database. Build before stopping the old workers. Stop app/bot, take a fresh final dump, initialise the new schema, run the approved cleanup once and start both workers. Verify health, disabled Telegram checkout/login, source features and zero bot restarts. Keep the protected backup for recovery; never restore a database over subsequent writes without assessing those writes.
+Commit and push the exact source, archive the commit, verify source checksums and back up code/images/database. Build before stopping the old workers. Stop app/bot, take a fresh final dump, initialise the new schema, run the approved cleanup only for the original email migration, and start both workers. Routine releases must preserve accounts and sessions. Verify health, disabled Telegram checkout/login, source features and zero bot restarts. Keep the protected backup for recovery; never restore a database over subsequent writes without assessing those writes.
+
+
+## Work page and chat follow-up
+
+- Main navigation is Home, Help, Work (`#/work`), Activities. Work has its own page with services, private clients, appointments and subscription. A private overview on Home shows metrics and upcoming appointments when a workspace exists.
+- Chat keeps a stable, per-account/per-request textarea with autocomplete disabled. Text and photo sends clear only their original unchanged draft and cannot replace another opened conversation.
+- Home places the current step and promotion in one column, recent tasks beside it, and League below. Mobile shows step, promotion, recent tasks, League.
+- Raster favicon variants are publicly served from `/favicon.ico` and `/assets/favicon-{48,192}.png`. Activities use the labelled generated meeting illustration.
+- Caddy allows the application's bounded photo/event JSON uploads while keeping the32KB cap for other routes. Reload/recreate Caddy after config changes.
+- `scripts/set_test_balances.py --target 10000 --batch-key UNIQUE_KEY` appends test-only ledger corrections for all existing users in one transaction. The batch key is one-time: replays preserve later spending. It never changes reserves or historical real balances. The authorised2026-10-26 production batch used `hpoint-test-balance-10000-20261026`; do not use a new key to replay it.
+
+Browser regressions: `chat_autofill_browser.cjs`, `home_order_browser.cjs`, `work_page_browser.cjs`; run using `tests/run_theme_qa.py`. PostgreSQL tests also cover exact balance adjustment, replay and concurrent reserve creation.
+
+New registrations receive10000test RUB once (`REGISTRATION_BONUS_RUB=10000`). This is independent of the one-time existing-user balance correction and does not refill wallets on login.

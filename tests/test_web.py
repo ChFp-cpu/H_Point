@@ -76,7 +76,7 @@ class Web(unittest.TestCase):
   finally:server.shutdown();thread.join(timeout=3);server.server_close()
  def test_page_contains_platform(self):
   self.assertIn("Smart Match",web.PAGE);self.assertIn("Telegram",web.PAGE);self.assertIn("руб",web.PAGE)
-  self.assertIn('rel="icon" type="image/svg+xml" href="/assets/favicon.svg"',web.PAGE)
+  self.assertIn('rel="icon" type="image/png" sizes="192x192" href="/assets/favicon-192.png"',web.PAGE)
   self.assertIn("timeout:2500",web.PAGE)
   if web.YANDEX_MAPS_API_KEY:self.assertIn("api-maps.yandex.ru",web.PAGE)
   else:self.assertIn("leaflet@1.9.4",web.PAGE)
