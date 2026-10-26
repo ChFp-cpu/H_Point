@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 RUN addgroup --system hpoint && adduser --system --ingroup hpoint hpoint
-COPY requirements.txt ./
+COPY requirements.txt requirements-media.txt ./
 RUN python -m pip install --no-cache-dir --upgrade "pip>=26.2" \
     && python -m pip install --no-cache-dir -r requirements.txt
 COPY . ./

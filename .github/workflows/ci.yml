@@ -31,6 +31,8 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Validate production Compose file
         run: ENV_FILE=.env.example docker compose --env-file .env.example config --quiet
+      - name: Build production image
+        run: docker build --tag hpoint-ci:latest .
 
   dependency-audit:
     runs-on: ubuntu-latest
