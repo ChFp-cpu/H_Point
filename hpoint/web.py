@@ -1575,6 +1575,7 @@ WORKSPACE_SHELL_UI=r'''
     if(button){event.preventDefault();button.click()}
   });
   document.addEventListener('wheel',function(event){if(event.ctrlKey)event.preventDefault()},{passive:false});
+  document.addEventListener('keydown',function(event){if((event.ctrlKey||event.metaKey)&&!event.altKey&&!event.isComposing&&['+','=','-','_','Add','Subtract'].includes(event.key))event.preventDefault()},{capture:true});
   for(const gesture of ['gesturestart','gesturechange','gestureend'])document.addEventListener(gesture,function(event){event.preventDefault()},{passive:false});
   window.addEventListener('hpoint:work-updated',function(){if(state.installed)refresh()});
   window.addEventListener('hashchange',function(){if(state.installed){state.route=currentRoute();render()}});
