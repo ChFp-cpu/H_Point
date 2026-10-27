@@ -533,10 +533,10 @@ class Web(unittest.TestCase):
   from types import SimpleNamespace
   from unittest.mock import AsyncMock
   from hpoint import handlers
-  for uid in (1,2,3):self.add_user(uid,f"Участник {uid}")
+  for uid in (1,2,3,4):self.add_user(uid,f"Участник {uid}",tg_user_id=uid,web_verified=True)
   payload={"what":"Чат заявки","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"}
-  old=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(old,2));services.complete_request(old,2,confirmed_by=1)
-  current=services.create_request(3,payload);self.assertTrue(services.try_assign_helper(current,2))
+  old=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(old,2))
+  current=services.create_request(3,payload);self.assertTrue(services.try_assign_helper(current,4))
   text="Ответ <с деталями> & второй строкой\nСпасибо!"
   message=SimpleNamespace(chat=SimpleNamespace(type="private"),from_user=SimpleNamespace(id=2),text=f"/chat #{old} {text}",answer=AsyncMock())
   bot=SimpleNamespace(send_message=AsyncMock())
@@ -549,6 +549,42 @@ class Web(unittest.TestCase):
    message.from_user.id=3;bot.send_message.reset_mock()
    asyncio.run(handlers.cmd_chat(message,None,bot));bot.send_message.assert_not_called()
    self.assertEqual(self.db.execute("SELECT COUNT(*) FROM chat_messages").fetchone()[0],1)
+   services.complete_request(old,2,confirmed_by=1)
+   message.from_user.id=2;bot.send_message.reset_mock()
+   asyncio.run(handlers.cmd_chat(message,None,bot));bot.send_message.assert_not_called()
+   self.assertEqual(self.db.execute("SELECT COUNT(*) FROM chat_messages").fetchone()[0],1)
+ def test_telegram_link_cancel_revokes_only_own_pending_code_and_preserves_sessions(self):
+  from hpoint import email_access
+  self.add_user(101,"Linked email member",tg_user_id=9101,web_verified=True)
+  self.add_user(202,"Unlinked email member")
+  tokens={uid:web.new_sess(uid) for uid in (101,202)}
+  codes={uid:database.create_link_code(uid) for uid in tokens}
+  before={uid:dict(database.get_user(uid)) for uid in tokens}
+  server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler)
+  thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+  base=f"http://127.0.0.1:{server.server_port}"
+  def cancel(uid=None):
+   headers={"Content-Type":"application/json"}
+   if uid:headers["Cookie"]="hpoint_session="+tokens[uid]
+   return urllib.request.urlopen(urllib.request.Request(base+"/api/profile/telegram/cancel",data=b"{}",headers=headers,method="POST"),timeout=3)
+  try:
+   with self.assertRaises(urllib.error.HTTPError) as denied:cancel()
+   self.assertEqual(denied.exception.code,401);denied.exception.close()
+   for uid,code in codes.items():self.assertTrue(email_access.link_owner_has_verified_email(self.db,code))
+   with cancel(202) as response:self.assertTrue(json.load(response)["ok"])
+   self.assertTrue(email_access.link_owner_has_verified_email(self.db,codes[101]))
+   with cancel(101) as response:self.assertTrue(json.load(response)["ok"])
+   for uid,code in codes.items():
+    user=database.get_user(uid)
+    self.assertEqual(tuple(user[key] for key in ("verification_code","verification_code_hash","verification_code_expires_at")),(None,None,None))
+    self.assertEqual(user["tg_user_id"],before[uid]["tg_user_id"])
+    self.assertEqual((user["email"],user["email_verified"]),(before[uid]["email"],before[uid]["email_verified"]))
+    self.assertFalse(email_access.link_owner_has_verified_email(self.db,code))
+    self.assertFalse(database.link_by_code(code,9200+uid)[0])
+    headers={"Cookie":"hpoint_session="+tokens[uid]}
+    with urllib.request.urlopen(urllib.request.Request(base+"/api/me",headers=headers),timeout=3) as response:self.assertEqual(json.load(response)["user"]["id"],uid)
+   self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM sessions").fetchone()["n"],2)
+  finally:server.shutdown();thread.join(timeout=3);server.server_close()
  def test_legacy_telegram_login_never_redirects_even_with_a_known_destination(self):
   self.add_user(1,"Email member")
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()

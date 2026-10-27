@@ -147,6 +147,62 @@ class Commercial(unittest.TestCase):
         for table in ("commercial_profiles","commercial_services","commercial_clients","commercial_bookings","commercial_renewals"):
             self.assertEqual(self.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0],0)
 
+    def test_delete_workspace_erases_private_content_but_keeps_financial_history(self):
+        self.profile();self.profile(2);self.booking(service=self.service());other=self.booking(uid=2,service=self.service(2))
+        self.credit(amount=1000);commercial.renew(self.db,1,"synthetic-before-delete")
+        ledger=[tuple(r) for r in self.db.execute("SELECT * FROM wallet_transactions ORDER BY id")]
+        renewals=[tuple(r) for r in self.db.execute("SELECT * FROM commercial_renewals ORDER BY id")]
+        self.assertEqual(commercial.delete_profile(self.db,1,True),{"deleted":True})
+        self.assertEqual(commercial.summary(self.db,1),{"exists":False})
+        data=commercial.dashboard(self.db,1)
+        self.assertIsNone(data["profile"]);self.assertFalse(data["trial_available"])
+        for key in ("clients","services","bookings","renewals"):self.assertEqual(data[key],[])
+        for table in ("commercial_bookings","commercial_clients","commercial_services"):
+            self.assertEqual(self.db.execute("SELECT COUNT(*) FROM "+table+" WHERE owner_id=1").fetchone()[0],0)
+        row=self.db.execute("SELECT title,description,contact FROM commercial_profiles WHERE user_id=1").fetchone()
+        self.assertEqual(tuple(row),("","",""))
+        self.assertEqual([tuple(r) for r in self.db.execute("SELECT * FROM wallet_transactions ORDER BY id")],ledger)
+        self.assertEqual([tuple(r) for r in self.db.execute("SELECT * FROM commercial_renewals ORDER BY id")],renewals)
+        self.assertEqual(commercial.dashboard(self.db,2)["bookings"][0]["id"],other)
+        self.assertEqual(commercial.delete_profile(self.db,1,True),{"deleted":False})
+        with self.assertRaisesRegex(ValueError,"создайте"):commercial.renew(self.db,1,"synthetic-hidden-renew")
+        with self.assertRaisesRegex(ValueError,"создайте"):self.service()
+
+    def test_delete_recreate_keeps_original_trial_and_payment_dates(self):
+        original=self.profile()["profile"];self.credit(amount=1000)
+        renewal=commercial.renew(self.db,1,"synthetic-recreate-key")
+        commercial.delete_profile(self.db,1,True)
+        recreated=self.profile()["profile"]
+        self.assertEqual(recreated["trial_started_at"],original["trial_started_at"])
+        self.assertEqual(recreated["trial_until"],original["trial_until"])
+        self.assertEqual(recreated["paid_until"],renewal["ends_at"])
+        self.assertFalse(commercial.dashboard(self.db,1)["trial_available"])
+        self.assertFalse(commercial.renew(self.db,1,"synthetic-recreate-key")["created"])
+        self.assertEqual(self.db.execute("SELECT SUM(test_amount_rub) FROM wallet_transactions WHERE user_id=1").fetchone()[0],510)
+
+    def test_expired_deleted_workspace_can_be_recreated_but_does_not_get_a_new_trial(self):
+        self.profile();self.expire();commercial.delete_profile(self.db,1,True)
+        recreated=self.profile()["profile"]
+        self.assertFalse(recreated["active"])
+        self.assertEqual(recreated["trial_until"],"2020-01-01T00:00:00+00:00")
+        with self.assertRaisesRegex(ValueError,"Пробный период"):self.service()
+        self.credit();commercial.renew(self.db,1,"synthetic-recreated-renewal")
+        self.assertTrue(commercial.dashboard(self.db,1)["profile"]["active"])
+        self.service()
+
+    def test_delete_requires_explicit_confirmation_and_rolls_back_partial_erasure(self):
+        self.profile();self.booking(service=self.service())
+        for confirmation in (None,False,1,"true"):
+            with self.assertRaisesRegex(ValueError,"Подтвердите"):commercial.delete_profile(self.db,1,confirmation)
+        self.db.execute("CREATE TRIGGER synthetic_delete_failure BEFORE DELETE ON commercial_clients BEGIN SELECT RAISE(ABORT,'synthetic delete failure'); END")
+        with self.assertRaises(sqlite3.IntegrityError):commercial.delete_profile(self.db,1,True)
+        data=commercial.dashboard(self.db,1)
+        self.assertIsNotNone(data["profile"]);self.assertEqual(len(data["bookings"]),1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM commercial_deleted_profiles").fetchone()[0],0)
+        self.db.execute("DROP TRIGGER synthetic_delete_failure")
+        self.db.execute("UPDATE users SET is_blocked=1 WHERE user_id=1")
+        with self.assertRaisesRegex(ValueError,"недоступен"):commercial.delete_profile(self.db,1,True)
+
     def test_summary_is_empty_until_profile_exists(self):
         self.assertEqual(commercial.summary(self.db,1),{"exists":False})
         self.profile(2)

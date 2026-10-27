@@ -53,6 +53,52 @@ class Postgres(Scenarios, unittest.TestCase):
             jobs = [pool.submit(run, function) for function in functions]
             return [job.result(timeout=20) for job in jobs]
 
+    def test_response_conversations_are_private_and_archive_is_per_user(self):
+        from hpoint import chat_threads
+        rid=self.request()
+        self.assertEqual(services.apply_to_request(rid,2),"created")
+        self.assertEqual(services.apply_to_request(rid,3),"created")
+        first=chat_threads.read_chat(self.db,2,request_id=rid)["id"]
+        second=chat_threads.read_chat(self.db,3,request_id=rid)["id"]
+        self.assertNotEqual(first,second)
+        chat_threads.send_message(self.db,2,"Only candidate A",chat_id=first)
+        chat_threads.send_message(self.db,3,"Only candidate B",chat_id=second)
+        with self.assertRaises(PermissionError):chat_threads.read_chat(self.db,2,chat_id=second)
+        self.assertEqual([m["text"] for m in chat_threads.read_chat(self.db,1,chat_id=first)["messages"]],["Only candidate A"])
+        chat_threads.archive_chat(self.db,1,first)
+        self.assertNotIn(first,[row["id"] for row in chat_threads.list_chats(self.db,1)])
+        chat_threads.send_message(self.db,2,"New incoming message",chat_id=first)
+        self.assertIn(first,[row["id"] for row in chat_threads.list_chats(self.db,1)])
+        self.assertEqual(database.get_request(rid)["status"],"open")
+
+    def test_concurrent_responses_keep_both_chats_then_choose_only_one(self):
+        from hpoint import chat_threads
+        rid=self.request()
+        self.assertEqual(self.race(lambda:services.apply_to_request(rid,2),lambda:services.apply_to_request(rid,3)),["created","created"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM chats WHERE request_id=?",(rid,)).fetchone()["n"],2)
+        applications={row["helper_id"]:row["application_token"] for row in services.get_request_applications(1)}
+        result=self.race(lambda:services.accept_open_request(rid,2,1,applications[2]),lambda:services.accept_open_request(rid,3,1,applications[3]))
+        self.assertEqual(result.count("created"),1)
+        selected=database.get_request(rid)["helper_id"]
+        self.assertEqual(chat_threads.read_chat(self.db,1,request_id=rid)["candidate_id"],selected)
+        other=3 if selected==2 else 2
+        other_chat=chat_threads.read_chat(self.db,other,request_id=rid)
+        self.assertFalse(other_chat["can_send"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM chats WHERE request_id=?",(rid,)).fetchone()["n"],2)
+
+    def test_legacy_postgres_chat_unique_constraint_migrates_without_losing_history(self):
+        from hpoint import chat_threads
+        rid=self.request()
+        self.assertEqual(services.accept_open_request(rid,2),"created")
+        cid=database.get_or_create_chat_for_request(rid)
+        chat_threads.send_message(self.db,2,"Legacy history",chat_id=cid)
+        self.db.execute("ALTER TABLE chats ADD CONSTRAINT legacy_one_chat_per_request UNIQUE(request_id)")
+        chat_threads.initialize_schema(self.db)
+        chat_threads.initialize_schema(self.db)
+        second=chat_threads.ensure_chat(self.db,rid,3)
+        self.assertNotEqual(cid,second)
+        self.assertEqual([m["text"] for m in chat_threads.read_chat(self.db,1,chat_id=cid)["messages"]],["Legacy history"])
+
     def test_race_two_helpers_one_request(self):
         rid = self.request()
         result = self.race(lambda: services.accept_open_request(rid,2), lambda: services.accept_open_request(rid,3))

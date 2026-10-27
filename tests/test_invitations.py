@@ -158,7 +158,7 @@ class InvitationCore(InvitationData, unittest.TestCase):
         self.assertEqual(database.get_request(self.rid)["status"], "open")
         self.assertEqual(services.apply_to_request(self.rid, 1), "unavailable")
         services.apply_to_request(self.rid, 3);services.remove_from_queue(3)
-        self.assertEqual(services.get_request_applications(1), [])
+        self.assertEqual([row["helper_id"] for row in services.get_request_applications(1)], [3])
 
     def test_withdraw_is_owner_only_and_does_not_cancel_request(self):
         self.assertTrue(services.offer_helper(self.rid, 2))

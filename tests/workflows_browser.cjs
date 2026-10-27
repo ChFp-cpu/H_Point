@@ -15,7 +15,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   // An explicit mode replaces location permission prompts.
   await helper.page.goto(base+'/#/help');await helper.page.evaluate(()=>helper());await helper.page.locator('#hpHelperLocation').fill('Тестовый район');await helper.page.locator('#hpEnterHelper').click();
   await helper.page.waitForFunction(()=>hpointWorkspace.state.data.user.helper_ready===true);
-  await helper.page.locator('#hpHelperModeBanner').waitFor();assert.match(await helper.page.locator('#hpHelperModeBanner').innerText(),/режиме помощника/);checks++;
+  await helper.page.getByRole('button',{name:'Настроить помощь',exact:true}).waitFor();assert.equal((await get(helper,'/api/me')).user.helper_ready,true);checks++;
   // The reserve is offered immediately, before matching anyone.
   await author.page.locator('.workspaceHeaderActions [data-ws-action="request"]').click();
   await author.page.locator('#qw').fill('Настройка ноутбука с резервом');await author.page.locator('#qc').selectOption('tech');await author.page.locator('#requestNext').click();
@@ -30,7 +30,9 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await helper.page.goto(base+'/#/help');await refresh(helper);await openHelpTab(helper.page,'open');
   const card=helper.page.locator('.workspaceRequest').filter({hasText:'Настройка ноутбука с резервом'});assert.doesNotMatch(await card.innerText(),/#\d|№\s*\d/);assert.match(await card.innerText(),/Тестовый участник/);checks+=2;
   await card.getByRole('button',{name:'Хочу помочь',exact:true}).click();await helper.page.locator('#hpEnterHelper').click();await helper.page.locator('#wsChatText').waitFor();assert.match(await helper.page.locator('.workspaceChatPanel h3').innerText(),/Настройка ноутбука/);checks++;
-  await refresh(author);await author.page.goto(base+'/#/help');await openHelpTab(author.page,'mine');
+  await refresh(author);await author.page.evaluate(id=>hpointWorkspace.openChat(id),rid);
+  author.page.once('dialog',d=>d.accept());await author.page.locator('[data-ws-action="chat-select"]').click();
+  await author.page.waitForFunction(id=>hpointWorkspace.state.data.requests.find(r=>r.id===id)?.status==='in_progress',rid);checks++;
   author.page.once('dialog',d=>d.accept());await author.page.locator('[data-ws-action="finish"][data-id="'+rid+'"]').click();
   await author.page.getByRole('heading',{name:'Как прошло взаимодействие?',exact:true}).waitFor();await author.page.locator('#hpSendReview').click();await author.page.locator('#modal').waitFor({state:'hidden'});checks++;
   await refresh(helper);await helper.page.getByRole('heading',{name:'Как прошло взаимодействие?',exact:true}).waitFor();await helper.page.locator('[name="hpReviewRating"][value="4"]').check();await helper.page.locator('#hpSendReview').click();await helper.page.locator('#modal').waitFor({state:'hidden'});checks++;

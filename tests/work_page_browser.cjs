@@ -13,14 +13,15 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await emailLogin(page,'theme-browser-data');
   assert.deepEqual((await get('/api/commercial/summary')).summary,{exists:false});
   await page.evaluate(()=>hpointWorkspace.refresh());assert.equal(await page.locator('.homeWorkSummary').count(),0);checks+=2;
-  const navigation=await page.locator('#sitePrimaryNav [data-route]').evaluateAll(nodes=>nodes.map(e=>e.dataset.route));assert.deepEqual(navigation,['home','help','work','activities']);checks++;
-  await page.locator('#sitePrimaryNav [data-route="work"]').click();
-  await page.waitForURL('**/#/work');await page.locator('#hpointWorkPage').getByRole('heading',{name:'Для работы',exact:true}).waitFor();
+  const navigation=await page.locator('#sitePrimaryNav [data-route]').evaluateAll(nodes=>nodes.map(e=>e.dataset.route));assert.deepEqual(navigation,['home','help','activities']);checks++;
+  await page.evaluate(()=>go('profile'));
+  await page.locator('#workspaceWorkCreationSlot').getByRole('button',{name:'Создать кабинет в профиле',exact:true}).click();
+  await page.waitForURL('**/#/profile');
   assert.equal(await page.locator('#commercialOverlay,[aria-modal="true"]#hpointWorkPage').count(),0);
   assert.equal(await page.locator('#hpointWorkPage').evaluate(e=>getComputedStyle(e).position==='fixed'),false);checks+=2;
   const host=page.locator('#commercialWorkspace'),profile=host.locator('[data-commercial-form="profile"]');
   await profile.locator('[name="kind"]').selectOption('organization');await profile.locator('[name="title"]').fill('Тестовая организация');
-  await profile.getByRole('button',{name:'Начать 7 бесплатных дней',exact:true}).click();await host.getByRole('heading',{name:'Тестовая организация',exact:true}).waitFor();checks++;
+  await profile.locator('[name="contact"]').press('Enter');await page.waitForURL('**/#/work');await host.getByRole('heading',{name:'Тестовая организация',exact:true}).waitFor();await page.evaluate(()=>hpointWorkspace.refresh());await page.locator('#sitePrimaryNav [data-route="work"]').waitFor();assert.equal(await page.locator('#sitePrimaryNav [data-route="work"]').count(),1);checks+=2;
   await host.locator('.commercialTabs').getByRole('button',{name:'Услуги',exact:true}).click();
   const service=host.locator('[data-commercial-form="services"]');await service.locator('[name="title"]').fill('Услуга для организации');
   await service.locator('[name="price_rub"]').fill('900');
@@ -47,8 +48,19 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   }
   // Switching accounts within the same JS runtime must clear the old page.
   await post('/api/auth/login',{email:'qa904@example.test',password:'SyntheticQa1'});await page.evaluate(()=>hpointWorkspace.refresh());
-  await host.getByRole('heading',{name:'Откройте свой кабинет',exact:true}).waitFor();assert.doesNotMatch(await host.innerText(),/Тестовая организация|Секретный контакт/);assert.deepEqual((await get('/api/commercial/summary')).summary,{exists:false});checks+=2;
+  await host.getByRole('heading',{name:'Создайте кабинет в профиле',exact:true}).waitFor();assert.doesNotMatch(await host.innerText(),/Тестовая организация|Секретный контакт/);assert.deepEqual((await get('/api/commercial/summary')).summary,{exists:false});checks+=2;
   await post('/api/auth/login',{email:'qa901@example.test',password:'SyntheticQa1'});await page.evaluate(()=>hpointWorkspace.refresh());await host.getByRole('heading',{name:'Тестовая организация',exact:true}).waitFor();checks++;
+  const original=(await get('/api/commercial')).commercial.profile;
+  await host.locator('.commercialTabs').getByRole('button',{name:'Настройки',exact:true}).click();
+  page.once('dialog',dialog=>dialog.dismiss());await host.getByRole('button',{name:'Удалить компанию',exact:true}).click();
+  assert.equal((await get('/api/commercial/summary')).summary.exists,true);checks++;
+  page.once('dialog',dialog=>dialog.accept());await host.getByRole('button',{name:'Удалить компанию',exact:true}).click();
+  await page.waitForURL('**/#/profile');await page.evaluate(()=>hpointWorkspace.refresh());
+  assert.equal(await page.locator('#sitePrimaryNav [data-route="work"]').count(),0);assert.equal((await get('/api/commercial/summary')).summary.exists,false);checks+=2;
+  const deleted=(await get('/api/commercial')).commercial;assert.equal(deleted.profile,null);assert.deepEqual(deleted.clients,[]);assert.deepEqual(deleted.services,[]);assert.deepEqual(deleted.bookings,[]);assert.equal(deleted.trial_available,false);checks+=5;
+  await page.locator('#workspaceWorkCreationSlot').getByRole('button',{name:'Создать кабинет в профиле',exact:true}).click();
+  const recreated=host.locator('[data-commercial-form="profile"]');assert.equal(await recreated.getByRole('button',{name:'Начать 7 бесплатных дней',exact:true}).count(),0);await recreated.locator('[name="title"]').fill('Новая тестовая компания');await recreated.locator('[name="contact"]').press('Enter');await page.waitForURL('**/#/work');
+  const restored=(await get('/api/commercial')).commercial.profile;assert.equal(restored.trial_until,original.trial_until);assert.equal(restored.trial_started_at,original.trial_started_at);checks+=3;
   assert.deepEqual(errors,[]);console.log(JSON.stringify({ok:true,checks,errors,dedicatedWorkPage:true,privateHomeSummary:true,stableWorkForms:true,accountSwitchSafe:true}));
- }catch(error){console.error('Work UI:',await page.locator('#commercialWorkspace').innerText().catch(()=>''));console.error('Browser errors:',errors);await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,'work-page-failure.png'),fullPage:true}).catch(()=>{});throw error}finally{await context.close();await browser.close()}
+ }catch(error){const sync=await context.request.get(base+'/api/sync');const diagnostic=await sync.json().catch(()=>({}));console.error('Sync diagnostic:',JSON.stringify({status:sync.status(),ok:diagnostic.ok,error:diagnostic.error,userPresent:Boolean(diagnostic.user)}));console.error('Work UI:',await page.locator('#commercialWorkspace').innerText().catch(()=>''));console.error('Browser errors:',errors);await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,'work-page-failure.png'),fullPage:true}).catch(()=>{});throw error}finally{await context.close();await browser.close()}
 })().catch(error=>{console.error(error.stack);process.exitCode=1});

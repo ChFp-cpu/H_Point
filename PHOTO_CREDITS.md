@@ -20,3 +20,7 @@
 ## Иллюстрация активностей
 
 `assets/community-official.webp` — сгенерированная для H-Point иллюстрация деловой встречи (1536 × 1024). Она заменяет садовые работы в разделе активностей и не изображает реальных пользователей или состоявшееся мероприятие. Подпись: «Иллюстрация H-Point». Внешняя лицензия фотобанка к ней не приписывается.
+
+## Локальный шрифт
+
+`assets/manrope-variable.ttf` — Manrope, [Google Fonts](https://github.com/google/fonts/tree/main/ofl/manrope), SIL Open Font License 1.1. Текст лицензии: `assets/manrope-OFL.txt`. Шрифт загружается с сервера H-Point без обращения браузера к Google Fonts.

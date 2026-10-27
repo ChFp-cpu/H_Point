@@ -194,7 +194,7 @@ class PausedGamesAPI(Fixtures,unittest.TestCase):
         with patch.object(games,"GAMES_ENABLED",True):session=games.start_game(2,"crossing")
         snapshot=dict(self.db.execute("SELECT * FROM game_sessions WHERE id=?",(session["id"],)).fetchone());before=self.balance()
         self.assertFalse(web.GAMES_ENABLED)
-        self.assertEqual(self.request(None,"/games")[0],503)
+        self.assertEqual(self.request(None,"/games")[0],410)
         self.assertEqual(self.request(None,"/api/games/state")[0],503)
         for path in ("start","action","abandon","shop/purchase","shop/equip"):
             status,body=self.request(2,"/api/games/"+path,{"game":"crossing","session_id":session["id"],"action":{"type":"finish"},"item_id":"shield","purchase_key":"paused-test"})

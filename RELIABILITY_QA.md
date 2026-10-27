@@ -1,4 +1,4 @@
-# H-Point release: email access and test-money workflows
+# H-Point release: stable conversations and simpler navigation
 
 This release keeps the requester as the only person who can confirm completed help.
 
@@ -41,7 +41,7 @@ Commit and push the exact source, archive the commit, verify source checksums an
 
 ## Work page and chat follow-up
 
-- Main navigation is Home, Help, Work (`#/work`), Activities. Work has its own page with services, private clients, appointments and subscription. A private overview on Home shows metrics and upcoming appointments when a workspace exists.
+- Main navigation is Home, Help, Work (`#/work`, only when a company exists), Activities. Work has its own page with services, private clients, appointments and subscription. A private overview on Home shows metrics and upcoming appointments when a workspace exists.
 - Chat keeps a stable, per-account/per-request textarea with autocomplete disabled. Text and photo sends clear only their original unchanged draft and cannot replace another opened conversation.
 - Home places the current step and promotion in one column, recent tasks beside it, and League below. Mobile shows step, promotion, recent tasks, League.
 - Raster favicon variants are publicly served from `/favicon.ico` and `/assets/favicon-{48,192}.png`. Activities use the labelled generated meeting illustration.
@@ -51,3 +51,33 @@ Commit and push the exact source, archive the commit, verify source checksums an
 Browser regressions: `chat_autofill_browser.cjs`, `home_order_browser.cjs`, `work_page_browser.cjs`; run using `tests/run_theme_qa.py`. PostgreSQL tests also cover exact balance adjustment, replay and concurrent reserve creation.
 
 New registrations receive10000test RUB once (`REGISTRATION_BONUS_RUB=10000`). This is independent of the one-time existing-user balance correction and does not refill wallets on login.
+
+
+## 27 October 2026 follow-up
+
+- Helper readiness, selected categories, radius and availability save atomically; background refresh preserves unsaved controls. The settings open from “Настроить помощь”, without a separate navigation section. Pausing automatic offers keeps manually sent responses.
+- A request accepts multiple responses. Each candidate has a private conversation with the requester before selection. Selecting one helper keeps the other conversations as history. Only the requester confirms completion; both selected participants can cancel. Applicants can withdraw their own response.
+- The selected conversation appears above the chat list. Enter sends; Shift+Enter adds a line. Text and photo drafts belong to the account and actual conversation, including while another send is pending. Closed conversations are archived per participant and can be restored; a new incoming message reopens the recipient’s conversation.
+- Visible chat polls every second with one in-flight request. Unchanged sync payloads do not rebuild the workspace; incremental message updates keep the composer, focus and scroll stable. The obsolete helper banner was removed.
+- Users without a company create one in Profile; Work navigation is hidden until creation. Deletion requires confirmation and removes private workspace records while preserving payment/trial history, preventing repeated free trials. Home keeps the private work summary.
+- Commercial access gates writes after expiry; history remains readable. PRO and request promotion change matching/listing priority, with explicit expiry checks. All payments and the 15% paid-help fee remain test funds.
+- The linked bot has site, chats, help and cancel actions. Pending linking can be cancelled on the website or in the bot. Email remains the only registration and login method.
+- Public metadata describes the current product. `/robots.txt`, `/sitemap.xml` and raster favicons are publicly crawlable. Removed `/games` responds410 and noindex for GET/HEAD; private routes are excluded from the sitemap. Search-engine results and favicon caches require recrawling.
+- A calmer sage palette, shorter headings and fewer decorative elements preserve the existing functions. Manrope is served locally, the logos use compressed WebP, and maps load only when needed. Unavailable external maps do not delay initial rendering or login.
+
+Validation includes full Python tests, isolated PostgreSQL concurrency tests and a production dump restored into a temporary database. Existing users, sessions, wallet ledger, requests, chats, messages, photos and commercial data retain exact fingerprints after migration; a second initialisation is idempotent. No account cleanup or balance reset belongs to this release.
+
+Current browser suites use disposable local databases and synthetic email users:
+
+```text
+python tests/run_theme_qa.py tests/helper_stability_browser.cjs
+python tests/run_theme_qa.py tests/marketplace_chat_browser.cjs
+python tests/run_theme_qa.py tests/chat_archive_browser.cjs
+python tests/run_theme_qa.py tests/startup_browser.cjs
+python tests/run_theme_qa.py tests/theme_browser.cjs
+python tests/run_theme_qa.py tests/home_order_browser.cjs
+python tests/run_theme_qa.py tests/work_page_browser.cjs
+HPOINT_QA_TEST_FUNDS=1 python tests/run_theme_qa.py tests/commercial_browser.cjs
+```
+
+Local release checks: 327 Python tests passed (40 PostgreSQL-only skips), plus 37 PostgreSQL tests and 6 commercial concurrency cases across SQLite/PostgreSQL. Browser checks include helper settings26, chat archive/account-switch29, startup23, homepage order31, work page40, commercial27, paid-help workflow29 and media23, with no JavaScript errors. The marketplace chat suite passed40 checks, including incoming delivery in642ms and an8.5-second idle DOM/focus check. The theme/authentication suite passed108 checks, including72 responsive screens, email verification, logout/login, password reset and removed-route deep links.

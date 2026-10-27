@@ -40,7 +40,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await page.locator('.homePaidOptions').waitFor({state:'detached'});
   await page.evaluate(()=>hpointWorkspace.refresh());
   assert.equal(await page.locator('.homePaidOptions').count(),0);
-  assert.equal(await page.locator('.homePromoSlot').isVisible(),false);
+  assert.match(await page.locator('.homePromoSlot').innerText(),/Работаете с клиентами/);
   assert.equal(await page.locator('.homeRecentCard').isVisible(),true);checks+=3;
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({ok:true,checks,errors,homepageOrder:true,promotionUnderCurrentStep:true,recentTasksVisibleOnMobile:true}));

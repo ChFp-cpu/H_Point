@@ -320,34 +320,22 @@ class Games(unittest.TestCase):
         self.assertTrue(all(button.callback_data is None for button in menu_buttons))
         self.assertTrue(all("ticket" not in parse_qs(urlparse(button.url).query) for button in menu_buttons))
         self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM web_login_tickets").fetchone()["n"],0)
-        self.assertTrue(any("Игры H-Point" in button.text for row in main_menu_kb().keyboard for button in row))
+        self.assertFalse(any("Игры H-Point" in button.text for row in main_menu_kb().keyboard for button in row))
         session = games.start_game(1, "match")
         callbacks = [button.callback_data for row in _match_kb(session).inline_keyboard for button in row]
         self.assertTrue(all(len(value.encode()) <= 64 for value in callbacks))
 
-    def test_bot_keeps_core_actions_discoverable_without_becoming_a_second_site(self):
-        from hpoint.config import (
-            BTN_FIND_CANDIDATES, BTN_GAMES, BTN_HISTORY, BTN_NAVIGATOR,
-            BTN_NEED_HELP, BTN_PROFILE, BTN_SETTINGS, BTN_WANT_HELP, BTN_WEBSITE,
-        )
-        from hpoint.handlers import BOT_GUIDE, BOT_START_OVERVIEW, onboarding_text
+    def test_bot_keeps_only_notifications_chat_and_account_connection_controls(self):
+        from hpoint.handlers import BOT_GUIDE,BOT_START_OVERVIEW,onboarding_text
         from hpoint.keyboards import main_menu_kb
-
-        labels = [button.text for row in main_menu_kb().keyboard for button in row]
-        self.assertTrue({
-            BTN_NEED_HELP, BTN_WANT_HELP, BTN_FIND_CANDIDATES, BTN_PROFILE,
-            BTN_HISTORY, BTN_SETTINGS, BTN_GAMES, BTN_WEBSITE, BTN_NAVIGATOR,
-        }.issubset(labels))
-        self.assertLessEqual(len(labels), 11)
-        self.assertIn("Бот и сайт используют общие профиль", BOT_GUIDE)
-        self.assertIn("Сайт остаётся основным местом", BOT_GUIDE)
-        self.assertIn("Нужна помощь", BOT_START_OVERVIEW)
-        self.assertIn("Подобрать кандидатов", BOT_START_OVERVIEW)
-        self.assertIn("Мои кандидаты", BOT_START_OVERVIEW)
-        self.assertIn("H-Point+", BOT_START_OVERVIEW)
-        self.assertIn("Как пользоваться", BOT_START_OVERVIEW)
-        self.assertIn("только по email", onboarding_text())
-        self.assertNotIn("Как вас зовут?", onboarding_text())
+        labels=[button.text for row in main_menu_kb().keyboard for button in row]
+        self.assertEqual(len(labels),4)
+        self.assertIn("💬 Мои чаты",labels)
+        self.assertNotIn("Игры",str(labels))
+        self.assertIn("/chat",BOT_GUIDE)
+        self.assertIn("/cancel",BOT_GUIDE)
+        self.assertIn("на сайте",BOT_START_OVERVIEW)
+        self.assertIn("только по email",onboarding_text())
 
     def test_old_bot_play_button_opens_website_without_starting_a_text_game(self):
         import asyncio

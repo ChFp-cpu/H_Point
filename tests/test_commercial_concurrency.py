@@ -42,6 +42,29 @@ class RenewalRaces:
         row=self.db.execute("SELECT SUM(amount_rub) total,SUM(test_amount_rub) test FROM wallet_transactions WHERE user_id=1").fetchone()
         self.assertEqual((row["total"],row["test"]),(10,10))
 
+    def test_delete_racing_renewal_never_recreates_or_loses_payment_history(self):
+        original=commercial.dashboard(self.db,1)["profile"]
+        gate=threading.Barrier(2)
+        def run(function):
+            try:
+                gate.wait(timeout=5)
+                try:return function()
+                except ValueError as error:return str(error)
+            finally:self.db.close()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            jobs=[pool.submit(run,lambda:commercial.renew(self.db,1,"synthetic-delete-race")),pool.submit(run,lambda:commercial.delete_profile(self.db,1,True))]
+            results=[job.result(timeout=20) for job in jobs]
+        self.assertEqual(results[1],{"deleted":True})
+        self.assertIsNone(commercial.dashboard(self.db,1)["profile"])
+        self.assertEqual(commercial.summary(self.db,1),{"exists":False})
+        renewals=self.db.execute("SELECT COUNT(*) n FROM commercial_renewals").fetchone()["n"]
+        amount=self.db.execute("SELECT SUM(test_amount_rub) amount FROM wallet_transactions WHERE user_id=1").fetchone()["amount"]
+        self.assertIn((renewals,amount),((0,500),(1,10)))
+        self.assertEqual(isinstance(results[0],dict),bool(renewals))
+        recreated=commercial.save_profile(self.db,1,dict(kind="organization",title="Recreated organisation"))["profile"]
+        self.assertEqual(recreated["trial_until"],original["trial_until"])
+        self.assertEqual(bool(recreated["paid_until"]),bool(renewals))
+
     def test_concurrent_identical_renewal_is_idempotent(self):
         result=self.race("synthetic-race-same-key","synthetic-race-same-key")
         self.assertEqual(sorted(row["created"] for row in result),[False,True])

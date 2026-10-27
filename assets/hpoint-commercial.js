@@ -5,8 +5,8 @@
   const money=value=>Number(value||0).toLocaleString('ru-RU')+' тест. ₽';
   const date=value=>value?new Date(value).toLocaleString('ru-RU',{dateStyle:'medium',timeStyle:'short'}):'—';
   const localDate=value=>{if(!value)return '';const d=new Date(value);return new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,16)};
-  const state={data:null,tab:'overview',edit:null,busy:false,renewKey:null,error:'',owner:null,loadVersion:0};
-  let pageNode=null,loadPromise=null,pendingTab=null;
+  const state={data:null,tab:'overview',edit:null,busy:false,renewKey:null,error:'',owner:null,loadVersion:0,mode:'work',creationOpen:false};
+  let pageNode=null,loadPromise=null,pendingTab=null,pendingCreation=false;
   const account=()=>String(window.hpointWorkspace?.state?.data?.current_user_id??'');
   const workspace=()=>pageNode?.querySelector('#commercialWorkspace');
   const tabs=[['overview','Обзор'],['services','Услуги'],['clients','Клиенты'],['bookings','Расписание'],['subscription','Подписка'],['profile','Настройки']];
@@ -41,11 +41,14 @@
     pageNode.addEventListener('click',handleClick);pageNode.addEventListener('submit',handleSubmit);pageNode.addEventListener('change',handleChange);
     return pageNode;
   }
-  function mount(host){
+  function mount(host,creation=false){
     if(!host)return null;
-    const owner=account();
+    const owner=account(),mode=creation?'creation':'work',modeChanged=state.mode!==mode;state.mode=mode;
     ensurePage();
-    if(state.owner!==owner){state.owner=owner;state.loadVersion++;state.data=null;state.tab='overview';state.edit=null;state.error='';state.busy=false;state.renewKey=null;loadPromise=null;render()}
+    if(creation){pageNode.removeAttribute('aria-labelledby');pageNode.setAttribute('aria-label','Кабинет для работы')}else{pageNode.setAttribute('aria-labelledby','commercialTitle');pageNode.removeAttribute('aria-label')}
+    if(state.owner!==owner){state.owner=owner;state.loadVersion++;state.data=null;state.tab='overview';state.edit=null;state.error='';state.busy=false;state.renewKey=null;state.creationOpen=false;loadPromise=null;render()}
+    if(pendingCreation){state.creationOpen=true;pendingCreation=false;render()}
+    if(modeChanged)render();
     if(pendingTab){state.tab=pendingTab;pendingTab=null;state.edit=null;render()}
     if(pageNode.parentElement!==host)host.appendChild(pageNode);
     if(!state.data&&!loadPromise){
@@ -55,12 +58,18 @@
     }
     return pageNode;
   }
+  function mountCreation(host){return mount(host,true)}
+  function openCreation(){pendingCreation=true;location.hash='#/profile';const host=$('workspaceWorkCreationSlot');if(host)mountCreation(host)}
+  function profileCardMarkup(summary){
+    styles();const exists=Boolean(summary?.exists);
+    return '<section class="commercialCard commercialProfileEntry"><h3>Для работы</h3><p>'+(exists?'Услуги, клиенты и расписание вашей компании.':'Услуги, клиенты и расписание для специалистов и организаций.')+'</p><button class="btn light" type="button" onclick="hpointCommercial.'+(exists?'open()':'openCreation()')+'">'+(exists?'Открыть кабинет':'Создать кабинет в профиле')+'</button></section>';
+  }
   function pageHeader(profile){return '<header class="commercialTop"><div><p class="commercialEyebrow">H-POINT · РАБОЧЕЕ ПРОСТРАНСТВО</p><h1 id="commercialTitle">Для работы</h1>'+(profile?'<h2 class="commercialProfileName">'+esc(profile.title)+'</h2>':'')+'<p class="commercialHelp">'+esc(profile?.kind_title||'Тренеры · организации · специалисты')+'</p></div></header>'}
   function close(){location.hash='#/home'}
   function input(label,name,value='',extra=''){return '<label>'+label+'<input class="input" name="'+name+'" value="'+esc(value)+'" '+extra+'></label>'}
   function textarea(label,name,value='',limit=2000){return '<label>'+label+'<textarea class="input" name="'+name+'" maxlength="'+limit+'">'+esc(value)+'</textarea></label>'}
   function submit(text,disabled){return '<button class="btn grad" type="submit" '+(disabled?'disabled':'')+'>'+text+'</button>'}
-  function profileForm(data){const p=state.edit?.type==='profile'?{...(data.profile||{}),...state.edit.row}:data.profile||{},disabled=Boolean(p.user_id&&!p.active);return '<section class="commercialCard"><h3>'+(p.user_id?'Настройки кабинета':'Откройте свой кабинет')+'</h3><form class="commercialForm" data-commercial-form="profile"><label>Ваш формат работы<select class="input" name="kind">'+Object.entries(data.kinds||{}).map(([key,label])=>'<option value="'+key+'" '+(p.kind===key?'selected':'')+'>'+esc(label)+'</option>').join('')+'</select></label>'+input('Название','title',p.title||'','maxlength="120" required minlength="2"')+textarea('О вашей работе','description',p.description||'')+input('Контакт для клиентов (необязательно)','contact',p.contact||'','maxlength="240"')+submit(p.user_id?'Сохранить профиль':'Начать 7 бесплатных дней',disabled||state.busy)+'</form><p class="commercialHelp">Данные клиентов и заметки доступны только вам. Контакт не заполняется автоматически из email аккаунта.</p></section>'}
+  function profileForm(data){const p=state.edit?.type==='profile'?{...(data.profile||{}),...state.edit.row}:data.profile||{},disabled=Boolean(p.user_id&&!p.active);return '<section class="commercialCard"><h3>'+(p.user_id?'Настройки кабинета':'Откройте свой кабинет')+'</h3><form class="commercialForm" data-commercial-form="profile"><label>Ваш формат работы<select class="input" name="kind">'+Object.entries(data.kinds||{}).map(([key,label])=>'<option value="'+key+'" '+(p.kind===key?'selected':'')+'>'+esc(label)+'</option>').join('')+'</select></label>'+input('Название','title',p.title||'','maxlength="120" required minlength="2"')+textarea('О вашей работе','description',p.description||'')+input('Контакт для клиентов (необязательно)','contact',p.contact||'','maxlength="240"')+submit(p.user_id?'Сохранить профиль':data.trial_available?'Начать 7 бесплатных дней':'Создать кабинет',disabled||state.busy)+'</form><p class="commercialHelp">Клиенты и заметки видны только вам.</p></section>'}
   function serviceForm(data){const s=state.edit?.type==='service'?state.edit.row:{},disabled=!data.profile.active;return '<section class="commercialCard"><h3>'+(s.id?'Редактировать услугу':'Новая услуга')+'</h3><form class="commercialForm" data-commercial-form="services">'+(s.id?'<input type="hidden" name="id" value="'+s.id+'">':'')+input('Название услуги','title',s.title||'','required minlength="2" maxlength="120"')+textarea('Описание','description',s.description||'')+'<div class="commercialPair">'+input('Стоимость, тестовые ₽','price_rub',s.price_rub||0,'type="number" min="0" max="1000000" required')+input('Длительность, минут','duration_minutes',s.duration_minutes||60,'type="number" min="5" max="1440" required')+'</div><label class="commercialCheck"><input type="checkbox" name="active" '+(s.active===0?'':'checked')+'> Услуга доступна</label>'+submit(s.id?'Сохранить услугу':'Добавить услугу',disabled||state.busy)+'</form></section>'}
   function clientForm(data){const c=state.edit?.type==='client'?state.edit.row:{},disabled=!data.profile.active;return '<section class="commercialCard"><h3>'+(c.id?'Редактировать клиента':'Новый клиент')+'</h3><form class="commercialForm" data-commercial-form="clients">'+(c.id?'<input type="hidden" name="id" value="'+c.id+'">':'')+input('Имя клиента','name',c.name||'','required minlength="2" maxlength="120"')+input('Контакт (необязательно)','contact',c.contact||'','maxlength="240"')+textarea('Ваши заметки','notes',c.notes||'',4000)+'<label class="commercialCheck"><input type="checkbox" name="active" '+(c.active===0?'':'checked')+'> Активный клиент</label>'+submit(c.id?'Сохранить клиента':'Добавить клиента',disabled||state.busy)+'</form></section>'}
   function bookingForm(data){const b=state.edit?.type==='booking'?state.edit.row:{},disabled=!data.profile.active||!data.clients.length;return '<section class="commercialCard"><h3>'+(b.id?'Редактировать запись':'Новая запись / заказ')+'</h3><form class="commercialForm" data-commercial-form="bookings">'+(b.id?'<input type="hidden" name="id" value="'+b.id+'">':'')+'<label>Клиент<select class="input" name="client_id" required><option value="">Выберите клиента</option>'+data.clients.filter(c=>c.active||c.id===b.client_id).map(c=>'<option value="'+c.id+'" '+(c.id===b.client_id?'selected':'')+'>'+esc(c.name)+'</option>').join('')+'</select></label><label>Услуга<select class="input" name="service_id"><option value="">Отдельная работа</option>'+data.services.filter(s=>s.active||s.id===b.service_id).map(s=>'<option value="'+s.id+'" '+(s.id===b.service_id?'selected':'')+'>'+esc(s.title)+'</option>').join('')+'</select></label>'+input('Тема записи / заказа','title',b.title||'','required minlength="2" maxlength="160"')+input('Дата и время','starts_at',localDate(b.starts_at),'type="datetime-local" required')+'<div class="commercialPair">'+input('Стоимость, тестовые ₽','price_rub',b.price_rub||0,'type="number" min="0" max="1000000" required')+input('Длительность, минут','duration_minutes',b.duration_minutes||60,'type="number" min="5" max="1440" required')+'</div><label>Статус<select class="input" name="status">'+Object.entries(labels).map(([key,label])=>'<option value="'+key+'" '+(key===(b.status||'planned')?'selected':'')+'>'+label+'</option>').join('')+'</select></label>'+textarea('Заметки','notes',b.notes||'',4000)+submit(b.id?'Сохранить запись':'Добавить запись',disabled||state.busy)+'</form>'+(!data.clients.length?'<p class="commercialHelp">Сначала добавьте клиента на вкладке «Клиенты».</p>':'')+'</section>'}
@@ -70,20 +79,24 @@
   function metric(value,label){return '<article class="commercialMetric"><span>'+label+'</span><b>'+esc(value)+'</b></article>'}
   function render(){
     const host=workspace();if(!host)return;const data=state.data;
-    if(!data){host.innerHTML=pageHeader(null)+'<p class="'+(state.error?'commercialError':'commercialLoading')+'">'+esc(state.error||'Загружаем рабочее пространство…')+'</p>';return}
+    if(!data){host.innerHTML=(state.mode==='creation'?'':pageHeader(null))+'<p class="'+(state.error?'commercialError':'commercialLoading')+'">'+esc(state.error||'Загружаем рабочее пространство…')+'</p>';return}
     const p=data.profile,m=data.metrics||{},active=p?.active;
-    let body='';if(!p)body='<div class="commercialIntro"><h3>Ваши услуги, клиенты и расписание в одном месте</h3><p>Для тренеров, организаций, прорабов и самостоятельных специалистов. Первые 7 дней бесплатно, затем 490 тестовых ₽ за 30 дней. Продление по вашему решению.</p></div>'+profileForm(data);
-    else if(state.tab==='profile')body=profileForm(data);
-    else if(state.tab==='subscription')body='<section class="commercialCard"><h3>Подписка для работы</h3><p>Первые 7 дней — бесплатно. Затем 490 тестовых ₽ за 30 дней. Вы продлеваете доступ самостоятельно; автоматических списаний нет.</p><h3 style="margin-top:24px">История продлений</h3><div class="commercialList">'+(data.renewals.length?data.renewals.map(row=>'<article class="commercialRow"><b>'+money(row.price_rub)+'</b><small>'+date(row.starts_at)+' — '+date(row.ends_at)+'</small></article>').join(''):'<div class="commercialEmpty">Продлений пока не было.</div>')+'</div></section>';
+    if(state.mode==='creation'){
+      host.innerHTML=(state.error?'<p class="commercialError" role="alert">'+esc(state.error)+'</p>':'')+(p?profileCardMarkup({exists:true}):state.creationOpen?'<div class="commercialIntro"><p>'+(data.trial_available?'7 дней бесплатно, затем 490 тестовых ₽ за 30 дней.':'Повторное создание сохраняет прежний срок доступа. Новый пробный период не начисляется.')+'</p></div>'+profileForm(data):profileCardMarkup({exists:false}));return;
+    }
+    let body='';if(!p)body='<section class="commercialCard"><h3>Создайте кабинет в профиле</h3><p>Для услуг, клиентов и расписания.</p><button class="btn light" type="button" data-commercial-action="create">Открыть профиль</button></section>';
+    else if(state.tab==='profile')body=profileForm(data)+'<section class="commercialCard" style="margin-top:18px"><button class="btn light commercialDelete" type="button" data-commercial-action="delete" '+(state.busy?'disabled':'')+'>Удалить компанию</button></section>';
+    else if(state.tab==='subscription')body='<section class="commercialCard"><h3>Подписка для работы</h3><p>Услуги, клиенты и расписание: 7 дней бесплатно, затем 490 тестовых ₽ за 30 дней. Продление вручную.</p><h3 style="margin-top:24px">История продлений</h3><div class="commercialList">'+(data.renewals.length?data.renewals.map(row=>'<article class="commercialRow"><b>'+money(row.price_rub)+'</b><small>'+date(row.starts_at)+' — '+date(row.ends_at)+'</small></article>').join(''):'<div class="commercialEmpty">Продлений пока не было.</div>')+'</div></section>';
     else if(state.tab==='services')body='<div class="commercialGrid">'+serviceForm(data)+'<section class="commercialCard"><h3>Ваши услуги</h3><div class="commercialList">'+serviceList(data)+'</div></section></div>';
     else if(state.tab==='clients')body='<div class="commercialGrid">'+clientForm(data)+'<section class="commercialCard"><h3>Ваши клиенты</h3><div class="commercialList">'+clientList(data)+'</div></section></div>';
     else if(state.tab==='bookings')body='<div class="commercialGrid">'+bookingForm(data)+'<section class="commercialCard"><h3>Расписание и заказы</h3><div class="commercialList">'+bookingList(data)+'</div></section></div>';
-    else body='<div class="commercialMetrics">'+metric(m.clients||0,'АКТИВНЫХ КЛИЕНТОВ')+metric(m.services||0,'УСЛУГ')+metric(m.planned||0,'ПРЕДСТОЯЩИХ ЗАПИСЕЙ')+metric(money(m.revenue_test_rub),'ВЫПОЛНЕНО РАБОТ')+'</div><p class="commercialHelp">Стоимость выполненных работ — учётный показатель. Она не списывает деньги с клиентов и не создаёт реальные выплаты.</p><section class="commercialCard" style="margin-top:18px"><h3>Ближайшие записи</h3><div class="commercialList">'+bookingList(data,true)+'</div></section><div class="commercialActions" style="margin-top:16px"><button class="btn grad" data-commercial-action="tab" data-tab="bookings">Добавить запись / заказ</button><button class="btn light" data-commercial-action="tab" data-tab="clients">Ваши клиенты</button></div>';
-    host.innerHTML=pageHeader(p)+(p?'<div class="commercialNotice"><div><b>'+(active?(p.trial_active?(p.paid_until?'Пробный период и оплаченное продление':'Пробный период'):'Кабинет активен'):'Период доступа завершён')+'</b><p>'+(active?'Доступ до '+date(p.access_until)+' · осталось '+p.days_remaining+' дн.':'Данные сохранены. Просмотр доступен; для изменений продлите кабинет.')+'</p></div><button class="btn grad" data-commercial-action="renew" '+(state.busy?'disabled':'')+'>Продлить на 30 дней · 490 тест. ₽</button></div><nav class="commercialTabs" aria-label="Коммерческий кабинет">'+tabs.map(([key,label])=>'<button data-commercial-action="tab" data-tab="'+key+'" class="'+(state.tab===key?'active':'')+'" aria-current="'+(state.tab===key?'page':'false')+'">'+label+'</button>').join('')+'</nav>':'')+(state.error?'<p class="commercialError" role="alert">'+esc(state.error)+'</p>':'')+body;
+    else body='<div class="commercialMetrics">'+metric(m.clients||0,'АКТИВНЫХ КЛИЕНТОВ')+metric(m.services||0,'УСЛУГ')+metric(m.planned||0,'ПРЕДСТОЯЩИХ ЗАПИСЕЙ')+metric(money(m.revenue_test_rub),'ВЫПОЛНЕНО РАБОТ')+'</div><details class="commercialHelp"><summary>Как считается сумма работ</summary><p>Это учёт стоимости выполненных записей. Оплата клиентов и выплаты не проводятся.</p></details><section class="commercialCard" style="margin-top:18px"><h3>Ближайшие записи</h3><div class="commercialList">'+bookingList(data,true)+'</div></section><div class="commercialActions" style="margin-top:16px"><button class="btn grad" data-commercial-action="tab" data-tab="bookings">Добавить запись / заказ</button><button class="btn light" data-commercial-action="tab" data-tab="clients">Ваши клиенты</button></div>';
+    host.innerHTML=pageHeader(p)+(p?'<div class="commercialNotice"><div><b>'+(active?(p.trial_active?(p.paid_until?'Пробный период и оплаченное продление':'Пробный период'):'Кабинет активен'):'Период доступа завершён')+'</b><p>'+(active?'Доступ до '+date(p.access_until)+' · осталось '+p.days_remaining+' дн.':'Данные сохранены. Просмотр доступен; для изменений продлите кабинет.')+'</p></div>'+(state.tab==='subscription'||!active?'<button class="btn grad" data-commercial-action="renew" '+(state.busy?'disabled':'')+'>Продлить на 30 дней · 490 тест. ₽</button>':'')+'</div><nav class="commercialTabs" aria-label="Коммерческий кабинет">'+tabs.map(([key,label])=>'<button data-commercial-action="tab" data-tab="'+key+'" class="'+(state.tab===key?'active':'')+'" aria-current="'+(state.tab===key?'page':'false')+'">'+label+'</button>').join('')+'</nav>':'')+(state.error?'<p class="commercialError" role="alert">'+esc(state.error)+'</p>':'')+body;
   }
   async function load(){const owner=account(),version=++state.loadVersion,response=await api('/api/commercial');if(owner!==account()||version!==state.loadVersion)return;state.data=response.commercial||response;render()}
   function open(tab){
     if(tab&&tabs.some(([key])=>key===tab)){pendingTab=tab;state.tab=tab;state.edit=null;state.error='';if(state.data)render()}
+    if(window.hpointWorkspace?.state?.data?.workSummary?.exists===false){openCreation();return}
     location.hash='#/work';const host=$('workspaceWorkSlot');if(host)mount(host);
   }
   async function perform(path,data){if(state.busy)return;const owner=account();state.busy=true;state.error='';render();try{await api(path,data);if(owner!==account())return;state.edit=null;await load();window.dispatchEvent(new Event('hpoint:work-updated'))}catch(error){if(owner===account())state.error=error.message}finally{if(owner===account()){state.busy=false;render()}}}
@@ -91,11 +104,16 @@
     const button=event.target.closest('[data-commercial-action]');if(!button||button.disabled)return;
     const action=button.dataset.commercialAction;
     if(action==='close'){close();return}
+    if(action==='create'){openCreation();return}
+    if(action==='delete'){
+      if(!confirm('Удалить компанию? Услуги, клиенты и записи будут удалены. История оплат сохранится. Повторное создание не даёт новый пробный период.'))return;
+      const owner=account();await perform('/api/commercial/delete',{confirm:true});if(owner===account()&&!state.error){state.creationOpen=false;location.hash='#/profile'}return;
+    }
     if(action==='tab'){if(!tabs.some(([key])=>key===button.dataset.tab))return;state.tab=button.dataset.tab;state.edit=null;state.error='';render();return}
     if(action==='edit'){const type=button.dataset.type,key={service:'services',client:'clients',booking:'bookings'}[type],row=state.data[key].find(r=>Number(r.id)===Number(button.dataset.id));if(!row)return;state.edit={type,row};state.tab=key;render();workspace()?.querySelector('form')?.scrollIntoView({block:'start',behavior:'smooth'});return}
     if(action==='status'){await perform('/api/commercial/bookings/status',{id:Number(button.dataset.id),status:button.dataset.status});return}
     if(action==='renew'){
-      if(!confirm('Продлить кабинет на 30 дней за 490 тестовых ₽ из кошелька? Реальные деньги не используются.'))return;
+      if(!confirm('Продлить кабинет на 30 дней за 490 тестовых ₽?'))return;
       if(!state.renewKey)state.renewKey='commercial-'+(crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random().toString(36).slice(2));
       const key=state.renewKey;await perform('/api/commercial/renew',{purchase_key:key});if(!state.error)state.renewKey=null;
     }
@@ -108,7 +126,7 @@
     if(type==='services'||type==='clients')data.active=form.elements.active.checked;
     if(type==='bookings')data.starts_at=new Date(data.starts_at).toISOString();
     state.edit={type:{services:'service',clients:'client',bookings:'booking',profile:'profile'}[type],row:data};
-    await perform('/api/commercial/'+type,data);
+    const creating=type==='profile'&&!state.data.profile,owner=account();await perform('/api/commercial/'+type,data);if(owner===account()&&creating&&!state.error){state.tab='overview';location.hash='#/work'}
   }
   function handleChange(event){if(event.target.name!=='service_id'||!event.target.value)return;const row=state.data.services.find(s=>Number(s.id)===Number(event.target.value)),form=event.target.form;if(!row||!form)return;form.elements.title.value=row.title;form.elements.price_rub.value=row.price_rub;form.elements.duration_minutes.value=row.duration_minutes}
   function homeSummaryMarkup(summary){
@@ -116,6 +134,6 @@
     styles();const m=summary.metrics||{},next=summary.next_appointments||[];
     return '<section class="workspaceCard homeWorkSummary" aria-labelledby="homeWorkTitle"><div class="homeWorkHeading"><div><span class="commercialEyebrow">ДЛЯ РАБОТЫ</span><h2 id="homeWorkTitle">'+esc(summary.title)+'</h2><p>'+(summary.active?(summary.trial_active?'Пробный период · ':'Доступ активен · ')+'до '+date(summary.access_until):'Период доступа завершён. Все данные сохранены.')+'</p></div><button class="btn light" type="button" onclick="hpointCommercial.open()">Открыть «Для работы» →</button></div><div class="commercialMetrics">'+metric(m.clients||0,'КЛИЕНТОВ')+metric(m.services||0,'УСЛУГ')+metric(m.planned||0,'ЗАПИСЕЙ В ПЛАНЕ')+metric(money(m.revenue_test_rub),'ВЫПОЛНЕНО РАБОТ')+'</div><div class="homeWorkUpcoming">'+next.map(row=>'<article class="homeWorkAppointment"><div><b>'+esc(row.title)+'</b><small>'+esc(row.client_name)+'</small></div><small>'+date(row.starts_at)+'</small></article>').join('')+'</div></section>';
   }
-  window.hpointCommercial={open,close,mount,refresh:load,homeSummaryMarkup};
-  if($('workspaceWorkSlot'))mount($('workspaceWorkSlot'));
+  window.hpointCommercial={open,close,mount,mountCreation,openCreation,profileCardMarkup,refresh:load,homeSummaryMarkup};
+  if($('workspaceWorkSlot'))mount($('workspaceWorkSlot'));else if($('workspaceWorkCreationSlot'))mountCreation($('workspaceWorkCreationSlot'));
 })();

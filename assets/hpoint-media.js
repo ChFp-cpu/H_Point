@@ -6,7 +6,7 @@
   const escape = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   let requestFiles = [], requestField = null, enhancementQueued = false, mediaOwner = null;
   const chatFiles = new Map();
-  const currentChat = () => Number(window.hpointWorkspace?.state?.chatId || 0);
+  const currentChat = () => Number(window.hpointWorkspace?.state?.threadId || window.hpointWorkspace?.state?.chat?.id || window.hpointWorkspace?.state?.chatId || 0);
   const notify = message => typeof window.toast === 'function' ? window.toast(message) : console.warn(message);
 
   async function api(url, options) {
@@ -157,6 +157,7 @@
   style.textContent = '.hpointPhotoPicker{grid-column:1/-1;min-width:0;width:100%;box-sizing:border-box;margin-top:10px;font:inherit}.hpointPhotoLabel{display:grid;min-width:0;gap:8px;font-weight:700}.hpointPhotoPicker input{display:block;min-width:0;width:100%;max-width:100%;box-sizing:border-box;overflow:hidden;font:inherit}.hpointPhotoPicker small,.hpointPhotoStatus{display:block;font:inherit;font-size:13px;line-height:1.5;opacity:.8}.hpointPhotoPreviews,.hpointPhotoGallery{display:flex;gap:8px;flex-wrap:wrap;max-width:100%;margin:10px 0}.hpointPhotoPreviews>div{display:grid;gap:4px}.hpointPhotoPreviews img,.hpointPhotoGallery img{display:block;width:92px;height:92px;object-fit:cover;border-radius:12px}.hpointPhotoPreviews button{min-height:36px!important;font-size:12px!important;padding:5px 8px!important}.hpointPhotoGallery a{max-width:100%;border-radius:12px;overflow:hidden}.hpointParticipantList{display:grid;gap:10px}.hpointParticipant{display:flex!important;align-items:center;gap:12px;text-align:left!important;justify-content:flex-start!important;font:inherit;white-space:normal!important}.hpointParticipantAvatar{display:grid;place-items:center;flex:0 0 38px;width:38px;height:38px;border-radius:50%;background:#b8f36b;color:#172417;font-weight:800}';
   document.head.appendChild(style);
   window.HPointMedia = {
+    enhance,
     requestPhotos:() => requestFiles.slice(),
     clearRequestPhotos:() => { requestFiles = []; },
     chatPhotos:() => (chatFiles.get(currentChat()) || []).slice(),

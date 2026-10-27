@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from .help_achievements import initialize_schema as initialize_help_achievements, migrate_profile_awards
 from datetime import datetime, timedelta, timezone
 from .config import REGISTRATION_BONUS_RUB
-from . import reliability, workflow, media, commercial
+from . import reliability, workflow, media, commercial, chat_threads
 from .config import DATABASE_URL, DB_PATH, START_BALANCE, STATUS_OPEN, STATUS_IN_PROGRESS, STATUS_DONE, ADMIN_TELEGRAM_IDS, TELEGRAM_AUTH_TTL_SECONDS, TELEGRAM_LINK_TTL_SECONDS, EMAIL_VERIFICATION_TTL_SECONDS, PHONE_VERIFICATION_TTL_SECONDS, AUTH_ATTEMPT_LIMIT, AUTH_ATTEMPT_WINDOW_SECONDS, CATEGORIES
 
 
@@ -204,7 +204,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS commercial_orders(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL REFERENCES users(user_id),
       title TEXT NOT NULL,gross_amount INTEGER NOT NULL,commission_percent INTEGER NOT NULL DEFAULT 10,commission_amount INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'draft',
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS chats(id INTEGER PRIMARY KEY AUTOINCREMENT,request_id INTEGER NOT NULL UNIQUE REFERENCES requests(id) ON DELETE CASCADE,user_a_id INTEGER NOT NULL REFERENCES users(user_id),user_b_id INTEGER NOT NULL REFERENCES users(user_id),created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS chats(id INTEGER PRIMARY KEY AUTOINCREMENT,request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,user_a_id INTEGER NOT NULL REFERENCES users(user_id),user_b_id INTEGER NOT NULL REFERENCES users(user_id),created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS chat_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,user_id INTEGER NOT NULL REFERENCES users(user_id),text TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS request_candidates(
       request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
@@ -391,6 +391,7 @@ def init_db():
         ("support_tickets", "request_id", "INTEGER"),
     ]:
         _add_column(table, name, definition)
+    chat_threads.initialize_schema(db)
     workflow.initialize_schema(db)
     media.initialize_schema(db)
     commercial.initialize_schema(db)
@@ -1226,14 +1227,8 @@ def link_telegram(user_id,tg_user_id,username=None):
     db.execute("UPDATE users SET tg_user_id=?, username=COALESCE(?,username), web_verified=1, verification_code=NULL, verification_code_hash=NULL, verification_code_expires_at=NULL WHERE user_id=?",(tg_user_id,username,user_id))
 def get_request(request_id): return db.execute("SELECT * FROM requests WHERE id=?",(request_id,)).fetchone()
 def get_or_create_chat_for_request(request_id):
-    """Return the one chat for an assigned request, safely under races."""
-    request=get_request(request_id)
-    if not request or not request["helper_id"]:
-        return None
-    db.execute("INSERT OR IGNORE INTO chats(request_id,user_a_id,user_b_id) VALUES(?,?,?)",
-               (request_id,request["requester_id"],request["helper_id"]))
-    row=db.execute("SELECT id FROM chats WHERE request_id=?",(request_id,)).fetchone()
-    return row["id"] if row else None
+    """Legacy selected-helper chat lookup; never returns another candidate's chat."""
+    return chat_threads.ensure_chat(db,request_id)
 def get_active_own_request(uid): return db.execute("SELECT * FROM requests WHERE requester_id=? AND status IN (?,?) ORDER BY id DESC LIMIT 1",(uid,STATUS_OPEN,STATUS_IN_PROGRESS)).fetchone()
 def get_active_help(uid): return db.execute("SELECT * FROM requests WHERE helper_id=? AND status=? ORDER BY id DESC LIMIT 1",(uid,STATUS_IN_PROGRESS)).fetchone()
 def get_unrated_request(uid): return db.execute("SELECT * FROM requests WHERE requester_id=? AND status=? AND requester_rating IS NULL ORDER BY id DESC LIMIT 1",(uid,STATUS_DONE)).fetchone()

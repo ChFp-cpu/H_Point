@@ -4,13 +4,8 @@ from .features import GAMES_ENABLED
 
 def main_menu_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text=BTN_NEED_HELP), KeyboardButton(text=BTN_WANT_HELP)],
-        [KeyboardButton(text=BTN_FIND_CANDIDATES), KeyboardButton(text=BTN_MY_CANDIDATES)],
-        [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_HISTORY)],
-        [KeyboardButton(text=BTN_SETTINGS)],
-        *([[KeyboardButton(text=BTN_GAMES)]] if GAMES_ENABLED else []),
-        [KeyboardButton(text="💳 H-Point+"), KeyboardButton(text=BTN_NAVIGATOR)],
-        [KeyboardButton(text=BTN_WEBSITE)],
+        [KeyboardButton(text=BTN_WEBSITE), KeyboardButton(text="💬 Мои чаты")],
+        [KeyboardButton(text=BTN_NAVIGATOR), KeyboardButton(text=BTN_CANCEL)],
     ], resize_keyboard=True)
 
 

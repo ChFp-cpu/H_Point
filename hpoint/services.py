@@ -3,7 +3,7 @@ import json, re, secrets
 from datetime import datetime, timedelta, timezone
 from .config import *
 from .help_achievements import award_locked
-from . import reliability, workflow
+from . import reliability, workflow, chat_threads
 from .database import db, get_request, get_user, get_active_help, save_request_candidates, get_request_candidates, insert_id, request_identity_verification, wallet_add_entry, get_or_create_chat_for_request
 
 
@@ -29,6 +29,40 @@ def get_helper_categories(user_id: int) -> list[str]:
         return [c for c in value if c in CATEGORIES]
     except (TypeError, ValueError):
         return []
+
+
+def save_helper_preferences(user_id, categories, availability="", ready=False, radius=0, available_from=None, available_until=None):
+    """Persist preferences and queue readiness atomically, independent of responses."""
+    if not isinstance(categories,list) or any(not isinstance(category,str) or category not in CATEGORIES for category in categories):
+        raise ValueError("Выберите категории помощи.")
+    if not isinstance(ready,bool):raise ValueError("Проверьте готовность к помощи.")
+    if not isinstance(availability,str) or len(availability)>240:raise ValueError("Комментарий: до 240 символов.")
+    categories=list(dict.fromkeys(categories))
+    availability=availability.strip()
+    if isinstance(radius,bool) or not isinstance(radius,(int,str)) or not re.fullmatch(r"[0-9]+",str(radius)):
+        raise ValueError("Радиус должен быть целым числом.")
+    radius=int(radius)
+    if radius<0 or radius>1000:raise ValueError("Радиус: от 0 до 1000 км.")
+    available_from=normalize_schedule(available_from)
+    available_until=normalize_schedule(available_until)
+    if available_from and available_until and available_until<=available_from:raise ValueError("Проверьте время доступности.")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        suffix=" FOR NO KEY UPDATE" if getattr(db,"is_postgres",False) else ""
+        user=db.execute("SELECT user_id,is_blocked FROM users WHERE user_id=?"+suffix,(user_id,)).fetchone()
+        if not user or user["is_blocked"]:raise PermissionError("Аккаунт недоступен.")
+        db.execute("""UPDATE users SET helper_categories=?,helper_availability=?,helper_radius_km=?,
+            helper_available_from=?,helper_available_until=? WHERE user_id=?""",
+            (json.dumps(categories,ensure_ascii=False),availability,radius,available_from,available_until,user_id))
+        active=bool(get_active_help(user_id))
+        if ready and not active:add_to_queue(user_id)
+        else:remove_from_queue(user_id)
+        db.execute("COMMIT")
+        return {"helper_categories":categories,"helper_availability":availability,"helper_radius_km":radius,
+            "helper_available_from":available_from,"helper_available_until":available_until,"helper_ready":bool(ready and not active)}
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
 
 
 def normalize_schedule(value):
@@ -96,7 +130,6 @@ def add_to_queue(user_id: int) -> None:
 
 def remove_from_queue(user_id: int) -> None:
     db.execute("DELETE FROM helper_queue WHERE user_id = ?", (user_id,))
-    db.execute("UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE candidate_id=? AND status='applied'", (user_id,))
 
 
 def accept_open_request(request_id: int, helper_id: int, author_id: int | None = None, application_token: str | None = None) -> str:
@@ -125,7 +158,6 @@ def accept_open_request(request_id: int, helper_id: int, author_id: int | None =
                       VALUES(?,?,0,'accepted',NULL,CURRENT_TIMESTAMP)
                       ON CONFLICT(request_id,candidate_id) DO UPDATE SET status='accepted',offer_token=NULL,updated_at=CURRENT_TIMESTAMP""",(request_id,helper_id))
         db.execute("UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND candidate_id!=? AND status IN ('pending','applied','offered')",(request_id,helper_id))
-        db.execute("UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE candidate_id=? AND request_id!=? AND status IN ('applied','offered')",(helper_id,request_id))
         get_or_create_chat_for_request(request_id)
         db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",(request_id,helper_id,"helper_accepted","Помощник принял опубликованную заявку. Чат создан без повторного выбора кандидата."))
         db.execute("COMMIT");return "created"
@@ -140,18 +172,19 @@ def apply_to_request(request_id: int, helper_id: int) -> str:
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
         request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
         helper = db.execute("SELECT * FROM users WHERE user_id=?" + (" FOR NO KEY UPDATE" if lock else ""), (helper_id,)).fetchone()
-        if not helper or helper["is_blocked"] or not request or request["status"] != STATUS_OPEN or request["requester_id"] == helper_id or get_active_help(helper_id):
+        if not helper or helper["is_blocked"] or not request or request["status"] != STATUS_OPEN or request["requester_id"] == helper_id:
             db.execute("ROLLBACK")
             return "unavailable"
         existing = db.execute("SELECT * FROM request_candidates WHERE request_id=? AND candidate_id=?" + lock, (request_id, helper_id)).fetchone()
         if existing and existing["status"] in ("applied", "offered"):
-            db.execute("ROLLBACK")
+            chat_threads.ensure_chat(db,request_id,helper_id)
+            db.execute("COMMIT")
             return existing["status"]
-        add_to_queue(helper_id)
         db.execute("""INSERT INTO request_candidates(request_id,candidate_id,score,status,offer_token,seen_at,updated_at)
                       VALUES(?,?,?,'applied',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
                       ON CONFLICT(request_id,candidate_id) DO UPDATE SET score=excluded.score,status='applied',offer_token=excluded.offer_token,updated_at=CURRENT_TIMESTAMP""",
                    (request_id, helper_id, match_score(request, helper_id), secrets.token_hex(8)))
+        chat_threads.ensure_chat(db,request_id,helper_id)
         db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)", (request_id, helper_id, "helper_applied", "Помощник откликнулся на заявку. Автор может выбрать его в подборе."))
         db.execute("COMMIT")
         return "created"
@@ -166,8 +199,7 @@ def get_request_applications(requester_id: int, limit: int = 100):
                          FROM request_candidates rc JOIN requests r ON r.id=rc.request_id
                          JOIN users u ON u.user_id=rc.candidate_id
                          WHERE r.requester_id=? AND r.status=? AND rc.status='applied' AND u.is_blocked=0
-                         AND NOT EXISTS(SELECT 1 FROM requests busy WHERE busy.helper_id=rc.candidate_id AND busy.status=?)
-                         ORDER BY rc.updated_at DESC,rc.request_id DESC LIMIT ?""", (requester_id, STATUS_OPEN, STATUS_IN_PROGRESS, limit)).fetchall()
+                         ORDER BY rc.updated_at DESC,rc.request_id DESC LIMIT ?""", (requester_id, STATUS_OPEN, limit)).fetchall()
 
 
 def get_helper_applications(helper_id: int):
@@ -235,7 +267,9 @@ def offer_helper(request_id: int, helper_id: int, replace_offer_token: str | Non
         request = db.execute("SELECT * FROM requests WHERE id = ?" + lock, (request_id,)).fetchone()
         if lock:
             db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (helper_id,)).fetchone()
-        available = db.execute("SELECT 1 FROM helper_queue q JOIN users u ON u.user_id=q.user_id WHERE q.user_id=? AND u.is_blocked=0", (helper_id,)).fetchone()
+        available = db.execute("""SELECT 1 FROM users u WHERE u.user_id=? AND u.is_blocked=0
+            AND (EXISTS(SELECT 1 FROM helper_queue q WHERE q.user_id=u.user_id)
+            OR EXISTS(SELECT 1 FROM request_candidates rc WHERE rc.request_id=? AND rc.candidate_id=u.user_id AND rc.status='applied'))""", (helper_id,request_id)).fetchone()
         busy = db.execute(
             "SELECT 1 FROM requests WHERE helper_id = ? AND status = ?",
             (helper_id, STATUS_IN_PROGRESS),
@@ -354,11 +388,6 @@ def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool, offer
             "UPDATE request_candidates SET status='withdrawn', updated_at=CURRENT_TIMESTAMP "
             "WHERE request_id=? AND candidate_id!=? AND status IN ('pending','applied','offered')",
             (request_id, helper_id),
-        )
-        db.execute(
-            "UPDATE request_candidates SET status='withdrawn', updated_at=CURRENT_TIMESTAMP "
-            "WHERE candidate_id=? AND request_id!=? AND status IN ('applied','offered')",
-            (helper_id, request_id),
         )
         get_or_create_chat_for_request(request_id)
         db.execute(
@@ -719,9 +748,11 @@ def smart_match(request_id, limit=20, query=""):
     if not req: return []
     rows=db.execute("""SELECT u.*, r.id request_id, r.category request_category, r.what, r.lat request_lat, r.lon request_lon
                        FROM users u
-                       JOIN helper_queue q ON q.user_id=u.user_id
+                       LEFT JOIN helper_queue q ON q.user_id=u.user_id
                        CROSS JOIN (SELECT id,category,what,lat,lon FROM requests WHERE id=?) r
                        WHERE u.user_id != ? AND u.user_id IS NOT NULL AND u.is_blocked=0
+                       AND (q.user_id IS NOT NULL OR EXISTS(SELECT 1 FROM request_candidates applied
+                         WHERE applied.request_id=r.id AND applied.candidate_id=u.user_id AND applied.status='applied'))
                        """,(request_id,req["requester_id"])).fetchall()
     applied_ids = {row["candidate_id"] for row in db.execute("SELECT candidate_id FROM request_candidates WHERE request_id=? AND status='applied'", (request_id,)).fetchall()}
     unavailable_for_request = {
@@ -733,12 +764,12 @@ def smart_match(request_id, limit=20, query=""):
     out=[]
     terms = _query_terms(query)
     for u in rows:
-        if u["user_id"] in unavailable_for_request or get_active_help(u["user_id"]) is not None: continue
+        if u["user_id"] in unavailable_for_request or (u["user_id"] not in applied_ids and get_active_help(u["user_id"]) is not None): continue
         cats=get_helper_categories(u["user_id"])
         if cats and req["category"] not in cats and u["user_id"] not in applied_ids: continue
         category_bonus=100 if (not cats or req["category"] in cats) else 0
         distance=haversine_km(req["lat"],req["lon"],u["lat"],u["lon"])
-        if not matches_helper_preferences(req,u,distance):continue
+        if u["user_id"] not in applied_ids and not matches_helper_preferences(req,u,distance):continue
         stats=db.execute("""SELECT AVG(requester_rating) avg,COUNT(*) n FROM requests
                             WHERE helper_id=? AND status=? AND requester_rating IS NOT NULL""",(u["user_id"],STATUS_DONE)).fetchone()
         rating=float(stats["avg"]) if stats["avg"] is not None else 0.0
@@ -754,7 +785,7 @@ def smart_match(request_id, limit=20, query=""):
         if category_bonus: reasons.append("подходит по категории")
         if distance_bonus: reasons.append("рядом")
         if rating_bonus: reasons.append("есть рейтинг")
-        if verified_bonus: reasons.append("Telegram подтверждён")
+        if verified_bonus: reasons.append("Личность подтверждена")
         if query_bonus: reasons.append("соответствует уточнению")
         out.append({"user_id":u["user_id"],"name":u["name"],"username":u["username"],"rating":round(rating,1),
                     "reviews":int(stats["n"] or 0),"verified":is_verified(u["user_id"]),"distance_km":round(distance,2) if distance<999 else None,

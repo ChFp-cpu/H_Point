@@ -53,6 +53,10 @@ def initialize_schema(db):
       starts_at TEXT NOT NULL, ends_at TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS commercial_deleted_profiles(
+      user_id INTEGER PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+      deleted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE INDEX IF NOT EXISTS idx_commercial_services_owner ON commercial_services(owner_id,active,id);
     CREATE INDEX IF NOT EXISTS idx_commercial_clients_owner ON commercial_clients(owner_id,active,id);
     CREATE INDEX IF NOT EXISTS idx_commercial_bookings_owner ON commercial_bookings(owner_id,starts_at);
@@ -103,9 +107,10 @@ def _user(db, uid, lock=False):
     return row
 
 
-def _profile(db, uid, lock=False):
+def _profile(db, uid, lock=False, include_deleted=False):
     suffix = " FOR UPDATE" if lock and getattr(db, "is_postgres", False) else ""
-    return db.execute("SELECT * FROM commercial_profiles WHERE user_id=?" + suffix, (uid,)).fetchone()
+    visible = "" if include_deleted else " AND NOT EXISTS (SELECT 1 FROM commercial_deleted_profiles d WHERE d.user_id=commercial_profiles.user_id)"
+    return db.execute("SELECT * FROM commercial_profiles WHERE user_id=?" + visible + suffix, (uid,)).fetchone()
 
 
 def _until(profile):
@@ -138,10 +143,13 @@ def save_profile(db, uid, data):
     db.execute("BEGIN IMMEDIATE")
     try:
         _user(db, uid, lock=True)
-        profile = _profile(db, uid, lock=True)
+        profile = _profile(db, uid, lock=True, include_deleted=True)
+        deleted = db.execute("SELECT 1 FROM commercial_deleted_profiles WHERE user_id=?", (uid,)).fetchone()
         if profile:
-            _active(profile)
+            if not deleted:
+                _active(profile)
             db.execute("UPDATE commercial_profiles SET kind=?,title=?,description=?,contact=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (kind,title,description,contact,uid))
+            db.execute("DELETE FROM commercial_deleted_profiles WHERE user_id=?", (uid,))
         else:
             now = _now()
             db.execute("INSERT INTO commercial_profiles(user_id,kind,title,description,contact,trial_started_at,trial_until) VALUES(?,?,?,?,?,?,?)", (uid,kind,title,description,contact,now.isoformat(),(now+timedelta(days=TRIAL_DAYS)).isoformat()))
@@ -150,6 +158,33 @@ def save_profile(db, uid, data):
         db.execute("ROLLBACK")
         raise
     return dashboard(db, uid)
+
+
+def delete_profile(db, uid, confirmed=False):
+    """Erase private workspace content while retaining payment/trial history.
+
+    The tombstone hides the profile from all reads. Keeping its access dates and
+    renewal keys prevents delete/recreate from granting another trial or charge.
+    """
+    if confirmed is not True:
+        raise ValueError("Подтвердите удаление кабинета.")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        _user(db, uid, lock=True)
+        profile = _profile(db, uid, lock=True, include_deleted=True)
+        already_deleted = db.execute("SELECT 1 FROM commercial_deleted_profiles WHERE user_id=?", (uid,)).fetchone()
+        if not profile or already_deleted:
+            db.execute("COMMIT")
+            return {"deleted":False}
+        for table in ("commercial_bookings", "commercial_clients", "commercial_services"):
+            db.execute("DELETE FROM " + table + " WHERE owner_id=?", (uid,))
+        db.execute("UPDATE commercial_profiles SET kind='other',title='',description='',contact='',updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (uid,))
+        db.execute("INSERT INTO commercial_deleted_profiles(user_id) VALUES(?)", (uid,))
+        db.execute("COMMIT")
+        return {"deleted":True}
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
 
 
 def renew(db, uid, purchase_key, add_wallet_entry=None):
@@ -279,7 +314,8 @@ def set_booking_status(db,uid,item_id,status):
 def dashboard(db,uid):
     _user(db,uid)
     row=_profile(db,uid)
-    base={"price_rub":PRICE_RUB,"trial_days":TRIAL_DAYS,"kinds":KINDS,"currency":"TEST_RUB"}
+    prior=_profile(db,uid,include_deleted=True)
+    base={"price_rub":PRICE_RUB,"trial_days":TRIAL_DAYS,"kinds":KINDS,"currency":"TEST_RUB","trial_available":prior is None}
     if not row:return {**base,"profile":None,"services":[],"clients":[],"bookings":[],"renewals":[],"metrics":{}}
     profile=dict(row)
     end=_until(row)
@@ -332,6 +368,7 @@ def post_action(db,uid,path,data,add_wallet_entry=None):
     """Small adapter for authenticated web routes; raises ValueError on input errors."""
     if not isinstance(data,dict):raise ValueError("Проверьте данные формы.")
     if path=="/api/commercial/profile":return save_profile(db,uid,data)
+    if path=="/api/commercial/delete":return delete_profile(db,uid,data.get("confirm"))
     if path=="/api/commercial/renew":return renew(db,uid,data.get("purchase_key"),add_wallet_entry)
     if path=="/api/commercial/services":return save_service(db,uid,data)
     if path=="/api/commercial/clients":return save_client(db,uid,data)

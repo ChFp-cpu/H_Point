@@ -1,6 +1,7 @@
 """Telegram UI и пользовательские сценарии H-Point."""
 import logging
 import secrets
+import time
 from urllib.parse import urlencode, urlparse
 from html import escape
 from aiogram import Bot, F, Router, BaseMiddleware
@@ -44,12 +45,21 @@ class EmailOnlyBotMiddleware(BaseMiddleware):
         if sender is None:return
         user=get_user(resolve_profile_id(sender.id))
         if has_verified_email(user) and not user["is_blocked"]:
+            if isinstance(event,CallbackQuery) and (str(event.data or "").startswith(("buy:","buyreq:","payreq:","setcat:","g:")) or event.data in {"profile:settings","profile:history","profile:achievements"}):
+                state=data.get("state")
+                if state:await state.clear()
+                await event.answer("Откройте эту функцию на сайте")
+                if event.message:await event.message.answer("Все настройки и возможности доступны на сайте.",reply_markup=bot_website_keyboard())
+                return
+            if await simplified_bot_message(event,data):return
             return await handler(event,data)
         text=str(getattr(event,"text","") or "")
         command=text.split(maxsplit=1)[0].split("@",1)[0] if text else ""
-        if isinstance(event,Message) and (command in {"/start","/help","/website","/cancel","/link"} or text==BTN_WEBSITE):
+        if isinstance(event,Message) and (command in {"/start","/help","/website","/cancel","/link","/unlink"} or text==BTN_WEBSITE):
             return await handler(event,data)
         if isinstance(event,CallbackQuery):
+            if event.data in {"telegram-link:confirm","telegram-link:cancel"}:
+                return await handler(event,data)
             await event.answer("Войдите по email на сайте и привяжите этот бот в профиле.",show_alert=True)
         else:
             await event.answer(EMAIL_ACCESS_NOTICE,reply_markup=email_access_keyboard())
@@ -59,47 +69,60 @@ router.message.outer_middleware(EmailOnlyBotMiddleware())
 router.callback_query.outer_middleware(EmailOnlyBotMiddleware())
 
 
-# The bot deliberately stays focused on the help flow.  This guide makes every
-# available control discoverable without turning the reply keyboard into a
-# second, crowded version of the website.
+# The website owns forms, settings and purchases. The bot delivers notifications
+# and can relay a reply to an already selected conversation.
 BOT_GUIDE = (
-    "ℹ️ <b>Как пользоваться H-Point</b>\n\n"
-    "<b>Основное меню</b>\n"
-    "🆘 <b>Мне нужна помощь</b> — ответьте на 5 коротких вопросов, чтобы создать заявку.\n"
-    "🤝 <b>Хочу помочь</b> — встать в общую очередь помощников сайта и бота.\n"
-    "⚡ <b>Подобрать кандидатов</b> / 👥 <b>Мои кандидаты</b> — выбрать человека для своей открытой заявки; он подтвердит участие сам.\n"
-    "📨 На сайте «Хочу помочь» в карточке заявки сразу назначает помощника и открывает чат. Уведомление с кнопкой чата придёт обоим в Telegram.\n"
-    "👤 <b>Мой профиль</b> — баланс HP, рейтинг, статистика и статус проверки.\n"
-    "📜 <b>История</b> — завершённые и текущие заявки.\n"
-    "⚙️ <b>Настройки помощи</b> — указать категории, в которых вы готовы помогать.\n" +
-    ("🎮 <b>Игры H-Point</b> — игры на сайте.\n" if GAMES_ENABLED else "🏅 <b>Достижения за помощь</b> — в профиле: условия, награды HP и ваш прогресс.\n") +
-    "💳 <b>H-Point+</b> — платные возможности и безопасный переход к оплате.\n"
-    "🌐 <b>Перейти на сайт</b> — открыть сайт и войти по email.\n\n"
-    "<b>Как проходит помощь</b>\n"
-    "1. Создайте заявку или встаньте в очередь.\n"
-    "2. Автор выбирает кандидата; помощник подтверждает согласие.\n"
-    "3. Сообщения с сайта приходят сюда целиком. Ответьте командой /chat ТЕКСТ или откройте чат с названием помощи на сайте, после выполнения автор завершает помощь, затем оба участника ставят оценки.\n\n"
-    "При проблеме нажмите «Есть проблема» в карточке помощи на сайте. Завершение и выплата приостановятся до решения поддержки. HP за одну пару участников начисляются не чаще раза в 24 часа.\n\n"
-    "<b>Синхронизация и безопасность</b>\n"
-    "Бот и сайт используют общие профиль, заявки, историю, HP и достижения за реальную помощь. "
-    "Чтобы подключить существующий сайт: сайт → «Профиль» → «Получить код Telegram», затем в боте <b>/link КОД</b>. "
-    "Код вводите только в этом боте. Для отмены незавершённого действия используйте /cancel. "
-    "Уточнить подбор можно командой <b>/ask НУЖНЫЙ ОПЫТ</b>; вернуть меню — /menu.\n\n"
-    "Сайт остаётся основным местом для карты, активностей, Лиги H-Point, профиля, подтверждения email и платежей — вход на сайт выполняется только по email."
+    "ℹ️ <b>H-Point в Telegram</b>\n\n"
+    "Здесь приходят уведомления по заявкам и сообщения. "
+    "Открыть переписку — «Мои чаты»; ответить по текущей помощи — <b>/chat ТЕКСТ</b>.\n\n"
+    "Регистрация и вход — только по email на сайте. "
+    "Для привязки получите код в профиле сайта и отправьте <b>/link КОД</b>. "
+    "Подтвердите привязку или нажмите «Отмена»; отвязать бот — <b>/unlink</b>.\n\n"
+    "Заявки, подбор, настройки помощи, профиль и подписки доступны на сайте. "
+    "Незавершённое действие можно отменить командой <b>/cancel</b>."
 )
-
-# The first reply for a returning participant remains short enough for a
-# messenger, but names every visible main-menu group.  The separate guide
-# keeps the explanations discoverable without adding secondary controls to the
-# reply keyboard.
 BOT_START_OVERVIEW = (
-    "<b>Что открывает меню</b>\n"
-    "🆘 Нужна помощь — новая заявка; 🤝 хочу помочь — очередь помощников.\n"
-    "⚡ Подобрать кандидатов и 👥 Мои кандидаты — выбор и статус помощника.\n"
-    "👤 профиль, 📜 история и ⚙️ настройки — ваш аккаунт и готовность помогать.\n"
-    "🏅 Достижения за помощь — в профиле; 💳 H-Point+ и 🌐 сайт — доступы и полный веб-интерфейс.\n"
-    "ℹ️ «Как пользоваться» показывает подробный порядок действий и команды чата."
+    "Уведомления и сообщения по вашей помощи будут приходить сюда. "
+    "Переписка — «Мои чаты», все настройки — на сайте."
 )
+BASIC_BOT_COMMANDS = {"/start", "/help", "/menu", "/website", "/chats", "/chat", "/problem", "/cancel", "/link", "/unlink"}
+LEGACY_BOT_DESTINATIONS = {
+    "/profile":"#/profile", "/history":"#/help", "/settings":"#/help", "/ask":"#/help",
+    "/billing":"#/profile/billing", "/commercial":"#/profile", "/verifyme":"#/profile",
+    "/games":"", "/achievements":"#/league", "/terms":"#/profile/billing", "/paysupport":"#/profile/billing",
+    BTN_NEED_HELP:"#/help", BTN_WANT_HELP:"#/help", BTN_FIND_CANDIDATES:"#/help", BTN_MY_CANDIDATES:"#/help",
+    BTN_PROFILE:"#/profile", BTN_HISTORY:"#/help", BTN_SETTINGS:"#/help", BTN_GAMES:"", "💳 H-Point+":"#/profile/billing",
+}
+
+
+def bot_website_keyboard(route="", title="Открыть H-Point"):
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=title,url=WEB_PUBLIC_URL.rstrip("/")+"/"+route)]])
+
+
+async def simplified_bot_message(event, data):
+    """Redirect obsolete bot forms while keeping messages and review replies."""
+    if not isinstance(event,Message):
+        return False
+    text=str(event.text or "")
+    command=text.split(maxsplit=1)[0].split("@",1)[0] if text else ""
+    state=data.get("state")
+    if text=="💬 Мои чаты" or command=="/chats":
+        if state:await state.clear()
+        await event.answer("Ваши чаты по заявкам.",reply_markup=bot_website_keyboard("#/help/chats","Открыть чаты"))
+        return True
+    destination=LEGACY_BOT_DESTINATIONS.get(command,LEGACY_BOT_DESTINATIONS.get(text))
+    if destination is not None:
+        if state:await state.clear()
+        await event.answer("Это действие доступно на сайте.",reply_markup=bot_website_keyboard(destination))
+        return True
+    if command in BASIC_BOT_COMMANDS or text in {BTN_WEBSITE,BTN_NAVIGATOR,BTN_CANCEL}:
+        return False
+    current_state=await state.get_state() if state else None
+    if current_state in {Review.requester_review.state,Review.helper_review.state}:
+        return False
+    if state:await state.clear()
+    await event.answer("Для ответа по текущей помощи отправьте /chat ТЕКСТ или откройте чат на сайте.",reply_markup=bot_website_keyboard("#/help/chats","Открыть чаты"))
+    return True
 
 
 def onboarding_text() -> str:
@@ -342,18 +365,22 @@ async def cmd_chat(message: Message, state: FSMContext, bot: Bot) -> None:
     if not request or not request["helper_id"] or user_id not in (request["requester_id"], request["helper_id"]) or (target_id is None and request["status"] != STATUS_IN_PROGRESS):
         await message.answer("Чат доступен после назначения помощника по активной заявке.")
         return
-    chat_id = get_or_create_chat_for_request(request["id"])
-    if not chat_id:
-        await message.answer("Не удалось открыть чат по этой заявке.")
+    from . import chat_threads
+    try:
+        # Older direct assignments may predate the first website/chat visit.
+        chat_threads.ensure_chat(db,request["id"],request["helper_id"])
+        conversation=chat_threads.send_message(db,user_id,text,request_id=request["id"])
+    except (PermissionError,LookupError,ValueError):
+        await message.answer("Не удалось отправить сообщение. Откройте нужный чат на сайте.",reply_markup=bot_website_keyboard("#/help/chats","Открыть чаты"))
         return
-    db.execute("INSERT INTO chat_messages(chat_id,user_id,text) VALUES(?,?,?)", (chat_id, user_id, text))
+    chat_id=conversation["chat_id"]
     other_id = request["helper_id"] if request["requester_id"] == user_id else request["requester_id"]
     other = get_user(other_id)
     if other and other["tg_user_id"]:
         try:
             await bot.send_message(
                 other["tg_user_id"],
-                chat_notification(request["id"], get_user(user_id)["name"], text, request["what"]),
+                chat_notification(request["id"],get_user(user_id)["name"],text,request["what"],chat_id=chat_id),
             )
         except Exception:
             logging.exception("Не удалось отправить уведомление о сообщении в Telegram")
@@ -738,7 +765,10 @@ async def game_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
 @router.message(F.text == BTN_CANCEL)
 async def cancel_action(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await show_main_menu(message, "Действие отменено.")
+    if has_verified_email(get_user(resolve_profile_id(message.from_user.id))):
+        await show_main_menu(message,"Действие отменено.")
+    else:
+        await message.answer("Действие отменено. Вход на сайт — по email.",reply_markup=email_access_keyboard())
 
 
 @router.message(Command("profile"))
@@ -1451,25 +1481,45 @@ async def paysupport(message: Message):
     )
 
 @router.message(Command("link"))
-async def link_account(message: Message):
+async def link_account(message: Message,state: FSMContext):
+    await state.clear()
+    if message.chat.type!="private":
+        await message.answer("Привязка выполняется только в личном чате с H-Point.")
+        return
     parts=(message.text or "").split(maxsplit=1)
     if len(parts)!=2:
-        await message.answer("🔐 Чтобы привязать Telegram к сайту, отправьте:\n\n<b>/link КОД</b>\n\nКод находится в разделе «Профиль» на сайте.")
+        await message.answer("Получите код в профиле сайта и отправьте <b>/link КОД</b>.",reply_markup=email_access_keyboard())
         return
-    if not link_owner_has_verified_email(db,parts[1]):
-        await message.answer("Сначала подтвердите email в профиле сайта и получите новый код привязки.",reply_markup=email_access_keyboard())
+    code=parts[1].strip().upper()
+    if not link_owner_has_verified_email(db,code):
+        await message.answer("Подтвердите email на сайте и получите новый код привязки.",reply_markup=email_access_keyboard())
         return
-    ok,msg=link_by_code(parts[1].strip().upper(),message.from_user.id,message.from_user.username)
+    await state.set_state("TelegramLink:confirmation")
+    await state.update_data(telegram_link_code=code,telegram_link_created_at=time.time())
+    await message.answer("Привязать этот Telegram к вашему профилю H-Point? Подтверждайте только свою привязку.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Привязать",callback_data="telegram-link:confirm"),InlineKeyboardButton(text="Отмена",callback_data="telegram-link:cancel")]
+    ]))
+
+
+@router.callback_query(F.data.in_({"telegram-link:confirm","telegram-link:cancel"}))
+async def confirm_telegram_link(callback: CallbackQuery,state: FSMContext):
+    pending=await state.get_data()
+    await state.clear()
+    if callback.data=="telegram-link:cancel":
+        await callback.answer("Привязка отменена")
+        await callback.message.answer("Привязка отменена. Вход на сайт — по email.",reply_markup=email_access_keyboard())
+        return
+    code=pending.get("telegram_link_code")
+    created=pending.get("telegram_link_created_at",0)
+    if not code or not isinstance(created,(int,float)) or not 0<=time.time()-created<=300 or not link_owner_has_verified_email(db,code):
+        await callback.answer("Подтверждение устарело. Получите новый код на сайте.",show_alert=True)
+        return
+    ok,result=link_by_code(code,callback.from_user.id,callback.from_user.username)
     if not ok:
-        await message.answer("❌ "+msg); return
-    user=get_user(resolve_profile_id(message.from_user.id))
-    await message.answer(
-        "✅ <b>Telegram успешно привязан!</b>\n\n"
-        f"Профиль: <b>{escape(user['name'])}</b>\n"
-        f"Баланс: <b>{user['balance']} HP</b>\n\n"
-        "Теперь сайт и бот работают с одним аккаунтом и общей историей.",
-        reply_markup=main_menu_kb(),
-    )
+        await callback.answer(str(result),show_alert=True)
+        return
+    await callback.answer("Telegram привязан")
+    await callback.message.answer("Telegram привязан. Здесь будут приходить уведомления и сообщения.",reply_markup=main_menu_kb())
 
 @router.message(Command("unlink"))
 async def unlink_account(message: Message):

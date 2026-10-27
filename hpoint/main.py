@@ -1,5 +1,6 @@
 import logging
 from aiogram import Bot, Dispatcher
+from aiogram.types import BotCommand
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -20,6 +21,12 @@ async def main() -> None:
     from . import web
     bot_profile = await bot.me()
     web.configure_telegram_notifications(bot, bot_profile.username)
+    # Replace the old Telegram command list as well as the reply keyboard.
+    await bot.set_my_commands([BotCommand(command=command,description=description) for command,description in (
+        ("start","Открыть H-Point"),("website","Перейти на сайт"),("chats","Открыть чаты"),
+        ("chat","Ответить по текущей помощи"),("help","Как пользоваться"),("cancel","Отменить действие"),
+        ("link","Привязать профиль по коду"),("unlink","Отвязать Telegram"),
+    )])
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     logging.info("H-Point бот запущен")

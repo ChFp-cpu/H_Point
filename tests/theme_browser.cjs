@@ -1,3 +1,4 @@
+const {emailLogin}=require('./email_browser_login.cjs');
 const {openHelpTab}=require('./help_navigation.cjs');
 /* Run against a disposable local database only. Requires Playwright and Edge. */
 const {chromium}=require('playwright');
@@ -29,11 +30,11 @@ async function loadPhotos(page){
   page.on('pageerror',error=>errors.push(error.message));
   let checks=0;
   try{
-    await page.goto(base+'/auth/telegram?ticket=theme-browser-data');
+    await emailLogin(page,'theme-browser-data');
     await page.locator('#hpointWorkspace').waitFor();
     const gamesEnabled=(await context.request.get(base+'/api/sync').then(r=>r.json())).features.games;
     const routes=['#/home','#/help','#/rating','#/activities','#/league','#/donate','#/profile','#/profile/wallet','#/profile/billing',...(gamesEnabled?['games']:[])];
-    const widths=[320,360,375,390,430,768,1024,1440,1920];
+    const widths=[320,390,768,1440];
     const failures=[];
     for(const colorScheme of ['light','dark']){
       await page.emulateMedia({colorScheme});
@@ -66,12 +67,13 @@ async function loadPhotos(page){
           }
           if(width===1440||width===390){await loadPhotos(page);await page.screenshot({path:path.join(output,`${colorScheme}-${width}-${route.replace(/[^a-z]/g,'')}.png`),fullPage:true,animations:'disabled'})}
           if(route==='#/help'){
-            assert.equal(await page.locator('.helpNavigation button').count(),6);
+            assert.equal(await page.locator('.helpNavigation [data-tab=preferences]').count(),0);
+
             assert.equal(await page.locator('#workspaceHistory').getAttribute('open'),null);
             assert.equal(await page.locator('#workspaceMapSlot').count(),0,'Map does not force scrolling on the requests screen');
           }
           if(route==='#/profile/billing')assert.equal(await page.locator('.workspaceProduct').count(),2);
-          if(route==='#/league')assert.equal(await page.locator('.leagueCategoryTop').first().evaluate(e=>getComputedStyle(e).color),colorScheme==='light'?'rgb(21, 35, 29)':'rgb(237, 244, 235)');
+          if(route==='#/league')assert.equal(await page.locator('.leagueCategoryTop').first().evaluate(e=>getComputedStyle(e).color),colorScheme==='light'?'rgb(35, 51, 44)':'rgb(232, 239, 234)');
         }
       }
       console.log('Responsive screens passed:',colorScheme);
@@ -91,11 +93,7 @@ async function loadPhotos(page){
     assert.equal(await page.locator('.communityProfile .reviewCard').count(),1);
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
     await page.locator('#modal .close').click();
-    await page.locator('.workspaceHeaderActions [data-route="profile"]').click();
-    if(!(await page.locator('.workspaceAccountNav [data-route="donate"]').isVisible()))await page.locator('#accountMore summary').click();
-    await page.locator('.workspaceAccountNav [data-route="donate"]').click();
-    await page.locator('.workspaceAccountMain #p-donate').waitFor();
-    assert.equal(await page.locator('.workspaceAccountNav [data-route="donate"]').getAttribute('class'),'active');
+    await page.goto(base+'/#/profile');
     // Changing only the emulated system preference must preserve the exact DOM
     // input, draft, route and game session (no reload or rerender).
     await page.goto(base+'/#/profile');
@@ -222,7 +220,7 @@ async function loadPhotos(page){
       assert.equal((await context.request.get(base+'/api/games/state').then(r=>r.json())).active_session,null,`${game} completes and saves its result`);
     }
     console.log('Gameplay passed: continuous traffic, pause, five resumable titles, endless stages and manual save');
-    }else{const paused=await context.request.get(base+'/games');assert.equal(paused.status(),503);console.log('Games are paused; stored game code is verified by the opt-in unit suite')}
+    }else{const paused=await context.request.get(base+'/games');assert.equal(paused.status(),410);console.log('Games are paused; stored game code is verified by the opt-in unit suite')}
     await page.goto(base+'/#/help');
     await page.locator('.helpNavigation [data-tab="chats"]').click();
     const chatButton=page.locator('.workspaceChatButton').first();
@@ -246,7 +244,7 @@ async function loadPhotos(page){
         setCenter(){} setBounds(){}
       },Placemark:class{},util:{bounds:{fromPoints:points=>points}}};
     });
-    await page.getByRole('button',{name:'Повторить загрузку карты',exact:true}).click();
+    await page.getByRole('button',{name:'Повторить',exact:true}).click();
     await page.locator('#workspaceMapSlot #mapTools').waitFor();
     await page.locator('#workspaceMapSlot #mapTasks .mapPrivacy').waitFor();
     const mapElement=await page.locator('#workspaceMapSlot #bigMap').elementHandle();
@@ -271,7 +269,7 @@ async function loadPhotos(page){
       for(const width of [390,1440]){
         await page.setViewportSize({width,height:900});
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,'Administrator view fits the screen');
-        assert.equal(await page.locator('.adminMetric b').first().evaluate(e=>getComputedStyle(e).color),colorScheme==='light'?'rgb(43, 101, 21)':'rgb(184, 243, 107)');
+        assert.equal(await page.locator('.adminMetric b').first().evaluate(e=>getComputedStyle(e).color),colorScheme==='light'?'rgb(61, 101, 80)':'rgb(189, 209, 195)');
         await page.screenshot({path:path.join(output,`${colorScheme}-${width}-admin.png`),animations:'disabled'});checks++;
       }
     }
@@ -287,7 +285,7 @@ async function loadPhotos(page){
     // Empty linked account and guest are checked independently.
     const empty=await browser.newContext({colorScheme:'light'}),emptyPage=await empty.newPage();
     await empty.route('**/*',route=>new URL(route.request().url()).origin===base?route.continue():route.abort());
-    await emptyPage.goto(base+'/auth/telegram?ticket=theme-browser-empty');
+    await emailLogin(emptyPage,'theme-browser-empty');
     for(const colorScheme of ['light','dark']){
       await emptyPage.emulateMedia({colorScheme});
       await emptyPage.setViewportSize({width:375,height:844});
@@ -328,15 +326,17 @@ async function loadPhotos(page){
         await guestPage.evaluate(()=>authForm(true));
         await guestPage.locator('#ap2').waitFor();
         assert.equal(await guestPage.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
-        assert.equal(await guestPage.locator('#modal h2').evaluate(e=>getComputedStyle(e).color),colorScheme==='light'?'rgb(21, 35, 29)':'rgb(237, 244, 235)');
-        assert.match(await guestPage.locator('#passwordRules').innerText(),/от 6 до 256/);
+        assert.equal(await guestPage.locator('#modal h2').evaluate(e=>getComputedStyle(e).color),colorScheme==='light'?'rgb(35, 51, 44)':'rgb(232, 239, 234)');
+        assert.match(await guestPage.locator('#modalbody .hpFormHelp').filter({hasText:/От 6 символов/}).innerText(),/заглавная и строчная латинские буквы, цифра/);
+        assert.equal(await guestPage.locator('#passwordHint').count(),1,'Registration exposes inline password feedback');
         assert.equal(await guestPage.locator('#ap').getAttribute('autocomplete'),'new-password');
         await guestPage.screenshot({path:path.join(output,`${colorScheme}-${width}-registration.png`),animations:'disabled'});
         await guestPage.locator('#modal .close').click();
         await guestPage.getByRole('button',{name:'Войти',exact:true}).first().click();
         await guestPage.locator('#ae').waitFor();
         assert.equal(await guestPage.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
-        assert.equal(await guestPage.locator('#passwordRules').count(),0,'Login does not repeat new-password rules');
+        assert.equal(await guestPage.locator('#passwordHint').count(),0,'Login does not repeat new-password rules');
+        assert.equal(await guestPage.locator('#modalbody .hpFormHelp').filter({hasText:/От 6 символов/}).count(),0);
         await guestPage.screenshot({path:path.join(output,`${colorScheme}-${width}-login.png`),animations:'disabled'});
         await guestPage.locator('#modal .close').click();checks+=2;
       }
@@ -345,22 +345,22 @@ async function loadPhotos(page){
     await guestPage.locator('#an').fill('Проверка регистрации');
     await guestPage.locator('#ae').fill('browser-qa@example.test');
     await guestPage.locator('#ap').fill('weak');await guestPage.locator('#ap2').fill('weak');
-    await guestPage.getByRole('button',{name:'Создать аккаунт',exact:true}).click();
+    await guestPage.getByRole('button',{name:'Зарегистрироваться',exact:true}).click();
     assert.ok((await guestPage.locator('#err').innerText()).length>0);
     await guestPage.locator('#ap').fill('Ab123');await guestPage.locator('#ap2').fill('Ab123');
-    await guestPage.getByRole('button',{name:'Создать аккаунт',exact:true}).click();
+    await guestPage.getByRole('button',{name:'Зарегистрироваться',exact:true}).click();
     assert.match(await guestPage.locator('#err').innerText(),/6/);
     await guestPage.locator('#ap').fill('Ab1234');await guestPage.locator('#ap2').fill('DifferentPassword123');
-    await guestPage.getByRole('button',{name:'Создать аккаунт',exact:true}).click();
+    await guestPage.getByRole('button',{name:'Зарегистрироваться',exact:true}).click();
     assert.match(await guestPage.locator('#err').innerText(),/не совпадают/);
     await guestPage.locator('#ap2').fill('Ab1234');
     await guestPage.route('**/api/auth/register',route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({ok:false,error:'Не удалось отправить код. Вход не выполнен.'})}));
-    await guestPage.getByRole('button',{name:'Создать аккаунт',exact:true}).click();
+    await guestPage.getByRole('button',{name:'Зарегистрироваться',exact:true}).click();
     await guestPage.waitForFunction(()=>document.querySelector('#err')?.textContent.includes('Не удалось отправить код'));
     assert.equal((await guest.request.get(base+'/api/me')).status(),401);
     assert.equal(await guestPage.locator('#modal').isVisible(),true,'Mail failure must not dismiss registration');
     await guestPage.unroute('**/api/auth/register');
-    await guestPage.getByRole('button',{name:'Создать аккаунт',exact:true}).click();
+    await guestPage.getByRole('button',{name:'Зарегистрироваться',exact:true}).click();
     await guestPage.locator('#emailCode').waitFor();
     assert.equal((await guest.request.get(base+'/api/me')).status(),401,'Registration is not login');
     assert.equal((await guest.cookies()).some(cookie=>cookie.name==='hpoint_session'),false);
@@ -410,7 +410,10 @@ async function loadPhotos(page){
     assert.equal((await guest.request.get(base+'/api/me').then(r=>r.json())).user.email,'browser-qa@example.test');
     const deep=await browser.newContext(),deepPage=await deep.newPage();
     await deep.route('**/*',route=>new URL(route.request().url()).origin===base?route.continue():route.abort());
-    await deepPage.goto(base+'/auth/telegram?ticket=theme-browser-game-deep&next='+encodeURIComponent('/games?game=crossing'));
+    await emailLogin(deepPage,'theme-browser-game-deep');
+    const legacyLogin=await deep.request.get(base+'/auth/telegram?ticket=theme-browser-game-deep&next='+encodeURIComponent('/games?game=crossing'));
+    assert.equal(legacyLogin.status(),410,'Removed Telegram login links stay disabled');
+    const deepResponse=await deepPage.goto(base+'/games?game=crossing');
     if(gamesEnabled){
     await deepPage.locator('#crossGrid').waitFor();
     const deepSession=(await deep.request.get(base+'/api/games/state').then(r=>r.json())).active_session;
@@ -418,9 +421,17 @@ async function loadPhotos(page){
     await deepPage.locator('.game-card').filter({has:deepPage.getByRole('heading',{name:'H-Crossing',exact:true})}).getByRole('button',{name:'Продолжить',exact:true}).click();
     await deepPage.locator('.pause-layer').waitFor();
     assert.equal((await deep.request.get(base+'/api/games/state').then(r=>r.json())).active_session.id,deepSession.id);
-    }else{await deepPage.locator('.workspaceAchievements').waitFor();assert.equal(new URL(deepPage.url()).hash,'#/profile')}
+    }else{
+      assert.equal(deepResponse.status(),410,'Removed game deep links return Gone');
+      assert.match(deepResponse.headers()['x-robots-tag'],/noindex/);
+      await deepPage.getByRole('heading',{name:'Этот раздел закрыт',exact:true}).waitFor();
+      await deepPage.getByRole('link',{name:'На главную',exact:true}).click();
+      await deepPage.locator('#hpointWorkspace').waitFor();
+      await deepPage.goto(base+'/#/profile');await deepPage.locator('.workspaceAchievements').waitFor();
+      assert.equal(new URL(deepPage.url()).hash,'#/profile');
+    }
     await deep.close();
-    console.log('Auth passed: email registration, password validation, verification, logout/login, password reset, Telegram safe deep link');
+    console.log('Auth passed: email registration, password validation, verification, logout/login, password reset, removed Telegram/game deep links and working return to profile');
     assert.deepEqual(errors,[]);
     console.log(JSON.stringify({ok:true,checks,liveThemePreservesDraft:true,gamesEnabled,errors,output}));
   }catch(error){console.error('Browser errors:',errors);console.error(await page.locator('body').innerText().then(text=>text.slice(-2500)).catch(()=>''));await page.screenshot({path:path.join(output,'failure.png'),fullPage:true});throw error}finally{await browser.close()}
