@@ -7,7 +7,7 @@ SYSTEM_THEME_CSS = r'''
 :root {
   color-scheme: light;
   --hp-background:#f5f7f6; --hp-surface:#ffffff; --hp-surface-secondary:#edf2ef;
-  --hp-text-primary:#23332c; --hp-text-secondary:#5f7067; --hp-border:#d0dcd5;
+  --hp-text-primary:#23332c; --hp-text-secondary:#4c5e53; --hp-border:#d0dcd5;
   --hp-accent:#bdd1c3; --hp-accent-contrast:#20382b; --hp-accent-text:#3d6550;
   --hp-hover:#e8f0ea; --hp-focus:#4d7460; --hp-disabled:#6b7c71;
   --hp-success:#21622d; --hp-warning:#795408; --hp-danger:#a52d36;
@@ -19,7 +19,7 @@ SYSTEM_THEME_CSS = r'''
   :root {
     color-scheme:dark;
     --hp-background:#151c1b; --hp-surface:#1e2823; --hp-surface-secondary:#28342d;
-    --hp-text-primary:#e8efea; --hp-text-secondary:#b6c4bb; --hp-border:#45594b;
+    --hp-text-primary:#e8efea; --hp-text-secondary:#c1cec5; --hp-border:#45594b;
     --hp-accent:#bdd1c3; --hp-accent-contrast:#20382b; --hp-accent-text:#bdd1c3;
     --hp-hover:#314739; --hp-focus:#bdd1c3; --hp-disabled:#95a697;
     --hp-success:#a5e9a7; --hp-warning:#f5d47c; --hp-danger:#ffb1ad;
@@ -31,7 +31,8 @@ SYSTEM_THEME_CSS = r'''
 html:root {
   --hp-ink:var(--hp-text-primary); --hp-muted:var(--hp-text-secondary);
   --hp-line:var(--hp-border); --hp-green:var(--hp-accent-text); --hp-green-strong:var(--hp-accent-text);
-  --hp-shadow-soft:var(--hp-shadow);
+  --hp-shadow-soft:var(--hp-shadow); --hp-canvas:var(--hp-background);
+  --hp-surface-alt:var(--hp-surface-secondary); --hp-green-soft:var(--hp-hover); --bg:var(--hp-background);
   --canvas:var(--hp-background); --surface:var(--hp-surface); --surface2:var(--hp-surface-secondary);
   --text:var(--hp-text-primary); --ink:var(--hp-text-primary); --muted:var(--hp-text-secondary);
   --line:var(--hp-border); --green:var(--hp-accent-text); --danger:var(--hp-danger); --shadow:var(--hp-shadow);
@@ -254,6 +255,81 @@ body{font-family:Manrope,Arial,sans-serif}.muted{color:var(--hp-text-secondary)}
 .helperSettingsHeading,.workspaceChatHeading{display:flex;gap:12px;align-items:center;justify-content:space-between}.helperSettingsHeading h2{font-size:24px}.helperAdvanced{display:grid;gap:12px}.helperAdvanced[open]{display:grid}.helperAdvanced>summary{cursor:pointer;margin-bottom:12px}.helperAdvanced label{margin-top:10px}.helperCategories{gap:10px!important}.helperCategories label{display:flex;align-items:center;gap:8px;min-height:42px;cursor:pointer}.helperCategories input,.helperReady input{accent-color:var(--hp-focus);width:19px;height:19px;flex:0 0 auto}.helperReady{display:flex!important;align-items:center!important;gap:10px!important}
 .workspaceChatPanel{margin:0 0 18px}.workspaceChatHeading h3{font-size:18px}.workspaceChatActions{display:flex;gap:8px;flex-wrap:wrap;margin:15px 0}.workspaceChatActions .btn{min-height:40px;padding:9px 13px;font-size:12px}.workspaceChatHeading .btn{font-size:12px}.workspaceMessage{white-space:pre-wrap;background:var(--hp-surface-secondary)!important}.workspaceMessage.mine{background:var(--hp-hover)!important}.workspaceMessages{height:clamp(260px,43vh,460px);overflow-anchor:auto}.workspaceChatForm{align-items:flex-end;flex-wrap:wrap}.workspaceChatForm textarea{flex:1;min-height:52px!important}.workspaceChatForm>.btn{height:52px;align-self:flex-start}.chatListCard{margin-top:18px}.workspaceChatButton[aria-current=true]{border-color:var(--hp-focus)}.chatArchivedList{margin-top:16px}.chatArchivedList>summary{cursor:pointer;color:var(--hp-text-secondary)}.chatListRow{display:flex;align-items:center;gap:8px}.chatListRow>.workspaceChatButton{flex:1;min-width:0}.chatListRow>.btn{padding:9px;font-size:12px}.workEntryPromo{background:var(--hp-surface)!important;margin-top:12px}.workEntryPromo p{margin:5px 0;font-size:12px}
 @media(max-width:700px){.workspaceChatForm{flex-direction:row}.workspaceChatForm>.btn{width:auto!important}.workspaceChatHeading{align-items:flex-start}.workspaceChatHeading h3{font-size:17px}.homeHero .homeTitle{font-size:35px}.helperSettingsHeading h2{font-size:22px}#sitePrimaryNav{grid-template-columns:repeat(var(--hp-nav-count,3),minmax(0,1fr))!important}}
+
+/* Numeric updates must not move the rest of the desktop navigation. */
+@media(min-width:1121px){
+ .workspaceHeaderActions .workspaceBalance{display:grid;grid-template-columns:14px 36px minmax(0,1fr);align-items:center;gap:6px;flex:0 0 156px;width:156px;min-width:156px;max-width:156px;white-space:nowrap;font-variant-numeric:tabular-nums}
+ .workspaceHeaderActions .workspaceBalance b,.workspaceHeaderActions .workspaceBalance i{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}
+ .workspaceHeaderActions .workspaceBalance b{text-align:right}
+ .workspaceHeaderActions .workspaceBalance i{text-align:right;padding-left:6px;border-color:var(--hp-border)}
+}
+@media(min-width:901px) and (max-width:1120px){.workspaceHeaderActions .workspaceBalance{display:none!important}}
+
+/* Legible hierarchy and complete light/dark surfaces, including legacy icons. */
+body{font-weight:450}
+.workspaceTitle,.homeTitle,.hero h1{font-weight:800}
+.workspaceCard h2,.workspaceCard h3,.homeLeagueIntro h2,.homeTogether h2,
+.leagueHeading h2,.leagueHero h3,.leagueSectionHead h3,.eventCopy h3,
+#commercialWorkspace h1,#commercialWorkspace h2,#commercialWorkspace h3{font-weight:750}
+.workspaceSubtitle,.workspaceCard p,.workspaceProfileHero p,.homeHeroCopy>p{font-weight:450}
+.workspaceRequestMain>b,.workspaceChatButton>b,.workspaceInfoRow b,.workspaceTransaction b,
+.homeRecent b,.workspaceCandidateCopy>b,.workspaceLeaderName{font-weight:750}
+#sitePrimaryNav button,#sitePrimaryNav a,.workspaceAccountNav>button,
+.workspaceAccountMore button,.workspaceSectionTabs button{color:var(--hp-text-primary);font-weight:700}
+#sitePrimaryNav .active,.workspaceAccountNav button.active,
+.workspaceSectionTabs button.active{color:var(--hp-accent-text);font-weight:800}
+.workspaceAccountNav>b,.workspaceMetric span,.workspaceWalletAmount>span,
+.workspaceForm label,.requestStep label,.helperAdvanced>summary{color:var(--hp-text-secondary);font-weight:650}
+.input::placeholder{color:var(--hp-text-secondary);opacity:1}
+.workspaceInlineError,.eventFormError,.commercialError{color:var(--hp-danger)}
+.workspaceProductDetails,.workspaceProductDetails p,.workspaceTransaction span,
+.workspaceInfoRow>span,.workspaceCandidateCopy>span,.workspaceLeaderMeta,
+.workspaceMessage small,.workspaceChatButton>span,.homeRecent small{color:var(--hp-text-secondary)}
+/* These components previously retained literal dark fills after a theme switch. */
+#globalBalance{background:var(--hp-surface);border-color:var(--hp-border);color:var(--hp-text-primary);box-shadow:none}
+#globalBalance:hover{background:var(--hp-hover);border-color:var(--hp-accent-text);box-shadow:none}
+#globalBalance .globalBalanceItem{background:transparent;border-color:var(--hp-border)}
+#globalBalance .globalBalanceItem small{color:var(--hp-text-secondary)}
+#globalBalance .globalBalanceItem b{color:var(--hp-accent-text)}
+.homePulseItem,.homePulseEmpty,.subscriptionStatus>div,.telegramSummary,
+.trackingEvent,.trackingMapNotice,.contactVerification,.identityCard,
+.reviewCard,.communityProfile,.adminEmpty,.adminSearch,.commercialCard,
+.commercialRow{background:var(--hp-surface);color:var(--hp-text-primary);border-color:var(--hp-border)}
+.subscriptionStatus,.homePulse{background:var(--hp-border)}
+.subscriptionStatus b,.homePulseItem b{color:var(--hp-accent-text)}
+.subscriptionStatus span,.homePulseItem span,.homePulseEmpty,.telegramCopy span,
+.reviewText,.reviewHead small,.trackingEvent span{color:var(--hp-text-secondary)}
+.avatar,.telegramAvatar,.workspaceCandidateAvatar,.workspaceLeaderAvatar,
+.workspaceMiniIcon,.stepNo{background:var(--hp-hover);color:var(--hp-accent-text);border-color:var(--hp-border);box-shadow:none}
+.mapToolbar,.mapTools,.mapLegend,.mapTask,.mapPrivacy,.mapRouteInfo,
+.mapTaskCopy,.mapLegendItem{background-color:var(--hp-surface-secondary);color:var(--hp-text-primary);border-color:var(--hp-border)}
+.mapToolbar .btn,.mapTools .btn{color:var(--hp-text-primary);border-color:var(--hp-border)}
+/* A quiet podium keeps its distinction through border and type, not black slabs. */
+.leagueHeadingMark{background:var(--hp-hover);color:var(--hp-accent-text);border:1px solid var(--hp-border);box-shadow:none}
+.leagueTrophy{width:112px;height:112px;font-size:56px;background:var(--hp-hover);color:var(--hp-accent-text);border:1px solid var(--hp-border);box-shadow:none;transform:none;animation:none}
+.leagueHero:before,.leagueHero:after{border-color:var(--hp-border);opacity:.35}
+.leagueProgressTrack,.leagueCategoryTrack{background:var(--hp-border);border-color:var(--hp-border);box-shadow:none}
+.leagueProgressTrack i,.leagueCategoryTrack i{background:var(--hp-accent-text);box-shadow:none}
+
+.leagueBoard .duoChampionCard{background:var(--hp-surface)!important;border-color:var(--hp-border);box-shadow:var(--hp-shadow)!important}
+.leagueBoard .duoChampion.first .duoChampionCard{background:linear-gradient(160deg,var(--hp-hover),var(--hp-surface))!important;border-color:var(--hp-accent-text);box-shadow:var(--hp-shadow)!important}
+.leagueBoard .duoChampion:hover .duoChampionCard{filter:none;transform:translateY(-2px)}
+.leagueBoard .duoRankBadge,.leagueBoard .duoChampion.first .duoRankBadge,
+.leagueBoard .duoAvatar,.leagueAvatar{background:var(--hp-hover);color:var(--hp-accent-text);border-color:var(--hp-border);box-shadow:none}
+.leagueBoard .duoChampion.first .duoRankBadge{border:1px solid var(--hp-border);box-shadow:none}
+.leagueBoard .duoChampionScore,.leagueBoard .leaguePosition{background:var(--hp-hover);color:var(--hp-accent-text)}
+.leagueBoard .duoChampionName,.leagueMemberName{color:var(--hp-text-primary)}
+.leagueBoard .duoChampionMeta,.leagueMemberMeta{color:var(--hp-text-secondary)}
+.leagueBoard .duoChampion:focus-visible{outline:2px solid var(--hp-focus)!important;outline-offset:4px!important}
+/* Dynamically mounted work styles also use theme colours at full text opacity. */
+#commercialWorkspace .commercialTabs button.active{background:var(--hp-hover);color:var(--hp-accent-text);border-color:var(--hp-accent-text)}
+#commercialWorkspace .commercialEyebrow,#commercialWorkspace .commercialMetric span,
+#commercialWorkspace .commercialHelp,#commercialWorkspace .commercialEmpty,
+#commercialWorkspace .commercialRow small,#commercialWorkspace .commercialRow p,
+#commercialWorkspace .commercialNotice p,.homeWorkSummary .commercialMetric span{color:var(--hp-text-secondary);opacity:1}
+#commercialWorkspace .commercialTag{background:var(--hp-hover);color:var(--hp-accent-text)}
+.hpFormHelp{color:var(--hp-text-secondary);opacity:1}
+.hpTestLabel{background:var(--hp-hover)!important;color:var(--hp-accent-text)!important}
 
 '''
 

@@ -2,7 +2,7 @@
 from html import escape
 from urllib.parse import urlsplit
 
-DESCRIPTION = "H-Point — помощь рядом: найдите помощника, создайте заявку и общайтесь в чате. Регистрация и вход по email."
+DESCRIPTION = "H-Point — помощь рядом и кабинет для работы: найдите помощника или ведите услуги, клиентов и записи. Регистрация и вход по email."
 
 
 def canonical_url(public_url):

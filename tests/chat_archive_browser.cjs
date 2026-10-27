@@ -5,7 +5,7 @@ const {chromium}=require('playwright'),assert=require('node:assert/strict');
 const base=process.env.HPOINT_QA_URL;
 if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
 (async()=>{
- const browser=await chromium.launch({channel:'msedge',headless:true}),contexts=[],errors=[];let checks=0;
+ const browser=await chromium.launch({channel:'msedge',headless:true}),contexts=[],errors=[];let checks=0,release;
  async function actor(ticket){const context=await browser.newContext({viewport:{width:390,height:844},reducedMotion:'reduce'});contexts.push(context);await context.route('**/*',r=>new URL(r.request().url()).origin===base?r.continue():r.abort());const page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));await emailLogin(page,ticket);return {context,page}}
  async function get(a,url){const r=await a.context.request.get(base+url);assert.equal(r.status(),200,await r.text());return r.json()}
  async function post(a,url,data){const r=await a.context.request.post(base+url,{data});assert.equal(r.status(),200,await r.text());return r.json()}
@@ -26,7 +26,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   const ca=(await get(helper,'/api/chats?request_id='+first)).chats[0].id,cb=(await get(other,'/api/chats?request_id='+second)).chats[0].id;
   await post(helper,'/api/chats/send',{request_id:first,chat_id:ca,text:'Private archived message A'});await page.evaluate(()=>hpointWorkspace.refresh());
   await open(author,first,ca);
-  let release=await captureResponse(author,'/api/chats/archive',()=>page.locator('[data-ws-action="chat-archive"]').click());
+  release=await captureResponse(author,'/api/chats/archive',()=>page.locator('[data-ws-action="chat-archive"]').click());
   await open(author,second,cb);await page.locator('#wsChatText').fill('Draft in B survives archive A');await release();await page.evaluate(()=>hpointWorkspace.refresh());
   assert.equal(await page.evaluate(()=>hpointWorkspace.state.threadId),cb);assert.equal(await page.locator('#wsChatText').inputValue(),'Draft in B survives archive A');assert.ok(!(await get(author,'/api/chats')).chats.some(c=>c.id===ca));checks+=3;
   await closed(author);await page.waitForFunction(cid=>hpointWorkspace.state.archivedChats?.some(c=>c.id===cid),ca);assert.match(await page.locator('.chatArchivedList').innerText(),/Private archived message A/);checks++;
@@ -54,5 +54,5 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   assert.equal(await page.evaluate(()=>hpointWorkspace.state.data),null);assert.deepEqual(await page.evaluate(()=>hpointWorkspace.state.archivedChats||[]),[]);assert.equal(await page.evaluate(()=>Boolean(hpointWorkspace.state.showClosedChats)),false);assert.equal(await page.evaluate(()=>hpointWorkspace.state.linkCode),'');checks+=4;
   await switchAccount(author,905);await open(author,second,cb);await closed(author);assert.equal(await page.locator('.chatArchivedList [data-ws-action="chat"][data-thread="'+ca+'"]').count(),0);assert.equal(await page.getByText('Private archived help A',{exact:false}).count(),0);checks+=2;
   assert.deepEqual(errors,[]);console.log(JSON.stringify({ok:true,checks,errors,archiveSwitchChatSafe:true,archiveIncomingDeduplicated:true,archiveOwnerChangePrivate:true,delayedArchiveListPrivate:true,delayedArchiveActionPrivate:true,logoutClearsArchives:true,helperFormOwnerPrivate:true,linkCodeOwnerPrivate:true}));
- }finally{for(const context of contexts)await context.close();await browser.close()}
+ }finally{await release?.().catch(()=>{});for(const context of contexts)await context.close();await browser.close()}
 })().catch(error=>{console.error(error.stack);process.exitCode=1});

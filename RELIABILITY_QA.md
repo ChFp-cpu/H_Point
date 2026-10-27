@@ -81,3 +81,14 @@ HPOINT_QA_TEST_FUNDS=1 python tests/run_theme_qa.py tests/commercial_browser.cjs
 ```
 
 Local release checks: 327 Python tests passed (40 PostgreSQL-only skips), plus 37 PostgreSQL tests and 6 commercial concurrency cases across SQLite/PostgreSQL. Browser checks include helper settings26, chat archive/account-switch29, startup23, homepage order31, work page40, commercial27, paid-help workflow29 and media23, with no JavaScript errors. The marketplace chat suite passed40 checks, including incoming delivery in642ms and an8.5-second idle DOM/focus check. The theme/authentication suite passed108 checks, including72 responsive screens, email verification, logout/login, password reset and removed-route deep links.
+
+
+## Stable header and first paint
+
+- The current workspace exclusively owns the header. H-Point+ and legacy purchase callbacks fetch billing data without invoking the previous balance/header renderers. Navigation and action nodes remain stable; the desktop balance reserves156px and uses tabular numbers.
+- The HTML hides legacy hooks before first paint and shows a neutral loading state. Initialisation begins after the three current feature modules execute and waits briefly for the local font. A failed module shows a retry action. Current data no longer passes through hidden dashboard renderers, including on account changes.
+- Light/dark surfaces, podium cards, crowns, avatars, map/status icons, tracking and work panels use theme variables. Secondary text has stronger contrast; headings and important names carry the visual emphasis.
+- The public welcome and registration explain Help and Work in two short blocks. Search metadata reflects both. Page pinch zoom is disabled through the viewport, touch-action and gesture handlers; ordinary touch/wheel scrolling remains enabled.
+- Message lists preserve their actual DOM and scroll position across full refreshes for the same account/conversation. Own text/photo sends follow the newest message; incoming messages preserve a position in history. Image loading respects that choice.
+
+Validation:327 Python tests passed locally (40 PostgreSQL-only skips);664 live-theme/contrast checks;48 header/cold-reload checks including delayed assets;25 long-chat scroll checks;55 startup/welcome/gesture checks including native touch pinch and touch scroll;29 archive/account-switch checks;108 responsive/email-auth checks;29 paid-help workflow checks;40 marketplace chat checks. Browser suites reported no JavaScript errors.
