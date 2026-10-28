@@ -8,11 +8,39 @@ from .database import db, get_request, get_user, get_active_help, save_request_c
 
 
 def infer_category(what: str) -> str:
-    text = what.lower()
+    """Suggest a direction without changing any explicitly chosen category.
+
+    Keywords are word prefixes, not arbitrary substrings: «автоматический»
+    is not transport and «ключевые слова» is not a request to borrow tools.
+    Specific phrases outrank a lone generic noun such as «мебель».
+    """
+    words = re.findall(r"[a-zа-я0-9]+", str(what or "").lower().replace("ё", "е"))
+    if not words:
+        return "other"
+    short_endings = {"", "а", "у", "ом", "е", "ы", "ов", "ам", "ами", "ах",
+                     "и", "я", "ю", "ем", "ей", "ях", "ям", "ями", "ь", "ья", "ью",
+                     "ой", "ою", "ый", "ая", "ое", "ые", "ого", "ому", "ым", "ыми", "ую"}
+
+    def starts(word, stem):
+        return word.startswith(stem) and (len(stem) > 4 or word[len(stem):] in short_endings)
+
+    winner, best = "other", (0, 0)
     for category, keywords in CATEGORY_KEYWORDS.items():
-        if any(keyword in text for keyword in keywords):
-            return category
-    return "other"
+        matches = []
+        for keyword in keywords:
+            stems = re.findall(r"[a-zа-я0-9]+", keyword.lower().replace("ё", "е"))
+            if any(all(starts(word, stem) for word, stem in zip(words[index:], stems))
+                   for index in range(len(words) - len(stems) + 1)):
+                matches.append((len(stems), sum(map(len, stems))))
+        if matches:
+            # Multiple meaningful words reinforce a suggestion; broad repair
+            # wording yields to a named trade (e.g. plumbing or electronics).
+            score = (max(item[0] for item in matches),
+                     sum(min(item[1], 14) for item in sorted(matches, reverse=True)[:3])
+                     - (2 if category == "repairs" else 0))
+            if score > best:
+                winner, best = category, score
+    return winner
 
 
 def set_helper_categories(user_id: int, categories: list[str]) -> None:

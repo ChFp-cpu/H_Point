@@ -104,3 +104,22 @@ Local release checks: 327 Python tests passed (40 PostgreSQL-only skips), plus 3
 - Message lists preserve their actual DOM and scroll position across full refreshes for the same account/conversation. Own text/photo sends follow the newest message; incoming messages preserve a position in history. Image loading respects that choice.
 
 Validation:327 Python tests passed locally (40 PostgreSQL-only skips);664 live-theme/contrast checks;48 header/cold-reload checks including delayed assets;25 long-chat scroll checks;57 startup/welcome/gesture checks including native touch pinch, touch scroll and desktop Ctrl+wheel/zoom shortcuts;29 archive/account-switch checks;108 responsive/email-auth checks;29 paid-help workflow checks;40 marketplace chat checks. Browser suites reported no JavaScript errors.
+
+## Help directions and leagues
+
+Requests, helper preferences, request filters and league filters share 28 help
+directions in five groups. All eight historical keys and explicit choices remain
+valid; existing Other requests are not silently reclassified. The request wizard
+requires an explicit direction and shows a brief example for it.
+
+League tiers are earned from completed help: Newcomer (0), Bronze (1), Silver (5),
+Gold (15), Platinum (40), Diamond (100). Each direction has its own ranking and
+progress, alongside the overall league. Rankings use completion count and review
+average, never purchased priority. Blocked users and legacy self-help do not rank.
+Personal position includes helpers outside the public top twenty. No balances,
+HP rewards, subscriptions or old achievements change when a league is calculated.
+
+Run `tests/help_categories_browser.cjs` and `tests/help_leagues_browser.cjs` with
+the disposable `tests/run_theme_qa.py` harness. `test_help_categories.py` covers
+inference and real matching; `test_leagues.py` covers levels, filtered metrics,
+privacy, tie ordering, top-twenty boundaries, SQLite and PostgreSQL.

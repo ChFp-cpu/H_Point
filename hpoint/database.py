@@ -639,49 +639,123 @@ def create_community_event(creator_id, title, description, place, starts_at, end
     return insert_id("""INSERT INTO community_events(creator_id,title,description,place,starts_at,ends_at,capacity,image_data)
                       VALUES(?,?,?,?,?,?,?,?)""", (creator_id, title, description, place, start, end, capacity, image_data or ""))
 
-def community_progress(days=30):
-    """Return aggregate-only community metrics safe to display publicly."""
+HELP_LEAGUES = (
+    ("newcomer", "Новичок", 0),
+    ("bronze", "Бронзовая", 1),
+    ("silver", "Серебряная", 5),
+    ("gold", "Золотая", 15),
+    ("platinum", "Платиновая", 40),
+    ("diamond", "Алмазная", 100),
+)
+
+
+def help_league(completed):
+    """A reputation milestone earned by completed help, never by paid priority."""
+    completed = max(0, int(completed))
+    index = max(i for i, (_, _, threshold) in enumerate(HELP_LEAGUES) if completed >= threshold)
+    key, title, threshold = HELP_LEAGUES[index]
+    following = HELP_LEAGUES[index + 1] if index + 1 < len(HELP_LEAGUES) else None
+    return {
+        "key": key, "title": title, "min_completed": threshold,
+        "next_key": following[0] if following else None,
+        "next_title": following[1] if following else None,
+        "next_at": following[2] if following else None,
+        "remaining": max(0, following[2] - completed) if following else 0,
+        "progress_percent": round((completed - threshold) / (following[2] - threshold) * 100) if following else 100,
+    }
+
+
+def community_progress(days=30, category="", user_id=None):
+    """Public help metrics and earned leagues, optionally within one direction.
+
+    Counts and leagues are all-time; only the small daily activity series uses
+    ``days``. Direction totals always include the entire catalog so unused new
+    directions remain discoverable. Personal placement is calculated over the
+    full ranking before the public top twenty is selected.
+    """
+    if not isinstance(category, str) or (category and category not in CATEGORIES):
+        raise ValueError("Выберите направление помощи.")
     days = max(7, min(int(days), 365))
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    total = int(db.execute("SELECT COUNT(*) n FROM requests").fetchone()["n"] or 0)
-    done = int(db.execute("SELECT COUNT(*) n FROM requests WHERE status=?", (STATUS_DONE,)).fetchone()["n"] or 0)
-    active = int(db.execute("SELECT COUNT(*) n FROM requests WHERE status IN ('open','in_progress')").fetchone()["n"] or 0)
-    counts = {row["category"]: int(row["n"] or 0) for row in db.execute(
-        "SELECT category,COUNT(*) n FROM requests GROUP BY category"
-    ).fetchall()}
+    filter_sql = " WHERE category=?" if category else ""
+    filter_args = (category,) if category else ()
+    totals = db.execute("""SELECT COUNT(*) total,
+        COALESCE(SUM(CASE WHEN status='done' THEN 1 ELSE 0 END),0) done,
+        COALESCE(SUM(CASE WHEN status IN ('open','in_progress') THEN 1 ELSE 0 END),0) active,
+        COALESCE(SUM(CASE WHEN reward_rub>0 THEN reward_rub ELSE 0 END),0) rewards
+        FROM requests""" + filter_sql, filter_args).fetchone()
+    total, done, active, rewards = (int(totals[key] or 0) for key in ("total", "done", "active", "rewards"))
+    counts = {row["category"]: row for row in db.execute("""SELECT category,COUNT(*) n,
+        SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) done,
+        SUM(CASE WHEN status IN ('open','in_progress') THEN 1 ELSE 0 END) active
+        FROM requests GROUP BY category""").fetchall()}
     categories = [
-        {"key": key, "title": title, "count": counts.get(key, 0)}
+        {"key": key, "title": title,
+         "count": int(counts[key]["n"] or 0) if key in counts else 0,
+         "done": int(counts[key]["done"] or 0) if key in counts else 0,
+         "active": int(counts[key]["active"] or 0) if key in counts else 0}
         for key, title in CATEGORIES.items()
     ]
     categories.sort(key=lambda item: (-item["count"], item["title"]))
     daily = db.execute(
-        "SELECT substr(created_at,1,10) AS created_day,COUNT(*) n FROM requests WHERE created_at>=? GROUP BY substr(created_at,1,10) ORDER BY created_day",
-        (since,),
+        "SELECT substr(created_at,1,10) AS created_day,COUNT(*) n FROM requests WHERE created_at>=?" +
+        (" AND category=?" if category else "") +
+        " GROUP BY substr(created_at,1,10) ORDER BY created_day",
+        (since,) + filter_args,
     ).fetchall()
-    rewards = int(db.execute("SELECT COALESCE(SUM(reward_rub),0) n FROM requests WHERE reward_rub>0").fetchone()["n"] or 0)
-    leaders = db.execute("""SELECT u.user_id,u.name,u.city,COUNT(r.id) helped,
-                                  AVG(r.requester_rating) rating,COUNT(r.requester_rating) reviews
-                           FROM users u JOIN requests r ON r.helper_id=u.user_id
-                           WHERE r.status=?
-                           GROUP BY u.user_id,u.name,u.city
-                           HAVING COUNT(r.id)>0
-                           ORDER BY COUNT(r.id) DESC,COALESCE(AVG(r.requester_rating),0) DESC,u.user_id ASC
-                           LIMIT 20""", (STATUS_DONE,)).fetchall()
+    # One grouped/window query, independent of the number of directions/users.
+    # Exclude blocked users and defensive legacy self-help from public rankings.
+    leaders = db.execute("""WITH completed AS (
+            SELECT u.user_id,u.name,u.city,COUNT(r.id) helped,
+                   AVG(r.requester_rating) rating,COUNT(r.requester_rating) reviews
+            FROM users u JOIN requests r ON r.helper_id=u.user_id
+            WHERE r.status=? AND u.is_blocked=0 AND r.helper_id<>r.requester_id""" +
+            (" AND r.category=?" if category else "") + """
+            GROUP BY u.user_id,u.name,u.city
+        ), ranked AS (
+            SELECT completed.*,
+                ROW_NUMBER() OVER (ORDER BY helped DESC,COALESCE(rating,0) DESC,user_id ASC) position,
+                COUNT(*) OVER () participants
+            FROM completed
+        ) SELECT * FROM ranked WHERE position<=20 OR user_id=? ORDER BY position""",
+        (STATUS_DONE,) + filter_args + (user_id,),
+    ).fetchall()
     leaderboard = []
-    for position, row in enumerate(leaders, 1):
+    current_user = None
+    for row in leaders:
         helped = int(row["helped"] or 0)
         rating = round(float(row["rating"]), 1) if row["rating"] is not None else None
-        leaderboard.append({
-            "position": position, "user_id": int(row["user_id"]), "name": row["name"],
+        item = {
+            "position": int(row["position"]), "user_id": int(row["user_id"]), "name": row["name"],
             "city": row["city"] or "", "helped": helped, "rating": rating,
             "reviews": int(row["reviews"] or 0),
             "score": helped * 20 + int((rating or 0) * 10),
-        })
+            "league": help_league(helped),
+        }
+        if item["position"] <= 20:
+            leaderboard.append(item)
+        if item["user_id"] == user_id:
+            current_user = item.copy()
+    if user_id is not None and current_user is None:
+        user = db.execute("SELECT user_id,name,city FROM users WHERE user_id=? AND is_blocked=0", (user_id,)).fetchone()
+        if user:
+            current_user = {
+                "position": None, "user_id": int(user["user_id"]), "name": user["name"],
+                "city": user["city"] or "", "helped": 0, "rating": None,
+                "reviews": 0, "score": 0, "league": help_league(0),
+            }
     return {
         "summary": {"total": total, "done": done, "active": active, "rewards": rewards},
         "categories": categories, "daily": [dict(row) for row in daily], "period_days": days,
         "completion_percent": round(done / total * 100) if total else 0,
-        "leaderboard": leaderboard,
+        "leaderboard": leaderboard, "current_user": current_user,
+        "selected_category": category, "category_title": CATEGORIES.get(category, "Все направления"),
+        "participants": int(leaders[0]["participants"]) if leaders else 0,
+        "leagues": [
+            {"key": key, "title": title, "min_completed": threshold,
+             "next_at": HELP_LEAGUES[i + 1][2] if i + 1 < len(HELP_LEAGUES) else None}
+            for i, (key, title, threshold) in enumerate(HELP_LEAGUES)
+        ],
     }
 
 def community_profile(user_id):
