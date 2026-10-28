@@ -75,6 +75,50 @@ class RenewalRaces:
         self.assertEqual(sum(isinstance(row,dict) for row in result),1)
         self.assert_single_debit()
 
+    def race_actions(self,*functions):
+        gate=threading.Barrier(len(functions))
+        def run(function):
+            try:
+                gate.wait(timeout=5)
+                try:return function()
+                except (ValueError,PermissionError) as error:return str(error)
+            finally:self.db.close()
+        with ThreadPoolExecutor(max_workers=len(functions)) as pool:
+            jobs=[pool.submit(run,function) for function in functions]
+            return [job.result(timeout=20) for job in jobs]
+
+    def post(self,uid,suffix,data):
+        return commercial.post_action(self.db,uid,"/api/commercial"+suffix,{"owner_id":1,**data})
+
+    def add_member(self):
+        database.create_user(-2,"Synthetic member",web_verified=True)
+        self.db.execute("UPDATE users SET email='member@example.test',email_verified=1 WHERE user_id=-2")
+        return self.post(1,"/team/invite",{"email":"member@example.test"})["id"]
+
+    def test_concurrent_assigned_bookings_cannot_double_book(self):
+        client=self.post(1,"/clients",{"name":"Synthetic client"})["id"]
+        payload=dict(title="Same assigned interval",client_id=client,assignee_id=1,starts_at="2030-01-01T12:00:00+00:00",duration_minutes=60)
+        result=self.race_actions(lambda:self.post(1,"/bookings",payload),lambda:self.post(1,"/bookings",payload))
+        self.assertEqual(sum(isinstance(r,dict) for r in result),1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM commercial_bookings").fetchone()["n"],1)
+
+    def test_revoke_racing_accept_has_no_access_after_revocation_wins(self):
+        item=self.add_member()
+        results=self.race_actions(lambda:self.post(1,"/team/revoke",{"invitation_id":item}),lambda:self.post(-2,"/team/accept",{"invitation_id":item}))
+        self.assertIsInstance(results[0],dict)
+        accepted=isinstance(results[1],dict)
+        count=self.db.execute("SELECT COUNT(*) n FROM commercial_members WHERE owner_id=1 AND user_id=-2").fetchone()["n"]
+        self.assertEqual(count,int(accepted))
+        self.assertIn(self.db.execute("SELECT status FROM commercial_invitations WHERE id=?",(item,)).fetchone()["status"],("accepted","revoked"))
+
+    def test_remove_racing_member_write_cannot_leave_future_access(self):
+        item=self.add_member();self.post(-2,"/team/accept",{"invitation_id":item})
+        results=self.race_actions(lambda:self.post(1,"/team/remove",{"user_id":-2}),lambda:self.post(-2,"/tasks",{"title":"Concurrent task","assignee_id":-2}))
+        self.assertIsInstance(results[0],dict)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM commercial_members WHERE user_id=-2").fetchone()["n"],0)
+        with self.assertRaises(PermissionError):self.post(-2,"/tasks",{"title":"Write after removal"})
+        for row in self.db.execute("SELECT assignee_id FROM commercial_tasks WHERE owner_id=1").fetchall():self.assertIsNone(row["assignee_id"])
+
 
 class SQLiteRenewalRaces(RenewalRaces,unittest.TestCase):
     def setUp(self):

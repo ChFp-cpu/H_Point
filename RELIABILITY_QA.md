@@ -1,5 +1,10 @@
 # H-Point release: stable conversations and simpler navigation
 
+Organisation collaboration, planning, estimates, publication and subscription
+status are documented in [WORKSPACE_QA.md](WORKSPACE_QA.md). The homepage now
+offers workspace creation directly; private organisation records remain outside
+the public activity service directory.
+
 This release keeps the requester as the only person who can confirm completed help.
 
 ## Behaviour

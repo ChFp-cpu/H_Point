@@ -651,19 +651,30 @@ from datetime import datetime, timedelta, timezone
 def _future_iso(days: int = 30) -> str:
     return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
 
+def _entitlement_date(value):
+    if not value:return None
+    try:
+        parsed=datetime.fromisoformat(str(value).replace("Z","+00:00"))
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    except (TypeError,ValueError):return None
+
+def _entitlement_active(value):
+    end=_entitlement_date(value)
+    return bool(end and end>datetime.now(timezone.utc))
+
 def is_pro(user_id: int) -> bool:
     row = get_user(user_id)
     if not row or not row["pro_until"]:
         return False
-    return row["pro_until"] > datetime.now(timezone.utc).isoformat()
+    return _entitlement_active(row["pro_until"])
 
 def is_verified(user_id: int) -> bool:
     row = get_user(user_id)
-    return bool(row and row["verified_until"] and row["verified_until"] > datetime.now(timezone.utc).isoformat())
+    return bool(row and _entitlement_active(row["verified_until"]))
 
 def is_business(user_id: int) -> bool:
     row = get_user(user_id)
-    return bool(row and row["business_until"] and row["business_until"] > datetime.now(timezone.utc).isoformat())
+    return bool(row and _entitlement_active(row["business_until"]))
 
 def grant_entitlement(user_id: int, item_type: str, request_id: int | None = None, ad_text: str | None = None, subscription_until: int | None = None) -> None:
     if item_type == "pro":
@@ -671,7 +682,7 @@ def grant_entitlement(user_id: int, item_type: str, request_id: int | None = Non
             until = datetime.fromtimestamp(subscription_until, tz=timezone.utc).isoformat()
         else:
             current = get_user(user_id)["pro_until"]
-            base = datetime.fromisoformat(current) if current else datetime.now(timezone.utc)
+            base = _entitlement_date(current) or datetime.now(timezone.utc)
             if base < datetime.now(timezone.utc): base = datetime.now(timezone.utc)
             until = (base + timedelta(days=30)).isoformat()
         db.execute("UPDATE users SET pro_until=? WHERE user_id=?", (until, user_id))
@@ -684,7 +695,7 @@ def grant_entitlement(user_id: int, item_type: str, request_id: int | None = Non
             until = datetime.fromtimestamp(subscription_until, tz=timezone.utc).isoformat()
         else:
             current = get_user(user_id)["business_until"]
-            base = datetime.fromisoformat(current) if current else datetime.now(timezone.utc)
+            base = _entitlement_date(current) or datetime.now(timezone.utc)
             if base < datetime.now(timezone.utc): base = datetime.now(timezone.utc)
             until = (base + timedelta(days=30)).isoformat()
         db.execute("UPDATE users SET business_until=? WHERE user_id=?", (until, user_id))

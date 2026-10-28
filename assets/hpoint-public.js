@@ -1,0 +1,2 @@
+/* Match the application's gesture policy on shared organisation pages. */
+(()=>{'use strict';document.addEventListener('wheel',event=>{if(event.ctrlKey)event.preventDefault()},{passive:false});for(const type of ['gesturestart','gesturechange','gestureend'])document.addEventListener(type,event=>event.preventDefault(),{passive:false});document.addEventListener('keydown',event=>{if((event.ctrlKey||event.metaKey)&&!event.altKey&&!event.isComposing&&['+','=','-','_','Add','Subtract'].includes(event.key))event.preventDefault()},true)})();

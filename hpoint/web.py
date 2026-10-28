@@ -6,7 +6,8 @@ from email.message import EmailMessage
 import asyncio, json, logging, os, secrets, hashlib, hmac, datetime as dt, re, smtplib, ssl, base64, binascii, threading, time
 from pathlib import Path
 from html import escape
-from . import database, services, workflow, commercial, media, chat_threads
+from . import database, services, workflow, commercial, media, chat_threads, organization_page
+from . import billing as billing_service
 from . import games, help_achievements, seo
 from .features import GAMES_ENABLED, GAMES_PAUSED_MESSAGE
 from .database import db, get_user, get_user_by_email, create_web_user, get_request, get_user_stats, get_active_own_request, get_history, get_billing_history, is_user_blocked, admin_summary, set_user_blocked
@@ -411,9 +412,14 @@ def user_payload(u):
     identity_payload={"status":identity["status"],"submitted_at":identity["submitted_at"],"reviewed_at":identity["reviewed_at"],"note":identity["note"]} if identity else {"status":"not_requested"}
     contacts_ready=bool((u["full_name"] or "").strip() and u["birth_date"] and u["email_verified"] and u["phone_verified"] and u["tg_user_id"])
     telegram = None
+    try:
+        pro_end=dt.datetime.fromisoformat(u["pro_until"].replace("Z","+00:00")) if u["pro_until"] else None
+        if pro_end and pro_end.tzinfo is None:pro_end=pro_end.replace(tzinfo=dt.timezone.utc)
+        pro_active=bool(pro_end and pro_end>now())
+    except (ValueError,TypeError):pro_active=False
     if u["tg_user_id"]:
         telegram = {"name": u["name"], "username": u["username"] or "", "avatar_url": None}
-    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"role":u["role"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"email_verified":bool(u["email_verified"]),"account_verified":account_is_verified(u),"email_delivery_configured":email_delivery_configured(),"sms_delivery_configured":sms_delivery_configured(),"full_name":u["full_name"] or "","birth_date":u["birth_date"] or "","phone":u["phone"] or "","phone_verified":bool(u["phone_verified"]),"contacts_verified":contacts_ready,"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram":telegram,"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code_available":code_valid,"pro_until":u["pro_until"],"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats,"helper_categories":get_helper_categories(u["user_id"]),"saved_location":u["saved_location"] or "","helper_radius_km":u["helper_radius_km"],"helper_available_from":u["helper_available_from"],"helper_available_until":u["helper_available_until"],"helper_availability":u["helper_availability"] or "","helper_ready":is_in_queue(u["user_id"])}
+    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"role":u["role"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"email_verified":bool(u["email_verified"]),"account_verified":account_is_verified(u),"email_delivery_configured":email_delivery_configured(),"sms_delivery_configured":sms_delivery_configured(),"full_name":u["full_name"] or "","birth_date":u["birth_date"] or "","phone":u["phone"] or "","phone_verified":bool(u["phone_verified"]),"contacts_verified":contacts_ready,"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram":telegram,"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code_available":code_valid,"pro_until":u["pro_until"],"pro_active":pro_active,"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats,"helper_categories":get_helper_categories(u["user_id"]),"saved_location":u["saved_location"] or "","helper_radius_km":u["helper_radius_km"],"helper_available_from":u["helper_available_from"],"helper_available_until":u["helper_available_until"],"helper_availability":u["helper_availability"] or "","helper_ready":is_in_queue(u["user_id"])}
 
 def request_payload(r):
     d=dict(r); d["requester_name"]=(get_user(r["requester_id"]) or {"name":"Участник"})["name"]; d["photos"]=media.request_photo_metadata(db,r["id"]); d["category_name"]=CATEGORIES.get(r["category"],"Другое"); d["status_title"]=STATUS_TITLES.get(r["status"],r["status"]); return d
@@ -1197,8 +1203,8 @@ WORKSPACE_SHELL_UI=r'''
     return '<aside class="workspaceRequestPromo" aria-label="Платная возможность H-Point+"><div class="workspacePromoCopy"><b><span class="workspacePromoLabel">H-POINT+</span>Заявка выше в ленте</b><p>Продвижение за '+money(offer.rub)+' или '+number(offer.hp)+' HP</p></div><button class="workspacePromoLink" type="button" data-ws-action="request-promo" data-item="boost" data-id="'+Number(row.id)+'">Подробнее →</button><div class="workspacePromoExtras">'+availablePaidPlans().map(paidPlanLink).join('')+'</div><button class="workspacePromoDismiss" type="button" data-ws-action="request-promo-dismiss" aria-label="Скрыть предложение H-Point+">×</button></aside>';
   }
   function decoratePromotion(){
-    if(state.route==='home'){let slot=root().querySelector('.homePromoSlot');if(slot)slot.innerHTML=subscriptionPromotion()+(!state.data.workSummary?.exists?'<aside class="workspaceRequestPromo workEntryPromo"><div><b>Работаете с клиентами?</b><p>Кабинет для услуг и записей можно оформить в профиле.</p></div><button class="btn light" type="button" onclick="hpointCommercial.openCreation()">В профиль</button></aside>':'');return}
-    if(state.route!=='billing'||!state.promotionItem)return;let item=state.promotionItem,needsRequest=['boost','more_responses'].includes(item),row=needsRequest?promotionRequest(state.promotionRequestId):null,offer=paidOffer(item);if(!offer||(needsRequest&&!row))return;
+    if(state.route==='home'){let slot=root().querySelector('.homePromoSlot');if(slot)slot.innerHTML=subscriptionPromotion()+(!state.data.workSummary?.exists?'<aside class="workspaceWorkPromo workEntryPromo" aria-labelledby="homeWorkPromoTitle"><div><span class="workspaceKicker">СПЕЦИАЛИСТАМ И ОРГАНИЗАЦИЯМ</span><h2 id="homeWorkPromoTitle">Для работы</h2><p>Клиенты, команда, расписание, объекты и сметы — в одном кабинете.</p><small>7 дней бесплатно · затем 490 тестовых ₽ за 30 дней</small></div><button class="btn grad" type="button" onclick="hpointCommercial.openCreation()">Создать кабинет →</button></aside>':'');return}
+    if(state.route!=='billing'||!state.promotionItem)return;if(state.promotionItem==='pro'&&state.data.user.pro_active){state.promotionItem=null;return}let item=state.promotionItem,needsRequest=['boost','more_responses'].includes(item),row=needsRequest?promotionRequest(state.promotionRequestId):null,offer=paidOffer(item);if(!offer||(needsRequest&&!row))return;
     let card=root().querySelector('.workspaceProduct [data-item="'+item+'"]')?.closest('.workspaceProduct');if(!card)return;
     card.classList.add('workspacePromoTarget');card.tabIndex=-1;let context=document.createElement('p');context.className='workspacePromoContext';context.innerHTML=needsRequest?'<b>Для заявки №'+Number(row.id)+'</b> · '+esc(compact(row.what))+'<br>Приоритет в ленте и автоматическом подборе не гарантирует отклик. Обычная публикация и подбор остаются бесплатными.':item==='pro'?'<b>PRO на 30 дней</b><br>Приоритет профиля и ваших заявок в автоматическом подборе. Не влияет на рейтинг и Лигу. Разовая оплата, без автоматического продления.':'<b>Рассмотрение заявки на проверку личности</b><br>Оплата не означает автоматическое подтверждение. Решение принимает администратор.';card.querySelector('h3').after(context);
     card.querySelector('.workspaceProductPrice').textContent=money(offer.rub)+' · '+number(offer.hp)+' HP';
@@ -1209,8 +1215,8 @@ WORKSPACE_SHELL_UI=r'''
     if(action==='request-promo-dismiss'){let key=promotionKey(button.dataset.slot||'request');state.promoDismissedSlots=[...(state.promoDismissedSlots||[]),key];try{localStorage.setItem(key,String(Date.now()))}catch(error){}render();return}
     let item=button.dataset.promoItem||button.dataset.item||'boost',offer=paidOffer(item),needsRequest=['boost','more_responses'].includes(item),id=Number(button.dataset.promoRequest||button.dataset.id||$('wsBoostRequest')?.value),row=needsRequest?promotionRequest(id):null;if(!offer||(needsRequest&&!row)){toast('Предложение уже изменилось. Обновляем список.');await refresh();return}
     if(action==='request-promo'){state.promotionItem=item;state.promotionRequestId=row?id:null;setRoute('billing');await refreshBilling();let card=root().querySelector('.workspacePromoTarget');if(card){card.focus({preventScroll:true});card.scrollIntoView({block:'center',behavior:'auto'})}return}
-    let price=button.dataset.method==='hp'?number(offer.hp)+' HP':money(offer.rub)+' из кошелька';if(!window.confirm('Подключить «'+offer.title+'»'+(row?' для заявки №'+id:'')+' за '+price+'?'))return;
-    button.disabled=true;try{await window.buy(item,button.dataset.method,row?{request_id:id}:{});await refresh();await refreshBilling()}finally{button.disabled=false}
+    let price=button.dataset.method==='hp'?number(offer.hp)+' HP':money(offer.rub)+' из кошелька',renew=item==='pro'&&state.data.user.pro_active,meta=item==='pro'?(window.hpointSubscriptions?.purchaseMetadata(item,state.billing?.subscription)||{}):{};if(!window.confirm((renew?'Продлить действующий PRO на 30 дней':'Подключить «'+offer.title+'»')+(row?' для заявки «'+compact(row.what)+'»':'')+' за '+price+'?'+(renew?' Новый срок добавится после '+stamp(state.data.user.pro_until)+'.':'')))return;
+    button.disabled=true;try{await window.buy(item,button.dataset.method,row?{request_id:id}:meta);await refresh();await refreshBilling()}finally{button.disabled=false}
   }
   function activeRequests(){return ownRequests().filter(row=>row.status==='open'||row.status==='in_progress')}
   function statusLabel(row){return row&&row.status_title||({open:'Ожидает помощника',in_progress:'В работе',done:'Завершена',cancelled:'Отменена'}[row&&row.status]||'Статус обновляется')}
@@ -1230,7 +1236,7 @@ WORKSPACE_SHELL_UI=r'''
     if(!user){renderGuestHeader();return}
     let toolbar=actions.querySelector('.workspaceHeaderActions');
     if(!toolbar||toolbar.dataset.owner!==String(state.data.current_user_id)||actions.children.length!==1){actions.innerHTML='<div class="workspaceHeaderActions"><button class="workspaceBalance" type="button" data-ws-action="route" data-route="wallet" title="Открыть кошелёк"><span>HP</span><b data-header-points></b><i data-header-rubles></i></button><button class="btn light" type="button" data-ws-action="support">Поддержка</button><button class="btn light" type="button" data-ws-action="route" data-route="profile"></button><button class="btn grad" type="button" data-ws-action="request">+ Заявка</button></div>';toolbar=actions.firstElementChild;toolbar.dataset.owner=String(state.data.current_user_id)}
-    const rating=user.stats?.helped_avg,values=[['[data-header-points]',number(user.balance)],['[data-header-rubles]',money((state.data.wallet||{}).balance_rub)],['[data-route="profile"]','Профиль'+(rating?' · ★ '+Number(rating).toFixed(1):'')]];
+    const profileButton=toolbar.querySelector('[data-route="profile"]');if(!profileButton.querySelector('[data-header-profile-label]'))profileButton.innerHTML='<span data-header-profile-label></span><span class="workspaceProBadge" data-header-pro hidden>PRO</span>';const proBadge=profileButton.querySelector('[data-header-pro]');proBadge.hidden=!user.pro_active;proBadge.title=user.pro_active?'H-Point PRO до '+stamp(user.pro_until):'';const rating=user.stats?.helped_avg,values=[['[data-header-points]',number(user.balance)],['[data-header-rubles]',money((state.data.wallet||{}).balance_rub)],['[data-header-profile-label]','Профиль'+(rating?' · ★ '+Number(rating).toFixed(1):'')]];
     values.forEach(([selector,text])=>{const node=toolbar.querySelector(selector);if(node.textContent!==text)node.textContent=text});
   }
 
@@ -1387,12 +1393,13 @@ WORKSPACE_SHELL_UI=r'''
     let awards=helpAchievementMarkup(achievements);
     let editor=state.profileDetails?'<section class="workspaceCard" style="margin-top:16px"><h3>Редактировать профиль</h3><div class="workspaceForm"><label>Имя<input id="wsName" class="input" maxlength="80" value="'+esc(user.name||'')+'"></label><label>Город<input id="wsCity" class="input" maxlength="80" value="'+esc(user.city||'')+'"></label><label>О себе<textarea id="wsBio" class="input textarea" maxlength="500">'+esc(user.bio||'')+'</textarea></label><button class="btn grad" type="button" data-ws-action="profile-save">Сохранить профиль</button></div></section>'+details+accountControls():'';
     return pageHead('Мой профиль','','ПРОФИЛЬ')+
-    '<section class="workspaceCard workspaceProfileHero"><i class="workspaceProfileAvatar" aria-hidden="true">'+esc((user.name||'?').slice(0,1).toUpperCase())+'</i><div><h2>'+esc(user.name||'Участник')+'</h2><p class="muted">'+esc(user.city||'Город не указан')+'</p><span class="workspaceTag '+(user.tg_linked?'open':'')+'">'+(user.tg_linked?'Telegram привязан':'Telegram не привязан')+'</span></div><div class="workspaceActions"><button class="btn light" type="button" data-ws-action="profile-details">Редактировать профиль</button></div></section>'+
+    '<section class="workspaceCard workspaceProfileHero"><i class="workspaceProfileAvatar" aria-hidden="true">'+esc((user.name||'?').slice(0,1).toUpperCase())+'</i><div><h2>'+esc(user.name||'Участник')+(user.pro_active?' <span class="workspaceProBadge" title="H-Point PRO до '+stamp(user.pro_until)+'">PRO</span>':'')+'</h2><p class="muted">'+esc(user.city||'Город не указан')+'</p><span class="workspaceTag '+(user.tg_linked?'open':'')+'">'+(user.tg_linked?'Telegram привязан':'Telegram не привязан')+'</span></div><div class="workspaceActions"><button class="btn light" type="button" data-ws-action="profile-details">Редактировать профиль</button></div></section>'+
     '<section class="workspaceStats">'+metric('H-POINTS',number(user.balance))+metric('ПОМОЩЕЙ ОКАЗАНО',number(stats.helped))+metric('ПОМОЩЕЙ ПОЛУЧЕНО',number(stats.received))+metric('РЕЙТИНГ',stats.helped_avg?'★ '+Number(stats.helped_avg).toFixed(1):'—')+'</section>'+
     '<div class="workspaceProfileGrid"><div><section class="workspaceCard"><h3>Достижения за помощь</h3><div class="workspaceAchievements">'+awards+'</div></section><section class="workspaceCard" style="margin-top:16px"><h3>Недавняя активность</h3><div class="workspaceMiniList">'+activity+'</div></section></div><aside class="workspaceCard"><h3>О себе</h3><div class="workspaceProfileInfo"><div class="workspaceInfoRow"><span>Город</span><b>'+esc(user.city||'не указан')+'</b></div><div class="workspaceInfoRow"><span>Email</span><b>'+esc(user.email||'не указан')+'</b></div><div class="workspaceInfoRow"><span>Вход</span><b>'+esc(user.email_verified?'Email':'подтвердите email')+'</b></div></div><p class="muted">'+esc(user.bio||'Информация ещё не заполнена.')+'</p><div class="workspaceActions">'+(user.tg_linked?(user.telegram_url?'<a class="btn light" href="'+esc(user.telegram_url)+'" target="_blank" rel="noopener">Открыть бот</a>':'<span class="workspaceTag open">Сайт и бот связаны</span>'):'<button class="btn grad" type="button" data-ws-action="link-code">Получить код Telegram</button>')+'</div>'+(state.linkCode?'<p class="workspaceAppNotice">В боте отправьте /link '+esc(state.linkCode)+'. Код одноразовый. <button class="workspacePromoLink" type="button" data-ws-action="link-cancel">Отменить подключение</button></p>':'')+'</aside></div>'+'<div id="workspaceWorkCreationSlot"></div>'+editor;
   }
   function walletBody(){let w=state.wallet||state.data.wallet||{};return pageHead('Тестовый кошелёк','Используйте тестовые средства для помощи и возможностей H-Point.','ТЕСТОВЫЙ РЕЖИМ')+profileTabs()+'<section class="workspaceWalletGrid">'+metric('ДОСТУПНО · ТЕСТ. ₽',number(w.test_balance_rub))+metric('В РЕЗЕРВЕ · ТЕСТ. ₽',number(w.test_reserved_rub))+metric('ЗА ПОМОЩЬ · ТЕСТ. ₽',number(w.test_incoming_rub))+'</section><section class="workspaceCard"><h2>История</h2><div class="workspaceTransactions">'+((w.transactions||[]).map(row=>'<article class="workspaceTransaction"><div><b>'+esc(row.description||'Операция')+'</b><span>'+stamp(row.created_at)+'</span></div><b>'+money(row.amount_rub)+' тест.</b></article>').join('')||'<p class="muted">Операций пока нет.</p>')+'</div><p class="muted">При регистрации начисляется 10 000 тестовых ₽. Резерв на помощь создаётся в течение 5 минут; после подтверждения автором помощник получает 85%, комиссия проекта — 15%. Тестовые средства не являются настоящими деньгами.</p></section>'}
   function billingBody(){
+    if(window.hpointSubscriptions)return pageHead('H-Point+','Возможности на тестовые ₽ или HP. Публикация, отклики и чаты бесплатны.','ВОЗМОЖНОСТИ')+profileTabs()+window.hpointSubscriptions.renderBilling({...state.billing,user:state.data.user,catalog:state.data.paid_catalog||{},requests:openOwnRequests().filter(row=>promotionRequest(row.id))});
     let billing=state.billing||{},history=billing.history||[],user=state.data.user,catalog=state.data.paid_catalog||{};
     let productCards=Object.entries(catalog).map(([key,item])=>'<article class="workspaceProduct"><h3>'+esc(item.title)+'</h3><p>'+esc(key==='boost'?'Выше в ленте: одна открытая заявка.':'Приоритет профиля и заявок в автоматическом подборе.')+'</p><p class="muted">'+esc(item.term)+'</p><details class="workspaceProductDetails"><summary>Что даёт и кому подойдёт</summary><p>'+esc(item.description)+'</p><ul>'+(item.benefits||[]).map(text=>'<li>'+esc(text)+'</li>').join('')+'</ul></details><div class="workspaceProductPrice">'+money(item.rub)+' · '+number(item.hp)+' HP</div>'+(key==='boost'?'<label>Ваша заявка<select id="wsBoostRequest" class="input"><option value="">Выберите открытую заявку</option>'+openOwnRequests().filter(row=>promotionRequest(row.id)).map(row=>'<option value="'+Number(row.id)+'">'+esc(compact(row.what))+'</option>').join('')+'</select></label>':'')+'<div class="workspaceProductActions"><button class="btn grad" type="button" data-ws-action="buy" data-promo-item="'+esc(key)+'" data-item="'+esc(key)+'" data-method="wallet">Оплатить ₽</button><button class="btn light" type="button" data-ws-action="buy" data-promo-item="'+esc(key)+'" data-item="'+esc(key)+'" data-method="hp">HP</button></div></article>').join('');
     let paid=history.length?'<div class="workspaceTransactions">'+history.map(row=>'<article class="workspaceTransaction"><div><b>'+esc(row.item_title||catalog[row.item_type]?.title||row.item_type||'Покупка')+'</b><span>'+stamp(row.created_at)+' · '+esc(row.status||'')+'</span></div><b class="workspaceTransactionAmount">'+number(row.amount_rub)+' '+esc(row.currency==='HP'?'HP':'₽')+'</b></article>').join('')+'</div>':'<div class="workspaceEmpty">Покупок пока нет.</div>';
@@ -1416,7 +1423,7 @@ WORKSPACE_SHELL_UI=r'''
   function communityStory(){return '<section class="communityPhotoStory"><div><span class="workspaceKicker">ЛЮДИ. ВСТРЕЧИ. ОБЩИЕ ДЕЛА.</span><h2>Есть повод собраться</h2><p>Деловые встречи, мастер-классы и совместные проекты. Организуйте событие и объединяйте людей рядом.</p></div>'+photo('garden')+'</section>'}
   function decorateLanding(){let cover=document.querySelector('#landing .cover');if(!cover||cover.classList.contains('peopleCover'))return;cover.classList.add('peopleCover');cover.innerHTML='<div class="welcomeComposition"><div class="welcomePhotoMain">'+photo('welcomeHelp',true)+'</div><div class="welcomePhotoSide">'+photo('welcomeGrow',true)+'</div><p class="welcomePhotoNote"><span aria-hidden="true">✳</span>С маленького дела<br>начинается знакомство.</p></div>';let hero=document.querySelector('#landing .hero');if(hero){hero.querySelector('h1').innerHTML='Помощь рядом.<br>Порядок в работе.';let copy=hero.querySelector('p');if(copy)copy.textContent='Найдите помощника для повседневных задач или ведите работу с клиентами.';hero.querySelector('.ey').textContent='ПОМОЩЬ · ДЛЯ РАБОТЫ';hero.querySelector('.audiencePortrait')?.remove();if(!hero.querySelector('.welcomeDirections'))copy.insertAdjacentHTML('afterend','<div class="welcomeDirections"><article><b>Помощь</b><span>Найти помощника или откликнуться на заявку.</span></article><article><b>Для работы</b><span>Услуги, клиенты и записи в одном кабинете.</span></article></div>');const note=cover.querySelector('.welcomePhotoNote');if(note)note.innerHTML='<span aria-hidden="true">✳</span>Для повседневных дел<br>и вашей работы.'}}
   function parkCommunity(){let storage=$('workspaceLegacyStorage');if(!storage){storage=document.createElement('div');storage.id='workspaceLegacyStorage';storage.hidden=true;app().appendChild(storage)}root().querySelectorAll('#p-activities,#p-progress,#p-donate').forEach(panel=>storage.appendChild(panel))}
-  function attachCommunity(){let route=state.route;if(!['activities','league','donate'].includes(route))return;let id=route==='activities'?'p-activities':route==='league'?'p-progress':'p-donate',ensure=route==='activities'?ensureActivitiesPanel:route==='league'?ensureProgressPanel:ensureDonationPanel;ensure();let panel=$(id),slot=$('workspaceCommunitySlot');if(!panel||!slot)return;panel.classList.add('active');slot.appendChild(panel);let key=route+':'+String(state.data.current_user_id);if(state.communityLoaded!==key){state.communityLoaded=key;(route==='activities'?loadActivities:route==='league'?loadProgress:loadDonationMenu)()}}
+  function attachCommunity(){let route=state.route;if(route==='activities')window.hpointOrganizations?.mount($('workspaceServiceDirectory'));if(!['activities','league','donate'].includes(route))return;let id=route==='activities'?'p-activities':route==='league'?'p-progress':'p-donate',ensure=route==='activities'?ensureActivitiesPanel:route==='league'?ensureProgressPanel:ensureDonationPanel;ensure();let panel=$(id),slot=$('workspaceCommunitySlot');if(!panel||!slot)return;panel.classList.add('active');slot.appendChild(panel);let key=route+':'+String(state.data.current_user_id);if(state.communityLoaded!==key){state.communityLoaded=key;(route==='activities'?loadActivities:route==='league'?loadProgress:loadDonationMenu)()}}
   function render(){
     let host=root();if(!host)return;if(!state.data){host.innerHTML='<div class="workspaceLoading">ЗАГРУЖАЕМ ПРОСТРАНСТВО…</div>';return}
     const owner=String(state.data.current_user_id),ownerChanged=chatComposerOwner!==owner;
@@ -1431,7 +1438,7 @@ WORKSPACE_SHELL_UI=r'''
     let previous=host.dataset.route,drafts={},focused=document.activeElement&&document.activeElement.id,folds=Object.fromEntries([...host.querySelectorAll('details.requestResponses,details.sentResponses')].map(node=>[node.className,node.open]));
     if(!ownerChanged&&previous===currentRoute())host.querySelectorAll('input[id],textarea[id],select[id]').forEach(input=>{if(input.id!=='wsMatchRequest'&&!input.closest('.workspaceChatForm'))drafts[input.id]={value:input.value,checked:input.checked}});
     if(priorForm){if(priorForm.dataset.userId===owner)chatComposers.set(Number(priorForm.dataset.chatId),priorForm);priorForm.remove()}
-    parkCommunity();state.route=currentRoute();renderPrimaryNav(state.data.user);let parked=takeMap(),body=['activities','league','donate'].includes(state.route)?'<div id="workspaceCommunitySlot"></div>':state.route==='help'?helpBody():state.route==='work'?'<div id="workspaceWorkSlot"></div>':state.route==='rating'?ratingBody():state.route==='wallet'?walletBody():state.route==='billing'?billingBody():state.route==='profile'?profileBody():homeBody();
+    parkCommunity();state.route=currentRoute();renderPrimaryNav(state.data.user);let parked=takeMap(),body=['activities','league','donate'].includes(state.route)?'<div id="workspaceCommunitySlot"></div>'+ (state.route==='activities'?'<div id="workspaceServiceDirectory"></div>':''):state.route==='help'?helpBody():state.route==='work'?'<div id="workspaceWorkSlot"></div>':state.route==='rating'?ratingBody():state.route==='wallet'?walletBody():state.route==='billing'?billingBody():state.route==='profile'?profileBody():homeBody();
     host.innerHTML=pendingNotices()+(['profile','wallet','billing','donate'].includes(state.route)?accountShell(body):(state.route==='activities'?communityStory():'')+body);host.dataset.route=state.route;const helperFresh=host.querySelector('.helperPreferences');if(helperFresh){if(state.helperForm)helperFresh.replaceWith(state.helperForm);else state.helperForm=helperFresh;syncHelperControls();if(activeHelper?.isConnected)activeHelper.focus({preventScroll:true})}if(state.route==='profile')window.hpointCommercial?.mountCreation($('workspaceWorkCreationSlot'));if(state.route==='work')window.hpointCommercial?.mount($('workspaceWorkSlot'));attachCommunity();decoratePromotion();
     if(activeWork?.isConnected){activeWork.focus({preventScroll:true});if(workSelection)activeWork.setSelectionRange(workSelection.start,workSelection.end,workSelection.direction)}
     const freshComposer=host.querySelector('.workspaceChatForm[data-chat-id]');
@@ -1512,7 +1519,7 @@ WORKSPACE_SHELL_UI=r'''
   async function assignCandidate(id,user){let waiting=(state.data.outgoing_offers||[]).find(offer=>Number(offer.request_id)===Number(id));if(waiting&&!window.confirm('Приглашение для '+(waiting.helper_name||'текущего помощника')+' будет отменено. Пригласить другого помощника?'))return;try{let payload={request_id:Number(id),helper_id:Number(user)};if(waiting)payload.replace_offer_token=waiting.offer_token||'';let result=await api('/api/smart-match/assign',{method:'POST',body:JSON.stringify(payload)});state.matches=null;await refresh();if(result.matched){await openWorkspaceChat(result.request_id||id);toast('Помощь подтверждена. Чат открыт.');return}if(state.route==='help'&&state.helpTab==='match')await loadMatches();toast('Приглашение отправлено. Условия оплаты указаны в заявке.')}catch(error){await refresh();if(state.route==='help'&&state.helpTab==='match')await loadMatches();toast(error.message)}}
   async function cancelInvitation(button){button.disabled=true;try{await api('/api/helper/offers/withdraw',{method:'POST',body:JSON.stringify({request_id:Number(button.dataset.id),helper_id:Number(button.dataset.user),offer_token:button.dataset.offerToken||''})});state.matches=null;await refresh();if(state.route==='help'&&state.helpTab==='match')await loadMatches();toast('Приглашение отменено. Заявка остаётся открытой.')}catch(error){await refresh();if(state.route==='help'&&state.helpTab==='match')await loadMatches();toast(error.message)}finally{button.disabled=false}}
   async function refreshWallet(){const owner=String(state.data?.current_user_id);try{let data=await api('/api/wallet');if(String(state.data?.current_user_id)!==owner)return;state.wallet=data.wallet||{};render()}catch(error){toast(error.message)}}
-  async function refreshBilling(){const owner=String(state.data?.current_user_id);try{let data=await api('/api/billing');if(String(state.data?.current_user_id)!==owner)return;state.billing=data;render()}catch(error){toast(error.message)}}
+  async function refreshBilling(){const owner=String(state.data?.current_user_id);try{let data=await api('/api/billing');if(String(state.data?.current_user_id)!==owner)return;state.billing=data;if(data.user)state.data.user=data.user;renderPrimaryNav(state.data.user);render()}catch(error){toast(error.message)}}
   async function saveProfile(){try{await api('/api/profile',{method:'POST',body:JSON.stringify({name:($('wsName')||{}).value||'',city:($('wsCity')||{}).value||'',bio:($('wsBio')||{}).value||''})});toast('Профиль сохранён');await refresh()}catch(error){toast(error.message)}}
   async function linkCode(){const owner=String(state.data?.current_user_id);try{let data=await api('/api/auth/link-code',{method:'POST',body:'{}'});if(String(state.data?.current_user_id)!==owner)return;state.linkCode=data.code||'';render();toast('Код привязки создан')}catch(error){toast(error.message)}}
   async function saveContacts(){try{await api('/api/profile/contacts',{method:'POST',body:JSON.stringify({full_name:($('wsFullName')||{}).value||'',birth_date:($('wsBirth')||{}).value||'',phone:($('wsPhone')||{}).value||''})});toast('Контактные данные сохранены');await refresh()}catch(error){toast(error.message)}}
@@ -1550,7 +1557,7 @@ WORKSPACE_SHELL_UI=r'''
   };
   async function finishBoot(){if(document.documentElement.dataset.hpointBoot==='loading'&&document.fonts?.load)await Promise.race([document.fonts.load('600 14px Manrope').catch(()=>{}),new Promise(resolve=>setTimeout(resolve,1000))]);document.documentElement.dataset.hpointBoot='ready';document.documentElement.setAttribute('aria-busy','false')}
   function bootFailed(){const screen=$('hpointBootScreen');if(screen)screen.innerHTML='<div><b>Не удалось загрузить H-Point</b><p>Проверьте соединение и повторите попытку.</p><button class="btn grad" type="button" onclick="location.reload()">Повторить</button></div>'}
-  window.hpointStart=function(){if(window.hpointWorkflowsReady&&window.HPointMedia&&window.hpointCommercial)return window.load();bootFailed()};
+  window.hpointStart=function(){if(window.hpointWorkflowsReady&&window.HPointMedia&&window.hpointCommercial&&window.hpointSubscriptions&&window.hpointOrganizations)return window.load();bootFailed()};
   window.load=async function(){
     const serial=(state.loadSerial||0)+1;state.loadSerial=serial;
     try{
@@ -1606,8 +1613,8 @@ _page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRI
 
 PAGE = PAGE.replace("</head>", SYSTEM_THEME_META + "<script>window.hpointGamesEnabled="+json.dumps(GAMES_ENABLED)+";document.documentElement.dataset.gamesEnabled=String(window.hpointGamesEnabled);</script><style>@media(max-width:700px){html[data-games-enabled=false] #sitePrimaryNav{grid-template-columns:repeat(4,minmax(0,1fr))}}</style></head>", 1)
 
-ASSETS.update({name:(Path(__file__).resolve().parent.parent/"assets"/name,"application/javascript;charset=utf-8") for name in ("hpoint-workflows.js","hpoint-media.js","hpoint-commercial.js")})
-PAGE=PAGE.replace("</body>",'<script src="/assets/hpoint-workflows.js?v=20261027-ui3"></script><script src="/assets/hpoint-media.js?v=20261027-ui3"></script><script src="/assets/hpoint-commercial.js?v=20261027-ui3"></script><script>window.hpointStart();</script></body>')
+ASSETS.update({name:(Path(__file__).resolve().parent.parent/"assets"/name,"application/javascript;charset=utf-8") for name in ("hpoint-workflows.js","hpoint-media.js","hpoint-commercial.js","hpoint-subscriptions.js","hpoint-organizations.js","hpoint-public.js")})
+PAGE=PAGE.replace("</body>",'<script src="/assets/hpoint-workflows.js?v=20261028-work1"></script><script src="/assets/hpoint-media.js?v=20261028-work1"></script><script src="/assets/hpoint-commercial.js?v=20261028-work1"></script><script src="/assets/hpoint-subscriptions.js?v=20261028-work1"></script><script src="/assets/hpoint-organizations.js?v=20261028-work1"></script><script>window.hpointStart();</script></body>')
 
 # Hide server-rendered legacy hooks before the first paint. Reveal only the
 # current workspace/landing, once its modules and initial data are ready.
@@ -1652,6 +1659,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200);self.send_header("Content-Type",item[1]);self.send_header("X-Content-Type-Options","nosniff");self.send_header("Cache-Control","public, max-age=604800, immutable");self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
     def html(self):
         b=PAGE.encode();self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
+    def organization_html(self,slug,head=False):
+        try:profile=commercial.public_organization(db,slug)
+        except (ValueError,LookupError):
+            body='<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="robots" content="noindex"><title>Организация не найдена — H-Point</title><body><h1>Страница недоступна</h1><p>Организация могла снять её с публикации.</p><a href="/">В H-Point</a></body></html>'
+            status=404
+        else:body=organization_page.document(profile,WEB_PUBLIC_URL);status=200
+        payload=body.encode("utf-8")
+        self.send_response(status);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("Content-Security-Policy",CSP);self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Length",str(len(payload)));self.end_headers()
+        if not head:self.wfile.write(payload)
     def games_html(self):
         b=games_document().encode();self.send_response(200 if GAMES_ENABLED else 410);self.send_header("X-Robots-Tag","index,follow" if GAMES_ENABLED else "noindex,nofollow");self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("X-Frame-Options","DENY");self.send_header("Referrer-Policy","same-origin");self.send_header("Content-Security-Policy",CSP);self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
     def search_resource(self,path,head=False):
@@ -1662,6 +1678,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         """Serve metadata for public resources without a response body."""
         p = urlparse(self.path)
+        if p.path.startswith("/organizations/"):return self.organization_html(p.path.removeprefix("/organizations/").rstrip("/"),head=True)
         if p.path in ("/robots.txt","/sitemap.xml"):return self.search_resource(p.path,head=True)
         if p.path == "/favicon.ico" or p.path.startswith("/assets/"):
             item = ASSETS.get(p.path.rsplit("/", 1)[-1])
@@ -1687,6 +1704,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         p=urlparse(self.path)
         try:
+            if p.path.startswith("/organizations/"):return self.organization_html(p.path.removeprefix("/organizations/").rstrip("/"))
+            if p.path=="/api/organizations/services":return reply(self,{"ok":True,"services":commercial.public_services(db)})
+            if p.path.startswith("/api/organizations/"):
+                try:profile=commercial.public_organization(db,p.path.removeprefix("/api/organizations/").rstrip("/"))
+                except (ValueError,LookupError):return reply(self,{"ok":False,"error":"Организация не найдена."},404)
+                return reply(self,{"ok":True,"organization":profile})
             if p.path in ("/robots.txt","/sitemap.xml"):return self.search_resource(p.path)
             if p.path=="/favicon.ico":
                 return self.asset("favicon.ico")
@@ -1816,11 +1839,19 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/commercial":
                 u=auth(self)
                 if not u:return
-                return reply(self,{"ok":True,"commercial":commercial.dashboard(db,u["user_id"])})
+                try:
+                    owner_id=parse_qs(p.query).get("owner_id",[None])[0]
+                    result=commercial.dashboard(db,u["user_id"],owner_id=owner_id)
+                except PermissionError as error:return reply(self,{"ok":False,"error":str(error)},403)
+                except (ValueError,LookupError) as error:return reply(self,{"ok":False,"error":str(error)},400)
+                return reply(self,{"ok":True,"commercial":result})
             if p.path=="/api/commercial/summary":
                 u=auth(self)
                 if not u:return
-                return reply(self,{"ok":True,"summary":commercial.summary(db,u["user_id"])})
+                try:result=commercial.summary(db,u["user_id"],owner_id=parse_qs(p.query).get("owner_id",[None])[0])
+                except PermissionError as error:return reply(self,{"ok":False,"error":str(error)},403)
+                except (ValueError,LookupError) as error:return reply(self,{"ok":False,"error":str(error)},400)
+                return reply(self,{"ok":True,"summary":result})
             if p.path=="/api/photos":
                 u=auth(self)
                 if not u:return
@@ -1940,7 +1971,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/billing":
                 u=auth(self)
                 if not u:return
-                return reply(self,{"ok":True,"user":user_payload(u),"history":[{**dict(x),"item_title":(MONETIZATION_ITEMS.get(x["item_type"]) or LEGACY_MONETIZATION_ITEMS.get(x["item_type"]) or {"title":"Вознаграждение за помощь"})["title"]} for x in database.get_billing_history(u["user_id"])]})
+                return reply(self,{"ok":True,"user":user_payload(u),"subscription":billing_service.subscription_state(u["user_id"]),"catalog":MONETIZATION_ITEMS,"history":[{**dict(x),"item_title":(MONETIZATION_ITEMS.get(x["item_type"]) or LEGACY_MONETIZATION_ITEMS.get(x["item_type"]) or {"title":"Вознаграждение за помощь"})["title"]} for x in database.get_billing_history(u["user_id"])]})
             if p.path=="/api/wallet":
                 u=auth(self)
                 if not u:return
@@ -1976,7 +2007,7 @@ class Handler(BaseHTTPRequestHandler):
                 logging.exception("Payment callback failed")
                 return self._text("payment callback failed",500)
         if not valid_origin(self): return reply(self,{"ok":False,"error":"invalid_origin"},403)
-        try:d=read(self, EVENT_JSON_BODY if p.path=="/api/events" else (14*1024*1024 if p.path in ("/api/requests","/api/chats/send") else MAX_JSON_BODY))
+        try:d=read(self, EVENT_JSON_BODY if p.path=="/api/events" else (14*1024*1024 if p.path in ("/api/requests","/api/chats/send") else (128*1024 if p.path=="/api/commercial/estimates" else MAX_JSON_BODY)))
         except:return reply(self,{"ok":False,"error":"Некорректный JSON"},400)
         try:
             if p.path.startswith("/api/games/"):
@@ -2661,6 +2692,7 @@ class Handler(BaseHTTPRequestHandler):
                 u=auth(self)
                 if not u:return
                 item=str(d.get("item_type", ""));meta=d.get("metadata") or {}
+                if not isinstance(meta,dict):return reply(self,{"ok":False,"error":"Некорректные параметры покупки."},400)
                 if item in ("boost","more_responses"):
                     try: meta["request_id"]=int(d.get("request_id") or meta.get("request_id") or 0)
                     except (TypeError,ValueError): meta["request_id"]=0
@@ -2668,13 +2700,14 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     invoice_id,created=purchase_with_points(u["user_id"],item,meta,d.get("purchase_key"))
                 except ValueError as exc:
-                    errors={"request already promoted":"Эта заявка уже продвинута. Повторная оплата не нужна.","request reward unpaid":"Сначала оплатите вознаграждение по заявке.","unknown billing item":"Эта функция больше не продаётся. Откройте актуальный каталог.","item is no longer sold":"Эта функция больше не продаётся.","insufficient_points":"Недостаточно H-Points.","request_id required":"Для этой функции нужна открытая заявка.","request is unavailable":"Заявка недоступна для продвижения.","telegram link required":"Сначала привяжите Telegram.","ad_text required":"Введите текст объявления."}
+                    errors={"request already promoted":"Эта заявка уже продвинута. Повторная оплата не нужна.","subscription already active":"PRO уже активен. Для продления используйте кнопку «Продлить на 30 дней».","subscription changed":"Срок подписки изменился. Обновите страницу и проверьте доступ перед продлением.","purchase key already used":"Эта покупка уже обработана с другими параметрами. Обновите страницу.","request reward unpaid":"Сначала оплатите вознаграждение по заявке.","unknown billing item":"Эта функция больше не продаётся. Откройте актуальный каталог.","item is no longer sold":"Эта функция больше не продаётся.","insufficient_points":"Недостаточно H-Points.","request_id required":"Для этой функции нужна открытая заявка.","request is unavailable":"Заявка недоступна для продвижения.","telegram link required":"Сначала привяжите Telegram.","ad_text required":"Введите текст объявления."}
                     return reply(self,{"ok":False,"error":errors.get(str(exc),"Не удалось выполнить покупку.")},409)
                 return reply(self,{"ok":True,"invoice_id":invoice_id,"created":created,"balance":get_user(u["user_id"])["balance"]})
             if p.path=="/api/payments/wallet":
                 u=auth(self)
                 if not u:return
                 item=str(d.get("item_type", ""));meta=d.get("metadata") or {}
+                if not isinstance(meta,dict):return reply(self,{"ok":False,"error":"Некорректные параметры покупки."},400)
                 if item in ("boost","more_responses"):
                     try: meta["request_id"]=int(d.get("request_id") or meta.get("request_id") or 0)
                     except (TypeError,ValueError): meta["request_id"]=0
@@ -2682,7 +2715,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     invoice_id,created=purchase_with_wallet(u["user_id"],item,meta,d.get("purchase_key"))
                 except ValueError as exc:
-                    errors={"request already promoted":"Эта заявка уже продвинута. Повторная оплата не нужна.","request reward unpaid":"Сначала оплатите вознаграждение по заявке.","unknown billing item":"Эта функция больше не продаётся. Откройте актуальный каталог.","item is no longer sold":"Эта функция больше не продаётся.","insufficient_wallet":"Недостаточно средств в кошельке.","request_id required":"Для этой функции нужна открытая заявка.","request is unavailable":"Заявка недоступна для продвижения.","telegram link required":"Сначала привяжите Telegram.","ad_text required":"Введите текст объявления."}
+                    errors={"request already promoted":"Эта заявка уже продвинута. Повторная оплата не нужна.","subscription already active":"PRO уже активен. Для продления используйте кнопку «Продлить на 30 дней».","subscription changed":"Срок подписки изменился. Обновите страницу и проверьте доступ перед продлением.","purchase key already used":"Эта покупка уже обработана с другими параметрами. Обновите страницу.","request reward unpaid":"Сначала оплатите вознаграждение по заявке.","unknown billing item":"Эта функция больше не продаётся. Откройте актуальный каталог.","item is no longer sold":"Эта функция больше не продаётся.","insufficient_wallet":"Недостаточно средств в кошельке.","request_id required":"Для этой функции нужна открытая заявка.","request is unavailable":"Заявка недоступна для продвижения.","telegram link required":"Сначала привяжите Telegram.","ad_text required":"Введите текст объявления."}
                     return reply(self,{"ok":False,"error":errors.get(str(exc),"Не удалось выполнить покупку.")},409)
                 return reply(self,{"ok":True,"invoice_id":invoice_id,"created":created,"wallet":public_wallet_summary(u["user_id"])})
             self.send_error(404)

@@ -65,6 +65,8 @@ def initialize_schema(db):
     if getattr(db, "is_postgres", False):
         schema = schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY").replace("INTEGER", "BIGINT")
     db.executescript(schema)
+    from . import commercial_team
+    commercial_team.initialize_schema(db)
 
 
 def _now():
@@ -94,6 +96,15 @@ def _integer(value, minimum, maximum):
     result = int(value)
     if not minimum <= result <= maximum:
         raise ValueError(f"Допустимое значение: от {minimum} до {maximum}.")
+    return result
+
+
+def _user_id(value):
+    if isinstance(value,bool) or not re.fullmatch(r"-?[0-9]{1,19}",str(value)):
+        raise ValueError("Некорректный идентификатор организации или участника.")
+    result=int(value)
+    if not -(2**63)<result<2**63 or result==0:
+        raise ValueError("Некорректный идентификатор организации или участника.")
     return result
 
 
@@ -133,34 +144,73 @@ def _insert_id(db, sql, args):
     return db.execute(sql, args).lastrowid
 
 
-def save_profile(db, uid, data):
+def _context(db, uid, owner_id=None, lock=False):
+    """Resolve one explicitly authorised organisation; never trust a form owner."""
+    _user(db, uid)
+    if owner_id is None:
+        own = _profile(db, uid)
+        if own:
+            owner_id = uid
+        else:
+            membership = db.execute("""SELECT m.owner_id FROM commercial_members m
+                JOIN commercial_profiles p ON p.user_id=m.owner_id
+                JOIN users u ON u.user_id=p.user_id
+                WHERE m.user_id=? AND u.is_blocked=0
+                AND NOT EXISTS(SELECT 1 FROM commercial_deleted_profiles d WHERE d.user_id=p.user_id)
+                ORDER BY p.title,m.owner_id LIMIT 1""", (uid,)).fetchone()
+            if not membership:
+                return None, None, None
+            owner_id = membership["owner_id"]
+    owner_id = _user_id(owner_id)
+    _user(db, owner_id, lock=lock)
+    profile = _profile(db, owner_id, lock=lock)
+    if not profile:
+        if owner_id == uid:
+            return None, None, None
+        raise ValueError("Организация недоступна.")
+    if owner_id == uid:
+        role = "owner"
+    else:
+        member = db.execute("SELECT role FROM commercial_members WHERE owner_id=? AND user_id=?", (owner_id,uid)).fetchone()
+        if not member:
+            raise PermissionError("Нет доступа к этой организации.")
+        role = member["role"]
+    return owner_id, profile, role
+
+
+def save_profile(db, uid, data, owner_id=None):
     kind = data.get("kind")
     if not isinstance(kind,str) or kind not in KINDS:
         raise ValueError("Выберите тип кабинета.")
     title = _text(data, "title", 120, True)
     description = _text(data, "description", 2000)
     contact = _text(data, "contact", 240)
+    owner_id = uid if owner_id is None else _user_id(owner_id)
     db.execute("BEGIN IMMEDIATE")
     try:
-        _user(db, uid, lock=True)
-        profile = _profile(db, uid, lock=True, include_deleted=True)
-        deleted = db.execute("SELECT 1 FROM commercial_deleted_profiles WHERE user_id=?", (uid,)).fetchone()
+        _user(db, uid)
+        _user(db, owner_id, lock=True)
+        if owner_id != uid:
+            _,_,role = _context(db,uid,owner_id)
+            if role not in ("owner","admin"):raise PermissionError("Изменять организацию может только руководитель.")
+        profile = _profile(db, owner_id, lock=True, include_deleted=True)
+        deleted = db.execute("SELECT 1 FROM commercial_deleted_profiles WHERE user_id=?", (owner_id,)).fetchone()
         if profile:
             if not deleted:
                 _active(profile)
-            db.execute("UPDATE commercial_profiles SET kind=?,title=?,description=?,contact=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (kind,title,description,contact,uid))
-            db.execute("DELETE FROM commercial_deleted_profiles WHERE user_id=?", (uid,))
+            db.execute("UPDATE commercial_profiles SET kind=?,title=?,description=?,contact=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (kind,title,description,contact,owner_id))
+            db.execute("DELETE FROM commercial_deleted_profiles WHERE user_id=?", (owner_id,))
         else:
             now = _now()
-            db.execute("INSERT INTO commercial_profiles(user_id,kind,title,description,contact,trial_started_at,trial_until) VALUES(?,?,?,?,?,?,?)", (uid,kind,title,description,contact,now.isoformat(),(now+timedelta(days=TRIAL_DAYS)).isoformat()))
+            db.execute("INSERT INTO commercial_profiles(user_id,kind,title,description,contact,trial_started_at,trial_until) VALUES(?,?,?,?,?,?,?)", (owner_id,kind,title,description,contact,now.isoformat(),(now+timedelta(days=TRIAL_DAYS)).isoformat()))
         db.execute("COMMIT")
     except Exception:
         db.execute("ROLLBACK")
         raise
-    return dashboard(db, uid)
+    return dashboard(db, uid, owner_id)
 
 
-def delete_profile(db, uid, confirmed=False):
+def delete_profile(db, uid, confirmed=False, owner_id=None):
     """Erase private workspace content while retaining payment/trial history.
 
     The tombstone hides the profile from all reads. Keeping its access dates and
@@ -168,6 +218,8 @@ def delete_profile(db, uid, confirmed=False):
     """
     if confirmed is not True:
         raise ValueError("Подтвердите удаление кабинета.")
+    if owner_id is not None and _user_id(owner_id) != uid:
+        raise PermissionError("Удалить организацию может только её владелец.")
     db.execute("BEGIN IMMEDIATE")
     try:
         _user(db, uid, lock=True)
@@ -176,6 +228,8 @@ def delete_profile(db, uid, confirmed=False):
         if not profile or already_deleted:
             db.execute("COMMIT")
             return {"deleted":False}
+        from . import commercial_team
+        commercial_team.erase_workspace(db,uid)
         for table in ("commercial_bookings", "commercial_clients", "commercial_services"):
             db.execute("DELETE FROM " + table + " WHERE owner_id=?", (uid,))
         db.execute("UPDATE commercial_profiles SET kind='other',title='',description='',contact='',updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (uid,))
@@ -187,8 +241,10 @@ def delete_profile(db, uid, confirmed=False):
         raise
 
 
-def renew(db, uid, purchase_key, add_wallet_entry=None):
+def renew(db, uid, purchase_key, add_wallet_entry=None, owner_id=None):
     """Spend test funds and extend by 30 days, atomically and idempotently."""
+    if owner_id is not None and _user_id(owner_id) != uid:
+        raise PermissionError("Продлить подписку может только владелец организации.")
     if not isinstance(purchase_key, str) or not re.fullmatch(r"[A-Za-z0-9:_-]{8,100}", purchase_key):
         raise ValueError("Обновите страницу и повторите продление.")
     db.execute("BEGIN IMMEDIATE")
@@ -225,12 +281,15 @@ def renew(db, uid, purchase_key, add_wallet_entry=None):
         raise
 
 
-def _mutate(db, uid, function):
+def _mutate(db, uid, function, owner_id=None, manage=False, allow_expired=False):
     db.execute("BEGIN IMMEDIATE")
     try:
-        _user(db,uid,lock=True)
-        _active(_profile(db,uid,lock=True))
-        result = function()
+        owner,profile,role = _context(db,uid,owner_id,lock=True)
+        if not profile:raise ValueError("Сначала создайте коммерческий кабинет.")
+        if manage and role not in ("owner","admin"):
+            raise PermissionError("Это действие доступно только руководителям организации.")
+        if not allow_expired:_active(profile)
+        result = function(owner)
         db.execute("COMMIT")
         return result
     except Exception:
@@ -245,7 +304,7 @@ def _owned(db, table, uid, item_id):
     return row
 
 
-def save_service(db,uid,data):
+def save_service(db,uid,data,owner_id=None):
     title=_text(data,"title",120,True)
     description=_text(data,"description",2000)
     price=_integer(data.get("price_rub",0),0,1_000_000)
@@ -253,32 +312,32 @@ def save_service(db,uid,data):
     active=data.get("active",True)
     if not isinstance(active,bool):raise ValueError("Проверьте статус услуги.")
     item_id=_integer(data["id"],1,2**63-1) if data.get("id") is not None else None
-    def save():
+    def save(owner):
         if item_id:
-            _owned(db,"commercial_services",uid,item_id)
-            db.execute("UPDATE commercial_services SET title=?,description=?,price_rub=?,duration_minutes=?,active=? WHERE id=? AND owner_id=?",(title,description,price,duration,int(active),item_id,uid))
+            _owned(db,"commercial_services",owner,item_id)
+            db.execute("UPDATE commercial_services SET title=?,description=?,price_rub=?,duration_minutes=?,active=? WHERE id=? AND owner_id=?",(title,description,price,duration,int(active),item_id,owner))
             return item_id
-        return _insert_id(db,"INSERT INTO commercial_services(owner_id,title,description,price_rub,duration_minutes,active) VALUES(?,?,?,?,?,?)",(uid,title,description,price,duration,int(active)))
-    return {"id":_mutate(db,uid,save)}
+        return _insert_id(db,"INSERT INTO commercial_services(owner_id,title,description,price_rub,duration_minutes,active) VALUES(?,?,?,?,?,?)",(owner,title,description,price,duration,int(active)))
+    return {"id":_mutate(db,uid,save,owner_id,manage=True)}
 
 
-def save_client(db,uid,data):
+def save_client(db,uid,data,owner_id=None):
     name=_text(data,"name",120,True)
     contact=_text(data,"contact",240)
     notes=_text(data,"notes",4000)
     active=data.get("active",True)
     if not isinstance(active,bool):raise ValueError("Проверьте статус клиента.")
     item_id=_integer(data["id"],1,2**63-1) if data.get("id") is not None else None
-    def save():
+    def save(owner):
         if item_id:
-            _owned(db,"commercial_clients",uid,item_id)
-            db.execute("UPDATE commercial_clients SET name=?,contact=?,notes=?,active=? WHERE id=? AND owner_id=?",(name,contact,notes,int(active),item_id,uid))
+            _owned(db,"commercial_clients",owner,item_id)
+            db.execute("UPDATE commercial_clients SET name=?,contact=?,notes=?,active=? WHERE id=? AND owner_id=?",(name,contact,notes,int(active),item_id,owner))
             return item_id
-        return _insert_id(db,"INSERT INTO commercial_clients(owner_id,name,contact,notes,active) VALUES(?,?,?,?,?)",(uid,name,contact,notes,int(active)))
-    return {"id":_mutate(db,uid,save)}
+        return _insert_id(db,"INSERT INTO commercial_clients(owner_id,name,contact,notes,active) VALUES(?,?,?,?,?)",(owner,name,contact,notes,int(active)))
+    return {"id":_mutate(db,uid,save,owner_id,manage=True)}
 
 
-def save_booking(db,uid,data):
+def save_booking(db,uid,data,owner_id=None):
     item_id=_integer(data["id"],1,2**63-1) if data.get("id") is not None else None
     client_id=_integer(data.get("client_id"),1,2**63-1)
     service_id=_integer(data["service_id"],1,2**63-1) if data.get("service_id") is not None else None
@@ -290,28 +349,38 @@ def save_booking(db,uid,data):
     except (ValueError,TypeError):raise ValueError("Укажите дату и время записи с часовым поясом.")
     price=_integer(data.get("price_rub",0),0,1_000_000)
     duration=_integer(data.get("duration_minutes",60),5,1440)
-    def save():
-        _owned(db,"commercial_clients",uid,client_id)
-        if service_id:_owned(db,"commercial_services",uid,service_id)
+    def save(owner):
+        from . import commercial_team
+        assignee= commercial_team.assignee(db,owner,data.get("assignee_id"))
+        obj= commercial_team.object_id(db,owner,data.get("object_id"))
+        if assignee is not None and status=="planned":
+            commercial_team.check_booking_overlap(db,owner,assignee,starts,starts+timedelta(minutes=duration),item_id)
+        _owned(db,"commercial_clients",owner,client_id)
+        if service_id:_owned(db,"commercial_services",owner,service_id)
         if item_id:
-            _owned(db,"commercial_bookings",uid,item_id)
-            db.execute("UPDATE commercial_bookings SET client_id=?,service_id=?,title=?,starts_at=?,duration_minutes=?,price_rub=?,status=?,notes=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND owner_id=?",(client_id,service_id,title,starts.isoformat(),duration,price,status,notes,item_id,uid))
+            _owned(db,"commercial_bookings",owner,item_id)
+            db.execute("UPDATE commercial_bookings SET client_id=?,service_id=?,title=?,starts_at=?,duration_minutes=?,price_rub=?,status=?,notes=?,assignee_id=?,object_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND owner_id=?",(client_id,service_id,title,starts.isoformat(),duration,price,status,notes,assignee,obj,item_id,owner))
             return item_id
-        return _insert_id(db,"INSERT INTO commercial_bookings(owner_id,client_id,service_id,title,starts_at,duration_minutes,price_rub,status,notes) VALUES(?,?,?,?,?,?,?,?,?)",(uid,client_id,service_id,title,starts.isoformat(),duration,price,status,notes))
-    return {"id":_mutate(db,uid,save)}
+        return _insert_id(db,"INSERT INTO commercial_bookings(owner_id,client_id,service_id,title,starts_at,duration_minutes,price_rub,status,notes,assignee_id,object_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(owner,client_id,service_id,title,starts.isoformat(),duration,price,status,notes,assignee,obj))
+    return {"id":_mutate(db,uid,save,owner_id,manage=False)}
 
 
-def set_booking_status(db,uid,item_id,status):
+def set_booking_status(db,uid,item_id,status,owner_id=None):
     item_id=_integer(item_id,1,2**63-1)
     if not isinstance(status,str) or status not in BOOKING_STATUSES:raise ValueError("Неизвестный статус записи.")
-    def save():
-        _owned(db,"commercial_bookings",uid,item_id)
-        db.execute("UPDATE commercial_bookings SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND owner_id=?",(status,item_id,uid))
+    def save(owner):
+        row=_owned(db,"commercial_bookings",owner,item_id)
+        if status=="planned" and row["assignee_id"] is not None:
+            from . import commercial_team
+            start=_date(row["starts_at"])
+            commercial_team.assignee(db,owner,row["assignee_id"])
+            commercial_team.check_booking_overlap(db,owner,row["assignee_id"],start,start+timedelta(minutes=row["duration_minutes"]),item_id)
+        db.execute("UPDATE commercial_bookings SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND owner_id=?",(status,item_id,owner))
         return {"id":item_id,"status":status}
-    return _mutate(db,uid,save)
+    return _mutate(db,uid,save,owner_id,manage=False)
 
 
-def dashboard(db,uid):
+def _dashboard_core(db,uid):
     _user(db,uid)
     row=_profile(db,uid)
     prior=_profile(db,uid,include_deleted=True)
@@ -335,7 +404,7 @@ def dashboard(db,uid):
             "metrics":{"clients":sum(bool(c["active"]) for c in clients),"services":sum(bool(s["active"]) for s in services),"planned":int(totals["planned"]),"completed":int(totals["completed"]),"revenue_test_rub":int(totals["revenue"])}}
 
 
-def summary(db,uid):
+def _summary_core(db,uid):
     """Small private home-page overview; contacts and notes never leave here."""
     _user(db,uid)
     profile=_profile(db,uid)
@@ -364,14 +433,41 @@ def summary(db,uid):
         "next_appointments":[dict(row) for row in upcoming]}
 
 
+def dashboard(db,uid,owner_id=None):
+    from . import commercial_team
+    owner,profile,role = _context(db,uid,owner_id)
+    data = _dashboard_core(db,owner if owner is not None else uid)
+    return commercial_team.enrich_dashboard(db,uid,owner,role,data)
+
+
+def summary(db,uid,owner_id=None):
+    owner,profile,role = _context(db,uid,owner_id)
+    if owner is None:return {"exists":False}
+    data = _summary_core(db,owner)
+    data.update(owner_id=owner,role=role)
+    return data
+
+
+def public_organization(db,slug):
+    from . import commercial_team
+    return commercial_team.public_organization(db,slug)
+
+
+def public_services(db):
+    from . import commercial_team
+    return commercial_team.public_services(db)
+
+
 def post_action(db,uid,path,data,add_wallet_entry=None):
-    """Small adapter for authenticated web routes; raises ValueError on input errors."""
+    """Authenticated route adapter. Organisation selection is always authorised."""
     if not isinstance(data,dict):raise ValueError("Проверьте данные формы.")
-    if path=="/api/commercial/profile":return save_profile(db,uid,data)
-    if path=="/api/commercial/delete":return delete_profile(db,uid,data.get("confirm"))
-    if path=="/api/commercial/renew":return renew(db,uid,data.get("purchase_key"),add_wallet_entry)
-    if path=="/api/commercial/services":return save_service(db,uid,data)
-    if path=="/api/commercial/clients":return save_client(db,uid,data)
-    if path=="/api/commercial/bookings":return save_booking(db,uid,data)
-    if path=="/api/commercial/bookings/status":return set_booking_status(db,uid,data.get("id"),data.get("status"))
-    raise ValueError("Неизвестное действие кабинета.")
+    owner=data.get("owner_id",data.get("organization_id"))
+    if path=="/api/commercial/profile":return save_profile(db,uid,data,owner)
+    if path=="/api/commercial/delete":return delete_profile(db,uid,data.get("confirm"),owner)
+    if path=="/api/commercial/renew":return renew(db,uid,data.get("purchase_key"),add_wallet_entry,owner)
+    if path=="/api/commercial/services":return save_service(db,uid,data,owner)
+    if path=="/api/commercial/clients":return save_client(db,uid,data,owner)
+    if path=="/api/commercial/bookings":return save_booking(db,uid,data,owner)
+    if path=="/api/commercial/bookings/status":return set_booking_status(db,uid,data.get("id"),data.get("status"),owner)
+    from . import commercial_team
+    return commercial_team.post_action(db,uid,path,data,owner)

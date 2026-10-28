@@ -1,16 +1,98 @@
 """Website RUB checkout via Robokassa; no in-Telegram digital sales."""
-import json, uuid, hashlib, hmac
+import json, uuid, hashlib, hmac, math
 from decimal import Decimal, InvalidOperation
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 from .config import *
 from .database import db, get_invoice, get_request, get_user, insert_id, wallet_add_entry
 from .services import grant_entitlement
 from .workflow import TEST_MONEY_ONLY
 
+
+def _utc_date(value):
+    """Read persisted access dates consistently, including legacy UTC dates."""
+    if not value:
+        return None
+    try:
+        date = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return date.replace(tzinfo=timezone.utc) if date.tzinfo is None else date.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def subscription_state(user_id, *, include_history=True, include_promotions=True):
+    """Public access status uses the same entitlement date as actual matching.
+
+    Invoice history is never treated as proof that a subscription is currently
+    active. An expired term must stop displaying PRO immediately.
+    """
+    user = get_user(user_id)
+    if not user:
+        raise ValueError("user not found")
+    now = datetime.now(timezone.utc)
+    end = _utc_date(user["pro_until"])
+    active = bool(end and end > now)
+    item = MONETIZATION_ITEMS["pro"]
+    pro = {
+        "plan": "pro", "title": item["title"], "active": active,
+        "status": "active" if active else "expired" if end else "inactive",
+        "ends_at": end.isoformat() if end else None,
+        "renewal_token": user["pro_until"],
+        "days_remaining": max(0, math.ceil((end-now).total_seconds()/86400)) if end else 0,
+        "auto_renew": False, "renewal_days": 30,
+        "price_test_rub": int(item["rub"]), "price_hp": int(item["hp"]),
+        "effects": {"helper_priority": 8 if active else 0, "request_priority": 10 if active else 0},
+        "available_effects": {"helper_priority": 8, "request_priority": 10},
+    }
+    result = {"pro": pro, "legacy_more_responses": {"sold": False, "replaced_by": "boost", "priority": 50}, "promotions": [], "history": []}
+    if include_promotions:
+        rows = db.execute("SELECT id,what,status,priority_boost,expires_at FROM requests WHERE requester_id=? AND priority_boost>0 ORDER BY id DESC LIMIT 50", (user_id,)).fetchall()
+        for row in rows:
+            expiry = _utc_date(row["expires_at"])
+            result["promotions"].append({
+                "request_id": row["id"], "title": row["what"], "status": row["status"],
+                "priority": int(row["priority_boost"]),
+                "active": row["status"] == "open" and (expiry is None or expiry > now),
+                "source": "boost" if int(row["priority_boost"]) >= 100 else "more_responses",
+            })
+    if include_history:
+        for row in db.execute("SELECT invoice_id,plan,starts_at,ends_at,provider FROM subscriptions WHERE user_id=? ORDER BY id DESC LIMIT 30", (user_id,)).fetchall():
+            entry = dict(row)
+            entry_end = _utc_date(row["ends_at"])
+            entry_start = _utc_date(row["starts_at"])
+            entry["status"] = "expired" if not entry_end or entry_end <= now else "scheduled" if entry_start and entry_start > now else "active"
+            result["history"].append(entry)
+    return result
+
+
+def _record_subscription(invoice_id, user_id, item_type, provider):
+    if item_type != "pro":
+        return
+    end = _utc_date(get_user(user_id)["pro_until"])
+    if end:
+        db.execute("""INSERT OR IGNORE INTO subscriptions(user_id,invoice_id,plan,status,starts_at,ends_at,provider)
+            VALUES(?,?,'pro','active',?,?,?)""", (user_id,invoice_id,(end-timedelta(days=30)).isoformat(),end.isoformat(),provider))
+
+
+def _check_replayed_purchase(existing, user_id, currency, item_type, metadata):
+    if (existing["user_id"] != user_id or existing["currency"] != currency
+            or existing["item_type"] != item_type or existing["status"] != "paid"
+            or json.loads(existing["metadata"] or "{}") != metadata):
+        raise ValueError("purchase key already used")
+
 def _validate_active_purchase(user_id, item_type, metadata, lock=False):
     if item_type not in MONETIZATION_ITEMS:
         raise ValueError("item is no longer sold")
+    if item_type == "pro":
+        current = get_user(user_id)["pro_until"]
+        end = _utc_date(current)
+        if end and end > datetime.now(timezone.utc):
+            if metadata.get("renew") is not True:
+                raise ValueError("subscription already active")
+            if metadata.get("expected_until") != current:
+                raise ValueError("subscription changed")
+        elif metadata.get("renew") is True and metadata.get("expected_until") != current:
+            raise ValueError("subscription changed")
     if item_type == "boost":
         request_id = metadata.get("request_id")
         if not isinstance(request_id, int) or isinstance(request_id, bool):
@@ -138,6 +220,7 @@ def fulfill_invoice(invoice_id,payment_id=None):
             fallback=True
         else:
             grant_entitlement(inv["user_id"],inv["item_type"],request_id=rid,ad_text=meta.get("ad_text"))
+            _record_subscription(invoice_id,inv["user_id"],inv["item_type"],"robokassa")
         db.execute("UPDATE billing_invoices SET status='paid',paid_at=CURRENT_TIMESTAMP WHERE id=?",(invoice_id,))
         db.execute("INSERT OR IGNORE INTO billing_events(invoice_id,event_type,provider_event_id,payload) VALUES(?,?,?,?)",(invoice_id,"successful_payment",payment_id or inv["provider_payment_id"],json.dumps(meta)))
         if fallback:
@@ -168,11 +251,8 @@ def purchase_with_points(user_id, item_type, metadata=None, idempotency_key=None
     # then applies the same mutation inside the transaction below.
     if item_type in ("boost", "more_responses"):
         request_id = metadata.get("request_id")
-        if not isinstance(request_id, int):
+        if not isinstance(request_id, int) or isinstance(request_id, bool):
             raise ValueError("request_id required")
-        request = get_request(request_id)
-        if not request or request["requester_id"] != user_id or request["status"] != "open":
-            raise ValueError("request is unavailable")
     if item_type == "verification" and not get_user(user_id)["tg_user_id"]:
         raise ValueError("telegram link required")
     if item_type == "ad" and not str(metadata.get("ad_text", "")).strip():
@@ -186,9 +266,7 @@ def purchase_with_points(user_id, item_type, metadata=None, idempotency_key=None
         _lock_buyer(user_id)
         existing = db.execute("SELECT * FROM billing_invoices WHERE payload=?", (payload,)).fetchone()
         if existing:
-            if existing["user_id"] != user_id or existing["currency"] != "HP":
-                db.execute("ROLLBACK")
-                raise ValueError("purchase key already used")
+            _check_replayed_purchase(existing,user_id,"HP",item_type,metadata)
             db.execute("COMMIT")
             return existing["id"], False
         _validate_active_purchase(user_id, item_type, metadata, lock=True)
@@ -205,6 +283,7 @@ def purchase_with_points(user_id, item_type, metadata=None, idempotency_key=None
             (user_id, item_type, price, "HP", payload, json.dumps(metadata, ensure_ascii=False)),
         )
         grant_entitlement(user_id, item_type, request_id=metadata.get("request_id"), ad_text=metadata.get("ad_text"))
+        _record_subscription(invoice_id,user_id,item_type,"points")
         db.execute(
             "INSERT OR IGNORE INTO billing_events(invoice_id,event_type,provider_event_id,payload) VALUES(?,?,?,?)",
             (invoice_id, "points_purchase", payload, json.dumps(metadata, ensure_ascii=False)),
@@ -237,11 +316,8 @@ def purchase_with_wallet(user_id, item_type, metadata=None, idempotency_key=None
 
     if item_type in ("boost", "more_responses"):
         request_id = metadata.get("request_id")
-        if not isinstance(request_id, int):
+        if not isinstance(request_id, int) or isinstance(request_id, bool):
             raise ValueError("request_id required")
-        request = get_request(request_id)
-        if not request or request["requester_id"] != user_id or request["status"] != "open":
-            raise ValueError("request is unavailable")
     if item_type == "verification" and not get_user(user_id)["tg_user_id"]:
         raise ValueError("telegram link required")
     if item_type == "ad" and not str(metadata.get("ad_text", "")).strip():
@@ -255,9 +331,7 @@ def purchase_with_wallet(user_id, item_type, metadata=None, idempotency_key=None
         _lock_buyer(user_id)
         existing = db.execute("SELECT * FROM billing_invoices WHERE payload=?", (payload,)).fetchone()
         if existing:
-            if existing["user_id"] != user_id or existing["currency"] != "WALLET":
-                db.execute("ROLLBACK")
-                raise ValueError("purchase key already used")
+            _check_replayed_purchase(existing,user_id,"WALLET",item_type,metadata)
             db.execute("COMMIT")
             return existing["id"], False
         _validate_active_purchase(user_id, item_type, metadata, lock=True)
@@ -278,6 +352,7 @@ def purchase_with_wallet(user_id, item_type, metadata=None, idempotency_key=None
             f"wallet-purchase:{key}", invoice_id=invoice_id, test_amount_rub=-price,
         )
         grant_entitlement(user_id, item_type, request_id=metadata.get("request_id"), ad_text=metadata.get("ad_text"))
+        _record_subscription(invoice_id,user_id,item_type,"test_wallet")
         db.execute(
             "INSERT OR IGNORE INTO billing_events(invoice_id,event_type,provider_event_id,payload) VALUES(?,?,?,?)",
             (invoice_id, "wallet_purchase", payload, json.dumps(metadata, ensure_ascii=False)),

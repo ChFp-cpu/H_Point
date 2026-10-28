@@ -84,7 +84,7 @@ class Billing(unittest.TestCase):
   self.assertEqual(database.wallet_summary(1)["test_balance_rub"],351)
   self.assertEqual(services.match_score(database.get_request(rid),2),before_score+10)
   self.assertEqual(next(row for row in services.smart_match(helper_request) if row["user_id"]==1)["score"],before_candidate+8)
-  billing.purchase_with_wallet(1,"pro",{},"pro-renew")
+  billing.purchase_with_wallet(1,"pro",{"renew":True,"expected_until":until.isoformat()},"pro-renew")
   self.assertEqual(datetime.fromisoformat(database.get_user(1)["pro_until"])-until,timedelta(days=30))
   self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM requests WHERE requester_rating IS NOT NULL OR helper_rating IS NOT NULL").fetchone()["n"],0)
 if __name__=="__main__":unittest.main()
