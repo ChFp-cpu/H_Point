@@ -9,7 +9,7 @@ import re
 
 PRICE_RUB = 490
 TRIAL_DAYS = 7
-KINDS = {"trainer": "Тренер", "organization": "Организация", "foreman": "Прораб", "other": "Специалист"}
+from .work_profiles import KINDS
 BOOKING_STATUSES = {"planned", "completed", "cancelled"}
 
 
@@ -67,6 +67,8 @@ def initialize_schema(db):
     db.executescript(schema)
     from . import commercial_team
     commercial_team.initialize_schema(db)
+    from . import work_profiles
+    work_profiles.initialize_schema(db)
 
 
 def _now():
@@ -229,6 +231,8 @@ def delete_profile(db, uid, confirmed=False, owner_id=None):
             db.execute("COMMIT")
             return {"deleted":False}
         from . import commercial_team
+        from . import work_profiles
+        work_profiles.erase_workspace(db,uid)
         commercial_team.erase_workspace(db,uid)
         for table in ("commercial_bookings", "commercial_clients", "commercial_services"):
             db.execute("DELETE FROM " + table + " WHERE owner_id=?", (uid,))
@@ -434,10 +438,12 @@ def _summary_core(db,uid):
 
 
 def dashboard(db,uid,owner_id=None):
-    from . import commercial_team
+    from . import commercial_team, work_profiles
     owner,profile,role = _context(db,uid,owner_id)
     data = _dashboard_core(db,owner if owner is not None else uid)
-    return commercial_team.enrich_dashboard(db,uid,owner,role,data)
+    data=commercial_team.enrich_dashboard(db,uid,owner,role,data)
+    data["professional"]=work_profiles.dashboard(db,uid,owner,role,profile["kind"] if profile else None,bool(data.get("profile",{}).get("active")) if data.get("profile") else False)
+    return data
 
 
 def summary(db,uid,owner_id=None):
@@ -469,5 +475,8 @@ def post_action(db,uid,path,data,add_wallet_entry=None):
     if path=="/api/commercial/clients":return save_client(db,uid,data,owner)
     if path=="/api/commercial/bookings":return save_booking(db,uid,data,owner)
     if path=="/api/commercial/bookings/status":return set_booking_status(db,uid,data.get("id"),data.get("status"),owner)
+    if path.startswith("/api/commercial/professional/"):
+        from . import work_profiles
+        return work_profiles.post_action(db,uid,path,data,owner)
     from . import commercial_team
     return commercial_team.post_action(db,uid,path,data,owner)

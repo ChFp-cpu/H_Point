@@ -18,6 +18,7 @@ from . import games as game_service
 from .chat_notifications import chat_notification
 from .features import GAMES_ENABLED, GAMES_PAUSED_MESSAGE
 from . import help_achievements
+from . import bot_work_ui
 from .email_access import has_verified_email, link_owner_has_verified_email
 
 router = Router()
@@ -45,14 +46,25 @@ class EmailOnlyBotMiddleware(BaseMiddleware):
         if sender is None:return
         user=get_user(resolve_profile_id(sender.id))
         if has_verified_email(user) and not user["is_blocked"]:
-            if isinstance(event,CallbackQuery) and (str(event.data or "").startswith(("buy:","buyreq:","payreq:","setcat:","g:")) or event.data in {"profile:settings","profile:history","profile:achievements"}):
-                state=data.get("state")
-                if state:await state.clear()
-                await event.answer("Откройте эту функцию на сайте")
-                if event.message:await event.message.answer("Все настройки и возможности доступны на сайте.",reply_markup=bot_website_keyboard())
-                return
-            if await simplified_bot_message(event,data):return
-            return await handler(event,data)
+            message=event.message if isinstance(event,CallbackQuery) else event
+            private=message and getattr(getattr(message,"chat",None),"type",None)=="private"
+            token=MENU_USER.set(user["user_id"] if private and user["tg_user_id"]==sender.id else None)
+            try:return await self._verified(handler,event,data,user)
+            finally:MENU_USER.reset(token)
+        return await self._unverified(handler,event,data)
+
+    async def _verified(self,handler,event,data,user):
+        if await bot_work_ui.handle_event(event,data,user,db):return
+        if isinstance(event,CallbackQuery) and (str(event.data or "").startswith(("buy:","buyreq:","payreq:","setcat:","g:")) or event.data in {"profile:settings","profile:history","profile:achievements"}):
+            state=data.get("state")
+            if state:await state.clear()
+            await event.answer("Откройте эту функцию на сайте")
+            if event.message:await event.message.answer("Все настройки и возможности доступны на сайте.",reply_markup=bot_website_keyboard())
+            return
+        if await simplified_bot_message(event,data):return
+        return await handler(event,data)
+
+    async def _unverified(self,handler,event,data):
         text=str(getattr(event,"text","") or "")
         command=text.split(maxsplit=1)[0].split("@",1)[0] if text else ""
         if isinstance(event,Message) and (command in {"/start","/help","/website","/cancel","/link","/unlink"} or text==BTN_WEBSITE):
@@ -1519,7 +1531,7 @@ async def confirm_telegram_link(callback: CallbackQuery,state: FSMContext):
         await callback.answer(str(result),show_alert=True)
         return
     await callback.answer("Telegram привязан")
-    await callback.message.answer("Telegram привязан. Здесь будут приходить уведомления и сообщения.",reply_markup=main_menu_kb())
+    await callback.message.answer("Telegram привязан. Здесь будут приходить уведомления и сообщения.",reply_markup=main_menu_kb(resolve_profile_id(callback.from_user.id)))
 
 @router.message(Command("unlink"))
 async def unlink_account(message: Message):

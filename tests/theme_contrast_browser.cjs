@@ -1,3 +1,4 @@
+const {workTab}=require('./work_browser_navigation.cjs');
 /* Live theme transitions must update surfaces, icons and readable text together. */
 const {emailLogin}=require('./email_browser_login.cjs');
 const {chromium}=require('playwright'),assert=require('node:assert/strict'),path=require('node:path');
@@ -26,13 +27,13 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local synthetic QA
  try{
   await emailLogin(page,'theme-browser-data');await page.evaluate(()=>hpointWorkspace.refresh());
   await page.goto(base+'/#/profile');await page.locator('#workspaceWorkCreationSlot').getByRole('button',{name:'Создать кабинет в профиле',exact:true}).click();
-  const profile=page.locator('[data-commercial-form=profile]');await profile.locator('[name=kind]').selectOption('organization');await profile.locator('[name=title]').fill('Контрастная тестовая организация');await profile.locator('[name=contact]').press('Enter');await page.waitForURL('**/#/work');await page.locator('.commercialTabs').waitFor();
+  const profile=page.locator('[data-commercial-form=profile]');await profile.locator('[name=kind]').selectOption('organization');await profile.locator('[name=title]').fill('Контрастная тестовая организация');await profile.locator('[name=contact]').press('Enter');await page.waitForURL('**/#/work');await page.locator('.commercialNavigation').waitFor();
   const routes=['home','help','profile','profile/wallet','profile/billing','activities','league','work'];
   for(const width of [320,390,768,1440]){
    await page.setViewportSize({width,height:1000});
    for(const route of routes){
     await page.goto(base+'/#/'+route);await page.locator('#hpointWorkspace').waitFor();await page.evaluate(()=>hpointWorkspace.refresh());
-    if(route==='league')await page.locator('.duoChampionCard').waitFor();if(route==='work')await page.locator('.commercialTabs').waitFor();
+    if(route==='league')await page.locator('.duoChampionCard').waitFor();if(route==='work')await page.locator('.commercialNavigation').waitFor();
     const current=await page.locator('#hpointWorkspace').elementHandle();
     for(const scheme of ['dark','light','dark','light']){
      await page.emulateMedia({colorScheme:scheme});await audit(scheme,width+' '+route+' '+scheme);

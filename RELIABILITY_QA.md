@@ -5,6 +5,13 @@ status are documented in [WORKSPACE_QA.md](WORKSPACE_QA.md). The homepage now
 offers workspace creation directly; private organisation records remain outside
 the public activity service directory.
 
+The profession release adds nine workspace kinds and eighteen typed workflows,
+private assigned-coach records, grouped desktop/mobile navigation and two-tab
+onboarding. The paid-only Telegram companion exposes an agenda, explicit
+completion and opt-in reminders without copying professional cards or health
+observations into messages. Existing workspaces, trial dates and paid periods
+survive the additive migration.
+
 This release keeps the requester as the only person who can confirm completed help.
 
 ## Behaviour

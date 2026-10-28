@@ -1,3 +1,4 @@
+const {workTab}=require('./work_browser_navigation.cjs');
 /* The native print action exposes one client estimate, with no dark-theme ink or private costs. */
 const {chromium}=require('playwright'),assert=require('node:assert/strict');
 const {emailLogin}=require('./email_browser_login.cjs');

@@ -330,7 +330,7 @@ def member_action(db,uid,data,action,owner_id=None):
             db.execute("UPDATE commercial_members SET role=? WHERE owner_id=? AND user_id=?",(role,owner,target))
         else:
             db.execute("DELETE FROM commercial_members WHERE owner_id=? AND user_id=?",(owner,target))
-            for table in ("commercial_bookings","commercial_tasks","commercial_objects"):
+            for table in ("commercial_bookings","commercial_tasks","commercial_objects","commercial_professional_records"):
                 db.execute("UPDATE "+table+" SET assignee_id=NULL WHERE owner_id=? AND assignee_id=?",(owner,target))
             db.execute("DELETE FROM commercial_shifts WHERE owner_id=? AND assignee_id=?",(owner,target))
         return {"user_id":target,"left":action=="leave","removed":action=="remove"}

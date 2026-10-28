@@ -395,6 +395,8 @@ def init_db():
     workflow.initialize_schema(db)
     media.initialize_schema(db)
     commercial.initialize_schema(db)
+    from .work_bot import initialize_schema as initialize_work_bot
+    initialize_work_bot(db)
     reliability.migrate_wallet_sources(db)
     reliability.reconcile_closed_reserves(db, wallet_add_entry)
     # Legacy payment columns remain for backwards-compatible data, but new code never uses them.

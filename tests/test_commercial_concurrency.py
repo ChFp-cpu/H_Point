@@ -119,6 +119,20 @@ class RenewalRaces:
         with self.assertRaises(PermissionError):self.post(-2,"/tasks",{"title":"Write after removal"})
         for row in self.db.execute("SELECT assignee_id FROM commercial_tasks WHERE owner_id=1").fetchall():self.assertIsNone(row["assignee_id"])
 
+    def test_parallel_reminder_claims_create_one_delivery(self):
+        from datetime import datetime,timedelta,timezone
+        from hpoint import work_bot
+        at=datetime.now(timezone.utc)
+        self.db.execute("UPDATE users SET tg_user_id=111 WHERE user_id=1")
+        self.db.execute("UPDATE commercial_profiles SET paid_until=? WHERE user_id=1",((at+timedelta(days=30)).isoformat(),))
+        client=self.post(1,"/clients",{"name":"Reminder client"})["id"]
+        schedule=(at+timedelta(minutes=30)).isoformat()
+        booking=self.post(1,"/bookings",dict(title="Reminder booking",client_id=client,assignee_id=1,starts_at=schedule,duration_minutes=15))["id"]
+        work_bot.set_preferences(self.db,1,True)
+        result=self.race_actions(lambda:work_bot.claim_reminder(self.db,1,1,"booking",booking,schedule,at),lambda:work_bot.claim_reminder(self.db,1,1,"booking",booking,schedule,at))
+        self.assertEqual(sum(isinstance(row,dict) for row in result),1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM work_bot_reminders").fetchone()["n"],1)
+
 
 class SQLiteRenewalRaces(RenewalRaces,unittest.TestCase):
     def setUp(self):

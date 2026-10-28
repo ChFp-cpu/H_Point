@@ -1,12 +1,19 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from .config import *
 from .features import GAMES_ENABLED
+from contextvars import ContextVar
 
-def main_menu_kb():
-    return ReplyKeyboardMarkup(keyboard=[
+MENU_USER = ContextVar("hpoint_bot_menu_user",default=None)
+
+def main_menu_kb(user_id=None):
+    from . import database,work_bot
+    user_id=MENU_USER.get() if user_id is None else user_id
+    rows=[
         [KeyboardButton(text=BTN_WEBSITE), KeyboardButton(text="💬 Мои чаты")],
         [KeyboardButton(text=BTN_NAVIGATOR), KeyboardButton(text=BTN_CANCEL)],
-    ], resize_keyboard=True)
+    ]
+    if work_bot.has_paid_access(database.db,user_id):rows.insert(1,[KeyboardButton(text=work_bot.WORK_BUTTON)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def cancel_kb(*extra_rows):

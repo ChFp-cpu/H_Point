@@ -78,3 +78,5 @@ jobs:
           python -m unittest discover -s tests -p 'test_postgres.py' -v
           python -m unittest discover -s tests -p 'test_commercial_concurrency.py' -v
           python -m unittest discover -s tests -p 'test_commercial_team.py' -v
+          python -m unittest discover -s tests -p 'test_work_profiles.py' -v
+          python -m unittest discover -s tests -p 'test_work_bot.py' -v

@@ -1,4 +1,6 @@
 import logging
+import asyncio
+from contextlib import suppress
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand
 from aiogram.client.default import DefaultBotProperties
@@ -30,4 +32,9 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     logging.info("H-Point бот запущен")
-    await dp.start_polling(bot)
+    from . import database,work_bot
+    reminders=asyncio.create_task(work_bot.reminder_loop(bot,database.db))
+    try:await dp.start_polling(bot)
+    finally:
+        reminders.cancel()
+        with suppress(asyncio.CancelledError):await reminders
