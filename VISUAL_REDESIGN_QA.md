@@ -92,3 +92,17 @@ The release asset query is advanced to `20261030-visual2` to refresh cached styl
 The updated editorial suite passed 1,226 checks; the eight photo/public-page
 Python tests also passed. The old decorative grid and ring are removed from the
 welcome hero so that the photograph and primary actions remain the focus.
+
+### Mobile Home and profile follow-up on 30 October 2026
+
+Home now follows the same document order on phones as on desktop. The previous
+flex ordering moved new category/service sections above the main actions.
+Both “Нужна помощь” and “Хочу помочь” are verified on the first mobile screen,
+including real clicks, existing/empty accounts and the Work summary: 477 checks.
+
+The profile header's grid items now fill their own cells. The inherited centred
+alignment could place the profile label across the PRO cell on narrow screens.
+The whole word “Профиль”, PRO, wallet fields and 44 px support/request actions are
+checked at 320–900 px with normal and long balances: 1,107 checks, plus 48 existing
+header stability checks. No JavaScript errors were reported.
+The asset query is `20261030-mobile3`; the eight photo/public-page tests passed.

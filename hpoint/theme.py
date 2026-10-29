@@ -197,7 +197,8 @@ body{font-family:Manrope,Arial,sans-serif}.muted{color:var(--hp-text-secondary)}
   #app.workspaceApp{padding:0 16px 28px!important}
   .workspaceTopbar{padding:22px 0 16px}.workspaceTitle{font-size:28px;line-height:1.15}
   .workspaceCard{padding:17px}.workspaceCard h2{font-size:22px}
-  #hpointWorkspace[data-route="home"]{display:flex;flex-direction:column}
+  /* Follow the shared DOM order: primary actions must precede later categories. */
+  #hpointWorkspace[data-route="home"]{display:block}
   #hpointWorkspace[data-route="home"]>.workspaceNotices{order:0}
   .homeHero{order:1;padding:24px 0 20px;gap:0}.homeHero .peopleComposition,.homePersonal,.homeDesktopTitle,.homeIntroDesktop{display:none}
   .homeMobileTitle,.homeIntroMobile{display:block;color:var(--hp-text-primary)}
