@@ -400,7 +400,7 @@ def public_services(db):
     result=[]
     for row in _public_rows(db):
         for service in db.execute("SELECT id,title,description,price_rub,duration_minutes FROM commercial_services WHERE owner_id=? AND active=1 AND published=1 ORDER BY id DESC",(row["user_id"],)).fetchall():
-            result.append({**_service_public(service),"organization_title":row["title"],"organization_slug":row["slug"],"organization_url":"/organizations/"+row["slug"]})
+            result.append({**_service_public(service),"organization_title":row["title"],"organization_kind":row["kind"],"organization_slug":row["slug"],"organization_url":"/organizations/"+row["slug"]})
     return sorted(result,key=lambda row:row["id"],reverse=True)[:300]
 
 

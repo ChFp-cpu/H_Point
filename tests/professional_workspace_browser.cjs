@@ -12,7 +12,7 @@ const base=process.env.HPOINT_QA_URL;if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base
  async function record(module,values){await workTab(page,'professional:'+module);const data=await save('professional/'+module,values);const saved=data.professional.modules.find(m=>m.key===module).records.find(r=>r.title===values.title);assert.ok(saved);checks++;return saved}
  let trial;
  try{
-  await emailLogin(page,'theme-browser-data');await page.locator('.workEntryPromo').getByRole('button',{name:'Создать кабинет →'}).click();await form('profile').waitFor();assert.equal(await form('profile').locator('[name=kind] option:not([value=""])').count(),9);checks++;
+  await emailLogin(page,'theme-browser-data');await page.locator('.workEntryPromo button[onclick*=openCreation]').click();await form('profile').waitFor();assert.equal(await form('profile').locator('[name=kind] option:not([value=""])').count(),9);checks++;
   await save('profile',{kind:'trainer',title:'Профильная тестовая команда'});await page.waitForURL('**/#/work');trial=(await get()).profile.trial_until;
   assert.equal(await page.locator('.commercialNavPanel [data-tab=estimates]').isVisible(),false);assert.equal(await page.locator('.commercialNavigation').evaluate(node=>getComputedStyle(node).position),'sticky');checks+=2;
   await workTab(page,'clients');await save('clients',{name:'Подопечный тестовый',contact:'synthetic@example.test'});const client=(await get()).clients[0].id;
