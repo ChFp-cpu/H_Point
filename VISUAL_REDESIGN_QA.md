@@ -79,3 +79,16 @@ These browser checks use temporary databases and synthetic local accounts. They
 do not register users, send messages or create organisations on the live site.
 Automated viewport checks are supplemented with desktop and mobile screenshots.
 Physical iOS/Android devices have not been used for this release.
+
+### Mobile welcome follow-up on 30 October 2026
+
+The published-site check exposed an older mobile theme rule that hid the welcome
+photograph even though the new photo markup was present. The editorial layer now
+explicitly shows its own compact cover, removes obsolete overlays and minimum
+height, and keeps sign-in and registration actions before the photograph.
+The browser regression checks actual photo visibility and decoding at every
+viewport/theme combination, rather than only checking that image markup exists.
+The release asset query is advanced to `20261030-visual2` to refresh cached styles.
+The updated editorial suite passed 1,226 checks; the eight photo/public-page
+Python tests also passed. The old decorative grid and ring are removed from the
+welcome hero so that the photograph and primary actions remain the focus.

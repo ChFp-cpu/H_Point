@@ -20,7 +20,15 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Disposable local Q
  async function shot(name){await page.evaluate(()=>{document.querySelectorAll('.hpPhotoImage').forEach(img=>img.loading='eager');scrollTo(0,0)});await page.waitForFunction(()=>[...document.querySelectorAll('.hpPhotoImage')].every(img=>img.complete&&img.naturalWidth>0));await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,'editorial-'+name+'.png'),fullPage:true})}
  try{
   await page.goto(base);await page.locator('.hpWelcomeVisual').waitFor();assert.equal(await page.locator('.welcomeDirections [role=tab]').count(),2);checks++;
-  for(const width of [320,375,768,1024,1440]){await page.setViewportSize({width,height:950});for(const colorScheme of ['light','dark']){await page.emulateMedia({colorScheme});await audit('welcome '+width+' '+colorScheme)}}
+  for(const width of [320,375,768,1024,1440]){await page.setViewportSize({width,height:950});for(const colorScheme of ['light','dark']){
+   await page.emulateMedia({colorScheme});await audit('welcome '+width+' '+colorScheme);
+   const visual=page.locator('.hpWelcomeVisual'),mainPhoto=page.locator('.hpWelcomeMain .hpPhotoImage');
+   assert.equal(await visual.isVisible(),true,'Welcome photograph must remain visible at '+width+' '+colorScheme);assert.equal(await mainPhoto.isVisible(),true);checks+=2;
+   await mainPhoto.evaluate(image=>image.decode());assert.equal(await mainPhoto.evaluate(image=>image.naturalWidth>0&&image.naturalHeight>0),true);checks++;
+   const cover=await page.locator('.cover.peopleCover').evaluate(node=>({height:node.getBoundingClientRect().height,before:getComputedStyle(node,':before').content,after:getComputedStyle(node,':after').content}));
+   assert.equal(cover.before,'none');assert.equal(cover.after,'none');checks+=2;
+   if(width<=375){const box=await visual.boundingBox(),actions=await page.locator('#landing .hero .actions').boundingBox();assert.ok(box.height>=260&&box.height<=340,'Compact mobile composition');assert.ok(cover.height<=box.height+50,'No legacy 420px minimum-height gap');assert.ok(actions.y+actions.height<=box.y,'Primary actions stay before the photograph');checks+=3;await shot('welcome-'+width+'-'+colorScheme)}
+  }}
   await emailLogin(page,'theme-browser-data');await page.evaluate(()=>hpointWorkspace.refresh());
   for(const width of [320,375,768,1024,1440])for(const colorScheme of ['light','dark']){
    await page.setViewportSize({width,height:950});await page.emulateMedia({colorScheme});
@@ -35,6 +43,6 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Disposable local Q
   await openHelpTab(page,'preferences');await page.locator('#wsHelperCategory_pets').check();await page.locator('.helperAdvanced summary').click();await page.locator('#wsHelperAvailability').fill('Тестовый черновик');const input=await page.locator('#wsHelperAvailability').elementHandle();await page.emulateMedia({colorScheme:'light'});await page.evaluate(()=>hpointWorkspace.refresh());assert.equal(await input.evaluate(node=>node===document.getElementById('wsHelperAvailability')),true);assert.equal(await page.locator('#wsHelperAvailability').inputValue(),'Тестовый черновик');checks+=2;
   await openHelpTab(page,'chats');assert.ok(await page.locator('.workspaceChatButton').count()>0);const activeChat=await page.evaluate(()=>hpointWorkspace.state.data.requests.find(row=>row.status==='in_progress').id);await page.locator('.workspaceChatButton[data-id="'+activeChat+'"]').click();await page.locator('#wsChatText').waitFor();await page.locator('#wsChatText').fill('Визуальная проверка чата');await page.locator('#wsChatText').press('Enter');await page.locator('.workspaceMessages').getByText('Визуальная проверка чата',{exact:false}).waitFor();checks+=2;await audit('chats');await openHelpTab(page,'match');await audit('matching');
   assert.deepEqual(external,[]);checks++;await openHelpTab(page,'map');await page.locator('#workspaceMapSlot').waitFor();await audit('map fallback');
-  assert.deepEqual(errors,[]);console.log(JSON.stringify({ok:true,checks,errors,allRoutesResponsive:true,localPhotos:true,liveThemes:true,realCategoryNavigation:true,draftsPreserved:true}));
+  assert.deepEqual(errors,[]);console.log(JSON.stringify({ok:true,checks,errors,allRoutesResponsive:true,localPhotos:true,liveThemes:true,mobileWelcomePhotoVisible:true,realCategoryNavigation:true,draftsPreserved:true}));
  }finally{await context.close();await browser.close()}
 })().catch(error=>{console.error(error.stack);process.exitCode=1});
