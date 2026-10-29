@@ -260,6 +260,21 @@ body{font-family:Manrope,Arial,sans-serif}.muted{color:var(--hp-text-secondary)}
 .workspaceChatPanel{margin:0 0 18px}.workspaceChatHeading h3{font-size:18px}.workspaceChatActions{display:flex;gap:8px;flex-wrap:wrap;margin:15px 0}.workspaceChatActions .btn{min-height:40px;padding:9px 13px;font-size:12px}.workspaceChatHeading .btn{font-size:12px}.workspaceMessage{white-space:pre-wrap;background:var(--hp-surface-secondary)!important}.workspaceMessage.mine{background:var(--hp-hover)!important}.workspaceMessages{height:clamp(260px,43vh,460px);overflow-anchor:auto}.workspaceChatForm{align-items:flex-end;flex-wrap:wrap}.workspaceChatForm textarea{flex:1;min-height:52px!important}.workspaceChatForm>.btn{height:52px;align-self:flex-start}.chatListCard{margin-top:18px}.workspaceChatButton[aria-current=true]{border-color:var(--hp-focus)}.chatArchivedList{margin-top:16px}.chatArchivedList>summary{cursor:pointer;color:var(--hp-text-secondary)}.chatListRow{display:flex;align-items:center;gap:8px}.chatListRow>.workspaceChatButton{flex:1;min-width:0}.chatListRow>.btn{padding:9px;font-size:12px}.workEntryPromo{background:var(--hp-surface)!important;margin-top:12px}.workEntryPromo p{margin:5px 0;font-size:12px}
 @media(max-width:700px){.workspaceChatForm{flex-direction:row}.workspaceChatForm>.btn{width:auto!important}.workspaceChatHeading{align-items:flex-start}.workspaceChatHeading h3{font-size:17px}.homeHero .homeTitle{font-size:35px}.helperSettingsHeading h2{font-size:22px}#sitePrimaryNav{grid-template-columns:repeat(var(--hp-nav-count,3),minmax(0,1fr))!important}}
 
+.workspaceHeaderActions .workspaceSupportIcon{display:none}
+.nav:not(.guestHeader) .workspaceHeaderActions .workspaceSupport{display:inline-flex!important;align-items:center;justify-content:center;min-height:44px}
+@media(max-width:900px){
+ .nav:not(.guestHeader) .workspaceHeaderActions .workspaceSupport{flex:0 0 44px!important;width:44px!important;min-width:44px!important;height:44px!important;min-height:44px!important;padding:10px!important}
+ .workspaceHeaderActions .workspaceSupport>span{display:none}
+ .workspaceHeaderActions .workspaceSupportIcon{display:block;flex:none;width:20px;height:20px}
+}
+@media(max-width:360px){
+ .nav:not(.guestHeader) .brandLogo img{width:80px!important;max-width:80px!important}
+ .nav:not(.guestHeader) .workspaceHeaderActions .btn[data-route="profile"]{font-size:11px!important;padding:10px 8px!important}
+}
+@media(max-width:420px){
+ .nav:not(.guestHeader) .workspaceHeaderActions .btn[data-ws-action="request"]{display:inline-flex!important;align-items:center;justify-content:center;flex:0 0 44px!important;width:44px!important;min-width:44px!important;height:44px!important;min-height:44px!important;padding:8px!important;font-size:0!important}
+ .nav:not(.guestHeader) .workspaceHeaderActions .btn[data-ws-action="request"]:before{content:'+'!important;font-size:22px!important;line-height:1}
+}
 /* Numeric updates must not move the rest of the desktop navigation. */
 @media(min-width:1121px){
  .workspaceHeaderActions .workspaceBalance{display:grid;grid-template-columns:14px 36px minmax(0,1fr);align-items:center;gap:6px;flex:0 0 156px;width:156px;min-width:156px;max-width:156px;white-space:nowrap;font-variant-numeric:tabular-nums}
