@@ -7,6 +7,7 @@ from .config import *
 from .database import db, get_invoice, get_request, get_user, insert_id, wallet_add_entry
 from .services import grant_entitlement
 from .workflow import TEST_MONEY_ONLY
+from . import workflow, personal
 
 
 def _utc_date(value):
@@ -44,7 +45,8 @@ def subscription_state(user_id, *, include_history=True, include_promotions=True
         "effects": {"helper_priority": 8 if active else 0, "request_priority": 10 if active else 0},
         "available_effects": {"helper_priority": 8, "request_priority": 10},
     }
-    result = {"pro": pro, "legacy_more_responses": {"sold": False, "replaced_by": "boost", "priority": 50}, "promotions": [], "history": []}
+    result = {"pro": pro, "usage": personal.usage(user_id, db_connection=db),
+              "legacy_more_responses": {"sold": False, "historical_only": True, "replaced_by": "pro", "priority": 50}, "promotions": [], "history": []}
     if include_promotions:
         rows = db.execute("SELECT id,what,status,priority_boost,expires_at FROM requests WHERE requester_id=? AND priority_boost>0 ORDER BY id DESC LIMIT 50", (user_id,)).fetchall()
         for row in rows:
@@ -125,14 +127,15 @@ def create_request_reward_invoice(user_id, request_id):
         lock=" FOR UPDATE" if getattr(db,"is_postgres",False) else ""
         request=db.execute("SELECT * FROM requests WHERE id=?"+lock,(request_id,)).fetchone()
         if not request or request["requester_id"]!=user_id or request["status"]!="open" or request["reward_payment_status"]!="none":raise ValueError("request unavailable")
-        amount=int(request["reward_rub"] or 0)
+        quote=workflow.reward_quote(request)
+        amount=int(quote["total_rub"])
         if amount<1:raise ValueError("reward is zero")
         rows=db.execute("SELECT * FROM billing_invoices WHERE item_type='request_reward' AND user_id=? AND status='pending' ORDER BY id DESC",(user_id,)).fetchall()
-        existing=next((r for r in rows if json.loads(r["metadata"] or "{}").get("request_id")==request_id and r["amount_rub"]==amount),None)
+        existing=next((r for r in rows if json.loads(r["metadata"] or "{}").get("request_id")==request_id and r["amount_rub"]==amount and _reward_invoice_matches(r,request)),None)
         if existing:
             db.execute("COMMIT");return existing["id"],existing["payload"],amount
         payload=f"hpoint:reward:{uuid.uuid4().hex}"
-        iid=insert_id("INSERT INTO billing_invoices(user_id,item_type,amount_rub,currency,payload,metadata) VALUES(?,?,?,?,?,?)",(user_id,'request_reward',amount,PAYMENT_CURRENCY,payload,json.dumps({'request_id':request_id})))
+        iid=insert_id("INSERT INTO billing_invoices(user_id,item_type,amount_rub,currency,payload,metadata) VALUES(?,?,?,?,?,?)",(user_id,'request_reward',amount,PAYMENT_CURRENCY,payload,json.dumps({'request_id':request_id,'reward_quote':quote})))
         db.execute("COMMIT");return iid,payload,amount
     except Exception:
         db.execute("ROLLBACK");raise
@@ -142,6 +145,17 @@ def _signature(value, password):
     try: digest=getattr(hashlib, ROBOKASSA_HASH_ALGORITHM.lower())
     except AttributeError: raise RuntimeError("Unsupported ROBOKASSA_HASH_ALGORITHM")
     return digest(f"{value}:{password}".encode()).hexdigest().upper()
+
+
+def _reward_invoice_matches(invoice, request):
+    """Match frozen agreement terms; never retrofit a legacy invoice."""
+    quote=workflow.reward_quote(request)
+    stored=json.loads(invoice["metadata"] or "{}").get("reward_quote")
+    if int(invoice["amount_rub"])!=quote["total_rub"]:
+        return False
+    if stored is None:
+        return quote["version"]==workflow.LEGACY_PRICING_VERSION
+    return isinstance(stored,dict) and all(stored.get(key)==quote[key] for key in ("version","helper_rub","commission_rub","total_rub"))
 
 def create_payment(invoice_id):
     if TEST_MONEY_ONLY:raise ValueError("Сейчас доступны только тестовые средства.")
@@ -165,6 +179,10 @@ def create_payment(invoice_id):
         if inv["item_type"]=="request_reward":
             request=db.execute("SELECT * FROM requests WHERE id=?"+lock,(meta.get("request_id"),)).fetchone()
             if not request or request["status"]!="open" or request["reward_payment_status"]!="none" or request["requester_id"]!=inv["user_id"]:raise ValueError("request unavailable")
+        elif inv["item_type"] in LEGACY_MONETIZATION_ITEMS:
+            # A previously issued invoice may still be paid. New issuance and
+            # immediate purchases for every retired item are rejected elsewhere.
+            pass
         else:_validate_active_purchase(inv["user_id"],inv["item_type"],meta,lock=True)
         db.execute("UPDATE billing_invoices SET provider_payment_id=? WHERE id=?",(str(invoice_id),invoice_id))
         db.execute("COMMIT")
@@ -209,7 +227,13 @@ def fulfill_invoice(invoice_id,payment_id=None):
         fallback=False
         if inv["item_type"]=="request_reward":
             wallet_add_entry(inv["user_id"],amount,"payment","Оплата вознаграждения",f"invoice:{invoice_id}:payment",rid if request else None,invoice_id,test_amount_rub=0)
-            can_reserve=active and request["reward_payment_status"]=="none" and int(request["reward_rub"])==amount
+            # Historical real acquiring keeps its original full-amount terms.
+            # New real acquiring is disabled; an unexpected verified callback
+            # is credited to the real wallet instead of creating unsupported
+            # mixed/new-pricing escrow or fabricating test funds.
+            can_reserve=bool(active and request["reward_payment_status"]=="none"
+                             and workflow.reward_quote(request)["version"]==workflow.LEGACY_PRICING_VERSION
+                             and _reward_invoice_matches(inv,request))
             if can_reserve:
                 inserted=wallet_add_entry(inv["user_id"],-amount,"reward_reserve","Резерв вознаграждения",f"request:{rid}:reserve",rid,invoice_id,test_amount_rub=0)
                 if not inserted:raise ValueError("reserve already exists")

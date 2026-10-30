@@ -115,6 +115,7 @@ class Photos(unittest.TestCase):
 
     def test_photo_insert_rolls_back_with_its_request(self):
         before=self.db.execute("SELECT COUNT(*) n FROM requests").fetchone()["n"]
+        self.db.execute("UPDATE users SET pro_until='2099-01-01T00:00:00+00:00' WHERE user_id=1")
         self.db.execute("BEGIN IMMEDIATE")
         rid=services.create_request(1,dict(what="Atomic",place="Private",time_needed="Today",urgency="Normal",details="Test"))
         media.attach_request_photos(self.db,rid,1,media.prepare_photos([self.image()]))

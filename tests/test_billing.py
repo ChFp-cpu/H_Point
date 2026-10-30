@@ -9,9 +9,8 @@ class Billing(unittest.TestCase):
   database.db=self.db;services.db=self.db;billing.db=self.db;database.init_db();database.create_user(1,"u",None)
  def tearDown(self):database.db=self.old;services.db=self.old;billing.db=self.old;self.db.close()
  def test_rub_invoice(self):
-  rid=self.request()
-  iid,payload,amount=create_pending_invoice(1,"boost",{"request_id":rid})
-  row=database.get_invoice(iid);self.assertEqual(row["currency"],"RUB");self.assertEqual(row["amount_rub"],49);self.assertTrue(payload.startswith("hpoint:v2:"))
+  iid,payload,amount=create_pending_invoice(1,"pro")
+  row=database.get_invoice(iid);self.assertEqual(row["currency"],"RUB");self.assertEqual(row["amount_rub"],149);self.assertEqual(amount,149);self.assertTrue(payload.startswith("hpoint:v2:"))
  def test_hidden_real_funds_cannot_pay_for_hpoint_plus(self):
   database.wallet_add_entry(1,1000,"payment","Historical real credit","hidden-real-credit",test_amount_rub=0)
   with self.assertRaisesRegex(ValueError,"insufficient_wallet"):
@@ -21,7 +20,7 @@ class Billing(unittest.TestCase):
   self.assertEqual(database.wallet_summary(1)["test_balance_rub"],0)
  def test_catalog(self):
   from hpoint.config import MONETIZATION_ITEMS
-  self.assertEqual(set(MONETIZATION_ITEMS),{"boost","pro"})
+  self.assertEqual(set(MONETIZATION_ITEMS),{"pro"})
   self.assertTrue(all("rub" in x and "hp" in x for x in MONETIZATION_ITEMS.values()))
  def test_points_purchase_is_atomic_and_idempotent(self):
   self.db.execute("UPDATE users SET balance=1000 WHERE user_id=1")
@@ -57,17 +56,21 @@ class Billing(unittest.TestCase):
    self.assertEqual(database.get_invoice(invoice)["amount_rub"],offer["rub"])
   self.assertEqual(database.get_user(1)["favorite_slots"],8)
   self.assertIsNotNone(database.get_user(1)["business_until"])
-  self.assertEqual(database.get_request(rid)["priority_boost"],50)
+  # Both historical obligations (boost +100 and more_responses +50) remain.
+  self.assertEqual(database.get_request(rid)["priority_boost"],150)
   self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM ads").fetchone()["n"],1)
   self.assertEqual(database.get_identity_verification(1)["status"],"pending")
- def test_boost_is_request_specific_and_cannot_be_charged_twice(self):
+ def test_legacy_boost_is_request_specific_and_callback_replay_is_safe(self):
   self.db.execute("UPDATE users SET balance=1000 WHERE user_id=1")
-  rid=self.request();other=self.request()
-  invoice,_=purchase_with_points(1,"boost",{"request_id":rid},"boost-once")
-  self.assertEqual(purchase_with_points(1,"boost",{"request_id":rid},"boost-once"),(invoice,False))
-  with self.assertRaisesRegex(ValueError,"already promoted"):
-   purchase_with_points(1,"boost",{"request_id":rid},"boost-again")
-  self.assertEqual(database.get_user(1)["balance"],975)
+  rid=self.request()
+  database.create_user(2,"Other author")
+  other=services.create_request(2,{"what":"Другая заявка","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test","category":"tech"})
+  self.db.execute("INSERT INTO billing_invoices(user_id,item_type,amount_rub,currency,payload,metadata) VALUES(1,'boost',49,'RUB','historical-boost',?)",(json.dumps({"request_id":rid}),))
+  invoice=self.db.execute("SELECT id FROM billing_invoices WHERE payload='historical-boost'").fetchone()["id"]
+  self.assertEqual(billing.fulfill_invoice(invoice),(True,"boost"))
+  self.assertEqual(billing.fulfill_invoice(invoice),(True,"already_paid"))
+  with self.assertRaises(ValueError):purchase_with_points(1,"boost",{"request_id":rid},"boost-new")
+  self.assertEqual(database.get_user(1)["balance"],1000)
   self.assertEqual(database.get_request(rid)["priority_boost"],100)
   self.assertEqual(database.get_request(other)["priority_boost"],0)
  def test_pro_new_price_duration_and_real_priority_without_rating_changes(self):

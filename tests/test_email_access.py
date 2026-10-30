@@ -120,7 +120,7 @@ class EmailAccess(unittest.TestCase):
         database.create_user(123,"Telegram helper")
         database.grant_registration_bonus(owner,500)
         rid=services.create_request(owner,dict(what="Synthetic help",place="Test",time_needed="Today",urgency="Normal",details="Test",reward_rub=400))
-        services.reserve_request_reward(rid,owner,400)
+        services.reserve_request_reward(rid,owner,460)
         services.accept_open_request(rid,123)
         until=(datetime.now(timezone.utc)+timedelta(days=1)).isoformat()
         for uid in (owner,pure_email,123):

@@ -81,13 +81,13 @@ class SimpleBot(unittest.IsolatedAsyncioTestCase):
         await handlers.link_account(self.message("/link "+code,chat_type="group"),self.state)
         self.assertEqual(await self.state.get_data(),{})
         self.assertIsNone(database.get_user(self.uid)["tg_user_id"])
-    async def test_obsolete_form_is_redirected_and_cleared(self):
+    async def test_expired_pro_form_is_redirected_without_clearing_draft(self):
         message=Message(message_id=1,date=datetime.now(),chat=Chat(id=123,type="private"),from_user=User(id=123,is_bot=False,first_name="Synthetic"),text=handlers.BTN_NEED_HELP)
         await self.state.set_state("HelpRequest:details")
         with patch.object(Message,"answer",new_callable=AsyncMock) as answer:
             self.assertTrue(await handlers.simplified_bot_message(message,{"state":self.state}))
             self.assertIn("на сайте",answer.await_args.args[0])
-        self.assertIsNone(await self.state.get_state())
+        self.assertEqual(await self.state.get_state(),"HelpRequest:details")
     async def test_chat_command_and_pending_review_still_reach_handler(self):
         message=Message(message_id=1,date=datetime.now(),chat=Chat(id=123,type="private"),from_user=User(id=123,is_bot=False,first_name="Synthetic"),text="/chat hello")
         self.assertFalse(await handlers.simplified_bot_message(message,{"state":self.state}))

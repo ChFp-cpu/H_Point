@@ -127,7 +127,9 @@ class Core(unittest.TestCase):
 
     def test_paid_request_releases_rubles_without_changing_hpoints(self):
         self.add(1, 0);self.add(2, 17)
-        rid=services.create_request(1,{"what":"paid","place":"x","time_needed":"x","urgency":"x","details":"x","reward_rub":750})
+        # Preserve a real-money agreement made before new test-only pricing.
+        # New creation and full test reserves are exercised by reward_pricing.
+        rid=database.insert_id("INSERT INTO requests(requester_id,category,what,place,time_needed,urgency,details,reward_rub,status) VALUES(1,'other','paid','x','x','x','x',750,'open')")
         self.assertFalse(services.try_assign_helper(rid,2))
         self.db.execute("UPDATE requests SET reward_payment_status='paid' WHERE id=?",(rid,))
         self.assertTrue(services.try_assign_helper(rid,2))
@@ -211,6 +213,8 @@ class Core(unittest.TestCase):
             database.init_db()
             for uid in (1, 2, 3): database.create_user(uid, f"User {uid}")
             shared.execute("UPDATE users SET balance=10 WHERE user_id=1")
+            # The race concerns two valid PRO requests sharing only ten HP.
+            shared.execute("UPDATE users SET pro_until=? WHERE user_id=1", ((datetime.now(timezone.utc)+timedelta(days=30)).isoformat(),))
             requests = [services.create_request(1, {"what":str(i), "place":"x", "time_needed":"x", "urgency":"x", "details":"x"}) for i in range(2)]
             for rid, helper in zip(requests, (2, 3)): self.assertTrue(services.try_assign_helper(rid, helper))
             barrier = threading.Barrier(3)

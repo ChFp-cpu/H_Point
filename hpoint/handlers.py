@@ -2,6 +2,8 @@
 import logging
 import secrets
 import time
+from functools import wraps
+from inspect import signature
 from urllib.parse import urlencode, urlparse
 from html import escape
 from aiogram import Bot, F, Router, BaseMiddleware
@@ -15,13 +17,70 @@ from .states import Registration, HelpRequest, Review, Billing
 from .keyboards import *
 from .billing import create_pending_invoice
 from . import games as game_service
-from .chat_notifications import chat_notification
+from .chat_notifications import chat_notification_chunks
 from .features import GAMES_ENABLED, GAMES_PAUSED_MESSAGE
 from . import help_achievements
 from . import bot_work_ui
 from .email_access import has_verified_email, link_owner_has_verified_email
 
 router = Router()
+
+REQUEST_FORM_STATES = {item.state for item in HelpRequest.__all_states__}
+
+
+def bot_pro_active(user_id):
+    from . import personal
+    return personal.is_pro(user_id, db_connection=db)
+
+
+def pro_management_keyboard(route="#/help"):
+    base = WEB_PUBLIC_URL.rstrip("/")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Продолжить бесплатно на сайте", url=base+"/"+route)],
+        [InlineKeyboardButton(text="Условия H-Point PRO", url=base+"/#/profile/billing")],
+    ])
+
+
+async def require_pro_management(event, state=None):
+    """Recheck expired subscriptions on messages, stale callbacks and form steps.
+
+    Drafts are deliberately retained on denial. Chat, consent, reviews and paid
+    professional workspace actions do not use this gate.
+    """
+    callback=isinstance(event,CallbackQuery) or (getattr(event,"message",None) is not None and isinstance(getattr(event,"data",None),str))
+    message=event.message if callback else event
+    if not message or getattr(getattr(message,"chat",None),"type",None)!="private":
+        if callback:await event.answer("Управление заявками доступно только в личном чате с H-Point.",show_alert=True)
+        elif message:await message.answer("Откройте личный диалог с H-Point или продолжите на сайте.",reply_markup=bot_website_keyboard("#/help"))
+        return False
+    actor=get_user(resolve_profile_id(event.from_user.id))
+    if (has_verified_email(actor) and not actor["is_blocked"]
+            and actor["tg_user_id"]==event.from_user.id and bot_pro_active(actor["user_id"])):
+        return True
+    if callback:
+        await event.answer("Управление заявками в боте доступно с PRO. Сайт остаётся бесплатным.", show_alert=True)
+    if message:
+        await message.answer(
+            "Управление заявками через Telegram доступно с H-Point PRO. "
+            "Продолжить это действие можно бесплатно на сайте. "
+            "Переписка, уведомления и отзывы в боте остаются доступными. "
+            "Введённые данные не удалены; отменить действие — /cancel.",
+            reply_markup=pro_management_keyboard(),
+        )
+    return False
+
+
+def pro_request_action(function):
+    """The handler guard also protects direct calls and delegated old callbacks."""
+    parameters = signature(function)
+
+    @wraps(function)
+    async def guarded(event, *args, **kwargs):
+        bound = parameters.bind_partial(event, *args, **kwargs)
+        if not await require_pro_management(event, bound.arguments.get("state")):
+            return
+        return await function(event, *args, **kwargs)
+    return guarded
 
 
 def resolve_profile_id(telegram_user_id):
@@ -45,7 +104,7 @@ class EmailOnlyBotMiddleware(BaseMiddleware):
         sender=getattr(event,"from_user",None)
         if sender is None:return
         user=get_user(resolve_profile_id(sender.id))
-        if has_verified_email(user) and not user["is_blocked"]:
+        if has_verified_email(user) and not user["is_blocked"] and user["tg_user_id"]==sender.id:
             message=event.message if isinstance(event,CallbackQuery) else event
             private=message and getattr(getattr(message,"chat",None),"type",None)=="private"
             token=MENU_USER.set(user["user_id"] if private and user["tg_user_id"]==sender.id else None)
@@ -55,7 +114,7 @@ class EmailOnlyBotMiddleware(BaseMiddleware):
 
     async def _verified(self,handler,event,data,user):
         if await bot_work_ui.handle_event(event,data,user,db):return
-        if isinstance(event,CallbackQuery) and (str(event.data or "").startswith(("buy:","buyreq:","payreq:","setcat:","g:")) or event.data in {"profile:settings","profile:history","profile:achievements"}):
+        if isinstance(event,CallbackQuery) and (str(event.data or "").startswith(("setcat:","g:")) or event.data in {"profile:settings","profile:history","profile:achievements"}):
             state=data.get("state")
             if state:await state.clear()
             await event.answer("Откройте эту функцию на сайте")
@@ -85,25 +144,29 @@ router.callback_query.outer_middleware(EmailOnlyBotMiddleware())
 # and can relay a reply to an already selected conversation.
 BOT_GUIDE = (
     "ℹ️ <b>H-Point в Telegram</b>\n\n"
-    "Здесь приходят уведомления по заявкам и сообщения. "
+    "Бесплатно: полные сообщения, важные уведомления и переписка по помощи. "
     "Открыть переписку — «Мои чаты»; ответить по текущей помощи — <b>/chat ТЕКСТ</b>.\n\n"
+    "С PRO в меню появляются «Мне нужна помощь» и «Мои заявки»: "
+    "создание, выбор помощника, отмена и завершение заявки. "
+    "На сайте эти действия доступны бесплатно. Шаблоны и расписание находятся на сайте.\n\n"
     "Регистрация и вход — только по email на сайте. "
-    "Для привязки получите код в профиле сайта и отправьте <b>/link КОД</b>. "
-    "Подтвердите привязку или нажмите «Отмена»; отвязать бот — <b>/unlink</b>.\n\n"
-    "Заявки, подбор, настройки помощи, профиль и подписки доступны на сайте. "
+    "Для привязки получите код в профиле и отправьте <b>/link КОД</b>. "
+    "Подтвердите привязку или нажмите «Отмена»; отвязать бот — <b>/unlink</b>. "
     "Незавершённое действие можно отменить командой <b>/cancel</b>."
 )
 BOT_START_OVERVIEW = (
-    "Уведомления и сообщения по вашей помощи будут приходить сюда. "
-    "Переписка — «Мои чаты», все настройки — на сайте."
+    "Здесь приходят полные сообщения и важные уведомления по помощи. "
+    "Переписка — «Мои чаты» или /chat ТЕКСТ. "
+    "Управление заявками — на сайте или в меню PRO."
 )
-BASIC_BOT_COMMANDS = {"/start", "/help", "/menu", "/website", "/chats", "/chat", "/problem", "/cancel", "/link", "/unlink"}
+BASIC_BOT_COMMANDS = {"/start", "/help", "/menu", "/website", "/chats", "/chat", "/problem", "/cancel", "/link", "/unlink", "/ask", "/billing", "/terms", "/paysupport"}
+PRO_BOT_ACTIONS = {BTN_NEED_HELP, BTN_FIND_CANDIDATES, BTN_MY_CANDIDATES, BOT_REQUESTS_BUTTON}
 LEGACY_BOT_DESTINATIONS = {
-    "/profile":"#/profile", "/history":"#/help", "/settings":"#/help", "/ask":"#/help",
-    "/billing":"#/profile/billing", "/commercial":"#/profile", "/verifyme":"#/profile",
-    "/games":"", "/achievements":"#/league", "/terms":"#/profile/billing", "/paysupport":"#/profile/billing",
-    BTN_NEED_HELP:"#/help", BTN_WANT_HELP:"#/help", BTN_FIND_CANDIDATES:"#/help", BTN_MY_CANDIDATES:"#/help",
-    BTN_PROFILE:"#/profile", BTN_HISTORY:"#/help", BTN_SETTINGS:"#/help", BTN_GAMES:"", "💳 H-Point+":"#/profile/billing",
+    "/profile":"#/profile", "/history":"#/help", "/settings":"#/help",
+    "/commercial":"#/profile", "/verifyme":"#/profile",
+    "/games":"", "/achievements":"#/league",
+    BTN_WANT_HELP:"#/help", BTN_PROFILE:"#/profile", BTN_HISTORY:"#/help",
+    BTN_SETTINGS:"#/help", BTN_GAMES:"", "💳 H-Point+":"#/profile/billing",
 }
 
 
@@ -112,7 +175,7 @@ def bot_website_keyboard(route="", title="Открыть H-Point"):
 
 
 async def simplified_bot_message(event, data):
-    """Redirect obsolete bot forms while keeping messages and review replies."""
+    """Keep a compact bot while letting authorised request forms reach handlers."""
     if not isinstance(event,Message):
         return False
     text=str(event.text or "")
@@ -122,6 +185,15 @@ async def simplified_bot_message(event, data):
         if state:await state.clear()
         await event.answer("Ваши чаты по заявкам.",reply_markup=bot_website_keyboard("#/help/chats","Открыть чаты"))
         return True
+    current_state=await state.get_state() if state else None
+    if text in PRO_BOT_ACTIONS:
+        if not await require_pro_management(event,state):return True
+        action={BTN_NEED_HELP:need_help_start,BTN_FIND_CANDIDATES:find_candidates,BTN_MY_CANDIDATES:my_candidates,BOT_REQUESTS_BUTTON:request_management_menu}[text]
+        await action(event,state)
+        return True
+    if command=="/ask":return not await require_pro_management(event,state)
+    if current_state in REQUEST_FORM_STATES and command not in BASIC_BOT_COMMANDS and text not in {BTN_CANCEL,BTN_WEBSITE,BTN_NAVIGATOR}:
+        return not await require_pro_management(event,state)
     destination=LEGACY_BOT_DESTINATIONS.get(command,LEGACY_BOT_DESTINATIONS.get(text))
     if destination is not None:
         if state:await state.clear()
@@ -129,7 +201,6 @@ async def simplified_bot_message(event, data):
         return True
     if command in BASIC_BOT_COMMANDS or text in {BTN_WEBSITE,BTN_NAVIGATOR,BTN_CANCEL}:
         return False
-    current_state=await state.get_state() if state else None
     if current_state in {Review.requester_review.state,Review.helper_review.state}:
         return False
     if state:await state.clear()
@@ -326,6 +397,7 @@ async def cmd_menu_guide(message: Message, state: FSMContext) -> None:
 
 
 @router.message(Command("ask"))
+@pro_request_action
 async def cmd_ask(message: Message, state: FSMContext) -> None:
     """Explainable local assistant: it ranks candidates without exporting user data."""
     question = (message.text or "").partition(" ")[2].strip()
@@ -366,14 +438,21 @@ async def cmd_chat(message: Message, state: FSMContext, bot: Bot) -> None:
     target_id = int(first[1:]) if first.startswith("#") and first[1:].isascii() and first[1:].isdigit() and len(first) <= 12 else None
     if target_id is not None:
         text = rest.strip()
-    text = text[:1000]
+    if len(text)>1000:
+        await message.answer("Сообщение не отправлено: максимум 1000 символов. Разделите его на несколько сообщений; текст не был обрезан.")
+        return
     if not text:
         await message.answer("Отправьте сообщение так: <b>/chat ТЕКСТ</b>")
         return
     user_id = resolve_profile_id(message.from_user.id)
-    request = get_request(target_id) if target_id is not None else get_active_own_request(user_id)
-    if target_id is None and (not request or request["status"] != STATUS_IN_PROGRESS):
-        request = get_active_help(user_id)
+    request = get_request(target_id) if target_id is not None else None
+    if target_id is None:
+        conversations=db.execute("SELECT * FROM requests WHERE status=? AND helper_id IS NOT NULL AND (requester_id=? OR helper_id=?) ORDER BY id DESC",(STATUS_IN_PROGRESS,user_id,user_id)).fetchall()
+        if len(conversations)>1:
+            choices="\n".join(f"• {escape(row['what'])} — <code>/chat #{row['id']} ТЕКСТ</code>" for row in conversations)
+            await message.answer("У вас несколько активных переписок. Укажите нужную помощь, чтобы сообщение не попало в другой чат:\n\n"+choices,reply_markup=bot_website_keyboard("#/help/chats","Открыть чаты"))
+            return
+        request=conversations[0] if conversations else None
     if not request or not request["helper_id"] or user_id not in (request["requester_id"], request["helper_id"]) or (target_id is None and request["status"] != STATUS_IN_PROGRESS):
         await message.answer("Чат доступен после назначения помощника по активной заявке.")
         return
@@ -390,10 +469,8 @@ async def cmd_chat(message: Message, state: FSMContext, bot: Bot) -> None:
     other = get_user(other_id)
     if other and other["tg_user_id"]:
         try:
-            await bot.send_message(
-                other["tg_user_id"],
-                chat_notification(request["id"],get_user(user_id)["name"],text,request["what"],chat_id=chat_id),
-            )
+            for part in chat_notification_chunks(request["id"],get_user(user_id)["name"],text,request["what"],chat_id=chat_id):
+                await bot.send_message(other["tg_user_id"],part)
         except Exception:
             logging.exception("Не удалось отправить уведомление о сообщении в Telegram")
     await message.answer(f"💬 Сообщение отправлено в общий чат помощи «{request_title(request['id'])}».")
@@ -922,7 +999,7 @@ async def cb_set_category(callback: CallbackQuery) -> None:
 
 
 async def _candidate_card(candidate: dict) -> str:
-    verified = " ✓" if candidate.get("verified") else ""
+    verified = (" ✓" if candidate.get("verified") else "")+(" · PRO" if candidate.get("pro_active") else "")
     rating = candidate.get("rating") or 0
     reviews = int(candidate.get("reviews") or 0)
     distance = candidate.get("distance_km")
@@ -988,39 +1065,94 @@ async def _show_candidates(message: Message, request_id: int, *, edit: bool = Fa
     await message.answer("Подбор можно обновить после изменения профилей или доступности.", reply_markup=candidates_navigation_kb(request_id, offer))
 
 
+def own_open_requests(user_id):
+    return db.execute("SELECT * FROM requests WHERE requester_id=? AND status=? ORDER BY id DESC LIMIT 5",(user_id,STATUS_OPEN)).fetchall()
+
+
 async def _choose_candidate_request(message: Message, state: FSMContext) -> bool:
-    if not await ensure_registered(message, state) or not await check_not_busy(message):
+    if not await ensure_registered(message,state):return False
+    requests=own_open_requests(resolve_profile_id(message.from_user.id))
+    if not requests:
+        await message.answer("Сначала создайте открытую заявку. Текущую помощь и чаты можно открыть на сайте.",reply_markup=bot_website_keyboard("#/help"))
         return False
-    active = get_active_own_request(resolve_profile_id(message.from_user.id))
-    if not active:
-        await message.answer(
-            "У вас нет активной заявки. Сначала создайте её через «🆘 Мне нужна помощь».\n\n"
-            "После создания здесь появится Smart Match с кандидатами."
-        )
-        return False
-    if active["status"] != STATUS_OPEN:
-        await message.answer("По вашей заявке уже назначен помощник. Новых кандидатов подбирать не нужно.", reply_markup=main_menu_kb())
+    if len(requests)>1:
+        await message.answer("Для какой заявки подобрать помощника?",reply_markup=choose_match_request_kb(requests))
         return False
     return True
 
 
 @router.message(StateFilter(None), F.text == BTN_FIND_CANDIDATES)
+@pro_request_action
 async def find_candidates(message: Message, state: FSMContext) -> None:
-    if not await _choose_candidate_request(message, state):
-        return
-    active = get_active_own_request(resolve_profile_id(message.from_user.id))
-    await _show_candidates(message, active["id"])
+    if await _choose_candidate_request(message,state):
+        await _show_candidates(message,own_open_requests(resolve_profile_id(message.from_user.id))[0]["id"])
 
 
 @router.message(StateFilter(None), F.text == BTN_MY_CANDIDATES)
+@pro_request_action
 async def my_candidates(message: Message, state: FSMContext) -> None:
-    if not await _choose_candidate_request(message, state):
+    await find_candidates(message,state)
+
+
+@router.callback_query(F.data.startswith("matchreq:"))
+@pro_request_action
+async def cb_match_request(callback: CallbackQuery):
+    try:request_id=int(callback.data.split(":",1)[1])
+    except (ValueError,IndexError):
+        await callback.answer("Некорректная заявка.",show_alert=True);return
+    await callback.answer()
+    if callback.message:await _show_candidates(callback.message,request_id,actor_id=resolve_profile_id(callback.from_user.id))
+
+
+async def show_request_management(message,user_id,request_id=None):
+    if request_id is None:
+        requests=db.execute("SELECT id,what,status FROM requests WHERE requester_id=? AND status IN (?,?) ORDER BY id DESC LIMIT 5",(user_id,STATUS_OPEN,STATUS_IN_PROGRESS)).fetchall()
+        if not requests:
+            await message.answer("Активных заявок пока нет. Создать заявку можно кнопкой «Мне нужна помощь» или на сайте.",reply_markup=bot_website_keyboard("#/help"));return
+        await message.answer("Выберите свою заявку:",reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=str(row["what"])[:48],callback_data="request:view:"+str(row["id"]))] for row in requests
+        ]))
         return
-    active = get_active_own_request(resolve_profile_id(message.from_user.id))
-    await _show_candidates(message, active["id"])
+    request=get_request(request_id)
+    if not request or request["requester_id"]!=user_id:
+        await message.answer("Заявка недоступна.");return
+    rows=[]
+    if request["status"]==STATUS_OPEN:
+        rows.append([InlineKeyboardButton(text="Подобрать помощника",callback_data="matchreq:"+str(request_id))])
+        rows.append([InlineKeyboardButton(text="Отменить заявку",callback_data="cancel_req:"+str(request_id))])
+    if request["status"]==STATUS_IN_PROGRESS:
+        rows.append([InlineKeyboardButton(text="Подтвердить завершение",callback_data="finish:"+str(request_id))])
+        rows.append([InlineKeyboardButton(text="Отменить помощь",callback_data="cancel_req:"+str(request_id))])
+    rows.extend(request_chat_kb(request_id).inline_keyboard)
+    rows.append([InlineKeyboardButton(text="Все мои заявки",callback_data="bot:requests")])
+    await message.answer(request_text(request),reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.message(StateFilter(None),F.text == BOT_REQUESTS_BUTTON)
+@pro_request_action
+async def request_management_menu(message: Message,state: FSMContext):
+    if await ensure_registered(message,state):await show_request_management(message,resolve_profile_id(message.from_user.id))
+
+
+@router.callback_query(F.data == "bot:requests")
+@pro_request_action
+async def cb_request_management_menu(callback: CallbackQuery):
+    await callback.answer()
+    if callback.message:await show_request_management(callback.message,resolve_profile_id(callback.from_user.id))
+
+
+@router.callback_query(F.data.startswith("request:view:"))
+@pro_request_action
+async def cb_request_management_view(callback: CallbackQuery):
+    try:request_id=int(callback.data.split(":")[-1])
+    except (ValueError,IndexError):
+        await callback.answer("Некорректная заявка.",show_alert=True);return
+    await callback.answer()
+    if callback.message:await show_request_management(callback.message,resolve_profile_id(callback.from_user.id),request_id)
 
 
 @router.callback_query(F.data.startswith("candidate:assign:"))
+@pro_request_action
 async def cb_candidate_assign(callback: CallbackQuery, bot: Bot) -> None:
     try:
         _, _, request_id_s, candidate_id_s = callback.data.split(":")
@@ -1089,7 +1221,9 @@ async def cb_application_cancel(callback: CallbackQuery, bot: Bot) -> None:
     except (ValueError, TypeError):
         await callback.answer("Некорректный отклик.", show_alert=True)
         return
-    if not cancel_request_application(request_id, helper_id, resolve_profile_id(callback.from_user.id), token):
+    actor_id=resolve_profile_id(callback.from_user.id)
+    if actor_id!=helper_id and not await require_pro_management(callback):return
+    if not cancel_request_application(request_id, helper_id, actor_id, token):
         await callback.answer("Отклик уже изменился или помощник выбран.", show_alert=True)
         return
     await callback.answer("Отклик отменён")
@@ -1116,6 +1250,7 @@ async def cb_helper_offer_response(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Некорректное предложение.", show_alert=True)
         return
     if action == "cancel":
+        if not await require_pro_management(callback):return
         offer = get_current_helper_offer(request_id)
         if not offer or not withdraw_helper_offer(request_id, resolve_profile_id(callback.from_user.id), offer["candidate_id"], token):
             await callback.answer("Приглашение уже изменилось или помощь подтверждена.", show_alert=True)
@@ -1156,7 +1291,7 @@ async def cb_helper_offer_response(callback: CallbackQuery, bot: Bot) -> None:
         try:
             await bot.send_message(
                 requester["tg_user_id"],
-                f"ℹ️ Помощник отклонил предложение по задаче «{request_title(request_id)}». Откройте «⚡ Подобрать кандидатов» и выберите другого.",
+                f"ℹ️ Помощник отклонил предложение по задаче «{request_title(request_id)}». Можно выбрать другого помощника на сайте.",
                 reply_markup=main_menu_kb(),
             )
         except Exception:
@@ -1164,6 +1299,7 @@ async def cb_helper_offer_response(callback: CallbackQuery, bot: Bot) -> None:
 
 
 @router.callback_query(F.data.startswith("candidate:refresh:"))
+@pro_request_action
 async def cb_candidate_refresh(callback: CallbackQuery) -> None:
     try:
         request_id = int(callback.data.split(":")[-1])
@@ -1179,6 +1315,7 @@ async def cb_candidate_refresh(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("candidate:back:"))
+@pro_request_action
 async def cb_candidate_back(callback: CallbackQuery) -> None:
     try:
         request_id = int(callback.data.split(":")[-1])
@@ -1194,23 +1331,18 @@ async def cb_candidate_back(callback: CallbackQuery) -> None:
 
 
 @router.message(StateFilter(None), F.text == BTN_NEED_HELP)
+@pro_request_action
 async def need_help_start(message: Message, state: FSMContext) -> None:
-    if not await ensure_registered(message, state) or not await check_not_busy(message):
+    if not await ensure_registered(message, state):
         return
+    from . import personal
     user_id = resolve_profile_id(message.from_user.id)
-    open_count = db.execute("SELECT COUNT(*) n FROM requests WHERE requester_id=? AND status=?", (user_id, STATUS_OPEN)).fetchone()["n"]
-    if int(open_count or 0) >= 10:
-        await message.answer("Одновременно можно опубликовать до 10 открытых заявок. Закройте или отмените одну из текущих.")
-        return
-    if is_in_queue(user_id):
-        await message.answer("Вы сейчас в очереди помощников. Выйдите из очереди, чтобы создать заявку.", reply_markup=leave_queue_kb())
-        return
-    user = get_user(user_id)
-    if user["balance"] < REQUEST_COST:
-        await message.answer(f"Для заявки нужно минимум {REQUEST_COST} HP. У вас {user['balance']} HP.")
+    usage=personal.usage(user_id,db_connection=db)
+    if usage["requests"]["remaining"]<=0:
+        await message.answer("Достигнут лимит собственных активных заявок: "+str(usage["requests"]["limit"])+". Завершите или отмените одну из текущих. Черновик сохранён.",reply_markup=bot_website_keyboard("#/help"))
         return
     await state.set_state(HelpRequest.what)
-    await message.answer("1/5. <b>Какая помощь нужна?</b>", reply_markup=cancel_kb())
+    await message.answer("1/5. <b>Какая помощь нужна?</b> Эта форма создаёт бесплатную заявку. Фото, вознаграждение и расписание доступны на сайте.", reply_markup=cancel_kb())
 
 
 async def read_answer(message: Message) -> str | None:
@@ -1227,7 +1359,8 @@ async def read_answer(message: Message) -> str | None:
     return text
 
 
-@router.message(HelpRequest.what)
+@router.message(HelpRequest.what, ~F.text.startswith("/"))
+@pro_request_action
 async def q_what(message: Message, state: FSMContext) -> None:
     text = await read_answer(message)
     if text is None: return
@@ -1236,7 +1369,8 @@ async def q_what(message: Message, state: FSMContext) -> None:
     await message.answer("2/5. <b>Где нужна помощь?</b>", reply_markup=cancel_kb())
 
 
-@router.message(HelpRequest.place)
+@router.message(HelpRequest.place, ~F.text.startswith("/"))
+@pro_request_action
 async def q_place(message: Message, state: FSMContext) -> None:
     text = await read_answer(message)
     if text is None: return
@@ -1245,7 +1379,8 @@ async def q_place(message: Message, state: FSMContext) -> None:
     await message.answer("3/5. <b>Когда нужна помощь?</b>", reply_markup=cancel_kb())
 
 
-@router.message(HelpRequest.time_needed)
+@router.message(HelpRequest.time_needed, ~F.text.startswith("/"))
+@pro_request_action
 async def q_time(message: Message, state: FSMContext) -> None:
     text = await read_answer(message)
     if text is None: return
@@ -1254,7 +1389,8 @@ async def q_time(message: Message, state: FSMContext) -> None:
     await message.answer("4/5. <b>Насколько срочно?</b> Выберите вариант или напишите свой.", reply_markup=cancel_kb(URGENCY_OPTIONS))
 
 
-@router.message(HelpRequest.urgency)
+@router.message(HelpRequest.urgency, ~F.text.startswith("/"))
+@pro_request_action
 async def q_urgency(message: Message, state: FSMContext) -> None:
     text = await read_answer(message)
     if text is None: return
@@ -1263,25 +1399,29 @@ async def q_urgency(message: Message, state: FSMContext) -> None:
     await message.answer("5/5. <b>Дополнительные детали?</b> Если деталей нет — нажмите «Нет».", reply_markup=cancel_kb([BTN_NO_DETAILS]))
 
 
-@router.message(HelpRequest.details)
+@router.message(HelpRequest.details, ~F.text.startswith("/"))
+@pro_request_action
 async def q_details(message: Message, state: FSMContext, bot: Bot) -> None:
     text = await read_answer(message)
     if text is None: return
-    if text == BTN_NO_DETAILS:
-        text = "Нет дополнительных деталей"
-    data = await state.update_data(details=text)
-    await state.clear()
+    if text == BTN_NO_DETAILS:text = "Нет дополнительных деталей"
+    await state.update_data(details=text)
+    data = await state.get_data()
     user_id = resolve_profile_id(message.from_user.id)
-    open_count = db.execute("SELECT COUNT(*) n FROM requests WHERE requester_id=? AND status=?", (user_id, STATUS_OPEN)).fetchone()["n"]
-    if int(open_count or 0) >= 10:
-        await show_main_menu(message, "Одновременно можно опубликовать до 10 открытых заявок. Новая не создана.")
+    try:
+        request_id = create_request(user_id, data)
+    except (ValueError,PermissionError) as error:
+        await message.answer(escape(str(error))+"\nВведённые данные сохранены. Можно повторить отправку после освобождения лимита или продолжить на сайте.",reply_markup=pro_management_keyboard())
         return
-    request_id = create_request(user_id, data)
+    await state.clear()
     req = get_request(request_id)
     await message.answer(
         f"✅ Заявка создана!\n\n{request_text(req)}\n\n"
-        "Теперь откройте «⚡ Подобрать кандидатов» и выберите человека из тех, кто готов помочь. Он сам подтвердит согласие.",
-        reply_markup=main_menu_kb(),
+        "Откройте кандидатов и выберите помощника. Он сам подтвердит согласие.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Подобрать помощника",callback_data="matchreq:"+str(request_id))],
+            [InlineKeyboardButton(text="Мои заявки",callback_data="bot:requests")],
+        ]),
     )
     await message.answer("Если помощь больше не нужна:", reply_markup=cancel_request_kb(request_id))
 
@@ -1312,6 +1452,7 @@ async def cb_leave_queue(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("cancel_req:"))
+@pro_request_action
 async def cb_cancel_request(callback: CallbackQuery) -> None:
     try:
         request_id = int(callback.data.split(":")[1])
@@ -1326,6 +1467,7 @@ async def cb_cancel_request(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("finish:"))
+@pro_request_action
 async def cb_finish(callback: CallbackQuery, bot: Bot) -> None:
     try:
         request_id = int(callback.data.split(":")[1])
@@ -1346,9 +1488,11 @@ async def cb_finish(callback: CallbackQuery, bot: Bot) -> None:
     request = get_request(request_id)
     paid = int(request["reward_rub"] or 0) > 0
     requester = get_user(request["requester_id"])
-    fee=int(request["commission_rub"] or 0) if "commission_rub" in request.keys() else 0
-    net=int(request["helper_reward_rub"] or 0) if fee else int(request["reward_rub"] or 0)
-    settlement = (f"{net} тестовых ₽ зачислено помощнику; комиссия платформы — {fee} тестовых ₽. H-Points не списывались."
+    from . import workflow
+    quote=workflow.reward_quote(request)
+    fee,net,total=quote["commission_rub"],quote["helper_reward_rub"],quote["total_rub"]
+    currency="тестовых ₽" if quote["test_only"] else "₽"
+    settlement = (f"Помощнику зачислено {net} {currency}; комиссия H-Point — {fee} {currency}; всего из резерва — {total} {currency}. HP за платную помощь не списывались и не начислялись."
                   if paid else (f"Списано {REQUEST_COST} HP. Баланс: {requester['balance']} HP." if request["hp_settled"] else "Повторная помощь за 24 часа: HP не списывались и не начислялись."))
     await callback.message.edit_text(
         f"✅ Вы подтвердили выполнение помощи по задаче «{request_title(request_id)}». {settlement}\n\nОцените помощь:",
@@ -1356,7 +1500,7 @@ async def cb_finish(callback: CallbackQuery, bot: Bot) -> None:
     )
     helper = get_user(request["helper_id"])
     if helper and helper["tg_user_id"]:
-        settlement = (f"{net} тестовых ₽ поступило в ваш кошелёк H-Point после комиссии {fee} тестовых ₽."
+        settlement = (f"В ваш кошелёк H-Point поступило {net} {currency}. Условия вознаграждения выполнены; комиссия H-Point — {fee} {currency}."
                       if paid else (f"Вам начислено +{HELPER_REWARD} HP. Баланс: {helper['balance']} HP." if request["hp_settled"] else "Повторная помощь за 24 часа: HP не списывались и не начислялись."))
         try:
             await bot.send_message(
@@ -1452,22 +1596,22 @@ async def helper_review(message: Message, state: FSMContext) -> None:
 
 
 async def show_billing(message: Message, state: FSMContext) -> None:
-    if not await ensure_registered(message, state):
-        return
+    if not await ensure_registered(message,state):return
+    from . import personal
     user=get_user(resolve_profile_id(message.from_user.id))
-    status=[]
-    if is_pro(user["user_id"]): status.append("⭐ PRO активен")
-    if is_verified(user["user_id"]): status.append("✓ Верификация активна")
-    if is_business(user["user_id"]): status.append("💼 Business активен")
+    usage=personal.usage(user["user_id"],db_connection=db)
+    active=usage["pro_active"]
+    status=("PRO активен до "+escape(str(usage["pro_until"])) if active else "Сейчас бесплатный тариф")
     await message.answer(
-        "💳 <b>H-Point+</b>\n\n"
-        "Продвижение — приоритет одной открытой заявки до её закрытия.\n"
-        "PRO — приоритет профиля и заявок в автоматическом подборе на 30 дней, без автопродления.\n"
-        "Рейтинг и Лига не продаются; отклики не гарантированы. Проверка личности бесплатна в профиле сайта.\n\n"
-        + ("\n".join(status)+"\n\n" if status else "") +
-        "Используются только тестовые ₽. Для вознаграждений за помощь действует комиссия 15%. Выберите функцию:",
+        "⭐ <b>H-Point PRO</b>\n\n"+status+"\n"
+        "Собственные активные заявки: "+str(usage["requests"]["active"])+" из "+str(usage["requests"]["limit"])+".\n\n"
+        "149 тестовых ₽ или 90 HP на 30 дней, без автопродления. Досрочное продление добавляет 30 дней к текущему сроку.\n"
+        "PRO: до 5 активных собственных заявок, активности без месячного тарифного лимита, личные шаблоны, повтор по расписанию, управление заявками в Telegram и мягкий приоритет среди подходящих кандидатов.\n\n"
+        "Бесплатно: 1 собственная активная заявка и 2 публикации активностей за календарный месяц. Переписка, уведомления, отклики и управление помощью на сайте доступны без PRO.\n"
+        "«Для работы» — отдельный профессиональный кабинет; его права и подписка сохраняются. Рейтинг и Лига не продаются, результат подбора не гарантирован.",
         reply_markup=billing_kb(),
     )
+
 
 @router.message(Command("billing"))
 @router.message(StateFilter(None), F.text == "💳 H-Point+")
@@ -1479,7 +1623,7 @@ async def terms(message: Message):
     await message.answer(
         "<b>Условия покупок H-Point</b>\n\n"
         "Сейчас используются только тестовые средства. Оплата и вывод реальных денег отключены. "
-        "Вознаграждение за помощь: комиссия платформы 15%, помощнику поступает 85%. "
+        "В новой платной заявке сумма — вознаграждение помощнику; комиссия H-Point 15% добавляется сверху и оплачивается автором. Старые договорённости сохраняют свои условия. "
         "Тестовые средства нельзя вывести.\n\n"
         "Поддержка платежей: /paysupport"
     )
@@ -1558,56 +1702,25 @@ def payment_button(item_type, request_id=None):
     ])
 
 @router.callback_query(F.data.startswith("buy:"))
-async def cb_buy(callback: CallbackQuery, state: FSMContext):
-    item_type=callback.data.split(":",1)[1]
-    if item_type not in MONETIZATION_ITEMS:
-        await callback.answer("Эта функция снята с продажи. Откройте обновлённое меню H-Point+.",show_alert=True);return
-    if item_type in ("boost","more_responses"):
-        requests=db.execute("SELECT id,what FROM requests WHERE requester_id=? AND status=? ORDER BY id DESC LIMIT 10",(resolve_profile_id(callback.from_user.id),STATUS_OPEN)).fetchall()
-        if not requests:
-            await callback.answer("Нет открытых заявок для продвижения.",show_alert=True);return
-        await callback.answer()
-        await callback.message.answer("Выберите заявку:",reply_markup=choose_request_kb(requests));return
-    if item_type=="ad":
-        await callback.answer();await state.set_state(Billing.ad_text)
-        await callback.message.answer("Напишите текст объявления до 500 символов. После этого получите ссылку на оплату.")
+async def cb_buy(callback: CallbackQuery,state: FSMContext):
+    item_type=str(callback.data or "").partition(":")[2]
+    if item_type!="pro":
+        await callback.answer("Эта отдельная функция снята с новых продаж. История и оплаченные права сохранены.",show_alert=True)
         return
     await callback.answer()
-    await callback.message.answer(
-        f"<b>{MONETIZATION_ITEMS[item_type]['title']}</b>\n"
-        f"{MONETIZATION_ITEMS[item_type]['description']}\n\n"
-        f"Цена: <b>{MONETIZATION_ITEMS[item_type]['rub']} ₽</b>",
-        reply_markup=payment_button(item_type)
-    )
+    if callback.message:
+        await callback.message.answer("H-Point PRO: 149 тестовых ₽ или 90 HP на 30 дней, без автопродления. Покупка и продление — на сайте.",reply_markup=payment_button("pro"))
+
 
 @router.callback_query(F.data.startswith("buyreq:"))
 async def cb_buy_request(callback: CallbackQuery):
-    try:request_id=int(callback.data.split(":",1)[1])
-    except:
-        await callback.answer("Некорректная заявка",show_alert=True);return
-    await callback.answer()
-    await callback.message.answer(
-        f"Помощь «{request_title(request_id)}». Выберите функцию:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"🚀 Продвижение — {PRICE_BOOST_RUB} ₽",callback_data=f"payreq:boost:{request_id}")]
-        ])
-    )
+    await callback.answer("Отдельное продвижение заявки снято с новых продаж. Ранее оплаченные права сохранены.",show_alert=True)
+
 
 @router.callback_query(F.data.startswith("payreq:"))
 async def cb_pay_request(callback: CallbackQuery):
-    try:_,item_type,rid=callback.data.split(":");rid=int(rid)
-    except:
-        await callback.answer("Некорректные данные",show_alert=True);return
-    if item_type != "boost":
-        await callback.answer("Эта функция больше не продаётся. Откройте H-Point+.",show_alert=True);return
-    req=get_request(rid)
-    if not req or req["requester_id"]!=resolve_profile_id(callback.from_user.id) or req["status"]!=STATUS_OPEN:
-        await callback.answer("Заявка уже недоступна.",show_alert=True);return
-    await callback.answer()
-    await callback.message.answer(
-        f"<b>{MONETIZATION_ITEMS[item_type]['title']}</b> · {MONETIZATION_ITEMS[item_type]['rub']} ₽",
-        reply_markup=payment_button(item_type,rid)
-    )
+    await callback.answer("Эта отдельная функция снята с новых продаж. Ранее оплаченные права сохранены.",show_alert=True)
+
 
 @router.message(Billing.ad_text,F.text)
 async def billing_ad_text(message: Message,state: FSMContext):

@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlparse, parse_qs
 
-from hpoint import database, services, billing, reliability, web
+from hpoint import database, services, billing, reliability, web, workflow
 
 
 class Scenarios:
@@ -29,8 +29,16 @@ class Scenarios:
         self.db.close()
 
     def request(self, owner=1, reward=0, **options):
-        return services.create_request(owner, dict(what="Synthetic request", place="Test", time_needed="Today",
-            urgency="Normal", details="No real data", category="tech", reward_rub=reward, **options))
+        # These regression scenarios replay persisted pre-upgrade agreements,
+        # including grandfathered request counts and real payment callbacks.
+        # New creation, limits and top-up commission have dedicated suites.
+        assert set(options) <= {"lat", "lon", "scheduled_at"}
+        fields=dict(requester_id=owner,what="Synthetic historical request",place="Test",time_needed="Today",
+                    urgency="Normal",details="No real data",category="tech",reward_rub=reward,status="open",
+                    expires_at=(datetime.now(timezone.utc)+timedelta(hours=48)).isoformat(),
+                    reserve_deadline_at=workflow.reserve_deadline() if reward else None,**options)
+        if fields.get("scheduled_at"):fields["scheduled_at"]=services.normalize_schedule(fields["scheduled_at"])
+        return database.insert_id("INSERT INTO requests("+",".join(fields)+") VALUES("+",".join("?" for _ in fields)+")",tuple(fields.values()))
 
     def funded(self, amount=400):
         database.grant_registration_bonus(1, 500)
@@ -127,7 +135,10 @@ class Scenarios:
 
     def test_late_promotion_is_available_real_credit(self):
         rid = self.request()
-        invoice, _, amount = billing.create_pending_invoice(1, "boost", {"request_id": rid})
+        # It was sold before retirement; a stale callback still owes either
+        # the original entitlement or the exact original monetary credit.
+        amount=49
+        invoice=database.insert_id("INSERT INTO billing_invoices(user_id,item_type,amount_rub,currency,payload,metadata) VALUES(1,'boost',?,'RUB',?,?)", (amount,"synthetic-historical-boost",json.dumps({"request_id":rid})))
         services.cancel_request(rid, 1)
         self.assertEqual(billing.fulfill_invoice(invoice), (True, "credited_to_wallet"))
         billing.fulfill_invoice(invoice)

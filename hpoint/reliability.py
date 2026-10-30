@@ -1,5 +1,6 @@
 """Ledger provenance and lifecycle operations using the caller's database."""
 from datetime import datetime, timedelta, timezone
+from . import workflow
 
 
 def migrate_wallet_sources(db):
@@ -56,7 +57,7 @@ def reconcile_closed_reserves(db, add_entry):
         rows=db.execute("SELECT * FROM requests WHERE status='cancelled' AND reward_payment_status='paid' AND reward_rub>0"+suffix).fetchall()
         for row in rows:
             rid=row["id"]
-            add_entry(row["requester_id"],row["reward_rub"],"reward_refund","Возврат резерва ранее закрытой заявки",f"request:{rid}:refund",rid,test_amount_rub=int(row["reward_test_rub"] or 0))
+            refund_locked_reserve(db, row, add_entry, "Возврат резерва ранее закрытой заявки")
             db.execute("UPDATE requests SET reward_payment_status='wallet_refunded' WHERE id=?",(rid,))
             db.execute("INSERT INTO request_events(request_id,event_type,message) VALUES(?,?,?)",(rid,"reserve_reconciled","Резерв закрытой заявки возвращён в кошелёк с сохранением типа средств."))
         db.execute("INSERT INTO schema_migrations(version) VALUES('007_closed_reserves')")
@@ -66,14 +67,31 @@ def reconcile_closed_reserves(db, add_entry):
         raise
 
 
+def refund_locked_reserve(db, request, add_entry, reason):
+    """Restore the entire agreed escrow and its source, once under a row lock."""
+    rid = request["id"]
+    total = workflow.reward_quote(request)["total_rub"]
+    test = int(request["reward_test_rub"] or 0)
+    if total <= 0 or not 0 <= test <= total:
+        raise ValueError("invalid reserve source")
+    reference = f"request:{rid}:refund"
+    inserted = add_entry(request["requester_id"], total, "reward_refund", reason,
+                         reference, rid, test_amount_rub=test)
+    if not inserted:
+        # Some historical rows had a ledger refund but retained a paid flag.
+        # Accept only the exact prior obligation, never an unrelated collision.
+        existing = db.execute("SELECT user_id,amount_rub,test_amount_rub,request_id,kind FROM wallet_transactions WHERE reference=?", (reference,)).fetchone()
+        if not existing or tuple(existing[key] for key in ("user_id", "amount_rub", "test_amount_rub", "request_id", "kind")) != (request["requester_id"], total, test, rid, "reward_refund"):
+            raise ValueError("refund snapshot changed")
+
+
 def close_locked_request(db, request, actor_id, reason, event_type, add_entry):
     """Caller owns the transaction and request row lock. Refund a reserve once."""
     rid = request["id"]
     db.execute("UPDATE requests SET status='cancelled',cancel_reason=?,cancelled_at=CURRENT_TIMESTAMP WHERE id=?", (reason, rid))
     db.execute("UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND status IN ('pending','applied','offered')", (rid,))
     if request["reward_payment_status"] == "paid" and int(request["reward_rub"] or 0):
-        add_entry(request["requester_id"], request["reward_rub"], "reward_refund", reason,
-                  f"request:{rid}:refund", rid, test_amount_rub=int(request["reward_test_rub"] or 0))
+        refund_locked_reserve(db, request, add_entry, reason)
         db.execute("UPDATE requests SET reward_payment_status='wallet_refunded' WHERE id=?", (rid,))
     db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)", (rid, actor_id, event_type, reason))
     db.execute("UPDATE support_tickets SET status='resolved' WHERE request_id=? AND status IN ('open','answered')", (rid,))

@@ -112,24 +112,34 @@ def matches_helper_preferences(request, helper, distance):
 
 
 def create_request(user_id: int, data: dict) -> int:
+    from . import personal
     category = data.get("category") or infer_category(data["what"])
     hours = max(1, min(int(data.get("expires_in_hours", 48)), 168))
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
-    reward = int(data.get("reward_rub") or 0)
-    if not 0 <= reward <= 100_000:
-        raise ValueError("reward_rub")
-    request_id = insert_id(
-        """INSERT INTO requests
-        (requester_id, category, what, place, time_needed, urgency, details, status, priority_boost, lat, lon, expires_at, reward_rub, scheduled_at, reserve_deadline_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)""",
-        (user_id, category, data["what"], data["place"], data["time_needed"], data["urgency"], data["details"], STATUS_OPEN,
-         data.get("lat"), data.get("lon"), expires_at, reward, normalize_schedule(data.get("scheduled_at")),workflow.reserve_deadline() if reward else None),
-    )
-    db.execute(
-        "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
-        (request_id, user_id, "created", "Заявка опубликована и ожидает помощника."),
-    )
-    return request_id
+    raw_reward = data.get("reward_rub", 0)
+    quote = workflow.quote_new_reward(0 if raw_reward is None or raw_reward == "" else raw_reward)
+    scheduled_at = normalize_schedule(data.get("scheduled_at"))
+    # Web creation and the recurrence runner can already own a transaction.
+    # The shared context uses a savepoint when nested; the capacity check and
+    # insertion always hold the same owner lock across processes.
+    with personal.owner_transaction(user_id, db_connection=db):
+        personal.assert_request_capacity(user_id, db_connection=db)
+        request_id = insert_id(
+            """INSERT INTO requests
+            (requester_id, category, what, place, time_needed, urgency, details, status, priority_boost,
+             lat, lon, expires_at, reward_rub, scheduled_at, reserve_deadline_at,
+             reward_pricing_version,reward_total_rub,commission_rub,helper_reward_rub)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, category, data["what"], data["place"], data["time_needed"], data["urgency"], data["details"], STATUS_OPEN,
+             data.get("lat"), data.get("lon"), expires_at, quote["reward_rub"], scheduled_at,
+             workflow.reserve_deadline() if quote["reward_rub"] else None, quote["version"],
+             quote["total_rub"], quote["commission_rub"], quote["helper_rub"]),
+        )
+        db.execute(
+            "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
+            (request_id, user_id, "created", "Заявка опубликована и ожидает помощника."),
+        )
+        return request_id
 
 def expire_open_requests() -> None:
     cutoff=datetime.now(timezone.utc).isoformat()
@@ -222,12 +232,40 @@ def apply_to_request(request_id: int, helper_id: int) -> str:
 
 
 def get_request_applications(requester_id: int, limit: int = 100):
-    return db.execute("""SELECT rc.request_id,rc.candidate_id helper_id,rc.offer_token application_token,
-                         u.name helper_name,r.what,r.requester_id,rc.updated_at
+    rows = db.execute("""SELECT rc.request_id,rc.candidate_id helper_id,rc.offer_token application_token,
+                         u.name helper_name,r.what,r.requester_id,rc.updated_at,
+                         r.category,r.lat request_lat,r.lon request_lon,r.scheduled_at,
+                         u.lat,u.lon,u.helper_categories,u.helper_radius_km,u.helper_available_from,
+                         u.helper_available_until,u.pro_until,u.verified_until,
+                         COALESCE((SELECT AVG(done.requester_rating) FROM requests done
+                            WHERE done.helper_id=u.user_id AND done.status='done' AND done.requester_rating IS NOT NULL),0) helper_rating,
+                         EXISTS(SELECT 1 FROM requests active WHERE active.helper_id=u.user_id AND active.status='in_progress') helper_busy
                          FROM request_candidates rc JOIN requests r ON r.id=rc.request_id
                          JOIN users u ON u.user_id=rc.candidate_id
                          WHERE r.requester_id=? AND r.status=? AND rc.status='applied' AND u.is_blocked=0
-                         ORDER BY rc.updated_at DESC,rc.request_id DESC LIMIT ?""", (requester_id, STATUS_OPEN, limit)).fetchall()
+                         ORDER BY rc.updated_at DESC,rc.request_id DESC""", (requester_id, STATUS_OPEN)).fetchall()
+    result = []
+    fields = ("request_id", "helper_id", "application_token", "helper_name", "what", "requester_id", "updated_at")
+    for row in rows:
+        try:
+            stored = json.loads(row["helper_categories"] or "[]")
+            cats = [category for category in stored if category in CATEGORIES] if isinstance(stored, list) else []
+        except (TypeError, ValueError):
+            cats = []
+        request = {"lat": row["request_lat"], "lon": row["request_lon"], "scheduled_at": row["scheduled_at"], "category": row["category"]}
+        distance = haversine_km(request["lat"], request["lon"], row["lat"], row["lon"])
+        category_match = not cats or request["category"] in cats
+        available = matches_helper_preferences(request, row, distance) and not row["helper_busy"]
+        fitness = 100 if category_match else 0
+        fitness += 20 if available else 0
+        fitness += float(row["helper_rating"]) * 12 + (max(0, 30-distance*3) if distance < 10 else 0)
+        fitness += 12 if _entitlement_active(row["verified_until"]) else 0
+        active = _entitlement_active(row["pro_until"])
+        # The same small live bonus as matching, never an unconditional PRO-first
+        # tier. Category, availability, reputation and distance retain weight.
+        result.append({**{field: row[field] for field in fields}, "pro_active": active, "score": round(fitness + (8 if active and category_match and available else 0), 1)})
+    result.sort(key=lambda row: (row["score"], row["updated_at"], row["request_id"]), reverse=True)
+    return result[:max(1, min(int(limit), 1000))]
 
 
 def get_helper_applications(helper_id: int):
@@ -277,6 +315,7 @@ def get_helper_offers(helper_id: int, limit: int = 20):
     return db.execute(
         """SELECT rc.request_id, rc.updated_at, rc.offer_token, r.category, r.what, r.place,
                   r.time_needed, r.urgency, r.details, r.requester_id, r.reward_rub, r.reward_test_rub, r.reward_payment_status,
+                  r.reward_pricing_version,r.reward_total_rub,r.commission_rub,r.helper_reward_rub,
                   requester.name requester_name, requester.username requester_username
            FROM request_candidates rc
            JOIN requests r ON r.id = rc.request_id
@@ -485,18 +524,23 @@ def try_assign_helper(request_id: int, helper_id: int) -> bool:
 
 
 def request_reward_note(request) -> str:
-    amount=int(request["reward_rub"] or 0)
-    if not amount:return "Бесплатная помощь, расчёт в H-Points."
-    test=int(request["reward_test_rub"] or 0) if "reward_test_rub" in request.keys() else 0
-    fee,net=workflow.split_reward(amount)
-    label=f"{amount} тестовых ₽, помощнику {net} после комиссии {fee} (15%)" if test==amount else f"{amount} ₽"
-    if request["reward_payment_status"]=="released":return f"Помощник получил {net if test==amount else amount} {'тестовых ' if test==amount else ''}₽ в кошелёк."
-    if request["reward_payment_status"]=="paid":return label+" в резерве. Выплата после подтверждения автором."
-    return f"{amount} тестовых ₽ за помощь. Создайте резерв в течение 5 минут. Комиссия проекта — 15%."
+    quote = workflow.reward_quote(request)
+    if not quote["reward_rub"]:
+        return "Бесплатная помощь, расчёт в H-Points."
+    unit = "тестовых ₽" if quote["test_only"] else "₽"
+    label = (f"Помощнику {quote['helper_rub']} {unit}; комиссия H-Point {quote['commission_rub']} {unit}; "
+             f"всего {quote['total_rub']} {unit}")
+    if request["reward_payment_status"] == "released":
+        return f"Помощник получил {quote['helper_rub']} {unit}. Комиссия H-Point — {quote['commission_rub']} {unit}."
+    if request["reward_payment_status"] == "wallet_refunded":
+        return f"Весь резерв {quote['total_rub']} {unit} возвращён автору."
+    if request["reward_payment_status"] == "paid":
+        return label + " в резерве. Выплата после подтверждения автором."
+    return label + ". Создайте резерв в течение 5 минут."
 
 
 def reserve_request_reward(request_id: int, requester_id: int, expected_amount: int) -> bool:
-    """Hold real wallet funds, without paying the helper or changing H-Points."""
+    """Hold the agreed full test reserve, without payout or changing H-Points."""
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
@@ -505,8 +549,9 @@ def reserve_request_reward(request_id: int, requester_id: int, expected_amount: 
             db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (requester_id,)).fetchone()
         if not request or request["requester_id"] != requester_id or request["status"] != STATUS_OPEN:
             raise ValueError("request unavailable")
-        amount = int(request["reward_rub"] or 0)
-        if amount <= 0 or amount != expected_amount:
+        quote = workflow.reward_quote(request)
+        amount = quote["total_rub"]
+        if amount <= 0 or isinstance(expected_amount, bool) or not isinstance(expected_amount, int) or amount != expected_amount:
             raise ValueError("reward changed")
         if request["reward_payment_status"] == "paid":
             db.execute("COMMIT")
@@ -521,7 +566,7 @@ def reserve_request_reward(request_id: int, requester_id: int, expected_amount: 
         balance = db.execute("SELECT COALESCE(SUM(test_amount_rub),0) amount FROM wallet_transactions WHERE user_id=?", (requester_id,)).fetchone()["amount"]
         if int(balance or 0) < amount:
             raise ValueError("insufficient wallet")
-        if not wallet_add_entry(requester_id, -amount, "reward_reserve", "Тестовое вознаграждение зарезервировано до подтверждения помощи автором", f"request:{request_id}:reserve", request_id, test_amount_rub=-amount):
+        if not wallet_add_entry(requester_id, -amount, "reward_reserve", "Полная тестовая сумма помощи и комиссии зарезервирована до подтверждения автором", f"request:{request_id}:reserve", request_id, test_amount_rub=-amount):
             raise ValueError("reserve already recorded")
         reserve=db.execute("SELECT test_amount_rub FROM wallet_transactions WHERE reference=?",(f"request:{request_id}:reserve",)).fetchone()
         db.execute("UPDATE requests SET reward_payment_status='paid',reward_test_rub=? WHERE id=?", (-int(reserve["test_amount_rub"]),request_id))
@@ -593,14 +638,18 @@ def complete_request(request_id: int, helper_id: int, confirmed_by: int | None =
             db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (REQUEST_COST, req["requester_id"]))
             db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (HELPER_REWARD, helper_id))
         if req["reward_payment_status"] == "paid" and int(req["reward_rub"] or 0) > 0:
-            amount = int(req["reward_rub"])
-            if int(req["reward_test_rub"] or 0)==amount:
-                fee,net=workflow.record_commission(db,request_id,amount)
-                wallet_add_entry(helper_id, net, "reward_earned", "Тестовое вознаграждение за помощь после комиссии 15%", f"request:{request_id}:earned", request_id, test_amount_rub=net)
+            quote = workflow.reward_quote(req)
+            if int(req["reward_test_rub"] or 0) == quote["total_rub"]:
+                fee, net = workflow.record_commission(db,request_id,quote)
+                if not wallet_add_entry(helper_id, net, "reward_earned", "Тестовое вознаграждение за завершённую помощь по согласованным условиям", f"request:{request_id}:earned", request_id, test_amount_rub=net):
+                    raise ValueError("payout already recorded")
                 db.execute("UPDATE requests SET commission_rub=?,helper_reward_rub=? WHERE id=?",(fee,net,request_id))
             else:
                 # Preserve obligations for any historical real reserves.
-                wallet_add_entry(helper_id, amount, "reward_earned", "Вознаграждение за завершённую заявку", f"request:{request_id}:earned", request_id, test_amount_rub=int(req["reward_test_rub"] or 0))
+                if quote["version"] != workflow.LEGACY_PRICING_VERSION:
+                    raise ValueError("new reward requires test reserve")
+                if not wallet_add_entry(helper_id, quote["helper_rub"], "reward_earned", "Вознаграждение за завершённую заявку", f"request:{request_id}:earned", request_id, test_amount_rub=quote["helper_test_rub"]):
+                    raise ValueError("payout already recorded")
             db.execute("UPDATE requests SET reward_payment_status='released' WHERE id=?", (request_id,))
         db.execute(
             "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
@@ -706,11 +755,20 @@ def is_business(user_id: int) -> bool:
 
 def grant_entitlement(user_id: int, item_type: str, request_id: int | None = None, ad_text: str | None = None, subscription_until: int | None = None) -> None:
     if item_type == "pro":
+        current = get_user(user_id)["pro_until"]
+        prior_end = _entitlement_date(current)
+        at = datetime.now(timezone.utc)
+        if prior_end and prior_end <= at:
+            # A purchase can arrive before the periodic worker observes expiry.
+            # Preserve the required explicit resume, even across server downtime.
+            from . import personal
+            for schedule in db.execute("SELECT id,frequency,local_time,weekday,day_of_month FROM personal_schedules WHERE owner_id=? AND status='active'", (user_id,)).fetchall():
+                following=personal.next_run(schedule["frequency"],schedule["local_time"],schedule["weekday"],schedule["day_of_month"],at)
+                db.execute("UPDATE personal_schedules SET status='paused',next_run_at=?,last_status='paused',last_reason='pro_expired',updated_at=? WHERE id=? AND owner_id=? AND status='active'", (following,at.isoformat(),schedule["id"],user_id))
         if subscription_until:
             until = datetime.fromtimestamp(subscription_until, tz=timezone.utc).isoformat()
         else:
-            current = get_user(user_id)["pro_until"]
-            base = _entitlement_date(current) or datetime.now(timezone.utc)
+            base = prior_end or at
             if base < datetime.now(timezone.utc): base = datetime.now(timezone.utc)
             until = (base + timedelta(days=30)).isoformat()
         db.execute("UPDATE users SET pro_until=? WHERE user_id=?", (until, user_id))
@@ -769,6 +827,7 @@ def match_score(request, helper_id: int) -> int:
     score += max(0, 20 - int(request["id"]) % 20)
     score += int(request["priority_boost"] or 0)
     if is_pro(request["requester_id"]): score += 10
+    if is_pro(helper_id): score += 8
     return score
 
 
@@ -803,18 +862,21 @@ def smart_match(request_id, limit=20, query=""):
     out=[]
     terms = _query_terms(query)
     for u in rows:
-        if u["user_id"] in unavailable_for_request or (u["user_id"] not in applied_ids and get_active_help(u["user_id"]) is not None): continue
+        busy = get_active_help(u["user_id"]) is not None
+        if u["user_id"] in unavailable_for_request or (u["user_id"] not in applied_ids and busy): continue
         cats=get_helper_categories(u["user_id"])
         if cats and req["category"] not in cats and u["user_id"] not in applied_ids: continue
         category_bonus=100 if (not cats or req["category"] in cats) else 0
         distance=haversine_km(req["lat"],req["lon"],u["lat"],u["lon"])
-        if u["user_id"] not in applied_ids and not matches_helper_preferences(req,u,distance):continue
+        available = matches_helper_preferences(req,u,distance)
+        if u["user_id"] not in applied_ids and not available:continue
         stats=db.execute("""SELECT AVG(requester_rating) avg,COUNT(*) n FROM requests
                             WHERE helper_id=? AND status=? AND requester_rating IS NOT NULL""",(u["user_id"],STATUS_DONE)).fetchone()
         rating=float(stats["avg"]) if stats["avg"] is not None else 0.0
         rating_bonus=rating*12
         verified_bonus=12 if is_verified(u["user_id"]) else 0
-        pro_bonus=8 if is_pro(u["user_id"]) else 0
+        pro_active=is_pro(u["user_id"])
+        pro_bonus=8 if pro_active and category_bonus and available and not busy else 0
         distance_bonus=max(0,30-distance*3) if distance < 10 else 0
         profile_text=" ".join(str(u.get(field) or "") if isinstance(u, dict) else str(u[field] or "") for field in ("name","username","city","bio","helper_categories")).lower()
         query_bonus=min(25, 8 * sum(term in profile_text for term in terms))
@@ -828,7 +890,7 @@ def smart_match(request_id, limit=20, query=""):
         if query_bonus: reasons.append("соответствует уточнению")
         out.append({"user_id":u["user_id"],"name":u["name"],"username":u["username"],"rating":round(rating,1),
                     "reviews":int(stats["n"] or 0),"verified":is_verified(u["user_id"]),"distance_km":round(distance,2) if distance<999 else None,
-                    "score":round(score,1),"applied":u["user_id"] in applied_ids,
+                    "score":round(score,1),"applied":u["user_id"] in applied_ids,"pro_active":pro_active,
                     # A requester only needs the distance to compare helpers.
                     # Publishing even rounded coordinates would expose a
                     # helper's neighbourhood before they accept the task.

@@ -1,4 +1,5 @@
 """Paid priorities change the actual matching results and expire normally."""
+import json
 import sqlite3
 import unittest
 from datetime import datetime,timedelta,timezone
@@ -47,7 +48,8 @@ class SubscriptionEffects(unittest.TestCase):
         self.assertEqual(services.smart_requests_for_helper(2)[0]["request"]["id"],first)
         billing.purchase_with_wallet(4,"pro",{},"effects-requester-pro")
         self.assertEqual(services.smart_requests_for_helper(2)[0]["request"]["id"],second)
-        billing.purchase_with_wallet(1,"boost",{"request_id":first},"effects-request-boost")
+        # A previously paid boost remains effective, but cannot be bought anew.
+        services.grant_entitlement(1,"boost",request_id=first)
         self.assertEqual(services.smart_requests_for_helper(2)[0]["request"]["id"],first)
         self.assertEqual(database.get_request(first)["priority_boost"],100)
 
@@ -98,31 +100,31 @@ class SubscriptionEffects(unittest.TestCase):
         self.assertEqual(len(billing.subscription_state(1)["history"]),2)
         self.assertEqual(billing.subscription_state(1)["history"][0]["status"],"scheduled")
 
-    def test_purchase_key_cannot_change_the_product_or_request(self):
+    def test_purchase_key_cannot_change_the_product_owner_or_metadata(self):
         self.db.execute("UPDATE users SET balance=1000 WHERE user_id=1")
-        first=self.request();second=self.request()
-        billing.purchase_with_points(1,"boost",{"request_id":first},"bound-product-key")
-        for item,metadata in (("pro",{}),("boost",{"request_id":second})):
+        billing.purchase_with_points(1,"pro",{},"bound-product-key")
+        for uid,metadata in ((1,{"renew":True}),(2,{})):
             with self.assertRaisesRegex(ValueError,"purchase key already used"):
-                billing.purchase_with_points(1,item,metadata,"bound-product-key")
-        self.assertEqual(database.get_user(1)["balance"],975)
-        self.assertEqual(database.get_request(second)["priority_boost"],0)
-        self.assertIsNone(database.get_user(1)["pro_until"])
+                billing.purchase_with_points(uid,"pro",metadata,"bound-product-key")
+        with self.assertRaises(ValueError):
+            billing.purchase_with_points(1,"boost",{},"bound-product-key")
+        self.assertEqual(database.get_user(1)["balance"],910)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM billing_invoices").fetchone()["n"],1)
 
     def test_purchase_key_cannot_change_wallet_metadata(self):
-        first=self.request();second=self.request()
-        billing.purchase_with_wallet(1,"boost",{"request_id":first},"wallet-bound-key")
+        billing.purchase_with_wallet(1,"pro",{},"wallet-bound-key")
         with self.assertRaisesRegex(ValueError,"purchase key already used"):
-            billing.purchase_with_wallet(1,"boost",{"request_id":second},"wallet-bound-key")
-        self.assertEqual(database.wallet_summary(1)["test_balance_rub"],951)
+            billing.purchase_with_wallet(1,"pro",{"renew":True},"wallet-bound-key")
+        self.assertEqual(database.wallet_summary(1)["test_balance_rub"],851)
 
     def test_promotion_retry_after_request_closes_returns_original_invoice(self):
         rid=self.request()
-        metadata={"request_id":rid}
-        invoice,_=billing.purchase_with_wallet(1,"boost",metadata,"closed-request-retry")
+        self.db.execute("INSERT INTO billing_invoices(user_id,item_type,amount_rub,currency,payload,metadata) VALUES(1,'boost',49,'RUB','historical-closed-request',?)",(json.dumps({"request_id":rid}),))
+        invoice=self.db.execute("SELECT id FROM billing_invoices WHERE payload='historical-closed-request'").fetchone()["id"]
+        self.assertEqual(billing.fulfill_invoice(invoice),(True,"boost"))
         self.db.execute("UPDATE requests SET status='cancelled' WHERE id=?",(rid,))
-        self.assertEqual(billing.purchase_with_wallet(1,"boost",metadata,"closed-request-retry"),(invoice,False))
-        self.assertEqual(database.wallet_summary(1)["test_balance_rub"],951)
+        self.assertEqual(billing.fulfill_invoice(invoice),(True,"already_paid"))
+        self.assertEqual(database.wallet_summary(1)["test_balance_rub"],1000)
 
     def test_legacy_response_priority_is_visible_and_expires_with_request(self):
         rid=self.request()

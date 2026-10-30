@@ -161,7 +161,7 @@ class PublicOrganizationVisuals(unittest.TestCase):
         self.assertIn("prefers-color-scheme:dark", html)
         self.assertIn("prefers-reduced-motion:reduce", html)
         self.assertIn("@media(max-width:640px)", html)
-        self.assertIn('/assets/hpoint-editorial.css?v=20261030-mobile3', html)
+        self.assertIn('/assets/hpoint-editorial.css?v=20261030-plans4', html)
         self.assertIn('name="viewport"', html)
         self.assertIn('href="/#/activities"', html)
         self.assertNotIn("fonts.googleapis.com", html)

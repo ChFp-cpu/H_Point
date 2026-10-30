@@ -82,7 +82,7 @@ def document(profile, public_url):
         '<link rel="canonical" href="' + canonical + '"><meta property="og:type" content="website">'
         '<meta property="og:title" content="' + title + ' — H-Point"><meta property="og:url" content="' + canonical + '">'
         '<link rel="icon" type="image/png" sizes="192x192" href="/assets/favicon-192.png">'
-        '<link rel="stylesheet" href="/assets/hpoint-editorial.css?v=20261030-mobile3">'
+        '<link rel="stylesheet" href="/assets/hpoint-editorial.css?v=20261030-plans4">'
         + SYSTEM_THEME_META + '<style>' + SYSTEM_THEME_CSS + ORG_CSS + '</style></head><body><main class="orgPage">'
         '<header class="orgHeader"><a href="/" aria-label="На главную H-Point"><img src="/assets/hpoint-logo-dark.webp" alt="H-Point" width="145" height="48"></a>'
         '<a class="orgLink" href="/#/activities">Все услуги <span aria-hidden="true">↗</span></a></header>'
@@ -101,4 +101,4 @@ def document(profile, public_url):
            '<p>' + contact_intro + '</p></div><div class="orgContactList">' + details + '</div></section>' if details else '')
         + '<p class="orgNote">Сейчас H-Point работает в тестовом режиме. Цены указаны в тестовых рублях; оплата через эту страницу не проводится.</p>'
         + '<footer class="orgFooter"><a class="orgLink" href="/#/profile">Открыть свой кабинет в H-Point <span aria-hidden="true">↗</span></a>'
-        + credits + '</footer></main><script src="/assets/hpoint-public.js?v=20261030-mobile3"></script></body></html>')
+        + credits + '</footer></main><script src="/assets/hpoint-public.js?v=20261030-plans4"></script></body></html>')

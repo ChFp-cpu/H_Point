@@ -29,6 +29,8 @@ class InvitationData:
             self.db.execute("UPDATE users SET email=?,email_verified=1 WHERE user_id=?",(f"user{uid}@example.test",uid))
             if uid != 1:
                 services.add_to_queue(uid)
+        # These invitation suites exercise several author contracts; tariff tests are separate.
+        self.db.execute("UPDATE users SET pro_until='2099-01-01T00:00:00+00:00' WHERE user_id=1")
         self.rid = services.create_request(1, {"what": "Компьютер", "category": "tech", "place": "центр", "time_needed": "сегодня", "urgency": "обычная", "details": "test"})
 
     def close(self):
@@ -56,7 +58,7 @@ class InvitationCore(InvitationData, unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM request_events WHERE event_type='helper_accepted'").fetchone()["n"],1)
 
     def test_paid_direct_accept_cannot_bypass_wallet_reserve(self):
-        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?",(self.rid,))
+        self.db.execute("UPDATE requests SET reward_rub=400,reward_pricing_version='legacy_v1',reward_total_rub=0,commission_rub=0,helper_reward_rub=0 WHERE id=?",(self.rid,))
         self.assertEqual(services.accept_open_request(self.rid,2),"awaiting_funds")
         self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM chats").fetchone()["n"],0)
         database.wallet_add_entry(1,500,"test","Synthetic","test")
@@ -86,7 +88,7 @@ class InvitationCore(InvitationData, unittest.TestCase):
         self.assertIsNone(database.get_request(self.rid)["helper_id"])
 
     def test_paid_invite_before_reserve_then_author_confirms_wallet_release(self):
-        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        self.db.execute("UPDATE requests SET reward_rub=400,reward_pricing_version='legacy_v1',reward_total_rub=0,commission_rub=0,helper_reward_rub=0 WHERE id=?", (self.rid,))
         hp = [database.get_user(uid)["balance"] for uid in (1, 2)]
         self.assertTrue(services.offer_helper(self.rid, 2))
         token = self.current()["offer_token"]
@@ -116,7 +118,7 @@ class InvitationCore(InvitationData, unittest.TestCase):
         self.assertEqual([database.get_user(uid)["balance"] for uid in (1, 2)], hp)
 
     def test_paid_reserve_is_returned_once_if_open_request_is_cancelled(self):
-        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        self.db.execute("UPDATE requests SET reward_rub=400,reward_pricing_version='legacy_v1',reward_total_rub=0,commission_rub=0,helper_reward_rub=0 WHERE id=?", (self.rid,))
         database.wallet_add_entry(1, 500, "test", "Synthetic funds", "test")
         services.reserve_request_reward(self.rid, 1, 400)
         self.assertTrue(services.cancel_request(self.rid, 1))
@@ -225,6 +227,8 @@ class InvitationRace(unittest.TestCase):
         for uid in (1, 2, 3):
             database.create_user(uid, f"User {uid}")
             services.add_to_queue(uid)
+        # These invitation suites exercise several author contracts; tariff tests are separate.
+        self.db.execute("UPDATE users SET pro_until='2099-01-01T00:00:00+00:00' WHERE user_id=1")
         self.rid = services.create_request(1, {"what": "Помочь", "place": "центр", "time_needed": "сегодня", "urgency": "обычная", "details": "test"})
         services.offer_helper(self.rid, 2)
         self.token = services.get_current_helper_offer(self.rid)["offer_token"]
@@ -248,7 +252,7 @@ class InvitationRace(unittest.TestCase):
             return [job.result(timeout=10) for job in jobs]
 
     def test_simultaneous_reserve_debits_only_once(self):
-        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        self.db.execute("UPDATE requests SET reward_rub=400,reward_pricing_version='legacy_v1',reward_total_rub=0,commission_rub=0,helper_reward_rub=0 WHERE id=?", (self.rid,))
         database.wallet_add_entry(1,600,"test","Synthetic","test")
         results=self.race(lambda:services.reserve_request_reward(self.rid,1,400),lambda:services.reserve_request_reward(self.rid,1,400))
         self.assertEqual(sorted(results),[False,True])
@@ -256,8 +260,9 @@ class InvitationRace(unittest.TestCase):
         self.assertEqual(database.wallet_summary(1)["test_reserved_rub"],400)
 
     def test_two_reserves_cannot_overdraw_one_wallet(self):
-        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        self.db.execute("UPDATE requests SET reward_rub=400,reward_pricing_version='legacy_v1',reward_total_rub=0,commission_rub=0,helper_reward_rub=0 WHERE id=?", (self.rid,))
         other=services.create_request(1,{"what":"Другой резерв","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test","reward_rub":400})
+        self.db.execute("UPDATE requests SET reward_pricing_version='legacy_v1',reward_total_rub=0,commission_rub=0,helper_reward_rub=0 WHERE id=?",(other,))
         database.wallet_add_entry(1,600,"test","Synthetic","test")
         def reserve(rid):
             try:return services.reserve_request_reward(rid,1,400)
@@ -267,7 +272,7 @@ class InvitationRace(unittest.TestCase):
         self.assertEqual(database.wallet_summary(1)["test_balance_rub"],200)
 
     def test_simultaneous_confirmation_cannot_pay_helper_twice(self):
-        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        self.db.execute("UPDATE requests SET reward_rub=400,reward_pricing_version='legacy_v1',reward_total_rub=0,commission_rub=0,helper_reward_rub=0 WHERE id=?", (self.rid,))
         database.wallet_add_entry(1,600,"test","Synthetic","test")
         services.reserve_request_reward(self.rid,1,400)
         self.assertTrue(services.respond_to_helper_offer(self.rid,2,True,self.token))
@@ -345,7 +350,7 @@ class InvitationAPI(InvitationData, unittest.TestCase):
             self.assertEqual(response.code, status)
 
     def test_paid_request_api_invites_reserves_and_confirms_without_hp_or_direct_pay(self):
-        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        self.db.execute("UPDATE requests SET reward_rub=400,reward_pricing_version='legacy_v1',reward_total_rub=0,commission_rub=0,helper_reward_rub=0 WHERE id=?", (self.rid,))
         self.request(1, "/api/smart-match/assign", {"request_id":self.rid,"helper_id":2})
         offer = self.request(2, "/api/helper/offers")["offers"][0]
         self.assertEqual(offer["reward_rub"], 400)
@@ -377,7 +382,7 @@ class InvitationAPI(InvitationData, unittest.TestCase):
         self.assertEqual([database.get_user(uid)["balance"] for uid in (1,2)],[90,120])
 
     def test_real_acquiring_is_disabled_without_creating_a_reward_invoice(self):
-        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        self.db.execute("UPDATE requests SET reward_rub=400,reward_pricing_version='legacy_v1',reward_total_rub=0,commission_rub=0,helper_reward_rub=0 WHERE id=?", (self.rid,))
         with patch.object(web,"ROBOKASSA_MERCHANT_LOGIN",""),patch.object(web,"ROBOKASSA_PASSWORD_1",""),patch.object(web,"ROBOKASSA_PASSWORD_2",""):
             self.assert_error(409,1,"/api/requests/reward/pay",{"request_id":self.rid})
         self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM billing_invoices WHERE item_type='request_reward'").fetchone()["n"],0)
@@ -497,7 +502,7 @@ class InvitationAPI(InvitationData, unittest.TestCase):
 
 class InvitationBot(InvitationData, unittest.IsolatedAsyncioTestCase):
     async def test_paid_bot_explains_reserve_and_requires_author_payout(self):
-        self.db.execute("UPDATE requests SET reward_rub=400 WHERE id=?", (self.rid,))
+        self.db.execute("UPDATE requests SET reward_rub=400,reward_pricing_version='legacy_v1',reward_total_rub=0,commission_rub=0,helper_reward_rub=0 WHERE id=?", (self.rid,))
         services.offer_helper(self.rid,2)
         callback = self.callback(2,"accept",self.current()["offer_token"])
         await handlers.cb_helper_offer_response(callback,self.bot)
@@ -541,6 +546,9 @@ class InvitationBot(InvitationData, unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self.prepare()
+        # Management authorization is tested independently. These lifecycle
+        # scenarios reach the author/helper rules through the paid bot gate.
+        self.db.execute("UPDATE users SET pro_until='2099-01-01T00:00:00+00:00'")
         self.bot = SimpleNamespace(send_message=AsyncMock())
 
     def tearDown(self):
@@ -548,7 +556,7 @@ class InvitationBot(InvitationData, unittest.IsolatedAsyncioTestCase):
 
     def callback(self, uid, action, token):
         # Telegram callback.message is sent by the bot, not by the requester.
-        message = SimpleNamespace(from_user=SimpleNamespace(id=999000), edit_text=AsyncMock(), answer=AsyncMock())
+        message = SimpleNamespace(from_user=SimpleNamespace(id=999000), chat=SimpleNamespace(type="private"), edit_text=AsyncMock(), answer=AsyncMock())
         return SimpleNamespace(from_user=SimpleNamespace(id=uid), data=f"offer:{action}:{self.rid}:{token}", message=message, answer=AsyncMock())
 
     async def test_bot_reads_real_applications_and_can_decline_them(self):
@@ -566,7 +574,7 @@ class InvitationBot(InvitationData, unittest.IsolatedAsyncioTestCase):
     async def test_bot_accepts_legacy_response_and_notifies_linked_accounts(self):
         services.apply_to_request(self.rid,2)
         self.db.execute("UPDATE users SET tg_user_id=user_id*1000")
-        callback=self.callback(1,"accept","")
+        callback=self.callback(1000,"accept","")
         callback.data=f"candidate:assign:{self.rid}:2"
         await handlers.cb_candidate_assign(callback,self.bot)
         self.assertEqual(database.get_request(self.rid)["helper_id"],2)

@@ -397,6 +397,8 @@ def init_db():
     commercial.initialize_schema(db)
     from .work_bot import initialize_schema as initialize_work_bot
     initialize_work_bot(db)
+    from .personal import initialize_schema as initialize_personal
+    initialize_personal(db)
     reliability.migrate_wallet_sources(db)
     reliability.reconcile_closed_reserves(db, wallet_add_entry)
     # Legacy payment columns remain for backwards-compatible data, but new code never uses them.
@@ -633,11 +635,21 @@ def create_community_event(creator_id, title, description, place, starts_at, end
         raise ValueError("Некорректное количество мест.") from exc
     if capacity and not 2 <= capacity <= 1000:
         raise ValueError("Количество мест — от 2 до 1000, либо оставьте поле пустым.")
-    future_count = db.execute("SELECT COUNT(*) total FROM community_events WHERE creator_id=? AND status='published' AND starts_at>?", (creator_id, current.isoformat())).fetchone()["total"]
-    if int(future_count) >= 20:
-        raise ValueError("У вас уже слишком много запланированных мероприятий.")
-    return insert_id("""INSERT INTO community_events(creator_id,title,description,place,starts_at,ends_at,capacity,image_data)
-                      VALUES(?,?,?,?,?,?,?,?)""", (creator_id, title, description, place, start, end, capacity, image_data or ""))
+    from . import personal
+    with personal.owner_transaction(creator_id, db):
+        # Lock waits can cross the Moscow month boundary. Count the successful
+        # publication using its actual insertion time, not form-validation time.
+        publication_time = datetime.now(timezone.utc)
+        if start_time <= publication_time:
+            raise ValueError("Время мероприятия должно быть в будущем.")
+        personal.assert_activity_capacity(creator_id, db, publication_time)
+        future_count = db.execute("SELECT COUNT(*) total FROM community_events WHERE creator_id=? AND status='published' AND starts_at>?", (creator_id, publication_time.isoformat())).fetchone()["total"]
+        if int(future_count) >= 20:
+            raise ValueError("У вас уже слишком много запланированных мероприятий.")
+        event_id = insert_id("""INSERT INTO community_events(creator_id,title,description,place,starts_at,ends_at,capacity,image_data)
+                          VALUES(?,?,?,?,?,?,?,?)""", (creator_id, title, description, place, start, end, capacity, image_data or ""))
+        personal.record_activity_publication(creator_id, event_id, db, publication_time)
+        return event_id
 
 HELP_LEAGUES = (
     ("newcomer", "Новичок", 0),
@@ -1378,13 +1390,25 @@ def grant_registration_bonus(user_id, amount_rub=None):
 
 def wallet_summary(user_id, limit=50):
     total,test=reliability.wallet_balances(db,user_id)
-    reserved=db.execute("SELECT COALESCE(SUM(reward_rub),0) total,COALESCE(SUM(reward_test_rub),0) test FROM requests WHERE requester_id=? AND reward_payment_status='paid' AND status IN (?,?)",(user_id,STATUS_OPEN,STATUS_IN_PROGRESS)).fetchone()
-    incoming=db.execute("SELECT COALESCE(SUM(reward_rub),0) total,COALESCE(SUM(reward_test_rub),0) test FROM requests WHERE helper_id=? AND reward_payment_status='paid' AND status=?",(user_id,STATUS_IN_PROGRESS)).fetchone()
+    reserved_rows=db.execute("SELECT * FROM requests WHERE requester_id=? AND reward_payment_status='paid' AND status IN (?,?)",(user_id,STATUS_OPEN,STATUS_IN_PROGRESS)).fetchall()
+    incoming_rows=db.execute("SELECT * FROM requests WHERE helper_id=? AND reward_payment_status='paid' AND status=?",(user_id,STATUS_IN_PROGRESS)).fetchall()
+    reserved_total=reserved_test=incoming_real=incoming_test=incoming_test_net=0
+    for row in reserved_rows:
+        quote=workflow.reward_quote(row)
+        reserved_total+=quote["total_rub"]
+        reserved_test+=int(row["reward_test_rub"] or 0)
+    for row in incoming_rows:
+        quote=workflow.reward_quote(row)
+        incoming_real+=quote["helper_rub"]-quote["helper_test_rub"]
+        incoming_test_net+=quote["helper_test_rub"]
+        # Retain the old private gross field for existing legacy consumers;
+        # the public wallet has always displayed the separate net field.
+        incoming_test+=(int(row["reward_test_rub"] or 0) if quote["version"]==workflow.LEGACY_PRICING_VERSION else quote["helper_test_rub"])
     rows=db.execute("SELECT amount_rub,test_amount_rub,kind,description,request_id,invoice_id,created_at FROM wallet_transactions WHERE user_id=? ORDER BY id DESC LIMIT ?",(user_id,limit)).fetchall()
     return {"balance_rub":total-test,"test_balance_rub":test,"available_total_rub":total,
-            "reserved_rub":int(reserved["total"])-int(reserved["test"]),"test_reserved_rub":int(reserved["test"]),
-            "incoming_rub":int(incoming["total"])-int(incoming["test"]),"test_incoming_rub":int(incoming["test"]),
-            "test_incoming_net_rub":sum(workflow.split_reward(int(row["reward_rub"]))[1] for row in db.execute("SELECT reward_rub FROM requests WHERE helper_id=? AND reward_payment_status='paid' AND status=? AND reward_test_rub=reward_rub",(user_id,STATUS_IN_PROGRESS)).fetchall()),
+            "reserved_rub":reserved_total-reserved_test,"test_reserved_rub":reserved_test,
+            "incoming_rub":incoming_real,"test_incoming_rub":incoming_test,
+            "test_incoming_net_rub":incoming_test_net,
             "transactions":[dict(row) for row in rows]}
 
 

@@ -98,6 +98,9 @@ class CategoryMatching(unittest.TestCase):
         database.init_db()
         for user_id in (1, 2, 3):
             database.create_user(user_id, "Synthetic category " + str(user_id), None)
+        # Matching cases compare several simultaneous author tasks; tariff
+        # enforcement has its own free/PRO boundary and race scenarios.
+        self.connection.execute("UPDATE users SET pro_until='2099-01-01T00:00:00+00:00' WHERE user_id=1")
 
     def tearDown(self):
         for item in reversed(self.patches):
@@ -139,6 +142,7 @@ class CategoryMatching(unittest.TestCase):
                 self.assertEqual(preferences["helper_categories"], [category])
                 request_id = self.create("Synthetic selected direction", category)
                 self.assertEqual(database.get_request(request_id)["category"], category)
+                services.cancel_request(request_id, 1)
 
 
 class CategoryHTTP(unittest.TestCase):
@@ -159,6 +163,7 @@ class CategoryHTTP(unittest.TestCase):
                                  email=f"category{user_id}@example.test", password_hash="synthetic-unused")
             self.connection.execute("UPDATE users SET email_verified=1 WHERE user_id=?", (user_id,))
             self.tokens[user_id] = web.new_sess(user_id)
+        self.connection.execute("UPDATE users SET pro_until='2099-01-01T00:00:00+00:00' WHERE user_id=1")
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), web.Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

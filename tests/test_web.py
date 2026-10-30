@@ -30,16 +30,18 @@ class Web(unittest.TestCase):
      self.assertEqual(raised.exception.code,503)
      raised.exception.close()
   finally:server.shutdown();thread.join(timeout=3);server.server_close()
- def test_request_promotion_uses_catalog_prices_without_creating_a_purchase(self):
+ def test_current_pro_catalog_is_shared_without_retired_request_ads_or_purchase(self):
   self.add_user(42,"Web",tg_user_id=42,web_verified=True);token=web.new_sess(42)
   before=database.get_user(42)["balance"]
-  catalog={**web.MONETIZATION_ITEMS,"boost":{**web.MONETIZATION_ITEMS["boost"],"rub":63,"hp":29}}
+  catalog={"pro":{**web.MONETIZATION_ITEMS["pro"],"rub":163,"hp":99}}
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
   try:
    with patch.object(web,"MONETIZATION_ITEMS",catalog):
     request=urllib.request.Request(f"http://127.0.0.1:{server.server_port}/api/sync",headers={"Cookie":"hpoint_session="+token})
-    with urllib.request.urlopen(request,timeout=3) as response:promotion=json.load(response)["request_promotion"]
-   self.assertEqual((promotion["item_type"],promotion["rub"],promotion["hp"]),("boost",63,29))
+    with urllib.request.urlopen(request,timeout=3) as response:synced=json.load(response)
+   self.assertIsNone(synced["request_promotion"])
+   self.assertEqual(set(synced["paid_catalog"]),{"pro"})
+   self.assertEqual((synced["paid_catalog"]["pro"]["rub"],synced["paid_catalog"]["pro"]["hp"]),(163,99))
    self.assertEqual(database.get_user(42)["balance"],before)
    self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM billing_invoices").fetchone()["n"],0)
   finally:server.shutdown();thread.join(timeout=3);server.server_close()
@@ -199,7 +201,8 @@ class Web(unittest.TestCase):
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
   base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Content-Type":"application/json","Cookie":f"hpoint_session={token}"}
   try:
-   payload={"what":"Оплатить работу","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test","reward_rub":500}
+   quote=web.workflow.quote_new_reward(500)
+   payload={"what":"Оплатить работу","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test","reward_rub":500,"pricing_version":quote["version"],"expected_total_rub":quote["total_rub"]}
    with urllib.request.urlopen(urllib.request.Request(base+"/api/requests",data=json.dumps(payload).encode(),headers=headers,method="POST"),timeout=3) as response:
     created=json.load(response);self.assertTrue(created["ok"])
    self.assertEqual(database.get_user(1)["balance"],0)
@@ -327,6 +330,7 @@ class Web(unittest.TestCase):
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_public_open_feed_preserves_status_and_excludes_history_and_own_requests(self):
   for uid in (1,2,3):self.add_user(uid,f"User {uid}",tg_user_id=uid,web_verified=True)
+  self.db.execute("UPDATE users SET pro_until='2099-01-01T00:00:00+00:00' WHERE user_id=1")
   payload={"what":"Помочь с техникой","place":"Скрытый адрес","time_needed":"сегодня","urgency":"обычная","details":"Личные сведения","lat":55.75,"lon":37.62}
   opened=services.create_request(1,payload)
   done=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(done,3));self.assertTrue(services.complete_request(done,3,confirmed_by=1))
@@ -395,7 +399,7 @@ class Web(unittest.TestCase):
   self.add_user(42,"Separate Telegram profile",tg_user_id=42)
   legacy_request=services.create_request(42,{"what":"Помощь другого профиля","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"Separate data"})
   web_uid=database.create_web_user("Site","site@example.test",web.ph("SyntheticPass1"))
-  self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=?",(web_uid,))
+  self.db.execute("UPDATE users SET email_verified=1,pro_until='2099-01-01T00:00:00+00:00' WHERE user_id=?",(web_uid,))
   site_request=services.create_request(web_uid,{"what":"Помощь до привязки","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"site"})
   conflict_code=database.create_link_code(web_uid)
   self.assertFalse(database.link_by_code(conflict_code,42,"separate")[0])
@@ -489,8 +493,9 @@ class Web(unittest.TestCase):
      self.assertEqual(json.load(response)["messages"][-1]["text"],"Здравствуйте! <b>Текст</b> & детали\nВторая строка")
     notice.assert_called_once()
     self.assertEqual(notice.call_args.args[0],2)
-    self.assertIn("Здравствуйте! &lt;b&gt;Текст&lt;/b&gt; &amp; детали\nВторая строка",notice.call_args.args[1])
-    self.assertIn("Нужна помощь",notice.call_args.args[1]);self.assertIn(f"/#/help/chat/{rid}",notice.call_args.args[1]);self.assertNotIn("заявка №",notice.call_args.args[1])
+    parts=notice.call_args.args[1];notice_text="".join(parts) if isinstance(parts,list) else parts
+    self.assertIn("Здравствуйте! &lt;b&gt;Текст&lt;/b&gt; &amp; детали\nВторая строка",notice_text)
+    self.assertIn("Нужна помощь",notice_text);self.assertIn(f"/#/help/chat/{rid}",notice_text);self.assertNotIn("заявка №",notice_text)
    with request(f"/api/chats?request_id={rid}",uid=2) as response:
     chat=json.load(response)["chats"][0]
    self.assertEqual(chat["messages"][-1]["text"],"Здравствуйте! <b>Текст</b> & детали\nВторая строка")

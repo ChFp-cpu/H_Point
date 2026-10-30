@@ -35,8 +35,8 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   assert.equal(bought.subscription.history[0].invoice_id,bought.history[0].id);checks+=3;
   assert.match(await page.locator('[data-pro-status="active"]').innerText(),/PRO активен/);
   assert.match(await page.locator('[data-pro-status="active"]').innerText(),/Осталось 30 дней/);
-  assert.match(await proCard().innerText(),/Уже подключён до/);
-  assert.match(await proCard().locator('[data-method="wallet"]').innerText(),/Продлить на 30 дней/);
+  assert.match(await proCard().innerText(),/Подключён до/);
+  assert.match(await proCard().locator('[data-method="wallet"]').innerText(),/Продлить/);
   assert.doesNotMatch(await proCard().locator('.workspaceProductActions').innerText(),/Оплатить/);
   assert.equal(await page.locator('.workspacePromoTarget').count(),0);
   assert.equal(await page.evaluate(()=>hpointWorkspace.state.promotionItem),null);checks+=3;
@@ -67,7 +67,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   assert.equal((await get('/api/billing')).history.length,renewed.history.length);checks+=5;
   await page.reload();await page.locator('[data-pro-status="active"]').waitFor();
   assert.match(await page.locator('[data-pro-status="active"]').innerText(),/Осталось 60 дней/);
-  assert.match(await proCard().innerText(),/Продлить на 30 дней/);checks+=2;
+  assert.match(await proCard().innerText(),/Продлить/);checks+=2;
   // An open page must stop offering a renewal from a stale active snapshot
   // once its recorded deadline has passed, even before the next billing fetch.
   const expiredSnapshot=await page.evaluate(snapshot=>{

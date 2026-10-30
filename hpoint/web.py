@@ -8,13 +8,13 @@ from pathlib import Path
 from html import escape
 from . import database, services, workflow, commercial, media, chat_threads, organization_page
 from . import billing as billing_service
-from . import games, help_achievements, seo, visuals
+from . import games, help_achievements, seo, visuals, personal
 from .features import GAMES_ENABLED, GAMES_PAUSED_MESSAGE
 from .database import db, get_user, get_user_by_email, create_web_user, get_request, get_user_stats, get_active_own_request, get_history, get_billing_history, is_user_blocked, admin_summary, set_user_blocked
 from .config import *
 from .games_page import GAMES_PAGE
 from .theme import SYSTEM_THEME_CSS, APP_THEME_CSS, SYSTEM_THEME_META
-from .chat_notifications import chat_notification
+from .chat_notifications import chat_notification_chunks
 from .services import *
 from .billing import create_pending_invoice, create_request_reward_invoice, create_payment, fulfill_invoice, purchase_with_points, purchase_with_wallet, verify_robokassa_result
 from .keyboards import helper_offer_kb, candidate_kb, application_kb, finish_kb, rating_kb, request_chat_kb
@@ -63,9 +63,13 @@ def configure_telegram_notifications(bot, username=None):
 def notify_telegram_user(user_id, text, reply_markup=None):
     if _telegram_bot is None or _telegram_loop is None:
         return
+    async def send_chunks():
+        chunks = text if isinstance(text, (list, tuple)) else [text]
+        for index, chunk in enumerate(chunks):
+            await _telegram_bot.send_message(user_id, chunk, reply_markup=reply_markup if index == len(chunks)-1 else None)
     try:
         future = asyncio.run_coroutine_threadsafe(
-            _telegram_bot.send_message(user_id, text, reply_markup=reply_markup), _telegram_loop
+            send_chunks(), _telegram_loop
         )
     except RuntimeError:
         logging.warning("Telegram notification could not be scheduled")
@@ -419,10 +423,16 @@ def user_payload(u):
     except (ValueError,TypeError):pro_active=False
     if u["tg_user_id"]:
         telegram = {"name": u["name"], "username": u["username"] or "", "avatar_url": None}
-    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"role":u["role"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"email_verified":bool(u["email_verified"]),"account_verified":account_is_verified(u),"email_delivery_configured":email_delivery_configured(),"sms_delivery_configured":sms_delivery_configured(),"full_name":u["full_name"] or "","birth_date":u["birth_date"] or "","phone":u["phone"] or "","phone_verified":bool(u["phone_verified"]),"contacts_verified":contacts_ready,"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram":telegram,"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code_available":code_valid,"pro_until":u["pro_until"],"pro_active":pro_active,"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats,"helper_categories":get_helper_categories(u["user_id"]),"saved_location":u["saved_location"] or "","helper_radius_km":u["helper_radius_km"],"helper_available_from":u["helper_available_from"],"helper_available_until":u["helper_available_until"],"helper_availability":u["helper_availability"] or "","helper_ready":is_in_queue(u["user_id"])}
+    return {"id":u["user_id"],"name":u["name"],"email":u["email"],"balance":u["balance"],"city":u["city"] or "","bio":u["bio"] or "","lat":u["lat"],"lon":u["lon"],"role":u["role"],"verified":bool(u["web_verified"]) or is_verified(u["user_id"]),"email_verified":bool(u["email_verified"]),"account_verified":account_is_verified(u),"email_delivery_configured":email_delivery_configured(),"sms_delivery_configured":sms_delivery_configured(),"full_name":u["full_name"] or "","birth_date":u["birth_date"] or "","phone":u["phone"] or "","phone_verified":bool(u["phone_verified"]),"contacts_verified":contacts_ready,"identity_verified":identity_payload["status"]=="approved","identity_verification":identity_payload,"tg_linked":bool(u["tg_user_id"]),"telegram":telegram,"telegram_url":f"https://t.me/{_telegram_username}?start=profile" if u["tg_user_id"] and _telegram_username else None,"link_code_available":code_valid,"pro_until":u["pro_until"],"pro_active":personal.is_pro(u["user_id"]),"personal_usage":personal.usage(u["user_id"]),"verified_until":u["verified_until"],"business_until":u["business_until"],"stats":stats,"helper_categories":get_helper_categories(u["user_id"]),"saved_location":u["saved_location"] or "","helper_radius_km":u["helper_radius_km"],"helper_available_from":u["helper_available_from"],"helper_available_until":u["helper_available_until"],"helper_availability":u["helper_availability"] or "","helper_ready":is_in_queue(u["user_id"])}
 
 def request_payload(r):
-    d=dict(r); d["requester_name"]=(get_user(r["requester_id"]) or {"name":"Участник"})["name"]; d["photos"]=media.request_photo_metadata(db,r["id"]); d["category_name"]=CATEGORIES.get(r["category"],"Другое"); d["status_title"]=STATUS_TITLES.get(r["status"],r["status"]); return d
+    d=dict(r); d["requester_name"]=(get_user(r["requester_id"]) or {"name":"Участник"})["name"]; d["photos"]=media.request_photo_metadata(db,r["id"]); d["category_name"]=CATEGORIES.get(r["category"],"Другое"); d["status_title"]=STATUS_TITLES.get(r["status"],r["status"])
+    d["reward_quote"]=workflow.reward_quote(r)
+    d["requester_pro"]=personal.is_pro(r["requester_id"])
+    return d
+
+def personal_limit_reply(handler, error):
+    return reply(handler,{"ok":False,"error":str(error),"code":error.code,"personal_usage":error.usage},409)
 
 def public_request_payload(r):
     """Discovery and map records never disclose address details or exact coordinates."""
@@ -439,7 +449,8 @@ def public_request_payload(r):
             # it is never rendered as an identifier or paired with contacts.
             "requester_name":(get_user(r["requester_id"]) or {"name":"Участник"})["name"],
             "photos":media.request_photo_metadata(db,r["id"]),
-            "author_profile_id": int(r["requester_id"])}
+            "author_profile_id": int(r["requester_id"]), "requester_pro":personal.is_pro(r["requester_id"]),
+            "reward_quote":workflow.reward_quote(r)}
 
 def record_request_view(request_id, viewer_id):
     inserted=db.execute("INSERT OR IGNORE INTO request_views(request_id,viewer_id) VALUES(?,?)", (request_id,viewer_id))
@@ -910,14 +921,14 @@ function requestForm(){
   $('modalbody').innerHTML='<div class="requestWizard"><h2>Нужна помощь</h2><p id="requestStepLabel" class="muted">Шаг 1 из 3 · Задача</p><div class="requestSteps" aria-hidden="true"><i class="active"></i><i></i><i></i></div><div class="form">'+
   '<section class="requestStep" data-request-step="0"><label>Что нужно сделать?<input id="qw" class="input" maxlength="160" placeholder="Например, настроить компьютер"></label><label>Направление<select id="qc" class="input"><option value="other">Другое</option><option value="carry">Перенос / переезд</option><option value="shopping">Покупки</option><option value="snow">Снег / уборка</option><option value="tools">Инструменты</option><option value="transport">Транспорт</option><option value="tech">Техника</option><option value="study">Учёба</option></select></label><label>Когда?<input id="qt" class="input" maxlength="120" placeholder="Сегодня после 18:00" value="По договорённости"></label><select id="qu" class="input" aria-label="Срочность"><option>🕊 Не срочно</option><option>⏳ В течение дня</option><option>🔥 Очень срочно</option></select></section>'+
   '<section class="requestStep" data-request-step="1" hidden><label>Город, адрес или ориентир<input id="qp" class="input" maxlength="180" autocomplete="street-address" placeholder="Город, улица и дом"></label><p id="savedLocationHint" class="muted">Проверьте сохранённое место. Если вы переехали, измените адрес или точку на карте.</p><p class="muted">Точный адрес увидит помощник после согласия. Если GPS недоступен, достаточно адреса.</p><details id="requestMapDetails" class="workspaceFold"><summary>Указать точку на карте</summary><div id="requestPicker" class="map"></div><button type="button" class="btn light" onclick="requestFindAddress(false)">Найти адрес на карте</button></details></section>'+
-  '<section class="requestStep" data-request-step="2" hidden><label>Подробности<textarea id="qd" class="input textarea" maxlength="1000" placeholder="Что нужно знать помощнику? Необязательно"></textarea></label><details class="workspaceFold"><summary>Срок публикации и вознаграждение</summary><label>Срок: <b id="requestDuration">2 дня</b><input id="requestHours" type="range" min="1" max="168" value="48" oninput="this.previousElementSibling.textContent=this.value+&quot; ч.&quot;"></label><label>Вознаграждение: <b id="rewardValue">0 ₽</b><input id="rewardRub" type="range" min="0" max="10000" step="100" value="0" oninput="this.previousElementSibling.textContent=this.value+&quot; ₽&quot;"></label></details><label>Точная дата и время (необязательно)<input class="input" id="requestScheduledAt" type="datetime-local"></label><p class="muted">По умолчанию помощь бесплатная, публикация на 2 дня. Для тестового вознаграждения сразу создайте резерв. Без резерва за 5 минут помощь будет отменена. Комиссия проекта — 15%.</p></section>'+
+  '<section class="requestStep" data-request-step="2" hidden><label>Подробности<textarea id="qd" class="input textarea" maxlength="1000" placeholder="Что нужно знать помощнику? Необязательно"></textarea></label><details class="workspaceFold"><summary>Срок публикации и вознаграждение</summary><label>Срок: <b id="requestDuration">2 дня</b><input id="requestHours" type="range" min="1" max="168" value="48" oninput="this.previousElementSibling.textContent=this.value+&quot; ч.&quot;"></label><label>Вознаграждение: <b id="rewardValue">0 ₽</b><input id="rewardRub" type="range" min="0" max="10000" step="100" value="0" oninput="this.previousElementSibling.textContent=this.value+&quot; ₽&quot;"></label></details><label>Точная дата и время (необязательно)<input class="input" id="requestScheduledAt" type="datetime-local"></label><p class="muted">По умолчанию помощь бесплатная, публикация на 2 дня. Для тестового вознаграждения сразу создайте резерв. Без резерва за 5 минут помощь будет отменена. Комиссия 15% добавляется сверху к сумме помощнику. Проверьте итог ниже.</p></section>'+
   '<div id="rqerr" class="eventFormError" role="status" aria-live="polite"></div><div class="requestWizardActions"><button id="requestBack" type="button" class="btn light" onclick="requestWizardStep(-1)" hidden>Назад</button><button id="requestNext" type="button" class="btn grad" onclick="requestWizardStep(1)">Далее →</button><button id="createRequestButton" type="button" class="btn grad" onclick="createReq()" hidden>Опубликовать</button></div></div></div>';
   $('qp').value=window.hpointWorkspace?.state?.data?.user?.saved_location||window.hpointWorkspace?.state?.data?.user?.city||'';
   $('qp').addEventListener('input',function(){window.hpointRequestPoint=null});
   $('requestMapDetails').addEventListener('toggle',function(){if(this.open&&!window.hpointLocationPickers?.requestPicker?.map?.container?.getElement?.()?.isConnected)locationPicker('requestPicker',function(point){window.hpointRequestPoint=point;$('rqerr').textContent='Точка выбрана.'})});
 }
 function requestWizardStep(delta){let step=window.hpointRequestStep||0,note=$('rqerr');if(delta>0&&step===0&&$('qw').value.trim().length<3){note.textContent='Опишите задачу: минимум 3 символа.';return}if(delta>0&&step===1&&$('qp').value.trim().length<2){note.textContent='Укажите адрес или ориентир.';return}step=Math.max(0,Math.min(2,step+delta));window.hpointRequestStep=step;document.querySelectorAll('[data-request-step]').forEach(node=>node.hidden=Number(node.dataset.requestStep)!==step);document.querySelectorAll('.requestSteps i').forEach((node,index)=>node.classList.toggle('active',index<=step));$('requestStepLabel').textContent='Шаг '+(step+1)+' из 3 · '+['Задача','Место','Публикация'][step];$('requestBack').hidden=step===0;$('requestNext').hidden=step===2;$('createRequestButton').hidden=step!==2;note.textContent='';$('modalbody').closest('.box').scrollTop=0}
-async function sendReq(lat,lon){let error=$('rqerr');try{let reward=Number(($('rewardRub')||{}).value||0),hours=Number(($('requestHours')||{}).value||48),data=await api('/api/requests',{method:'POST',body:JSON.stringify({what:$('qw').value,place:$('qp').value,time_needed:$('qt').value,urgency:$('qu').value,details:$('qd').value.trim()||'Без дополнительных деталей',category:$('qc').value,lat:lat,lon:lon,expires_in_hours:hours,reward_rub:reward,scheduled_at:$("requestScheduledAt")?.value?new Date($("requestScheduledAt").value).toISOString():null,photos:window.HPointMedia?.requestPhotos()||[]})});if(window.hpointWorkspace){hpointWorkspace.state.matchRequestId=data.request_id;hpointWorkspace.state.matches=null}closeModal();await requests();if(window.hpointWorkspace)await hpointWorkspace.refresh();toast('Помощь опубликована');go('match');if(reward>0)window.hpointCreatedRequest?.(data.request_id)}catch(exception){if(error)error.textContent=exception.message||'Не удалось создать заявку'}}
+async function sendReq(lat,lon){let error=$('rqerr');try{let reward=Number(($('rewardRub')||{}).value||0),hours=Number(($('requestHours')||{}).value||48),data=await api('/api/requests',{method:'POST',body:JSON.stringify({what:$('qw').value,place:$('qp').value,time_needed:$('qt').value,urgency:$('qu').value,details:$('qd').value.trim()||'Без дополнительных деталей',category:$('qc').value,lat:lat,lon:lon,expires_in_hours:hours,reward_rub:reward,pricing_version:window.hpointPersonal?.currentQuote()?.version,expected_total_rub:window.hpointPersonal?.currentQuote()?.total_rub,scheduled_at:$("requestScheduledAt")?.value?new Date($("requestScheduledAt").value).toISOString():null,photos:window.HPointMedia?.requestPhotos()||[]})});if(window.hpointWorkspace){hpointWorkspace.state.matchRequestId=data.request_id;hpointWorkspace.state.matches=null}closeModal();await requests();if(window.hpointWorkspace)await hpointWorkspace.refresh();toast('Помощь опубликована');go('match');if(reward>0)window.hpointCreatedRequest?.(data.request_id)}catch(exception){if(error)error.textContent=exception.message||'Не удалось создать заявку';window.hpointPersonal?.refreshUsage()}}
 ensureProgressPanel();loadDonation();
 '''
 
@@ -966,7 +977,7 @@ function podiumCard(person){let name=esc(person.name||'Участник'),letter
 function leaderRow(person){let letter=esc((person.name||'?').slice(0,1).toUpperCase()),rating=person.rating===null?'нет оценок':'★ '+Number(person.rating).toFixed(1);return '<button type="button" class="leaderRow showcaseReveal" onclick="openCommunityProfile('+Number(person.user_id)+')"><span class="leaderPlace">#'+Number(person.position)+'</span><span class="leaderAvatar">'+letter+'</span><span><span class="leaderName">'+esc(person.name)+'</span><span class="leaderMeta">'+Number(person.helped)+' заверш. · '+Number(person.reviews)+' отзывов</span></span><span class="leaderScore">'+rating+'<br>'+Number(person.score)+' баллов</span></button>'}
 async function loadProgress(){ensureProgressPanel();let host=$('progressData');if(!host)return;host.innerHTML='<div class="eventEmpty">Обновляем картину сообщества…</div>';try{let d=await api('/api/progress'),summary=d.summary||{},categories=d.categories||[],leaders=d.leaderboard||[],max=Math.max(1,...categories.map(function(x){return Number(x.count)||0})),percent=Math.max(0,Math.min(100,Number(d.completion_percent)||0));let categoryHtml=categories.map(function(x){let width=Math.max(0,Math.round(Number(x.count)/max*100));return '<div class="categoryBar showcaseReveal"><span title="'+esc(x.title)+'">'+esc(x.title)+'</span><span class="categoryTrack"><i style="--bar:'+width+'%"></i></span><b>'+Number(x.count)+'</b></div>'}).join('');let podium=leaders.slice(0,3).map(podiumCard).join('');let list=leaders.slice(3).map(leaderRow).join('');host.innerHTML='<div class="progressHero"><div class="progressMetrics">'+progressMetric(summary.total,'всего заявок')+progressMetric(summary.active,'сейчас в работе')+progressMetric(summary.done,'успешно завершены')+'</div><div class="progressRingCard"><div class="progressRing" style="--progress:'+percent+'%"><b>'+percent+'%</b><span>доведено до конца</span></div></div></div><div class="progressLayout"><section class="card showcaseSection"><div class="sectionTitle"><div><h3>Направления помощи</h3><p class="muted">Что чаще всего требуется сообществу.</p></div><span class="sectionCount">'+Number(summary.total||0)+' заявок</span></div><div class="categoryList">'+(categoryHtml||'<div class="eventEmpty">Заявок пока нет.</div>')+'</div></section><section class="card showcaseSection"><div class="sectionTitle"><div><h3>Рейтинг помощников</h3><p class="muted">За завершённые заявки и оценки от участников.</p></div><span class="sectionCount">топ '+Number(leaders.length)+'</span></div>'+(podium?'<div class="ratingPodium">'+podium+'</div>':'<div class="eventEmpty">Первое завершённое дело откроет рейтинг.</div>')+(list?'<div class="leaderboardList">'+list+'</div>':'')+'</section></div>';animateCommunityNumbers(host);requestAnimationFrame(function(){host.querySelectorAll('.categoryBar').forEach(function(row,index){setTimeout(function(){row.classList.add('is-visible')},index*55)})})}catch(error){host.innerHTML='<div class="eventEmpty"><b>Статистика временно недоступна.</b><br><span class="muted">Обновите страницу и попробуйте ещё раз.</span></div>';console.warn('progress',error)}}
 function eventCard(event){let date=eventDateParts(event.starts_at),count=Number(event.participant_count||0),capacity=Number(event.capacity||0),full=capacity>0&&count>=capacity,fill=capacity?Math.min(100,Math.round(count/capacity*100)):Math.min(100,count*12),status=event.is_creator?'<span class="eventStatus">ваше событие</span>':event.joined?'<span class="eventStatus joined">вы участвуете</span>':full?'<span class="eventStatus full">мест нет</span>':'',capacityText=capacity?count+' из '+capacity+' мест':count+' участников',action=event.status!=='published'?'<span class="muted">Архив</span>':event.is_creator?'<button class="btn danger" type="button" onclick="cancelEvent('+Number(event.id)+')">Отменить</button>':event.joined?'<button class="btn light" type="button" onclick="leaveEvent('+Number(event.id)+')">Не участвовать</button>':full?'<button class="btn light" type="button" disabled>Мест нет</button>':'<button class="btn grad" type="button" onclick="joinEvent('+Number(event.id)+')">Участвовать</button>',visual=event.has_image?'<img src="/api/events/image?id='+Number(event.id)+'" alt="Фото мероприятия">':'<span>'+esc((event.title||'H').slice(0,1).toUpperCase())+'</span>';return '<article class="eventCard"><div class="eventDate"><b>'+esc(date.day)+'</b><span>'+esc(date.month)+'</span></div><div class="eventVisual">'+visual+'</div><div class="eventCopy"><h3>'+esc(event.title)+status+'</h3><div class="eventMeta"><span>◷ '+esc(eventTimeRange(event))+'</span><span>⌖ '+esc(event.place)+'</span><span>Организатор: '+esc(event.creator_name)+'</span></div>'+(event.description?'<p class="eventDescription">'+esc(event.description)+'</p>':'')+'</div><div class="eventActions"><span class="eventCapacity">'+esc(capacityText)+'<i style="--fill:'+fill+'%"></i></span>'+action+'</div></article>'}
-async function loadActivities(mine){ensureActivitiesPanel();let host=$('eventsList'),stats=$('activityStats');if(!host)return;host.innerHTML='<div class="eventEmpty">Ищем ближайшие события…</div>';try{let data=await api('/api/events'+(mine?'?mine=1':'')),events=data.events||[],joined=events.filter(function(x){return x.joined}).length,seats=events.reduce(function(sum,x){return sum+Number(x.participant_count||0)},0);if(stats)stats.innerHTML='<div class="activityStat showcaseReveal"><b data-count="'+events.length+'">0</b><span>ближайших событий</span></div><div class="activityStat showcaseReveal"><b data-count="'+seats+'">0</b><span>участников уже записались</span></div><div class="activityStat showcaseReveal"><b data-count="'+joined+'">0</b><span>событий в вашем плане</span></div>';host.innerHTML=events.length?events.map(eventCard).join(''):'<div class="eventEmpty"><b>Пока нет ближайших мероприятий.</b><br><span class="muted">Создайте первое событие для своего района.</span></div>';if(stats)animateCommunityNumbers(stats)}catch(error){host.innerHTML='<div class="eventEmpty">Не удалось загрузить мероприятия: '+esc(error.message)+'</div>'}}
+async function loadActivities(mine){ensureActivitiesPanel();let host=$('eventsList'),stats=$('activityStats');if(!host)return;host.innerHTML='<div class="eventEmpty">Ищем ближайшие события…</div>';try{let data=await api('/api/events'+(mine?'?mine=1':'')),events=data.events||[],joined=events.filter(function(x){return x.joined}).length,seats=events.reduce(function(sum,x){return sum+Number(x.participant_count||0)},0);if(stats)stats.innerHTML='<div class="activityStat showcaseReveal"><b data-count="'+events.length+'">0</b><span>ближайших событий</span></div><div class="activityStat showcaseReveal"><b data-count="'+seats+'">0</b><span>участников уже записались</span></div><div class="activityStat showcaseReveal"><b data-count="'+joined+'">0</b><span>событий в вашем плане</span></div>';host.innerHTML=events.length?events.map(eventCard).join(''):'<div class="eventEmpty"><b>Пока нет ближайших мероприятий.</b><br><span class="muted">Создайте первое событие для своего района.</span></div>';if(stats)animateCommunityNumbers(stats);window.hpointPersonal?.activityUsage(data.personal_usage,host)}catch(error){host.innerHTML='<div class="eventEmpty">Не удалось загрузить мероприятия: '+esc(error.message)+'</div>'}}
 const hpointShowcaseGo=window.go;window.go=function(tab){ensureActivitiesPanel();ensureProgressPanel();hpointShowcaseGo(tab);if(tab==='activities')loadActivities();if(tab==='progress')loadProgress()};ensureActivitiesPanel();ensureProgressPanel();
 '''
 
@@ -1194,20 +1205,17 @@ WORKSPACE_SHELL_UI=r'''
   function promotionRequest(id){return ownRequests().find(row=>Number(row.id)===Number(id)&&Number(row.requester_id)===Number(state.data.current_user_id)&&row.status==='open'&&!Number(row.priority_boost||0)&&(!Number(row.reward_rub||0)||row.reward_payment_status==='paid'))}
   function promotionKey(slot){return 'hpoint:'+(slot==='home'?'home-promo':'request-promo')+':'+state.data.current_user_id}
   function promotionHidden(slot='request'){if((state.promoDismissedSlots||[]).includes(promotionKey(slot)))return true;try{let saved=Number(localStorage.getItem(promotionKey(slot)));return saved>0&&Date.now()-saved<7*86400000}catch(error){return false}}
-  function paidOffer(item){return (state.data.paid_catalog||{})[item]||(item==='boost'?state.data.request_promotion:null)}
+  function paidOffer(item){return item==='pro'?(state.data.paid_catalog||{}).pro:null}
   function availablePaidPlans(){let user=state.data.user;return ['pro'].filter(item=>paidOffer(item)&&(!user.pro_until||new Date(user.pro_until).getTime()<=Date.now()))}
   function paidPlanLink(item){let offer=paidOffer(item),label=item==='pro'?'PRO':item==='verification'?'Проверка профиля':offer.title;return '<button class="workspacePromoLink" type="button" data-ws-action="request-promo" data-item="'+item+'">'+label+' · '+money(offer.rub)+(item==='pro'?' / 30 дней':'')+' →</button>'}
-  function subscriptionPromotion(){let plans=availablePaidPlans();if(!plans.length||promotionHidden('home'))return '';return '<aside class="workspaceRequestPromo homePaidOptions" aria-label="Подписка H-Point PRO"><div class="workspacePromoCopy"><b><span class="workspacePromoLabel">H-POINT+</span>Помогаете регулярно? Есть PRO.</b><p>Приоритет профиля и ваших заявок в автоматическом подборе. На 30 дней, без автопродления.</p></div><div class="workspacePromoExtras">'+plans.map(paidPlanLink).join('')+'</div><button class="workspacePromoDismiss" type="button" data-ws-action="request-promo-dismiss" data-slot="home" aria-label="Скрыть предложение подписки">×</button></aside>'}
-  function requestPromotion(rows){
-    const offer=state.data.request_promotion;if(!offer||promotionHidden())return '';let row=rows.find(item=>promotionRequest(item.id));if(!row)return '';
-    return '<aside class="workspaceRequestPromo" aria-label="Платная возможность H-Point+"><div class="workspacePromoCopy"><b><span class="workspacePromoLabel">H-POINT+</span>Заявка выше в ленте</b><p>Продвижение за '+money(offer.rub)+' или '+number(offer.hp)+' HP</p></div><button class="workspacePromoLink" type="button" data-ws-action="request-promo" data-item="boost" data-id="'+Number(row.id)+'">Подробнее →</button><div class="workspacePromoExtras">'+availablePaidPlans().map(paidPlanLink).join('')+'</div><button class="workspacePromoDismiss" type="button" data-ws-action="request-promo-dismiss" aria-label="Скрыть предложение H-Point+">×</button></aside>';
-  }
+  function subscriptionPromotion(){let plans=availablePaidPlans();if(!plans.length||promotionHidden('home'))return '';return '<aside class="workspaceRequestPromo homePaidOptions" aria-label="Подписка H-Point PRO"><div class="workspacePromoCopy"><b><span class="workspacePromoLabel">H-POINT+</span>Помогаете регулярно? Есть PRO.</b><p>До 5 активных заявок, шаблоны, повторы и управление помощью в Telegram. На 30 дней, без автопродления.</p></div><div class="workspacePromoExtras">'+plans.map(paidPlanLink).join('')+'</div><button class="workspacePromoDismiss" type="button" data-ws-action="request-promo-dismiss" data-slot="home" aria-label="Скрыть предложение подписки">×</button></aside>'}
+  function requestPromotion(rows){return ''}
   function decoratePromotion(){
     if(state.route==='home'){let slot=root().querySelector('.homePromoSlot');if(slot)slot.innerHTML=subscriptionPromotion()+(!state.data.workSummary?.exists?window.HPointVisuals.workPromo():'');return}
     if(state.route!=='billing'||!state.promotionItem)return;if(state.promotionItem==='pro'&&state.data.user.pro_active){state.promotionItem=null;return}let item=state.promotionItem,needsRequest=['boost','more_responses'].includes(item),row=needsRequest?promotionRequest(state.promotionRequestId):null,offer=paidOffer(item);if(!offer||(needsRequest&&!row))return;
     let card=root().querySelector('.workspaceProduct [data-item="'+item+'"]')?.closest('.workspaceProduct');if(!card)return;
-    card.classList.add('workspacePromoTarget');card.tabIndex=-1;let context=document.createElement('p');context.className='workspacePromoContext';context.innerHTML=needsRequest?'<b>Для заявки №'+Number(row.id)+'</b> · '+esc(compact(row.what))+'<br>Приоритет в ленте и автоматическом подборе не гарантирует отклик. Обычная публикация и подбор остаются бесплатными.':item==='pro'?'<b>PRO на 30 дней</b><br>Приоритет профиля и ваших заявок в автоматическом подборе. Не влияет на рейтинг и Лигу. Разовая оплата, без автоматического продления.':'<b>Рассмотрение заявки на проверку личности</b><br>Оплата не означает автоматическое подтверждение. Решение принимает администратор.';card.querySelector('h3').after(context);
-    card.querySelector('.workspaceProductPrice').textContent=money(offer.rub)+' · '+number(offer.hp)+' HP';
+    card.classList.add('workspacePromoTarget');card.tabIndex=-1;let context=document.createElement('p');context.className='workspacePromoContext';context.innerHTML=needsRequest?'<b>Для заявки №'+Number(row.id)+'</b> · '+esc(compact(row.what))+'<br>Приоритет в ленте и автоматическом подборе не гарантирует отклик. Обычная публикация и подбор остаются бесплатными.':item==='pro'?'<b>PRO на 30 дней</b><br>5 активных заявок, шаблоны, повторы и управление в Telegram. Разовая оплата, без автоматического продления.':'<b>Рассмотрение заявки на проверку личности</b><br>Оплата не означает автоматическое подтверждение. Решение принимает администратор.';card.querySelector('h3').after(context);
+    card.querySelector('.workspaceProductPrice').textContent=number(offer.rub)+' тест. ₽ или '+number(offer.hp)+' HP';
     card.querySelectorAll('[data-ws-action="buy"]').forEach(button=>{button.dataset.promoItem=item;if(row)button.dataset.promoRequest=String(row.id);button.textContent=button.dataset.method==='hp'?'Оплатить '+number(offer.hp)+' HP':'Оплатить '+money(offer.rub)+' из кошелька'});
   }
   async function handlePromotion(button){
@@ -1215,7 +1223,7 @@ WORKSPACE_SHELL_UI=r'''
     if(action==='request-promo-dismiss'){let key=promotionKey(button.dataset.slot||'request');state.promoDismissedSlots=[...(state.promoDismissedSlots||[]),key];try{localStorage.setItem(key,String(Date.now()))}catch(error){}render();return}
     let item=button.dataset.promoItem||button.dataset.item||'boost',offer=paidOffer(item),needsRequest=['boost','more_responses'].includes(item),id=Number(button.dataset.promoRequest||button.dataset.id||$('wsBoostRequest')?.value),row=needsRequest?promotionRequest(id):null;if(!offer||(needsRequest&&!row)){toast('Предложение уже изменилось. Обновляем список.');await refresh();return}
     if(action==='request-promo'){state.promotionItem=item;state.promotionRequestId=row?id:null;setRoute('billing');await refreshBilling();let card=root().querySelector('.workspacePromoTarget');if(card){card.focus({preventScroll:true});card.scrollIntoView({block:'center',behavior:'auto'})}return}
-    let price=button.dataset.method==='hp'?number(offer.hp)+' HP':money(offer.rub)+' из кошелька',renew=item==='pro'&&state.data.user.pro_active,meta=item==='pro'?(window.hpointSubscriptions?.purchaseMetadata(item,state.billing?.subscription)||{}):{};if(!window.confirm((renew?'Продлить действующий PRO на 30 дней':'Подключить «'+offer.title+'»')+(row?' для заявки «'+compact(row.what)+'»':'')+' за '+price+'?'+(renew?' Новый срок добавится после '+stamp(state.data.user.pro_until)+'.':'')))return;
+    let price=button.dataset.method==='hp'?number(offer.hp)+' HP':money(offer.rub)+' из кошелька',renew=item==='pro'&&state.data.user.pro_active,meta=item==='pro'?(window.hpointSubscriptions?.purchaseMetadata(item,state.billing?.subscription||{pro:{active:state.data.user.pro_active,ends_at:state.data.user.pro_until,renewal_token:state.data.user.pro_until}})||{}):{};if(!window.confirm((renew?'Продлить действующий PRO на 30 дней':'Подключить «'+offer.title+'»')+(row?' для заявки «'+compact(row.what)+'»':'')+' за '+price+'?'+(renew?' Новый срок добавится после '+stamp(state.data.user.pro_until)+'.':'')))return;
     button.disabled=true;try{await window.buy(item,button.dataset.method,row?{request_id:id}:meta);await refresh();await refreshBilling()}finally{button.disabled=false}
   }
   function activeRequests(){return ownRequests().filter(row=>row.status==='open'||row.status==='in_progress')}
@@ -1245,7 +1253,7 @@ WORKSPACE_SHELL_UI=r'''
   function requestActionMarkup(row,mine){let id=Number(row.id),actions=[];if(mine){actions.push('<button class="btn light" type="button" data-ws-action="track" data-id="'+id+'">Детали</button>');if(row.status==='open'&&Number(row.reward_rub)>0&&row.reward_payment_status==='none')actions.push('<button class="btn grad" type="button" onclick="hpointCreatedRequest('+id+')">Создать резерв</button>');if(['open','in_progress'].includes(row.status))actions.push('<button class="btn light" type="button" onclick="hpointCancelRequest('+id+')">Отменить</button>');if(row.status==='open')actions.push('<button class="btn grad" type="button" data-ws-action="help-tab" data-tab="match" data-id="'+id+'">Подбор</button>');if(row.status==='in_progress')actions.push('<button class="btn light" type="button" data-ws-action="chat" data-id="'+id+'">Чат</button>');if(row.status==='in_progress'&&row.dispute_status!=='open'&&Number(row.requester_id)===Number(state.data.current_user_id))actions.push('<button class="btn grad" type="button" data-ws-action="finish" data-id="'+id+'">'+(Number(row.reward_rub)?'Завершить и выплатить '+money(row.reward_rub):'Завершить помощь')+'</button>');if(row.status==='in_progress')actions.push(row.dispute_status==='open'?'<span class="workspaceTag">На рассмотрении поддержки · выплата приостановлена</span>':'<button class="btn light" type="button" data-ws-action="dispute" data-id="'+id+'">Есть проблема</button>');if(row.status==='done'&&row.helper_id!=null&&((Number(row.requester_id)===Number(state.data.current_user_id)&&!row.requester_rating)||(Number(row.helper_id)===Number(state.data.current_user_id)&&!row.helper_rating)))actions.push('<button class="btn grad" type="button" data-ws-action="review" data-id="'+id+'" data-side="'+(Number(row.requester_id)===Number(state.data.current_user_id)?'requester':'helper')+'">Оценить</button>')}else{actions.push('<button class="btn grad" type="button" data-ws-action="join" data-id="'+id+'">Хочу помочь</button>')}return actions.join('')}
   function responseCancelButton(response,label){return '<button class="btn light" type="button" data-ws-action="response-cancel" data-id="'+Number(response.request_id)+'" data-user="'+Number(response.helper_id)+'" data-token="'+esc(response.application_token)+'">'+label+'</button>'}
   function responseActionMarkup(row,mine){let html=requestActionMarkup(row,mine);if(mine&&row.status==='open'){let count=(state.data.applications||[]).filter(item=>Number(item.request_id)===Number(row.id)).length;if(count)html=html.replace('>Подбор</button>','>Отклики · '+number(count)+'</button>')}if(!mine){let response=(state.data.my_applications||[]).find(item=>Number(item.request_id)===Number(row.id));if(response){const chat=(state.data.chats||[]).find(c=>Number(c.request_id)===Number(row.id)&&Number(c.candidate_id)===Number(state.data.current_user_id));return '<button class="btn grad" type="button" data-ws-action="chat" data-id="'+Number(row.id)+'" data-thread="'+Number(chat?.id||0)+'">Обсудить</button>'+responseCancelButton(response,'Отозвать отклик')}}return html}
-  function requestCard(row,mine){let reward=Number(row.reward_rub||0)>0?' · '+rewardNote(row):'',place=mine&&row.place?' · '+esc(row.place):'';return '<article class="workspaceRequest">'+window.HPointVisuals.requestVisual(row)+'<div class="workspaceRequestMain"><b>'+esc(compact(row.what))+'</b><span class="workspaceRequestAuthor">Запрашивает: '+esc(row.requester_name||'Участник')+'</span><div class="workspaceRequestMeta">'+esc(row.category_name||'Другое')+' · '+esc(row.urgency||'без срочности')+place+reward+'</div><span class="workspaceTag '+statusClass(row)+'">'+esc(statusLabel(row))+'</span>'+(Number(row.reward_rub)?'<p class="muted">'+esc(rewardNote(row))+'</p>':'')+'</div><div class="workspaceRequestActions">'+responseActionMarkup(row,mine)+'</div></article>'}
+  function requestCard(row,mine){let reward=Number(row.reward_rub||0)>0?' · '+rewardNote(row):'',place=mine&&row.place?' · '+esc(row.place):'';return '<article class="workspaceRequest">'+window.HPointVisuals.requestVisual(row)+'<div class="workspaceRequestMain"><b>'+esc(compact(row.what))+'</b><span class="workspaceRequestAuthor">Запрашивает: '+esc(row.requester_name||'Участник')+(row.requester_pro?' <span class="workspaceProBadge">PRO</span>':'')+'</span><div class="workspaceRequestMeta">'+esc(row.category_name||'Другое')+' · '+esc(row.urgency||'без срочности')+place+reward+'</div><span class="workspaceTag '+statusClass(row)+'">'+esc(statusLabel(row))+'</span>'+(Number(row.reward_rub)?'<p class="muted">'+esc(rewardNote(row))+'</p>':'')+'</div><div class="workspaceRequestActions">'+responseActionMarkup(row,mine)+(window.hpointPersonal?.templateButton(row,Number(row.requester_id)===Number(state.data.current_user_id))||'')+'</div></article>'}
   function applicationNotices(){
     let incoming=state.data.applications||[],sent=state.data.my_applications||[];
     return (incoming.length?'<details class="workspaceFold requestResponses"><summary>Отклики на ваши заявки · '+number(incoming.length)+'</summary>'+incoming.map(response=>'<article class="workspacePendingInvite"><div><b>'+esc(response.helper_name)+' хочет помочь</b><p>'+esc(compact(response.what))+'</p></div><div class="workspaceActions"><button class="btn grad" type="button" data-ws-action="application-accept" data-id="'+Number(response.request_id)+'" data-user="'+Number(response.helper_id)+'" data-token="'+esc(response.application_token)+'">Принять помощь и открыть чат</button>'+responseCancelButton(response,'Отклонить')+'</div></article>').join('')+'</details>':'')+(sent.length?'<details class="workspaceFold sentResponses"><summary>Ваши отклики · '+number(sent.length)+'</summary>'+sent.map(response=>'<article class="workspacePendingInvite"><div><b>Отклик отправлен · '+esc(response.requester_name)+'</b><p>'+esc(compact(response.what))+'</p></div><div class="workspaceActions">'+responseCancelButton(response,'Отозвать отклик')+'</div></article>').join('')+'</details>':'');
@@ -1268,16 +1276,17 @@ WORKSPACE_SHELL_UI=r'''
   function ownRequestsPane(){let rows=ownRequests();return rows.length?'<div class="workspaceRequestList">'+rows.map(row=>requestCard(row,true)).join('')+'</div>':'<div class="workspaceEmpty"><b>У вас ещё нет заявок.</b><br>Опишите задачу — адрес и контакты не будут показаны до взаимного подтверждения.</div><div class="workspaceActions"><button class="btn grad" type="button" data-ws-action="request">Создать заявку</button></div>'}
   function openRequestsPane(){let rows=state.data.open||[];return rows.length?'<div class="workspaceRequestList">'+rows.map(row=>requestCard(row,false)).join('')+'</div>':'<div class="workspaceEmpty"><b>Открытых заявок сейчас нет.</b><br>Можно встать в общую очередь — авторы увидят вас в подборе.</div><div class="workspaceActions"><button class="btn grad" type="button" data-ws-action="queue">Встать в очередь</button></div>'}
   function cancelInvitationButton(offer){return '<button class="btn light" type="button" data-ws-action="offer-cancel" data-id="'+Number(offer.request_id)+'" data-user="'+Number(offer.helper_id)+'" data-offer-token="'+esc(offer.offer_token||'')+'">Отменить приглашение</button>'}
-  function rewardNote(row){if(!Number(row.reward_rub))return '';let amount=Number(row.reward_rub),fee=Math.round(amount*.15),net=amount-fee;return money(amount)+' тест. · помощнику '+money(net)+' · комиссия '+money(fee)+' (15%)'+(row.reward_payment_status==='released'?' · выплачено':row.reward_payment_status==='paid'?' · в резерве':' · создайте резерв за 5 минут')}
+  function contractQuote(row){return row?.reward_quote||null}
+  function rewardNote(row){if(!Number(row.reward_rub))return '';let q=contractQuote(row);if(!q)return 'Условия вознаграждения загружаются';return 'Помощнику '+money(q.helper_rub)+' · комиссия '+money(q.commission_rub)+' · всего '+money(q.total_rub)+(q.currency==='TEST_RUB'?' тест.':'')+(row.reward_payment_status==='released'?' · выплачено':row.reward_payment_status==='paid'?' · в резерве':' · резерв за 5 минут')}
   function rewardReservePanel(row,waiting){
     if(!row||!Number(row.reward_rub))return '';
-    let funded=row.reward_payment_status==='paid',balance=Number((state.data.wallet||{}).available_total_rub||0),amount=Number(row.reward_rub);
+    let funded=row.reward_payment_status==='paid',balance=Number((state.data.wallet||{}).available_total_rub||0),amount=Number(contractQuote(row)?.total_rub||0);
     return '<div class="workspaceAppNotice rewardReservePanel"><b>'+esc(rewardNote(row))+'</b><p>'+(funded?'Деньги пока не выплачены помощнику. После выполнения вы подтвердите результат и выплату.':waiting?'Выбран помощник: '+esc(waiting.helper_name||'участник')+'. Зарезервируйте сумму до начала помощи. Выплата — только после её подтверждения.':'Кандидатов можно найти и пригласить без оплаты. Сразу создайте тестовый резерв. Без резерва в течение 5 минут помощь отменится. Комиссия проекта — 15%.')+'</p>'+(!funded?'<div class="workspaceActions"><button class="btn grad" type="button" data-ws-action="reward-reserve" data-id="'+Number(row.id)+'" '+(balance<amount?'disabled':'')+'>Зарезервировать '+money(amount)+'</button><button class="btn light" type="button" data-ws-action="route" data-route="wallet">Кошелёк · '+money(balance)+'</button></div>'+(balance<amount?'<p>Для резерва не хватает '+money(amount-balance)+'. '+(state.data.reward_checkout_available?'<button class="workspacePromoLink" type="button" data-ws-action="reward-card" data-id="'+Number(row.id)+'">Оплатить и зарезервировать картой</button>':'Пополнение картой пока не подключено. Приглашение сохранено; ничего не списано.')+'</p>':'') :'')+(waiting?'<div class="workspaceActions">'+cancelInvitationButton(waiting)+'</div>':'')+'</div>';
   }
-  function payoutDescription(row){let amount=Number(row.reward_rub),fee=Math.round(amount*.15);return number(amount-fee)+' тестовых ₽ помощнику и '+number(fee)+' тестовых ₽ — комиссия проекта (15%).'}
+  function payoutDescription(row){let q=contractQuote(row);return q?'Помощнику '+money(q.helper_rub)+', комиссия '+money(q.commission_rub)+', всего '+money(q.total_rub)+(q.currency==='TEST_RUB'?' тестовых.':'.'):'Обновите данные заявки перед подтверждением.'}
   async function handleRewardAction(button){
     let id=Number(button.dataset.id),row=ownRequests().find(item=>Number(item.id)===id);if(!row||button.disabled)return;
-    let action=button.dataset.wsAction,confirming=action==='paid-confirm',amount=Number(row.reward_rub);
+    let action=button.dataset.wsAction,confirming=action==='paid-confirm',amount=Number(contractQuote(row)?.total_rub||0);if(!contractQuote(row)){toast('Обновите данные заявки');return}
     if(!window.confirm(confirming?'Подтверждаете выполнение «'+row.what+'»? '+payoutDescription(row):'Создать тестовый резерв '+money(amount)+' для «'+row.what+'»? '+payoutDescription(row)+' Выплата после вашего подтверждения помощи.'))return;
     button.disabled=true;
     try{
@@ -1293,7 +1302,7 @@ WORKSPACE_SHELL_UI=r'''
     let selectedRow=requests.find(row=>Number(row.id)===Number(selected)),waiting=(state.data.outgoing_offers||[]).find(offer=>Number(offer.request_id)===Number(selected));
     let candidates=state.matches,matches=(candidates&&candidates.matches||[]).filter(candidate=>!waiting||Number(candidate.user_id)!==Number(waiting.helper_id));
     let notice=waiting?'<div class="workspaceAppNotice workspacePendingInvite"><div><b>Ждём ответ: '+esc(waiting.helper_name||'помощник')+'.</b><p>Можно посмотреть других кандидатов или отменить приглашение. Сама заявка останется открытой.</p></div><div class="workspaceActions">'+cancelInvitationButton(waiting)+'</div></div>':'';
-    let result=state.matchLoading?'<div class="workspaceLoading" role="status">Ищем помощников…</div>':matches.length?'<div class="workspaceRequestList">'+matches.map(candidate=>'<article class="workspaceCandidate"><i class="workspaceCandidateAvatar">'+esc((candidate.name||'?').slice(0,1).toUpperCase())+'</i><div class="workspaceCandidateCopy"><b>'+esc(candidate.name||'Участник')+(candidate.verified?' ✓':'')+'</b><span>'+(candidate.rating?'★ '+Number(candidate.rating).toFixed(1)+' · ':'')+(candidate.distance_km===null||candidate.distance_km===undefined?'геопозиция не указана':number(candidate.distance_km)+' км')+' · '+number(candidate.reviews)+' отзывов</span><span>'+esc(candidate.availability||'По договорённости')+'</span><span>'+esc((candidate.reasons||[]).join(' · ')||'подходит по параметрам заявки')+'</span></div><button class="btn grad" type="button" data-ws-action="assign" data-id="'+Number(selected)+'" data-user="'+Number(candidate.user_id)+'">'+(waiting?'Пригласить вместо него':'Выбрать')+'</button></article>').join('')+'</div>':waiting&&Number(selectedRow?.reward_rub)&&selectedRow.reward_payment_status!=='paid'?'':candidates?'<div class="workspaceEmpty">'+(waiting?'Других подходящих свободных помощников пока нет. Можно дождаться ответа или отменить приглашение.':'Подходящих свободных помощников пока нет. Попробуйте позже или уточните задачу.')+'</div>':'';
+    let result=state.matchLoading?'<div class="workspaceLoading" role="status">Ищем помощников…</div>':matches.length?'<div class="workspaceRequestList">'+matches.map(candidate=>'<article class="workspaceCandidate"><i class="workspaceCandidateAvatar">'+esc((candidate.name||'?').slice(0,1).toUpperCase())+'</i><div class="workspaceCandidateCopy"><b>'+esc(candidate.name||'Участник')+(candidate.pro_active?' <span class="workspaceProBadge">PRO</span>':'')+(candidate.verified?' ✓':'')+'</b><span>'+(candidate.rating?'★ '+Number(candidate.rating).toFixed(1)+' · ':'')+(candidate.distance_km===null||candidate.distance_km===undefined?'геопозиция не указана':number(candidate.distance_km)+' км')+' · '+number(candidate.reviews)+' отзывов</span><span>'+esc(candidate.availability||'По договорённости')+'</span><span>'+esc((candidate.reasons||[]).join(' · ')||'подходит по параметрам заявки')+'</span></div><button class="btn grad" type="button" data-ws-action="assign" data-id="'+Number(selected)+'" data-user="'+Number(candidate.user_id)+'">'+(waiting?'Пригласить вместо него':'Выбрать')+'</button></article>').join('')+'</div>':waiting&&Number(selectedRow?.reward_rub)&&selectedRow.reward_payment_status!=='paid'?'':candidates?'<div class="workspaceEmpty">'+(waiting?'Других подходящих свободных помощников пока нет. Можно дождаться ответа или отменить приглашение.':'Подходящих свободных помощников пока нет. Попробуйте позже или уточните задачу.')+'</div>':'';
     return '<div class="workspaceMatchForm"><label>Ваша заявка<select id="wsMatchRequest" class="input" '+(state.matchLoading?'disabled':'')+'>'+requests.map(row=>'<option value="'+Number(row.id)+'" '+(Number(row.id)===Number(selected)?'selected':'')+'>'+esc(compact(row.what))+'</option>').join('')+'</select></label><input id="wsMatchQuestion" class="input" maxlength="500" value="'+esc(state.matchQuestion)+'" placeholder="Необязательно: уточните нужный опыт"><button class="btn grad" type="button" data-ws-action="match-load" '+(state.matchLoading?'disabled':'')+'>Найти кандидатов</button></div>'+notice+rewardReservePanel(selectedRow,waiting)+result;
   }
   function chatsPane(){
@@ -1398,13 +1407,10 @@ WORKSPACE_SHELL_UI=r'''
     '<section class="workspaceStats">'+metric('H-POINTS',number(user.balance))+metric('ПОМОЩЕЙ ОКАЗАНО',number(stats.helped))+metric('ПОМОЩЕЙ ПОЛУЧЕНО',number(stats.received))+metric('РЕЙТИНГ',stats.helped_avg?'★ '+Number(stats.helped_avg).toFixed(1):'—')+'</section>'+
     '<div class="workspaceProfileGrid"><div><section class="workspaceCard"><h3>Достижения за помощь</h3><div class="workspaceAchievements">'+awards+'</div></section><section class="workspaceCard" style="margin-top:16px"><h3>Недавняя активность</h3><div class="workspaceMiniList">'+activity+'</div></section></div><aside class="workspaceCard"><h3>О себе</h3><div class="workspaceProfileInfo"><div class="workspaceInfoRow"><span>Город</span><b>'+esc(user.city||'не указан')+'</b></div><div class="workspaceInfoRow"><span>Email</span><b>'+esc(user.email||'не указан')+'</b></div><div class="workspaceInfoRow"><span>Вход</span><b>'+esc(user.email_verified?'Email':'подтвердите email')+'</b></div></div><p class="muted">'+esc(user.bio||'Информация ещё не заполнена.')+'</p><div class="workspaceActions">'+(user.tg_linked?(user.telegram_url?'<a class="btn light" href="'+esc(user.telegram_url)+'" target="_blank" rel="noopener">Открыть бот</a>':'<span class="workspaceTag open">Сайт и бот связаны</span>'):'<button class="btn grad" type="button" data-ws-action="link-code">Получить код Telegram</button>')+'</div>'+(state.linkCode?'<p class="workspaceAppNotice">В боте отправьте /link '+esc(state.linkCode)+'. Код одноразовый. <button class="workspacePromoLink" type="button" data-ws-action="link-cancel">Отменить подключение</button></p>':'')+'</aside></div>'+'<div id="workspaceWorkCreationSlot"></div>'+editor;
   }
-  function walletBody(){let w=state.wallet||state.data.wallet||{};return pageHead('Тестовый кошелёк','Используйте тестовые средства для помощи и возможностей H-Point.','ТЕСТОВЫЙ РЕЖИМ')+profileTabs()+'<section class="workspaceWalletGrid">'+metric('ДОСТУПНО · ТЕСТ. ₽',number(w.test_balance_rub))+metric('В РЕЗЕРВЕ · ТЕСТ. ₽',number(w.test_reserved_rub))+metric('ЗА ПОМОЩЬ · ТЕСТ. ₽',number(w.test_incoming_rub))+'</section><section class="workspaceCard"><h2>История</h2><div class="workspaceTransactions">'+((w.transactions||[]).map(row=>'<article class="workspaceTransaction"><div><b>'+esc(row.description||'Операция')+'</b><span>'+stamp(row.created_at)+'</span></div><b>'+money(row.amount_rub)+' тест.</b></article>').join('')||'<p class="muted">Операций пока нет.</p>')+'</div><p class="muted">При регистрации начисляется 10 000 тестовых ₽. Резерв на помощь создаётся в течение 5 минут; после подтверждения автором помощник получает 85%, комиссия проекта — 15%. Тестовые средства не являются настоящими деньгами.</p></section>'}
+  function walletBody(){let w=state.wallet||state.data.wallet||{};return pageHead('Тестовый кошелёк','Используйте тестовые средства для помощи и возможностей H-Point.','ТЕСТОВЫЙ РЕЖИМ')+profileTabs()+'<section class="workspaceWalletGrid">'+metric('ДОСТУПНО · ТЕСТ. ₽',number(w.test_balance_rub))+metric('В РЕЗЕРВЕ · ТЕСТ. ₽',number(w.test_reserved_rub))+metric('ЗА ПОМОЩЬ · ТЕСТ. ₽',number(w.test_incoming_rub))+'</section><section class="workspaceCard"><h2>История</h2><div class="workspaceTransactions">'+((w.transactions||[]).map(row=>'<article class="workspaceTransaction"><div><b>'+esc(row.description||'Операция')+'</b><span>'+stamp(row.created_at)+'</span></div><b>'+money(row.amount_rub)+' тест.</b></article>').join('')||'<p class="muted">Операций пока нет.</p>')+'</div><p class="muted">При регистрации начисляется 10 000 тестовых ₽. Резерв на помощь создаётся в течение 5 минут; автор оплачивает помощнику указанное вознаграждение полностью, комиссия 15% добавляется сверху. У старых договорённостей сохраняются их условия. Тестовые средства не являются настоящими деньгами.</p></section>'}
   function billingBody(){
-    if(window.hpointSubscriptions)return pageHead('H-Point+','Возможности на тестовые ₽ или HP. Публикация, отклики и чаты бесплатны.','ВОЗМОЖНОСТИ')+profileTabs()+window.hpointSubscriptions.renderBilling({...state.billing,user:state.data.user,catalog:state.data.paid_catalog||{},requests:openOwnRequests().filter(row=>promotionRequest(row.id))});
-    let billing=state.billing||{},history=billing.history||[],user=state.data.user,catalog=state.data.paid_catalog||{};
-    let productCards=Object.entries(catalog).map(([key,item])=>'<article class="workspaceProduct"><h3>'+esc(item.title)+'</h3><p>'+esc(key==='boost'?'Выше в ленте: одна открытая заявка.':'Приоритет профиля и заявок в автоматическом подборе.')+'</p><p class="muted">'+esc(item.term)+'</p><details class="workspaceProductDetails"><summary>Что даёт и кому подойдёт</summary><p>'+esc(item.description)+'</p><ul>'+(item.benefits||[]).map(text=>'<li>'+esc(text)+'</li>').join('')+'</ul></details><div class="workspaceProductPrice">'+money(item.rub)+' · '+number(item.hp)+' HP</div>'+(key==='boost'?'<label>Ваша заявка<select id="wsBoostRequest" class="input"><option value="">Выберите открытую заявку</option>'+openOwnRequests().filter(row=>promotionRequest(row.id)).map(row=>'<option value="'+Number(row.id)+'">'+esc(compact(row.what))+'</option>').join('')+'</select></label>':'')+'<div class="workspaceProductActions"><button class="btn grad" type="button" data-ws-action="buy" data-promo-item="'+esc(key)+'" data-item="'+esc(key)+'" data-method="wallet">Оплатить ₽</button><button class="btn light" type="button" data-ws-action="buy" data-promo-item="'+esc(key)+'" data-item="'+esc(key)+'" data-method="hp">HP</button></div></article>').join('');
-    let paid=history.length?'<div class="workspaceTransactions">'+history.map(row=>'<article class="workspaceTransaction"><div><b>'+esc(row.item_title||catalog[row.item_type]?.title||row.item_type||'Покупка')+'</b><span>'+stamp(row.created_at)+' · '+esc(row.status||'')+'</span></div><b class="workspaceTransactionAmount">'+number(row.amount_rub)+' '+esc(row.currency==='HP'?'HP':'₽')+'</b></article>').join('')+'</div>':'<div class="workspaceEmpty">Покупок пока нет.</div>';
-    return pageHead('H-Point+','Тестовый режим: платные функции используют только тестовые ₽ или HP. Публикация, отклики, подбор и чаты бесплатны.','ВОЗМОЖНОСТИ')+profileTabs()+'<section class="workspaceGrid"><article class="workspaceCard"><h2>Ваш доступ</h2><div class="workspaceProfileInfo"><div class="workspaceInfoRow"><span>PRO до</span><b>'+(user.pro_until?stamp(user.pro_until):'не подключён')+'</b></div><div class="workspaceInfoRow"><span>Проверка личности · бесплатно</span><b>'+(user.identity_verified?'подтверждена':user.identity_verification?.status==='pending'?'на проверке':'в настройках профиля')+'</b></div>'+(user.business_until?'<div class="workspaceInfoRow"><span>Ранее оплаченный Business до</span><b>'+stamp(user.business_until)+'</b></div>':'')+'</div><div class="workspaceAppNotice">PRO не повышает рейтинг и место в Лиге, не подтверждает личность и не гарантирует отклик. Покупки разовые; автоматических списаний нет.</div></article><aside class="workspaceCard"><h3>История платежей</h3>'+paid+'</aside></section><section class="workspaceCard" style="margin-top:16px"><h2>Выберите нужный приоритет</h2><div class="workspaceBillingGrid" style="margin-top:16px">'+productCards+'</div><details class="workspaceProductDetails"><summary>Куда делись прежние функции?</summary><p>Business, Business Pro, Избранное+ и локальные объявления сняты с новых продаж: отдельного готового сценария для них пока нет. «Больше откликов» объединено с продвижением. Проверка личности доступна бесплатно в профиле. Ранее оплаченные сроки, права и счета сохранены.</p></details></section>';
+    if(window.hpointSubscriptions)return pageHead('H-Point+','Возможности на тестовые ₽ или HP. Бесплатный тариф, PRO и кабинет «Для работы».','ВОЗМОЖНОСТИ')+profileTabs()+window.hpointSubscriptions.renderBilling({...state.billing,user:state.data.user,catalog:state.data.paid_catalog||{},personal_usage:state.data.personal_usage||state.data.user.personal_usage,workSummary:state.data.workSummary,requests:openOwnRequests()});
+    return pageHead('H-Point+','Не удалось загрузить тарифы. Обновите страницу.','ВОЗМОЖНОСТИ')+profileTabs();
   }
   function takeMap(){let map=$('bigMap'),tools=$('mapTools'),holder=$('workspaceMapSlot'),out=state.parkedMap||{map:null,tools:null};if(map&&holder&&holder.contains(map)){$('workspaceLegacyStorage').appendChild(map);out.map=map}if(tools&&holder&&holder.contains(tools)){$('workspaceLegacyStorage').appendChild(tools);out.tools=tools}state.parkedMap=out;return out}
   function attachMap(parked){if(state.route!=='help')return;let holder=$('workspaceMapSlot');if(!holder)return;if(!window.L&&!window.ymaps){if(holder.dataset.loading==='1')return;holder.dataset.loading='1';holder.innerHTML='<div class="workspaceEmpty">Загрузка карты…</div>';window.hpointLoadMapLibrary().then(()=>{if(holder.isConnected){delete holder.dataset.loading;attachMap(state.parkedMap||parked)}}).catch(()=>{if(holder.isConnected){delete holder.dataset.loading;holder.innerHTML='<div class="workspaceEmpty">Карта временно недоступна.<br><button class="btn light" type="button" data-ws-action="map-retry">Повторить</button></div>'}});return}let map=parked.map||$('bigMap');if(!map)return;holder.replaceChildren(map);if(parked.tools)holder.insertBefore(parked.tools,map);if(typeof window.hpointSetupMapPanel==='function')window.hpointSetupMapPanel();let tools=$('mapTools');if(tools)holder.insertBefore(tools,map);state.parkedMap={map:map,tools:tools};setTimeout(function(){if(typeof window.loadBigMap==='function')window.loadBigMap()},70)}
@@ -1440,7 +1446,7 @@ WORKSPACE_SHELL_UI=r'''
     if(!ownerChanged&&previous===currentRoute())host.querySelectorAll('input[id],textarea[id],select[id]').forEach(input=>{if(input.id!=='wsMatchRequest'&&!input.closest('.workspaceChatForm'))drafts[input.id]={value:input.value,checked:input.checked}});
     if(priorForm){if(priorForm.dataset.userId===owner)chatComposers.set(Number(priorForm.dataset.chatId),priorForm);priorForm.remove()}
     parkCommunity();state.route=currentRoute();renderPrimaryNav(state.data.user);let parked=takeMap(),body=['activities','league','donate'].includes(state.route)?'<div id="workspaceCommunitySlot"></div>'+ (state.route==='activities'?'<div id="workspaceServiceDirectory"></div>':''):state.route==='help'?helpBody():state.route==='work'?'<div id="workspaceWorkSlot"></div>':state.route==='rating'?ratingBody():state.route==='wallet'?walletBody():state.route==='billing'?billingBody():state.route==='profile'?profileBody():homeBody();
-    host.innerHTML=pendingNotices()+(['profile','wallet','billing','donate'].includes(state.route)?accountShell(body):(state.route==='activities'?communityStory():'')+body);host.dataset.route=state.route;const helperFresh=host.querySelector('.helperPreferences');if(helperFresh){if(state.helperForm)helperFresh.replaceWith(state.helperForm);else state.helperForm=helperFresh;syncHelperControls();if(activeHelper?.isConnected)activeHelper.focus({preventScroll:true})}if(state.route==='profile')window.hpointCommercial?.mountCreation($('workspaceWorkCreationSlot'));if(state.route==='work')window.hpointCommercial?.mount($('workspaceWorkSlot'));attachCommunity();decoratePromotion();
+    host.innerHTML=pendingNotices()+(['profile','wallet','billing','donate'].includes(state.route)?accountShell(body):(state.route==='activities'?communityStory():'')+body);host.dataset.route=state.route;const helperFresh=host.querySelector('.helperPreferences');if(helperFresh){if(state.helperForm)helperFresh.replaceWith(state.helperForm);else state.helperForm=helperFresh;syncHelperControls();if(activeHelper?.isConnected)activeHelper.focus({preventScroll:true})}window.hpointPersonal?.decorate?.(host,state.data,state);if(state.route==='profile')window.hpointCommercial?.mountCreation($('workspaceWorkCreationSlot'));if(state.route==='work')window.hpointCommercial?.mount($('workspaceWorkSlot'));attachCommunity();decoratePromotion();
     if(activeWork?.isConnected){activeWork.focus({preventScroll:true});if(workSelection)activeWork.setSelectionRange(workSelection.start,workSelection.end,workSelection.direction)}
     const freshComposer=host.querySelector('.workspaceChatForm[data-chat-id]');
     if(freshComposer){const id=Number(freshComposer.dataset.chatId),saved=chatComposers.get(id);if(saved)freshComposer.replaceWith(saved);else chatComposers.set(id,freshComposer);const send=host.querySelector('[data-ws-action="chat-send"]');if(send)send.disabled=Boolean(state.chatSending)}
@@ -1466,9 +1472,9 @@ WORKSPACE_SHELL_UI=r'''
       if(state.lastOfferIds&&offers.some(offer=>!state.lastOfferIds.includes(offer.request_id)))toast('Вас просят помочь — подтвердите предложение.');
       if(state.lastApplicationKeys&&applicationKeys.some(key=>!state.lastApplicationKeys.includes(key)))toast('Новый отклик на вашу заявку — откройте «Отклики».');
       state.lastStatuses=statuses;state.lastOfferIds=offers.map(offer=>offer.request_id);state.lastApplicationKeys=applicationKeys;
-      const previousData=JSON.stringify(state.data);state.data={...sync,open:results[1].requests||[],chats:results[2].chats||[],offers,games:results[4],progress:results[5],workSummary:results[6].summary};
+      const billingChanged=state.billing&&state.billing.user?.pro_until!==sync.user.pro_until;if(billingChanged)state.billing=null;const previousData=JSON.stringify(state.data);state.data={...sync,open:results[1].requests||[],chats:results[2].chats||[],offers,games:results[4],progress:results[5],workSummary:results[6].summary};
       state.archivedChats=(state.archivedChats||[]).filter(row=>!state.data.chats.some(active=>Number(active.id)===Number(row.id)));renderPrimaryNav(state.data.user);if(changed)state.matches=null;state.wallet=sync.wallet||{};if(state.data.user.tg_linked)state.linkCode='';if(previousData!==JSON.stringify(state.data)||root()?.dataset.route!==currentRoute())render();
-      window.hpointLeague?.update(results[5]);
+      window.hpointLeague?.update(results[5]);if(billingChanged&&state.route==='billing')await refreshBilling();
       let deepChat=location.hash.match(/^#\/help\/chat\/(\d+)(?:\/(\d+))?$/);if(deepChat&&(Number(state.chatId)!==Number(deepChat[1])||(deepChat[2]&&Number(state.threadId)!==Number(deepChat[2])))){await openWorkspaceChat(Number(deepChat[1]),deepChat[2]?Number(deepChat[2]):undefined);return}if(location.hash==='#/help/chats'&&state.helpTab!=='chats'){state.helpTab='chats';render()}
       if(accepted){state.pendingChats=state.pendingChats.filter(id=>id!==Number(accepted.id));state.matches=null;state.matchRequestId=null;if(state.helpTab!=='chats'||Number(state.chatId)!==Number(accepted.id))await openWorkspaceChat(accepted.id);return}
       if(state.route==='help'&&state.helpTab==='chats'&&state.chatId)await refreshWorkspaceChat();
@@ -1559,7 +1565,7 @@ WORKSPACE_SHELL_UI=r'''
   };
   async function finishBoot(){if(document.documentElement.dataset.hpointBoot==='loading'&&document.fonts?.load)await Promise.race([document.fonts.load('600 14px Manrope').catch(()=>{}),new Promise(resolve=>setTimeout(resolve,1000))]);document.documentElement.dataset.hpointBoot='ready';document.documentElement.setAttribute('aria-busy','false')}
   function bootFailed(){const screen=$('hpointBootScreen');if(screen)screen.innerHTML='<div><b>Не удалось загрузить H-Point</b><p>Проверьте соединение и повторите попытку.</p><button class="btn grad" type="button" onclick="location.reload()">Повторить</button></div>'}
-  window.hpointStart=function(){if(window.HPointVisuals&&window.hpointWorkflowsReady&&window.hpointHelpCategories&&window.hpointLeague&&window.HPointMedia&&window.HPointProfessional&&window.hpointCommercial&&window.hpointSubscriptions&&window.hpointOrganizations)return window.load();bootFailed()};
+  window.hpointStart=function(){if(window.hpointPersonal&&window.HPointVisuals&&window.hpointWorkflowsReady&&window.hpointHelpCategories&&window.hpointLeague&&window.HPointMedia&&window.HPointProfessional&&window.hpointCommercial&&window.hpointSubscriptions&&window.hpointOrganizations)return window.load();bootFailed()};
   window.load=async function(){
     const serial=(state.loadSerial||0)+1;state.loadSerial=serial;
     try{
@@ -1587,8 +1593,8 @@ WORKSPACE_SHELL_UI=r'''
   document.addEventListener('keydown',function(event){if((event.ctrlKey||event.metaKey)&&!event.altKey&&!event.isComposing&&['+','=','-','_','Add','Subtract'].includes(event.key))event.preventDefault()},{capture:true});
   for(const gesture of ['gesturestart','gesturechange','gestureend'])document.addEventListener(gesture,function(event){event.preventDefault()},{passive:false});
   window.addEventListener('hpoint:work-updated',function(){if(state.installed)refresh()});
-  window.addEventListener('hashchange',function(){if(state.installed){state.route=currentRoute();render()}});
-  window.addEventListener('popstate',function(){if(state.installed){state.route=currentRoute();render()}});
+  window.addEventListener('hashchange',function(){if(state.installed){state.route=currentRoute();render();if(state.route==='billing')refreshBilling();if(state.route==='wallet')refreshWallet()}});
+  window.addEventListener('popstate',function(){if(state.installed){state.route=currentRoute();render();if(state.route==='billing')refreshBilling();if(state.route==='wallet')refreshWallet()}});
 })();
 '''
 
@@ -1615,8 +1621,8 @@ _page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRI
 
 PAGE = PAGE.replace("</head>", SYSTEM_THEME_META + "<script>window.hpointGamesEnabled="+json.dumps(GAMES_ENABLED)+";document.documentElement.dataset.gamesEnabled=String(window.hpointGamesEnabled);</script><style>@media(max-width:700px){html[data-games-enabled=false] #sitePrimaryNav{grid-template-columns:repeat(4,minmax(0,1fr))}}</style></head>", 1)
 
-ASSETS.update({name:(Path(__file__).resolve().parent.parent/"assets"/name,"application/javascript;charset=utf-8") for name in ("hpoint-workflows.js","hpoint-media.js","hpoint-commercial.js","hpoint-subscriptions.js","hpoint-organizations.js","hpoint-public.js","hpoint-professional.js","hpoint-help-categories.js","hpoint-league.js","hpoint-visuals.js")})
-PAGE=PAGE.replace("</body>",'<script>window.hpointHelpCategoriesData='+json.dumps({"catalog":CATEGORY_CATALOG,"groups":CATEGORY_GROUPS},ensure_ascii=False).replace("<","\\u003c")+';</script><script src="/assets/hpoint-workflows.js?v=20261030-mobile3"></script><script src="/assets/hpoint-media.js?v=20261030-mobile3"></script><script src="/assets/hpoint-visuals.js?v=20261030-mobile3"></script><script src="/assets/hpoint-professional.js?v=20261030-mobile3"></script><script src="/assets/hpoint-commercial.js?v=20261030-mobile3"></script><script src="/assets/hpoint-subscriptions.js?v=20261030-mobile3"></script><script src="/assets/hpoint-organizations.js?v=20261030-mobile3"></script><script src="/assets/hpoint-help-categories.js?v=20261030-mobile3"></script><script src="/assets/hpoint-league.js?v=20261030-mobile3"></script><script>window.hpointStart();</script></body>')
+ASSETS.update({name:(Path(__file__).resolve().parent.parent/"assets"/name,"application/javascript;charset=utf-8") for name in ("hpoint-workflows.js","hpoint-media.js","hpoint-commercial.js","hpoint-subscriptions.js","hpoint-organizations.js","hpoint-public.js","hpoint-professional.js","hpoint-help-categories.js","hpoint-league.js","hpoint-visuals.js","hpoint-personal.js")})
+PAGE=PAGE.replace("</body>",'<script>window.hpointHelpCategoriesData='+json.dumps({"catalog":CATEGORY_CATALOG,"groups":CATEGORY_GROUPS},ensure_ascii=False).replace("<","\\u003c")+';</script><script src="/assets/hpoint-workflows.js?v=20261030-plans4"></script><script src="/assets/hpoint-media.js?v=20261030-plans4"></script><script src="/assets/hpoint-visuals.js?v=20261030-plans4"></script><script src="/assets/hpoint-professional.js?v=20261030-plans4"></script><script src="/assets/hpoint-commercial.js?v=20261030-plans4"></script><script src="/assets/hpoint-subscriptions.js?v=20261030-plans4"></script><script src="/assets/hpoint-organizations.js?v=20261030-plans4"></script><script src="/assets/hpoint-help-categories.js?v=20261030-plans4"></script><script src="/assets/hpoint-league.js?v=20261030-plans4"></script><script src="/assets/hpoint-personal.js?v=20261030-plans4"></script><script>window.hpointStart();</script></body>')
 
 # Hide server-rendered legacy hooks before the first paint. Reveal only the
 # current workspace/landing, once its modules and initial data are ready.
@@ -1629,7 +1635,7 @@ PAGE=PAGE.replace('<body>','<body><div id="hpointBootScreen" role="status" aria-
 ASSETS.update(visuals.assets())
 ASSETS["hpoint-editorial.css"]=(Path(__file__).resolve().parents[1]/"assets"/"hpoint-editorial.css","text/css;charset=utf-8")
 ASSETS["photo-sources.json"]=(Path(__file__).resolve().parents[1]/"assets"/"photo-sources.json","application/json;charset=utf-8")
-PAGE=PAGE.replace("</head>",'<link rel="stylesheet" href="/assets/hpoint-editorial.css?v=20261030-mobile3"></head>',1)
+PAGE=PAGE.replace("</head>",'<link rel="stylesheet" href="/assets/hpoint-editorial.css?v=20261030-plans4"></head>',1)
 PAGE=PAGE.replace("<body>",'<body class="hpEditorial">',1)
 PAGE=PAGE.replace("window.hpointHelpCategoriesData=","window.hpointPhotoCatalog="+json.dumps(visuals.catalog(),ensure_ascii=False).replace("<",r"\u003c")+";window.hpointHelpCategoriesData=",1)
 
@@ -1768,6 +1774,23 @@ class Handler(BaseHTTPRequestHandler):
                 try: limit=int(query.get("limit",[100])[0])
                 except (TypeError,ValueError): limit=100
                 return reply(self,{"ok":True,**database.admin_dashboard(days,limit,query.get("q",[""])[0])})
+            if p.path=="/api/requests/quote":
+                u=auth(self)
+                if not u:return
+                try:quote=workflow.quote_new_reward(int(parse_qs(p.query).get("reward_rub",[0])[0]))
+                except (TypeError,ValueError):return reply(self,{"ok":False,"error":"Вознаграждение — от 0 до 100 000 тестовых ₽."},400)
+                return reply(self,{"ok":True,"quote":quote})
+            if p.path in ("/api/personal","/api/personal/templates","/api/personal/template","/api/personal/schedules"):
+                u=auth(self)
+                if not u:return
+                uid=u["user_id"]
+                try:
+                    if p.path=="/api/personal/template":
+                        template=personal.get_template(uid,int(parse_qs(p.query).get("id",[0])[0]),for_use=True)
+                        return reply(self,{"ok":True,"template":template,"quote":workflow.quote_new_reward(template["fields"].get("reward_rub",0)),"personal_usage":personal.usage(uid)})
+                    return reply(self,{"ok":True,"personal_usage":personal.usage(uid),"templates":personal.list_templates(uid),"schedules":personal.list_schedules(uid)})
+                except personal.PersonalLimitError as error:return personal_limit_reply(self,error)
+                except (TypeError,ValueError,LookupError,PermissionError) as error:return reply(self,{"ok":False,"error":str(error) or "Шаблон не найден."},400)
             if p.path=="/api/me":
                 u=auth(self)
                 if not u:return
@@ -1819,7 +1842,7 @@ class Handler(BaseHTTPRequestHandler):
                 offers=db.execute("""SELECT rc.request_id,rc.candidate_id helper_id,rc.offer_token,u.name helper_name FROM request_candidates rc
                     JOIN requests r ON r.id=rc.request_id JOIN users u ON u.user_id=rc.candidate_id
                     WHERE r.requester_id=? AND r.status=? AND rc.status='offered'""",(u["user_id"],STATUS_OPEN)).fetchall()
-                return reply(self,{"ok":True,"user":user_payload(u),"wallet":public_wallet_summary(u["user_id"], limit=5),"help_achievements":help_achievements.achievement_state(u["user_id"]),"features":{"games":GAMES_ENABLED},"current_user_id":u["user_id"],"requests":[request_payload(r) for r in rs],"outgoing_offers":[dict(row) for row in offers],"applications":[dict(row) for row in get_request_applications(u["user_id"])],"my_applications":[dict(row) for row in get_helper_applications(u["user_id"])],"request_promotion":{"item_type":"boost",**MONETIZATION_ITEMS["boost"]},"paid_catalog":MONETIZATION_ITEMS,"reward_checkout_available":False})
+                return reply(self,{"ok":True,"user":user_payload(u),"wallet":public_wallet_summary(u["user_id"], limit=5),"help_achievements":help_achievements.achievement_state(u["user_id"]),"features":{"games":GAMES_ENABLED},"current_user_id":u["user_id"],"requests":[request_payload(r) for r in rs],"outgoing_offers":[dict(row) for row in offers],"applications":[dict(row) for row in get_request_applications(u["user_id"])],"my_applications":[dict(row) for row in get_helper_applications(u["user_id"])],"personal_usage":personal.usage(u["user_id"]),"request_promotion":None,"paid_catalog":MONETIZATION_ITEMS,"reward_checkout_available":False})
             if p.path=="/api/requests/mine":
                 u=auth(self)
                 if not u:return
@@ -1908,7 +1931,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/helper/offers":
                 u=auth(self)
                 if not u:return
-                return reply(self,{"ok":True,"offers":[dict(row) for row in get_helper_offers(u["user_id"])]})
+                return reply(self,{"ok":True,"offers":[{**dict(row),"reward_quote":workflow.reward_quote(row)} for row in get_helper_offers(u["user_id"])]})
             if p.path=="/api/support":
                 u=auth(self)
                 if not u:return
@@ -1939,7 +1962,7 @@ class Handler(BaseHTTPRequestHandler):
                     item["joined"]=bool(item["joined"])
                     item["is_creator"]=item["creator_id"]==u["user_id"]
                     events.append(item)
-                return reply(self,{"ok":True,"events":events,"mine":mine})
+                return reply(self,{"ok":True,"events":events,"mine":mine,"personal_usage":personal.usage(u["user_id"])})
             if p.path=="/api/search":
                 u=auth(self)
                 if not u:return
@@ -2025,6 +2048,32 @@ class Handler(BaseHTTPRequestHandler):
         try:d=read(self, EVENT_JSON_BODY if p.path=="/api/events" else (14*1024*1024 if p.path in ("/api/requests","/api/chats/send") else (128*1024 if p.path=="/api/commercial/estimates" else MAX_JSON_BODY)))
         except:return reply(self,{"ok":False,"error":"Некорректный JSON"},400)
         try:
+            if p.path.startswith("/api/personal/"):
+                u=auth(self)
+                if not u:return
+                if not verified_community_account(self,u):return
+                uid=u["user_id"]
+                try:
+                    if p.path=="/api/personal/templates":
+                        fields=d.get("fields") or {}
+                        if d.get("request_id"):
+                            source=get_request(int(d["request_id"]))
+                            if not source or source["requester_id"]!=uid:raise ValueError("Можно сохранить только собственную заявку.")
+                            fields=dict(source)
+                        result=personal.save_template(uid,{"name":d.get("name"),"fields":fields},int(d["id"]) if d.get("id") else None)
+                        return reply(self,{"ok":True,"template":result,"personal_usage":personal.usage(uid)})
+                    if p.path=="/api/personal/template/delete":
+                        removed=personal.delete_template(uid,int(d.get("id",0)))
+                        return reply(self,{"ok":True,"deleted":removed})
+                    if p.path=="/api/personal/schedules":
+                        result=personal.save_schedule(uid,d,int(d["id"]) if d.get("id") else None)
+                        return reply(self,{"ok":True,"schedule":result})
+                    if p.path=="/api/personal/schedule/status":
+                        result=personal.set_schedule_status(uid,int(d.get("id",0)),str(d.get("status","")))
+                        return reply(self,{"ok":True,"schedule":result})
+                    return self.send_error(404)
+                except personal.PersonalLimitError as error:return personal_limit_reply(self,error)
+                except (TypeError,ValueError,LookupError,PermissionError) as error:return reply(self,{"ok":False,"error":str(error) or "Некорректные параметры."},400)
             if p.path.startswith("/api/games/"):
                 u=auth(self)
                 if not u:return
@@ -2265,6 +2314,8 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     image=event_image_data(d.get("image_data"))
                     event_id=database.create_community_event(u["user_id"],d.get("title"),d.get("description"),d.get("place"),d.get("starts_at"),d.get("ends_at"),d.get("capacity"),image)
+                except personal.PersonalLimitError as exc:
+                    return personal_limit_reply(self,exc)
                 except ValueError as exc:
                     return reply(self,{"ok":False,"error":str(exc)},400)
                 if u["tg_user_id"]:
@@ -2349,17 +2400,20 @@ class Handler(BaseHTTPRequestHandler):
                 u=auth(self)
                 if not u:return
                 if not verified_community_account(self,u):return
-                open_count=db.execute("SELECT COUNT(*) n FROM requests WHERE requester_id=? AND status=?",(u["user_id"],STATUS_OPEN)).fetchone()["n"]
-                if int(open_count or 0)>=10:return reply(self,{"ok":False,"error":"Одновременно можно опубликовать до 10 открытых заявок."},409)
                 f={k:str(d.get(k,"" )).strip() for k in ("what","place","time_needed","urgency","details")}
                 if not all(f.values()):return reply(self,{"ok":False,"error":"Заполните все поля."},400)
                 if any(len(value)>MAX_TEXT_LEN for value in f.values()):return reply(self,{"ok":False,"error":f"Каждое поле должно быть не длиннее {MAX_TEXT_LEN} символов."},400)
                 try:lat,lon=coordinates_from_payload(d)
                 except ValueError:return reply(self,{"ok":False,"error":"Некорректные координаты."},400)
-                try: expires_in_hours=int(d.get("expires_in_hours",48)); reward_rub=int(d.get("reward_rub",0) or 0)
-                except (TypeError,ValueError): return reply(self,{"ok":False,"error":"Некорректный срок заявки."},400)
+                try:
+                    expires_in_hours=int(d.get("expires_in_hours",48))
+                    quote=workflow.quote_new_reward(d.get("reward_rub",0))
+                    reward_rub=quote["reward_rub"]
+                except (TypeError,ValueError): return reply(self,{"ok":False,"error":"Проверьте срок и целую сумму вознаграждения."},400)
                 if not 1 <= expires_in_hours <= 168:return reply(self,{"ok":False,"error":"Срок заявки — от 1 часа до 7 дней."},400)
                 if not 0 <= reward_rub <= 100_000:return reply(self,{"ok":False,"error":"Вознаграждение — от 0 до 100 000 ₽."},400)
+                if reward_rub and (d.get("pricing_version")!=quote["version"] or d.get("expected_total_rub")!=quote["total_rub"]):
+                    return reply(self,{"ok":False,"code":"pricing_confirmation_required","error":"Проверьте полную сумму с комиссией перед публикацией.","quote":quote},409)
                 if reward_rub == 0 and u["balance"]<REQUEST_COST:return reply(self,{"ok":False,"error":f"Нужно {REQUEST_COST} HP."},400)
                 f["category"]=str(d.get("category","other"))
                 if f["category"] not in CATEGORIES:return reply(self,{"ok":False,"error":"Некорректная категория."},400)
@@ -2373,6 +2427,8 @@ class Handler(BaseHTTPRequestHandler):
                     media.attach_request_photos(db,rid,u["user_id"],photos)
                     db.execute("UPDATE users SET saved_location=?,lat=?,lon=? WHERE user_id=?",(f["place"],lat,lon,u["user_id"]))
                     db.execute("COMMIT")
+                except personal.PersonalLimitError as error:
+                    db.execute("ROLLBACK");return personal_limit_reply(self,error)
                 except Exception:
                     db.execute("ROLLBACK");raise
                 if lat is not None:
@@ -2382,9 +2438,9 @@ class Handler(BaseHTTPRequestHandler):
                     notify_telegram_user(
                         u["tg_user_id"],
                         f"🆕 На сайте создана заявка №{rid}: {escape(req['what'])}\n"
-                        "Откройте в H-Point «⚡ Подобрать кандидатов», выберите человека из очереди — он сам подтвердит согласие.",
+                        f"Откройте заявку на сайте: {WEB_PUBLIC_URL}/#/help. Помощник сам подтвердит согласие.",
                     )
-                return reply(self,{"ok":True,"request_id":rid,"matched":False})
+                return reply(self,{"ok":True,"request_id":rid,"matched":False,"quote":workflow.reward_quote(req),"personal_usage":personal.usage(u["user_id"])})
             if p.path=="/api/helper/preferences":
                 u=auth(self)
                 if not u:return
@@ -2423,7 +2479,7 @@ class Handler(BaseHTTPRequestHandler):
                 chat=chat_threads.read_chat(db,u["user_id"],request_id=rid)
                 other=get_user(chat["requester_id"])
                 if result=="created" and other and other["tg_user_id"]:
-                    notify_telegram_user(other["tg_user_id"],chat_notification(rid,u["name"],"Хочу помочь. Обсудим детали?",chat["what"],chat_id=chat["id"]))
+                    notify_telegram_user(other["tg_user_id"],chat_notification_chunks(rid,u["name"],"Хочу помочь. Обсудим детали?",chat["what"],chat_id=chat["id"]))
                 return reply(self,{"ok":True,"request_id":rid,"chat":chat,"chat_id":chat["id"]})
             if p.path=="/api/requests/accept":
                 u=auth(self)
@@ -2624,8 +2680,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not u:return
                 if not verified_community_account(self,u):return
                 try:
-                    rid=int(d["request_id"]);amount=int(d["amount_rub"])
-                    if isinstance(d["amount_rub"],bool):raise ValueError("amount")
+                    rid=int(d["request_id"]);amount=d["amount_rub"]
+                    if isinstance(amount,bool) or not isinstance(amount,int):raise ValueError("amount")
                 except (KeyError,TypeError,ValueError):return reply(self,{"ok":False,"error":"Некорректная сумма или заявка."},400)
                 try:created=reserve_request_reward(rid,u["user_id"],amount)
                 except ValueError as error:
@@ -2679,7 +2735,7 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as error:return reply(self,{"ok":False,"error":str(error)},409 if str(error).startswith("Обсуждение закрыто") else 400)
                 other=get_user(chat["other_id"])
                 if other and other["tg_user_id"]:
-                    notify_telegram_user(other["tg_user_id"],chat_notification(chat["request_id"],u["name"],str(d.get("text","") or "Фото"),chat["what"],chat_id=chat["id"]))
+                    notify_telegram_user(other["tg_user_id"],chat_notification_chunks(chat["request_id"],u["name"],str(d.get("text","") or "Фото"),chat["what"],chat_id=chat["id"]))
                 return reply(self,{"ok":True,"chat":chat,"messages":chat["messages"]})
 
             if p.path=="/api/payments/create":
@@ -2738,6 +2794,28 @@ class Handler(BaseHTTPRequestHandler):
             logging.exception("Web request failed: %s", p.path)
             reply(self,{"ok":False,"error":"Внутренняя ошибка сервера"},500)
 
+def maintain_personal_schedules():
+    """Publish once in DB first; notification failure cannot replay publication."""
+    result=personal.process_due()
+    for event in result["published"]:
+        user=get_user(event["user_id"])
+        request=get_request(event["request_id"])
+        if not user or not user["tg_user_id"] or not request:continue
+        message="По расписанию опубликована помощь: "+escape(request["what"])
+        if event["paid"]:
+            quote=workflow.reward_quote(request)
+            message+=(f"\nПомощнику: {quote['helper_rub']} тест. ₽. Комиссия: {quote['commission_rub']} тест. ₽."
+                      f"\nСоздайте новый резерв {quote['total_rub']} тест. ₽ на сайте в течение 5 минут. Средства ещё не списаны.")
+        message+="\n"+escape(WEB_PUBLIC_URL.rstrip('/')+"/#/help/mine")
+        notify_telegram_user(user["tg_user_id"],message)
+    # Several schedules may expire together; one compact notice per account.
+    for uid in {event["user_id"] for event in result["skipped"] if event["reason"]=="pro_expired"}:
+        user=get_user(uid)
+        if user and user["tg_user_id"]:
+            notify_telegram_user(user["tg_user_id"],"Срок PRO завершён. Повторы заявок поставлены на паузу; данные и переписка сохранены. После продления возобновите нужные повторы на сайте.\n"+escape(WEB_PUBLIC_URL.rstrip('/')+"/#/help/mine"))
+    if result["errors"]:logging.warning("Personal schedule processing errors: %d",len(result["errors"]))
+    return result
+
 def create_server():
     database.init_db()
     server=ThreadingHTTPServer((WEB_HOST,WEB_PORT),Handler)
@@ -2745,8 +2823,10 @@ def create_server():
         stopped=threading.Event()
         def maintain():
             while not stopped.wait(10):
-                try:expire_open_requests()
-                except Exception:logging.exception("Request expiry maintenance failed")
+                try:
+                    expire_open_requests()
+                    maintain_personal_schedules()
+                except Exception:logging.exception("Request maintenance failed")
                 finally:database.db.close()
         worker=threading.Thread(target=maintain,name="hpoint-request-expiry",daemon=True)
         worker.start()

@@ -32,6 +32,10 @@ for uid, name in [(901,"Тестовый участник"),(902,"Тестовы
     database.create_user(uid,name,email=f"qa{uid}@example.test",password_hash=web.ph("SyntheticQa1"),tg_user_id=uid,web_verified=True)
     database.db.execute("UPDATE users SET email_verified=1,city='Тестовый город' WHERE user_id=?",(uid,))
 database.db.execute("UPDATE users SET role='admin' WHERE user_id=901")
+# Historical multi-request fixtures predate the tariff. Seed them under PRO,
+# then restore the free plan; expiry must retain all existing agreements.
+from datetime import datetime, timezone, timedelta
+database.db.execute("UPDATE users SET pro_until=? WHERE user_id IN (901,903)",((datetime.now(timezone.utc)+timedelta(days=1)).isoformat(),))
 payload={"what":"Настроить домашнюю технику","place":"Тестовый район","time_needed":"сегодня","urgency":"В течение дня","details":"Только тестовые данные","category":"tech"}
 services.create_request(901,payload)
 services.create_request(903,{**payload,"what":"Перенести коробки","category":"carry"})
@@ -59,6 +63,7 @@ if os.environ.get("HPOINT_QA_HELP_AWARDS") == "1":
     games.start_game(904,"crossing")
     games.GAMES_ENABLED=False
     database.db.execute("INSERT INTO game_achievements(user_id,achievement_id) VALUES(904,'first_steps')")
+database.db.execute("UPDATE users SET pro_until=NULL WHERE user_id IN (901,903)")
 database.create_web_login_ticket(901,"theme-browser-data")
 database.create_web_login_ticket(905,"theme-browser-empty")
 database.create_web_login_ticket(905,"theme-browser-game-deep")
