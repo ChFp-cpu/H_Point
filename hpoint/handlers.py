@@ -146,8 +146,8 @@ BOT_GUIDE = (
     "ℹ️ <b>H-Point в Telegram</b>\n\n"
     "Бесплатно: полные сообщения, важные уведомления и переписка по помощи. "
     "Открыть переписку — «Мои чаты»; ответить по текущей помощи — <b>/chat ТЕКСТ</b>.\n\n"
-    "С PRO в меню появляются «Мне нужна помощь» и «Мои заявки»: "
-    "создание, выбор помощника, отмена и завершение заявки. "
+    "С PRO в меню появляются «Мне нужна помощь», «Хочу помочь» и «Мои заявки»: "
+    "создание, подбор помощи, отклики, выбор помощника, отмена и завершение заявки. "
     "На сайте эти действия доступны бесплатно. Шаблоны и расписание находятся на сайте.\n\n"
     "Регистрация и вход — только по email на сайте. "
     "Для привязки получите код в профиле и отправьте <b>/link КОД</b>. "
@@ -160,12 +160,12 @@ BOT_START_OVERVIEW = (
     "Управление заявками — на сайте или в меню PRO."
 )
 BASIC_BOT_COMMANDS = {"/start", "/help", "/menu", "/website", "/chats", "/chat", "/problem", "/cancel", "/link", "/unlink", "/ask", "/billing", "/terms", "/paysupport"}
-PRO_BOT_ACTIONS = {BTN_NEED_HELP, BTN_FIND_CANDIDATES, BTN_MY_CANDIDATES, BOT_REQUESTS_BUTTON}
+PRO_BOT_ACTIONS = {BTN_NEED_HELP, BTN_WANT_HELP, BTN_FIND_CANDIDATES, BTN_MY_CANDIDATES, BOT_REQUESTS_BUTTON}
 LEGACY_BOT_DESTINATIONS = {
     "/profile":"#/profile", "/history":"#/help", "/settings":"#/help",
     "/commercial":"#/profile", "/verifyme":"#/profile",
     "/games":"", "/achievements":"#/league",
-    BTN_WANT_HELP:"#/help", BTN_PROFILE:"#/profile", BTN_HISTORY:"#/help",
+    BTN_PROFILE:"#/profile", BTN_HISTORY:"#/help",
     BTN_SETTINGS:"#/help", BTN_GAMES:"", "💳 H-Point+":"#/profile/billing",
 }
 
@@ -188,6 +188,8 @@ async def simplified_bot_message(event, data):
     current_state=await state.get_state() if state else None
     if text in PRO_BOT_ACTIONS:
         if not await require_pro_management(event,state):return True
+        if text==BTN_WANT_HELP:
+            await want_help(event,state,data.get("bot"));return True
         action={BTN_NEED_HELP:need_help_start,BTN_FIND_CANDIDATES:find_candidates,BTN_MY_CANDIDATES:my_candidates,BOT_REQUESTS_BUTTON:request_management_menu}[text]
         await action(event,state)
         return True
@@ -1106,7 +1108,7 @@ async def cb_match_request(callback: CallbackQuery):
 
 async def show_request_management(message,user_id,request_id=None):
     if request_id is None:
-        requests=db.execute("SELECT id,what,status FROM requests WHERE requester_id=? AND status IN (?,?) ORDER BY id DESC LIMIT 5",(user_id,STATUS_OPEN,STATUS_IN_PROGRESS)).fetchall()
+        requests=db.execute("SELECT id,what,status FROM requests WHERE requester_id=? AND status IN (?,?) ORDER BY id DESC LIMIT 10",(user_id,STATUS_OPEN,STATUS_IN_PROGRESS)).fetchall()
         if not requests:
             await message.answer("Активных заявок пока нет. Создать заявку можно кнопкой «Мне нужна помощь» или на сайте.",reply_markup=bot_website_keyboard("#/help"));return
         await message.answer("Выберите свою заявку:",reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -1426,19 +1428,124 @@ async def q_details(message: Message, state: FSMContext, bot: Bot) -> None:
     await message.answer("Если помощь больше не нужна:", reply_markup=cancel_request_kb(request_id))
 
 
+def _helper_card(request, distance=None):
+    """Public matching summary; exact address and private details stay in chat."""
+    text=(f"🤝 <b>{escape(str(request['what']))}</b>\n"
+          f"Кому нужна помощь: {request_author_name(request)}\n"
+          f"{escape(CATEGORIES.get(request['category'],CATEGORIES['other']))} · {escape(str(request['time_needed']))}")
+    if distance is not None:text+=f"\nОколо {distance:g} км от сохранённой точки"
+    text+="\n"+escape(request_reward_note(request))
+    return text
+
+
+async def show_helper_status(message,user_id):
+    active=get_active_help(user_id)
+    applications=get_helper_applications(user_id)
+    offers=get_helper_offers(user_id,limit=5)
+    ready=is_in_queue(user_id)
+    rows=[]
+    lines=["🤝 <b>Хочу помочь</b>","Готовность к новым приглашениям: "+("включена" if ready else "на паузе")]
+    if active:
+        lines.extend(["", "Сейчас вы помогаете: <b>"+escape(str(active["what"]))+"</b>",
+                      "Завершение подтверждает автор. Новую помощь можно взять после текущей."])
+        rows.extend(request_chat_kb(active["id"]).inline_keyboard)
+        rows.append([InlineKeyboardButton(text="Помощь не состоялась · отменить",callback_data="cancel_req:"+str(active["id"]))])
+    else:
+        rows.append([InlineKeyboardButton(text="Подобрать помощь",callback_data="helper:find")])
+        if not ready:rows.append([InlineKeyboardButton(text="Готов получать приглашения",callback_data="helper:ready")])
+    if ready:rows.append([InlineKeyboardButton(text="Приостановить новые приглашения",callback_data="leave_queue")])
+    if offers:
+        lines.append("\nПриглашений от авторов: "+str(len(offers)))
+        for offer in offers:rows.append([InlineKeyboardButton(text="Приглашение · "+str(offer["what"])[:40],callback_data="helper:view:"+str(offer["request_id"]))])
+    if applications:
+        lines.append("Ожидают выбора автора: "+str(len(applications)))
+        for application in applications[:5]:rows.append([InlineKeyboardButton(text=str(application["what"])[:45],callback_data="helper:view:"+str(application["request_id"]))])
+    closed=db.execute("SELECT r.what,r.status FROM requests r WHERE (r.helper_id=? OR EXISTS(SELECT 1 FROM request_candidates rc WHERE rc.request_id=r.id AND rc.candidate_id=?)) AND r.status IN ('done','cancelled') ORDER BY r.id DESC LIMIT 3",(user_id,user_id)).fetchall()
+    if closed:
+        lines.append("\nПоследняя помощь:")
+        lines.extend(("✅ " if row["status"]=="done" else "↩️ ")+escape(str(row["what"])) for row in closed)
+    lines.append("\nИзменения, сообщения и важные уведомления приходят бесплатно, в том числе после окончания PRO.")
+    rows.append([InlineKeyboardButton(text="Обновить статус",callback_data="helper:status")])
+    rows.append([InlineKeyboardButton(text="Навыки и место на сайте",url=WEB_PUBLIC_URL.rstrip("/")+"/#/help")])
+    await message.answer("\n".join(lines),reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
 @router.message(StateFilter(None), F.text == BTN_WANT_HELP)
-async def want_help(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not await ensure_registered(message, state) or not await check_not_busy(message):
+@pro_request_action
+async def want_help(message: Message, state: FSMContext, bot: Bot=None) -> None:
+    if await ensure_registered(message,state):await show_helper_status(message,resolve_profile_id(message.from_user.id))
+
+
+@router.callback_query(F.data.startswith("helper:"))
+@pro_request_action
+async def cb_helper_management(callback: CallbackQuery,bot: Bot) -> None:
+    user_id=resolve_profile_id(callback.from_user.id)
+    parts=str(callback.data or "").split(":")
+    action=parts[1] if len(parts)>1 else ""
+    if not callback.message:return
+    if action in ("status","menu"):
+        await callback.answer();await show_helper_status(callback.message,user_id);return
+    if action in ("find","ready"):
+        await callback.answer()
+        if not await check_not_busy(_helper_actor_message(callback)):
+            return
+        if action=="ready":
+            add_to_queue(user_id)
+            await callback.message.answer("Готовность включена. Навыки и сохранённая точка синхронизированы с сайтом. Когда автор пригласит вас, придёт уведомление.")
+            await show_helper_status(callback.message,user_id);return
+        matches=smart_requests_for_helper(user_id,limit=5)
+        if not matches:
+            await callback.message.answer("По вашим навыкам, доступности и сохранённому месту подходящей помощи пока нет. Можно включить готовность и получать приглашения.")
+        for match in matches:
+            request=match["request"]
+            await callback.message.answer(_helper_card(request,match["distance_km"]),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Откликнуться",callback_data="helper:apply:"+str(request["id"]))]]))
+        await callback.message.answer("Отклик открывает обсуждение. Автор сам выберет помощника; деньги не списываются.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Моя помощь и отклики",callback_data="helper:status")],[InlineKeyboardButton(text="Все заявки на сайте",url=WEB_PUBLIC_URL.rstrip("/")+"/#/help")]]))
         return
-    user_id = resolve_profile_id(message.from_user.id)
-    if is_in_queue(user_id):
-        await message.answer("Вы уже в очереди помощников.", reply_markup=leave_queue_kb())
+    try:
+        if len(parts)!=3 or action not in ("apply","view"):raise ValueError()
+        request_id=int(parts[2])
+        if request_id<1:raise ValueError()
+    except ValueError:
+        await callback.answer("Действие недоступно.",show_alert=True);return
+    request=get_request(request_id)
+    if action=="apply":
+        if not await check_not_busy(_helper_actor_message(callback)):
+            await callback.answer("Сначала откройте текущую помощь или оценку в сообщении бота.");return
+        eligible={item["request"]["id"] for item in smart_requests_for_helper(user_id,limit=100)}
+        if request_id not in eligible:
+            await callback.answer("Заявка уже недоступна или не подходит текущим настройкам. Обновите подбор.",show_alert=True);return
+        result=apply_to_request(request_id,user_id)
+        if result not in ("created","applied","offered"):
+            await callback.answer("Заявка уже изменилась. Обновите подбор.",show_alert=True);return
+        await callback.answer("Отклик отправлен" if result=="created" else "Отклик уже сохранён")
+        candidate=db.execute("SELECT status,offer_token FROM request_candidates WHERE request_id=? AND candidate_id=?",(request_id,user_id)).fetchone()
+        author=get_user(request["requester_id"])
+        if result=="created" and candidate and candidate["status"]=="applied" and author and author["tg_user_id"]:
+            try:await bot.send_message(author["tg_user_id"],f"🤝 <b>{escape(str(get_user(user_id)['name']))}</b> откликнулся на помощь «{request_title(request_id)}». Обсудите детали и выберите помощника.",reply_markup=application_kb(request_id,user_id,candidate["offer_token"],True))
+            except Exception:logging.exception("Не удалось уведомить автора об отклике %s",request_id)
+        await callback.message.answer("Отклик сохранён. Обсудите детали в чате; автор увидит вас среди откликнувшихся. Когда вас выберут, придёт уведомление.",reply_markup=request_chat_kb(request_id))
         return
-    add_to_queue(user_id)
-    await message.answer(
-        "Вы добавлены в общую очередь помощников сайта и бота. Когда вас выберут, вы сами подтвердите или отклоните предложение.",
-        reply_markup=leave_queue_kb(),
-    )
+    candidate=db.execute("SELECT status,offer_token FROM request_candidates WHERE request_id=? AND candidate_id=?",(request_id,user_id)).fetchone()
+    if not request or not (request["helper_id"]==user_id or candidate and candidate["status"] in ("applied","offered","accepted")):
+        await callback.answer("Эта помощь вам недоступна.",show_alert=True);return
+    await callback.answer()
+    status={"open":"Ожидает выбора автора","in_progress":"В работе","done":"Завершена","cancelled":"Отменена"}.get(request["status"],request["status"])
+    rows=request_chat_kb(request_id).inline_keyboard
+    if candidate and candidate["status"]=="offered" and request["status"]==STATUS_OPEN:
+        rows+=helper_offer_kb(request_id,candidate["offer_token"] or "").inline_keyboard
+    elif candidate and candidate["status"]=="applied" and request["status"]==STATUS_OPEN:
+        rows+=application_kb(request_id,user_id,candidate["offer_token"],False).inline_keyboard
+    rows.append([InlineKeyboardButton(text="Моя помощь и отклики",callback_data="helper:status")])
+    await callback.message.answer(_helper_card(request)+"\nСтатус: "+escape(status),reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+def _helper_actor_message(callback):
+    # A callback's message is authored by the bot; permission/business checks
+    # must use the person who pressed the button, never message.from_user.
+    from types import SimpleNamespace
+    return SimpleNamespace(from_user=callback.from_user,answer=callback.message.answer)
 
 
 @router.callback_query(F.data == "leave_queue")
@@ -1446,22 +1553,35 @@ async def cb_leave_queue(callback: CallbackQuery) -> None:
     if is_in_queue(resolve_profile_id(callback.from_user.id)):
         remove_from_queue(resolve_profile_id(callback.from_user.id))
         await callback.answer("Вы вышли из очереди")
-        await callback.message.edit_text("Вы вышли из очереди помощников. Ожидающие отклики отозваны; уже принятая помощь не отменяется.")
+        await callback.message.edit_text("Новые приглашения приостановлены. Сохранённые отклики и уже принятая помощь продолжают действовать.")
     else:
         await callback.answer("Вы не в очереди", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("cancel_req:"))
 @pro_request_action
-async def cb_cancel_request(callback: CallbackQuery) -> None:
+async def cb_cancel_request(callback: CallbackQuery,bot: Bot=None) -> None:
     try:
         request_id = int(callback.data.split(":")[1])
-    except ValueError:
+    except (ValueError,IndexError):
         await callback.answer("Некорректная заявка", show_alert=True)
         return
-    if cancel_request(request_id, resolve_profile_id(callback.from_user.id)):
+    actor=resolve_profile_id(callback.from_user.id)
+    request=get_request(request_id)
+    recipients=set()
+    if request:
+        recipients={request["requester_id"],request["helper_id"]}
+        recipients.update(row["candidate_id"] for row in db.execute("SELECT candidate_id FROM request_candidates WHERE request_id=? AND status IN ('applied','offered')",(request_id,)).fetchall())
+    reason="Помощник сообщил, что помощь не состоялась" if request and request["helper_id"]==actor else "Отменено автором заявки"
+    if cancel_request(request_id,actor,reason):
         await callback.answer("Заявка отменена")
         await callback.message.edit_text(f"🗑 Помощь «{request_title(request_id)}» отменена.")
+        if bot:
+            for uid in recipients-{None,actor}:
+                user=get_user(uid)
+                if user and user["tg_user_id"]:
+                    try:await bot.send_message(user["tg_user_id"],f"↩️ Помощь «{request_title(request_id)}» отменена. "+escape(reason)+". Переписка и история сохранены.",reply_markup=request_chat_kb(request_id))
+                    except Exception:logging.exception("Не удалось уведомить об отмене помощи %s",request_id)
     else:
         await callback.answer("Заявку уже нельзя отменить.", show_alert=True)
 

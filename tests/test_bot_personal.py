@@ -160,11 +160,11 @@ class PersonalBot(unittest.IsolatedAsyncioTestCase):
         self.access()
         await self.state.set_state(HelpRequest.details)
         await self.state.update_data(what="Saved task", category="other", place="Saved place", time_needed="По договорённости", urgency="🕊 Не срочно")
-        for index in range(5):
+        for index in range(10):
             self.request(title="Existing task " + str(index))
         message = self.message("Saved final detail")
         await handlers.q_details(message, self.state, self.bot)
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM requests").fetchone()[0], 5)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM requests").fetchone()[0], 10)
         self.assertEqual((await self.state.get_data())["details"], "Saved final detail")
         self.assertEqual(await self.state.get_state(), HelpRequest.details.state)
         self.assertIn("сохранены", message.answer.await_args.args[0])

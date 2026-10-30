@@ -84,15 +84,15 @@ class PersonalScenarios:
         self.assertNotEqual(replacement, own)
         self.assertEqual(database.get_active_help(1)["id"], other)
 
-    def test_pro_expiry_preserves_five_requests_and_blocks_only_new_creation(self):
+    def test_pro_expiry_preserves_ten_requests_and_blocks_only_new_creation(self):
         self.pro()
-        ids = [self.request() for _ in range(5)]
+        ids = [self.request() for _ in range(10)]
         with self.assertRaises(personal.PersonalLimitError):
             self.request()
         self.pro(active=False)
         state = personal.usage(1)
-        self.assertEqual(state["requests"], {"active": 5, "limit": 1, "remaining": 0})
-        self.assertEqual(len(database.get_history(1)), 5)
+        self.assertEqual(state["requests"], {"active": 10, "limit": 1, "remaining": 0})
+        self.assertEqual(len(database.get_history(1)), 10)
         with self.assertRaises(personal.PersonalLimitError):
             self.request()
         for rid in ids:
@@ -106,11 +106,11 @@ class PersonalScenarios:
         self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM requests WHERE requester_id=1").fetchone()["n"], 1)
         self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM personal_activity_publications WHERE owner_id=1").fetchone()["n"], 2)
 
-    def test_pro_parallel_creation_is_capped_at_five(self):
+    def test_pro_parallel_creation_is_capped_at_ten(self):
         self.pro()
-        result = self.race(*([self.request]*7))
-        self.assertEqual(sum(isinstance(row, int) for row in result), 5)
-        self.assertEqual(personal.usage(1)["requests"]["active"], 5)
+        result = self.race(*([self.request]*12))
+        self.assertEqual(sum(isinstance(row, int) for row in result), 10)
+        self.assertEqual(personal.usage(1)["requests"]["active"], 10)
 
     def test_activity_quota_records_only_successes_and_cancel_does_not_refund(self):
         with self.assertRaises(ValueError):
@@ -158,6 +158,17 @@ class PersonalScenarios:
         self.assertEqual(november["resets_at"], "2026-12-01T00:00:00+03:00")
         self.assertEqual(before, [dict(row) for row in self.db.execute("SELECT * FROM community_events ORDER BY id").fetchall()])
 
+    def test_template_from_request_recovers_duration_without_copying_dates(self):
+        self.pro()
+        rid=self.request(expires_in_hours=73,reward_rub=1234,details="Original details")
+        fields=dict(database.get_request(rid))
+        saved=personal.save_template(1,{"name":"From request","fields":fields})
+        self.assertEqual(saved["fields"]["expires_in_hours"],73)
+        self.assertEqual(saved["fields"]["reward_rub"],1234)
+        self.assertEqual(saved["fields"]["details"],"Original details")
+        self.assertNotIn("expires_at",saved["fields"])
+        self.assertNotIn("created_at",saved["fields"])
+
     def test_templates_are_private_content_only_and_opening_never_publishes(self):
         self.pro()
         template = self.template(helper_id=2, chat_id=42, requester_rating=5, status="done", reward_payment_status="paid", priority_boost=100,
@@ -170,7 +181,7 @@ class PersonalScenarios:
             personal.get_template(2, template["id"], for_use=False)
         self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM requests").fetchone()["n"], 0)
         self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM wallet_transactions").fetchone()["n"], 0)
-        self.assertEqual(personal.usage(1)["requests"]["remaining"], 5)
+        self.assertEqual(personal.usage(1)["requests"]["remaining"], 10)
 
     def test_expired_templates_remain_listed_and_deletable_but_cannot_be_used(self):
         self.pro()
@@ -273,12 +284,12 @@ class PersonalScenarios:
     def test_global_limit_skips_with_reason_without_pausing_or_losing_schedule(self):
         self.pro()
         schedule = self.schedule()
-        for _ in range(5):
+        for _ in range(10):
             self.request()
         result = personal.process_due(self.due(schedule))
         self.assertEqual(result["skipped"][0]["reason"], "active_request_limit")
         self.assertEqual(personal.get_schedule(1, schedule["id"])["status"], "active")
-        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM requests").fetchone()["n"], 5)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM requests").fetchone()["n"], 10)
 
     def test_expiry_pauses_future_schedule_once_and_renewal_never_replays_backlog(self):
         self.pro()

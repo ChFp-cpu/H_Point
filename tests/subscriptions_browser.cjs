@@ -13,12 +13,13 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  const get=async route=>context.request.get(base+route).then(response=>response.json());
  const proCard=()=>page.locator('.workspaceProduct').filter({has:page.locator('[data-item="pro"]')});
  const billing=async()=>{await page.goto(base+'/#/profile/billing');await page.locator('[data-pro-status]').waitFor();};
+ async function currentPlansOnly(){assert.equal(await page.getByRole('heading',{name:'История платежей',exact:true}).count(),0);assert.equal(await page.locator('summary').filter({hasText:/^Прежние покупки$/}).count(),0);assert.equal(await page.locator('.subscriptionPromotions').count(),0);assert.equal(await page.locator('.subscriptionPlanGrid > .workspaceProduct').count(),3);checks+=4}
  const post=async(route,data)=>{let response=await context.request.post(base+route,{data});return {status:response.status(),data:await response.json()}};
  try{
   await emailLogin(page,'theme-browser-data');
   const before=await get('/api/billing'),walletBefore=(await get('/api/sync')).wallet.test_balance_rub;
   assert.equal(before.subscription.pro.active,false);assert.ok(walletBefore>=298,'Run with HPOINT_QA_TEST_FUNDS=1');checks+=2;
-  await billing();assert.equal(await page.locator('[data-pro-status="inactive"]').count(),1);
+  await billing();await currentPlansOnly();assert.equal(await page.locator('[data-pro-status="inactive"]').count(),1);
   assert.equal(await page.locator('[data-header-pro]:not([hidden])').count(),0);checks+=2;
   // Follow the real home advert: its remembered promotion context must not
   // replace the post-purchase renewal controls with another purchase offer.
@@ -67,7 +68,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   assert.equal((await get('/api/billing')).history.length,renewed.history.length);checks+=5;
   await page.reload();await page.locator('[data-pro-status="active"]').waitFor();
   assert.match(await page.locator('[data-pro-status="active"]').innerText(),/Осталось 60 дней/);
-  assert.match(await proCard().innerText(),/Продлить/);checks+=2;
+  assert.match(await proCard().innerText(),/Продлить/);await currentPlansOnly();checks+=2;
   // An open page must stop offering a renewal from a stale active snapshot
   // once its recorded deadline has passed, even before the next billing fetch.
   const expiredSnapshot=await page.evaluate(snapshot=>{
@@ -76,12 +77,19 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
    return {status:host.querySelector('[data-pro-status]').dataset.proStatus,renewals:host.querySelectorAll('[data-renew]').length,metadata:hpointSubscriptions.purchaseMetadata('pro',subscription)};
   },renewed);
   assert.equal(expiredSnapshot.status,'expired');assert.equal(expiredSnapshot.renewals,0);assert.deepEqual(expiredSnapshot.metadata,{});checks+=3;
+  // Historical invoices can still exist in the API. The current tariff page
+  // must not bring back removed purchase panels when such data is present.
+  const historicalDisplay=await page.evaluate(snapshot=>{
+   const host=document.createElement('div');host.innerHTML=hpointSubscriptions.renderBilling({...snapshot,history:[{item_title:'Legacy invoice fixture',item_type:'boost',amount_rub:49,currency:'WALLET',status:'paid'}],subscription:{...snapshot.subscription,promotions:[{title:'Legacy priority fixture',source:'boost',priority:100,active:true}]}});
+   return {text:host.textContent,legacyCards:host.querySelectorAll('.subscriptionPromotions').length,plans:host.querySelectorAll('.subscriptionPlanGrid>.workspaceProduct').length};
+  },renewed);
+  assert.doesNotMatch(historicalDisplay.text,/История платежей|Прежние покупки|Legacy invoice fixture|Legacy priority fixture/);assert.equal(historicalDisplay.legacyCards,0);assert.equal(historicalDisplay.plans,3);checks+=3;
   for(const colorScheme of ['light','dark']){
    await page.emulateMedia({colorScheme});
    for(const width of [320,390,768,1440]){
     await page.setViewportSize({width,height:950});
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
-    assert.equal(await page.locator('[data-pro-status="active"]').count(),1);checks+=2;
+    assert.equal(await page.locator('[data-pro-status="active"]').count(),1);await currentPlansOnly();checks+=2;
     if(width===390)await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,`subscriptions-${colorScheme}-${width}.png`),fullPage:true});
    }
   }

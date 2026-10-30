@@ -5,3 +5,4 @@ python-dotenv==1.2.4
 psycopg[binary]==3.3.6
 
 -r requirements-media.txt
+-r requirements-exports.txt

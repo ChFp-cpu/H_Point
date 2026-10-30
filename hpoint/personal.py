@@ -94,7 +94,7 @@ def usage(user_id, now=None, db_connection=None):
     active = int(connection.execute("SELECT COUNT(*) n FROM requests WHERE requester_id=? AND status IN (?,?)", (user_id, *ACTIVE)).fetchone()["n"])
     month, resets = _month(at)
     used = int(connection.execute("SELECT COUNT(*) n FROM personal_activity_publications WHERE owner_id=? AND month_key=?", (user_id, month)).fetchone()["n"])
-    limit = 5 if pro else 1
+    limit = 10 if pro else 1
     return {"pro_active": pro, "pro_until": end.isoformat() if end else None,
             "requests": {"active": active, "limit": limit, "remaining": max(0, limit-active)},
             "activities": {"used": used, "limit": None if pro else 2,
@@ -219,7 +219,13 @@ def sanitize_fields(fields):
     if category not in CATEGORIES:
         raise ValueError("Выберите направление помощи.")
     clean["category"] = category
-    clean["expires_in_hours"] = _integer(fields.get("expires_in_hours", 48), 1, 168, "Срок заявки — от 1 часа до 7 дней.")
+    duration = fields.get("expires_in_hours")
+    if duration is None:
+        # Persisted requests have absolute dates, not the wizard's duration.
+        # Recover only the interval; never carry the old expiration into a draft.
+        created, expires = _date(fields.get("created_at")), _date(fields.get("expires_at"))
+        duration = max(1,min(168,round((expires-created).total_seconds()/3600))) if created and expires and expires>created else 48
+    clean["expires_in_hours"] = _integer(duration, 1, 168, "Срок заявки — от 1 часа до 7 дней.")
     clean["reward_rub"] = _integer(fields.get("reward_rub", 0), 0, 100000, "Вознаграждение — от 0 до 100 000 ₽.")
     lat, lon = fields.get("lat"), fields.get("lon")
     if lat is None and lon is None:

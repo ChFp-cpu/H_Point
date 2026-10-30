@@ -89,6 +89,12 @@ def initialize_schema(db):
         ("commercial_services","published","INTEGER NOT NULL DEFAULT 0"),
         ("commercial_bookings","assignee_id","INTEGER REFERENCES users(user_id) ON DELETE SET NULL"),
         ("commercial_bookings","object_id","INTEGER REFERENCES commercial_objects(id) ON DELETE SET NULL"),
+        ("commercial_estimates","client_id","INTEGER REFERENCES commercial_clients(id) ON DELETE SET NULL"),
+        ("commercial_estimates","number","TEXT NOT NULL DEFAULT ''"),
+        ("commercial_estimates","issued_on","TEXT NOT NULL DEFAULT ''"),
+        ("commercial_estimates","valid_until","TEXT NOT NULL DEFAULT ''"),
+        ("commercial_estimates","notes","TEXT NOT NULL DEFAULT ''"),
+        ("commercial_estimates","discount_percent","TEXT NOT NULL DEFAULT '0.00'"),
     ):
         if getattr(db,"is_postgres",False):
             db.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {field} {definition.replace('INTEGER','BIGINT')}")
@@ -233,29 +239,117 @@ def _decimal(value,maximum,positive=False):
 def _money(value):return format(value.quantize(CENT,rounding=ROUND_HALF_UP),".2f")
 
 
-def save_estimate(db,uid,data,owner_id=None):
-    item=_id(data);title=c._text(data,"title",160,True)
-    status=_status(data.get("status","draft"),ESTIMATE_STATUSES)
+def calculate_estimate(data):
+    """One decimal calculation for previews, persistence and exported formulas."""
+    if not isinstance(data,dict):raise ValueError("Проверьте данные сметы.")
     markup=_decimal(data.get("markup_percent",0),Decimal("1000"))
+    discount=_decimal(data.get("discount_percent",0),Decimal("100"))
     lines=data.get("items")
     if not isinstance(lines,list) or not 1<=len(lines)<=100:raise ValueError("Добавьте от 1 до 100 строк сметы.")
     normalized=[];subtotal=Decimal(0);cost=Decimal(0)
     for line in lines:
         if not isinstance(line,dict):raise ValueError("Проверьте строки сметы.")
         name=c._text(line,"title",160,True);unit=c._text(line,"unit",24) or "шт."
+        kind=_status(line.get("kind","work"),{"work","material","other"})
         quantity=_decimal(line.get("quantity",1),Decimal("1000000"),True)
         price=_decimal(line.get("price_rub",0),Decimal("100000000")).quantize(CENT,rounding=ROUND_HALF_UP)
         expense=_decimal(line.get("cost_rub",0),Decimal("100000000")).quantize(CENT,rounding=ROUND_HALF_UP)
         amount=(quantity*price).quantize(CENT,rounding=ROUND_HALF_UP)
         line_cost=(quantity*expense).quantize(CENT,rounding=ROUND_HALF_UP)
         subtotal+=amount;cost+=line_cost
-        normalized.append(dict(title=name,unit=unit,quantity=format(quantity,"f"),price_rub=_money(price),cost_rub=_money(expense),total_rub=_money(amount),cost_total_rub=_money(line_cost)))
-    total=(subtotal*(Decimal(1)+markup/100)).quantize(CENT,rounding=ROUND_HALF_UP)
+        normalized.append(dict(title=name,kind=kind,unit=unit,quantity=format(quantity,"f"),price_rub=_money(price),cost_rub=_money(expense),total_rub=_money(amount),cost_total_rub=_money(line_cost)))
+    markup_amount=(subtotal*markup/100).quantize(CENT,rounding=ROUND_HALF_UP)
+    discount_amount=((subtotal+markup_amount)*discount/100).quantize(CENT,rounding=ROUND_HALF_UP)
+    total=subtotal+markup_amount-discount_amount
     if total>Decimal("1000000000000") or cost>Decimal("1000000000000"):
         raise ValueError("Итог сметы не должен превышать один триллион тестовых ₽.")
+    return dict(items=normalized,markup_percent=format(markup,"f"),discount_percent=format(discount,"f"),
+                subtotal_rub=_money(subtotal),markup_rub=_money(markup_amount),discount_rub=_money(discount_amount),
+                total_rub=_money(total),cost_rub=_money(cost),profit_rub=_money(total-cost),
+                groups={key:_money(sum((Decimal(row["total_rub"]) for row in normalized if row["kind"]==key),Decimal(0))) for key in ("work","material","other")})
+
+
+def quote_estimate(db,uid,data,owner_id=None):
+    quote=calculate_estimate(data)
+    return c._mutate(db,uid,lambda owner:{"quote":quote},owner_id,manage=True)
+
+
+def save_estimate(db,uid,data,owner_id=None):
+    item=_id(data);title=c._text(data,"title",160,True)
+    status=_status(data.get("status","draft"),ESTIMATE_STATUSES)
+    quote=calculate_estimate(data)
+    issued=_day(data.get("issued_on"));valid=_day(data.get("valid_until"))
+    if issued and valid and valid<issued:raise ValueError("Срок действия сметы должен быть не раньше даты составления.")
+    values=dict(title=title,status=status,number=c._text(data,"number",40),issued_on=issued,valid_until=valid,
+                notes=c._text(data,"notes",4000),markup_percent=quote["markup_percent"],discount_percent=quote["discount_percent"],
+                items_json=json.dumps(quote["items"],ensure_ascii=False),
+                **{key:quote[key] for key in ("subtotal_rub","total_rub","cost_rub","profit_rub")})
     def save(owner):
-        return _upsert(db,"commercial_estimates",owner,item,dict(title=title,status=status,object_id=object_id(db,owner,data.get("object_id")),markup_percent=format(markup,"f"),items_json=json.dumps(normalized,ensure_ascii=False),subtotal_rub=_money(subtotal),total_rub=_money(total),cost_rub=_money(cost),profit_rub=_money(total-cost)))
+        client=_id(data,"client_id")
+        if client:c._owned(db,"commercial_clients",owner,client)
+        return _upsert(db,"commercial_estimates",owner,item,{**values,"object_id":object_id(db,owner,data.get("object_id")),"client_id":client})
     return c._mutate(db,uid,save,owner_id,manage=True)
+
+
+def shape_estimate(row):
+    result=dict(row)
+    result["items"]=json.loads(result.pop("items_json"))
+    for item in result["items"]:item.setdefault("kind","work")
+    subtotal=Decimal(result["subtotal_rub"])
+    markup=(subtotal*Decimal(result["markup_percent"])/100).quantize(CENT,rounding=ROUND_HALF_UP)
+    result["markup_rub"]=_money(markup)
+    result["discount_rub"]=_money(subtotal+markup-Decimal(result["total_rub"]))
+    result["groups"]={key:_money(sum((Decimal(item["total_rub"]) for item in result["items"] if item["kind"]==key),Decimal(0))) for key in ("work","material","other")}
+    return result
+
+
+def estimate_status(db,uid,data,owner_id=None):
+    item=c._integer(data.get("id"),1,2**63-1)
+    status=_status(data.get("status"),ESTIMATE_STATUSES)
+    return c._mutate(db,uid,lambda owner:_upsert(db,"commercial_estimates",owner,item,{"status":status}),owner_id,manage=True)
+
+
+def delete_estimate(db,uid,data,owner_id=None):
+    item=c._integer(data.get("id"),1,2**63-1)
+    if data.get("confirm") is not True:raise ValueError("Подтвердите удаление сметы.")
+    def remove(owner):
+        c._owned(db,"commercial_estimates",owner,item)
+        db.execute("DELETE FROM commercial_estimates WHERE id=? AND owner_id=?",(item,owner))
+        return {"id":item,"deleted":True}
+    return c._mutate(db,uid,remove,owner_id,manage=True)
+
+
+def duplicate_estimate(db,uid,data,owner_id=None):
+    item=c._integer(data.get("id"),1,2**63-1)
+    def duplicate(owner):
+        row=dict(c._owned(db,"commercial_estimates",owner,item))
+        values={key:row[key] for key in ("title","object_id","client_id","markup_percent","discount_percent","notes","items_json","subtotal_rub","total_rub","cost_rub","profit_rub")}
+        values.update(title=(row["title"][:145]+" · копия"),status="draft",number="",issued_on="",valid_until="")
+        return _upsert(db,"commercial_estimates",owner,None,values)
+    return c._mutate(db,uid,duplicate,owner_id,manage=True)
+
+
+def export_estimate(db,uid,item_id,owner_id=None,format="pdf",audience="client"):
+    item=c._integer(item_id,1,2**63-1)
+    if format not in ("pdf","xlsx") or audience not in ("client","internal"):raise ValueError("Выберите PDF или Excel и вид сметы.")
+    def snapshot(owner):
+        _,profile,role=c._context(db,uid,owner)
+        if audience=="internal" and role not in ("owner","admin"):raise PermissionError("Внутренний расчёт доступен только руководителям организации.")
+        row=shape_estimate(c._owned(db,"commercial_estimates",owner,item))
+        client=db.execute("SELECT name FROM commercial_clients WHERE id=? AND owner_id=?",(row["client_id"],owner)).fetchone() if row["client_id"] else None
+        obj=db.execute("SELECT title,address FROM commercial_objects WHERE id=? AND owner_id=?",(row["object_id"],owner)).fetchone() if row["object_id"] else None
+        document={**row,"organization_title":profile["title"],"organization_contact":profile["contact"],
+                  "client_name":client["name"] if client else "","object_title":obj["title"] if obj else "","object_address":obj["address"] if obj else "","audience":audience}
+        if audience=="client":
+            for key in ("cost_rub","profit_rub"):document.pop(key,None)
+            document["items"]=[{key:value for key,value in line.items() if key not in ("cost_rub","cost_total_rub")} for line in row["items"]]
+        return document
+    document=c._mutate(db,uid,snapshot,owner_id)
+    from . import estimate_exports
+    body=estimate_exports.pdf(document) if format=="pdf" else estimate_exports.xlsx(document)
+    title=re.sub(r'[\\/:*?"<>|\r\n]','-',document["title"]).strip(" .")[:70] or "Смета"
+    return {"body":body,"content_type":"application/pdf" if format=="pdf" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "filename":"Смета-"+title+("-внутренний" if audience=="internal" else "")+"."+format}
 
 
 def _role(db,uid,owner):
@@ -468,7 +562,7 @@ def enrich_dashboard(db,uid,owner,role,data):
         data["invitations"]=[dict(r) for r in db.execute("SELECT id,email,role,status,expires_at FROM commercial_invitations WHERE owner_id=? ORDER BY id DESC LIMIT 200",(owner,)).fetchall()]
     for key,table,order in (("objects","commercial_objects","id DESC"),("tasks","commercial_tasks","id DESC"),("estimates","commercial_estimates","id DESC"),("shifts","commercial_shifts","starts_at DESC,id DESC")):
         data[key]=[dict(r) for r in db.execute("SELECT * FROM "+table+" WHERE owner_id=? ORDER BY "+order+" LIMIT 1000",(owner,)).fetchall()]
-    for estimate in data["estimates"]:estimate["items"]=json.loads(estimate.pop("items_json"))
+    data["estimates"]=[shape_estimate(row) for row in data["estimates"]]
     for service in data["services"]:service["published"]=bool(service["published"])
     names={m["user_id"]:m["name"] for m in members};objects={r["id"]:r["title"] for r in data["objects"]}
     for collection in ("bookings","tasks","objects","shifts"):
@@ -485,7 +579,9 @@ def enrich_dashboard(db,uid,owner,role,data):
 
 def post_action(db,uid,path,data,owner_id=None):
     actions={"/objects":save_object,"/tasks":save_task,"/tasks/status":set_task_status,
-             "/estimates":save_estimate,"/shifts":save_shift,"/shifts/delete":delete_shift,"/team/invite":invite,
+             "/estimates":save_estimate,"/estimates/quote":quote_estimate,"/estimates/status":estimate_status,
+             "/estimates/delete":delete_estimate,"/estimates/duplicate":duplicate_estimate,
+             "/shifts":save_shift,"/shifts/delete":delete_shift,"/team/invite":invite,
              "/public-profile":save_public_profile,"/services/publish":publish_service}
     suffix=path.removeprefix("/api/commercial")
     if suffix in actions:return actions[suffix](db,uid,data,owner_id)

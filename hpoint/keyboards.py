@@ -17,6 +17,7 @@ def main_menu_kb(user_id=None):
         from . import personal
         if personal.is_pro(user_id,db_connection=database.db):
             rows.insert(1,[KeyboardButton(text=BTN_NEED_HELP),KeyboardButton(text=BOT_REQUESTS_BUTTON)])
+            rows.insert(2,[KeyboardButton(text=BTN_WANT_HELP)])
     if work_bot.has_paid_access(database.db,user_id):rows.insert(1,[KeyboardButton(text=work_bot.WORK_BUTTON)])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 

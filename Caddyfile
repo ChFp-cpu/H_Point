@@ -16,12 +16,12 @@
     request_body @event_uploads {
         max_size 1610000
     }
-    @work_estimates path /api/commercial/estimates
+    @work_estimates path /api/commercial/estimates /api/commercial/estimates/quote
     request_body @work_estimates {
         max_size 128KB
     }
     @small_requests {
-        not path /api/requests /api/chats/send /api/events /api/commercial/estimates
+        not path /api/requests /api/chats/send /api/events /api/commercial/estimates /api/commercial/estimates/quote
     }
     request_body @small_requests {
         max_size 32KB
