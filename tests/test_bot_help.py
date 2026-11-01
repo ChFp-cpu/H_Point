@@ -4,6 +4,7 @@ import sqlite3
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
+from html import unescape
 
 from hpoint import database, handlers, keyboards, services
 
@@ -227,3 +228,48 @@ class HelperBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.send_message.await_args.args[0],self.tg(self.helper))
         await handlers.cb_cancel_request(self.callback("cancel_req:"+str(rid),self.author),self.bot)
         self.assertEqual(self.bot.send_message.await_count,1)
+
+    async def test_invitation_keeps_private_fields_until_consent_then_delivers_full_notice(self):
+        place="PRIVATE-PLACE-"+"<"*480
+        details="PRIVATE-DETAILS-"+"&"*480
+        rid=self.request(what="&"*500,place=place,details=details,time_needed='"'*500,urgency="&"*500)
+        services.add_to_queue(self.helper);self.assertTrue(services.offer_helper(rid,self.helper))
+        await handlers.notify_helper_offer(self.bot,rid,self.helper)
+        offered=self.bot.send_message.await_args.args[1]
+        self.assertNotIn("PRIVATE-PLACE",offered);self.assertNotIn("PRIVATE-DETAILS",offered)
+        self.assertLessEqual(len(offered.encode("utf-16-le"))//2,4096)
+        self.bot.send_message.reset_mock()
+        token=services.get_current_helper_offer(rid)["offer_token"]
+        await handlers.cb_helper_offer_response(self.callback(f"offer:accept:{rid}:{token}"),self.bot)
+        helper_parts=[call.args[1] for call in self.bot.send_message.await_args_list if call.args[0]==self.tg(self.helper)]
+        self.assertGreater(len(helper_parts),1)
+        restored="".join(unescape(part.split("</b>\n\n",1)[1]) for part in helper_parts)
+        self.assertIn(place,restored);self.assertIn(details,restored)
+        for part in helper_parts:self.assertLessEqual(len(part.encode("utf-16-le"))//2,4096)
+
+    async def test_helper_status_counts_all_pending_items_but_keeps_keyboard_compact(self):
+        self.pro(self.author)
+        for _ in range(7):
+            services.apply_to_request(self.request(),self.helper)
+        callback=await self.action("status")
+        self.assertIn("Ожидают выбора автора: 7",self.body(callback.message))
+        self.assertIn("Показаны первые 5",self.body(callback.message))
+        keyboard=callback.message.answer.await_args.kwargs["reply_markup"]
+        self.assertEqual(sum(button.callback_data.startswith("helper:view:") for row in keyboard.inline_keyboard for button in row if button.callback_data),5)
+        self.assertIn("Все приглашения и отклики",str(keyboard))
+
+    async def test_maximum_form_fields_create_once_and_confirmation_is_never_truncated(self):
+        fields=dict(what="&"*500,place="<"*500,time_needed='"'*500,urgency="&"*500,category="other")
+        state=SimpleNamespace(update_data=AsyncMock(side_effect=lambda **kw:fields.update(kw)),get_data=AsyncMock(return_value=fields),clear=AsyncMock())
+        message=self.message(text="DETAILS-"+"&"*490)
+        await handlers.q_details(message,state,self.bot)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM requests WHERE requester_id=?",(self.helper,)).fetchone()[0],1)
+        calls=[call for call in message.answer.await_args_list if call.args[0].startswith("<b>✅ Заявка создана!")]
+        parts=[call.args[0] for call in calls]
+        self.assertGreater(len(parts),1)
+        restored="".join(unescape(part.split("</b>\n\n",1)[1]) for part in parts)
+        for field in (fields["what"],fields["place"],fields["time_needed"],fields["details"]):self.assertIn(field,restored)
+        for call in calls[:-1]:self.assertIsNone(call.kwargs["reply_markup"])
+        self.assertIsNotNone(calls[-1].kwargs["reply_markup"])
+        for part in parts:self.assertLessEqual(len(part.encode("utf-16-le"))//2,4096)
+        state.clear.assert_awaited_once()

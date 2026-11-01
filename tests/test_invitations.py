@@ -349,12 +349,31 @@ class InvitationAPI(InvitationData, unittest.TestCase):
         with error.exception as response:
             self.assertEqual(response.code, status)
 
+    def test_web_invitation_hides_location_until_consent_and_keeps_full_public_text(self):
+        title="<&>"*160
+        self.db.execute("UPDATE requests SET what=?,place='PRIVATE ADDRESS',details='PRIVATE DETAILS',lat=55.75,lon=37.62 WHERE id=?",(title,self.rid))
+        self.request(1,"/api/smart-match/assign",{"request_id":self.rid,"helper_id":2})
+        helper_messages=[call.args[1] for call in self.notify.call_args_list if call.args[0]==2]
+        self.assertTrue(helper_messages)
+        parts=helper_messages[0]
+        self.assertIsInstance(parts,list)
+        rendered="".join(parts)
+        self.assertNotIn("PRIVATE ADDRESS",rendered)
+        self.assertNotIn("PRIVATE DETAILS",rendered)
+        self.assertTrue(all(len(part)<4096 for part in parts))
+        offer=self.request(2,"/api/helper/offers")["offers"][0]
+        self.assertEqual(offer["place"],"");self.assertIsNone(offer["lat"])
+        self.request(2,"/api/helper/offers/respond",{"request_id":self.rid,"accept":True,"offer_token":offer["offer_token"]})
+        tracking=self.request(2,"/api/requests/tracking?request_id="+str(self.rid))["request"]
+        self.assertEqual(tracking["place"],"PRIVATE ADDRESS")
+        self.assertEqual(tracking["details"],"PRIVATE DETAILS")
+
     def test_paid_request_api_invites_reserves_and_confirms_without_hp_or_direct_pay(self):
         self.db.execute("UPDATE requests SET reward_rub=400,reward_pricing_version='legacy_v1',reward_total_rub=0,commission_rub=0,helper_reward_rub=0 WHERE id=?", (self.rid,))
         self.request(1, "/api/smart-match/assign", {"request_id":self.rid,"helper_id":2})
         offer = self.request(2, "/api/helper/offers")["offers"][0]
         self.assertEqual(offer["reward_rub"], 400)
-        self.assertIn("400", self.notify.call_args_list[0].args[1])
+        self.assertIn("400", "".join(self.notify.call_args_list[0].args[1]))
         accept = {"request_id":self.rid,"accept":True,"offer_token":offer["offer_token"]}
         self.assert_error(409, 2, "/api/helper/offers/respond", accept)
         self.assert_error(409, 1, "/api/requests/reward/reserve", {"request_id":self.rid,"amount_rub":400})

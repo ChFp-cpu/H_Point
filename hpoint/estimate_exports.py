@@ -18,6 +18,7 @@ STATUSES={"draft":"Черновик","approved":"Согласована","comple
 _font_lock=threading.Lock()
 _pdf_lock=threading.Lock()
 FONT="HPointManrope"
+FONT_BOLD="HPointManropeSemiBold"
 
 
 def _document_text(document):
@@ -46,8 +47,12 @@ def _register_font():
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
     with _font_lock:
-        if FONT not in pdfmetrics.getRegisteredFontNames():
-            pdfmetrics.registerFont(TTFont(FONT,str(Path(__file__).resolve().parent.parent/"assets"/"manrope-variable.ttf")))
+        # ReportLab ignores the variable font's weight axis and would embed its
+        # ExtraLight (200) base outlines. These static 400/600 instances come
+        # from the existing Manrope font and retain its SIL OFL license.
+        for name,filename in ((FONT,"manrope-regular.ttf"),(FONT_BOLD,"manrope-semibold.ttf")):
+            if name not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont(name,str(Path(__file__).resolve().parent.parent/"assets"/filename)))
 
 
 def pdf(document):
@@ -70,10 +75,13 @@ def _pdf(document):
     ink=colors.HexColor("#20362E");muted=colors.HexColor("#536B61");pale=colors.HexColor("#EDF4F0");line=colors.HexColor("#D5E0DA")
     body=ParagraphStyle("body",fontName=FONT,fontSize=9,leading=13,textColor=ink,spaceAfter=6,splitLongWords=1)
     small=ParagraphStyle("small",parent=body,fontSize=8,leading=11,textColor=muted)
-    title=ParagraphStyle("title",parent=body,fontSize=23,leading=29,spaceAfter=12)
-    head=ParagraphStyle("head",parent=body,fontSize=10,leading=14,spaceBefore=12,spaceAfter=8)
+    title=ParagraphStyle("title",parent=body,fontName=FONT_BOLD,fontSize=23,leading=29,spaceAfter=12)
+    head=ParagraphStyle("head",parent=body,fontName=FONT_BOLD,fontSize=10,leading=14,spaceBefore=12,spaceAfter=8)
     right=ParagraphStyle("right",parent=body,fontSize=8,leading=11,alignment=TA_RIGHT,spaceAfter=0)
     cell=ParagraphStyle("cell",parent=body,fontSize=8,leading=11,spaceAfter=0)
+    header=ParagraphStyle("header",parent=cell,fontName=FONT_BOLD)
+    total_label=ParagraphStyle("total_label",parent=body,fontName=FONT_BOLD)
+    total_value=ParagraphStyle("total_value",parent=right,fontName=FONT_BOLD)
     def p(value,style=body):return Paragraph(escape(str(value or "")).replace("\n","<br/>"),style)
     story=[p(document["organization_title"],small),p(document["title"],title)]
     number=document.get("number") or "СМ-"+str(document["id"]).zfill(4)
@@ -87,11 +95,11 @@ def _pdf(document):
     if document["audience"]=="internal":story.append(p("Внутренний расчёт организации",head))
     story.append(Spacer(1,10))
     headers=["№","Позиция","Раздел","Ед.","Кол-во","Цена, тест. ₽","Сумма, тест. ₽"]
-    rows=[[p(value,cell) for value in headers]]
+    rows=[[p(value,header) for value in headers]]
     for index,item in enumerate(document["items"],1):
         rows.append([p(index,cell),p(item["title"],cell),p(KINDS.get(item.get("kind"),"Работы"),cell),p(item["unit"],cell),
-                     p(item["quantity"],right),p(_number(item["price_rub"]),right),p(_number(item["total_rub"]),right)])
-    table=LongTable(rows,colWidths=[20,166,44,27,57,101,108],repeatRows=1,hAlign="LEFT")
+                     p(str(item["quantity"]).replace(".",","),right),p(_number(item["price_rub"]),right),p(_number(item["total_rub"]),right)])
+    table=LongTable(rows,colWidths=[20,151,64,27,57,96,108],repeatRows=1,hAlign="LEFT")
     table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),pale),("TEXTCOLOR",(0,0),(-1,-1),ink),
         ("FONTNAME",(0,0),(-1,-1),FONT),("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),5),
         ("RIGHTPADDING",(0,0),(-1,-1),5),("TOPPADDING",(0,0),(-1,-1),8),("BOTTOMPADDING",(0,0),(-1,-1),8),
@@ -105,13 +113,13 @@ def _pdf(document):
         totals.append(("Скидка "+str(document["discount_percent"])+"%","-"+document["discount_rub"]))
     totals.append(("Итого, тест. ₽",document["total_rub"]))
     if document["audience"]=="internal":totals.extend([("Себестоимость, тест. ₽",document["cost_rub"]),("Плановая прибыль, тест. ₽",document["profit_rub"])])
-    total_table=Table([[p(label),p(_number(amount),right)] for label,amount in totals],colWidths=[width-130,130],hAlign="LEFT")
+    total_table=Table([[p(label,total_label if label=="Итого, тест. ₽" else body),p(_number(amount),total_value if label=="Итого, тест. ₽" else right)] for label,amount in totals],colWidths=[width-130,130],hAlign="LEFT")
     total_table.setStyle(TableStyle([("BACKGROUND",(0,len(totals)-1),(-1,len(totals)-1),pale),("VALIGN",(0,0),(-1,-1),"TOP"),
         ("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7),("LINEABOVE",(0,0),(-1,0),.7,line)]))
     story.append(KeepTogether([total_table]))
     if document["audience"]=="internal":
         story.append(p("Себестоимость по позициям",head))
-        cost_rows=[[p(x,cell) for x in ("Позиция","За единицу, тест. ₽","Всего, тест. ₽")]]
+        cost_rows=[[p(x,header) for x in ("Позиция","За единицу, тест. ₽","Всего, тест. ₽")]]
         cost_rows.extend([[p(item["title"],cell),p(_number(item["cost_rub"]),right),p(_number(item["cost_total_rub"]),right)] for item in document["items"]])
         cost_table=LongTable(cost_rows,colWidths=[width-230,115,115],repeatRows=1,hAlign="LEFT")
         cost_table.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"),("BACKGROUND",(0,0),(-1,0),pale),("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7),("LINEBELOW",(0,0),(-1,-1),.35,line)]))
@@ -179,11 +187,22 @@ def xlsx(document):
         row=9+index;sheet.set_row(row,max(24,math.ceil(len(item["title"])/36)*15,math.ceil(len(item["unit"])/7)*15))
         sheet.write_number(row,0,index+1,styles["quantity"]);text(sheet,row,1,item["title"]);text(sheet,row,2,KINDS.get(item.get("kind"),"Работы"));text(sheet,row,3,item["unit"])
         number(sheet,row,4,item["quantity"],"input_number");number(sheet,row,5,item["price_rub"],"input_money")
-        formula(sheet,row,6,f"=ROUND(E{row+1}*F{row+1},2)",item["total_rub"])
+        formula(sheet,row,6,f"=ROUND(ROUND(E{row+1},4)*ROUND(F{row+1},2),2)",item["total_rub"])
     last=9+len(document["items"])-1;summary=last+2
     sheet.autofilter(8,0,last,6)
-    sheet.data_validation(9,4,last,4,{"validate":"decimal","criteria":">","value":0,"input_title":"Количество","input_message":"Положительное число, до 4 знаков после запятой."})
-    sheet.data_validation(9,5,last,5,{"validate":"decimal","criteria":">=","value":0})
+    def numeric_input(sheet,first_row,last_row,col,cell,maximum,places,positive=False,percent=False):
+        # The server and a downloaded workbook share the same editable precision.
+        # ROUND in the formulas also protects calculations after Excel pastes
+        # which can bypass native input validation.
+        visible_max=str(maximum*100)+"%" if percent else str(maximum)
+        visible_places=places-2 if percent else places
+        sheet.data_validation(first_row,col,last_row,col,{"validate":"custom",
+            "value":f"=AND(ISNUMBER({cell}),{cell}{'>' if positive else '>='}0,{cell}<={maximum},ROUND({cell},{places})={cell})",
+            "input_title":"Процент" if percent else "Количество" if positive else "Цена",
+            "input_message":f"До {visible_places} знаков после запятой; максимум {visible_max}.",
+            "error_title":"Проверьте значение","error_message":f"Введите число от {'0 (не включая)' if positive else '0'} до {visible_max}, не более {visible_places} знаков после запятой."})
+    numeric_input(sheet,9,last,4,"E10",1000000,4,True)
+    numeric_input(sheet,9,last,5,"F10",100000000,2)
     summaries=[("Стоимость позиций",document["subtotal_rub"]),("Наценка, %",Decimal(document["markup_percent"])/100),("Сумма наценки",document["markup_rub"]),
                ("Скидка, %",Decimal(document.get("discount_percent","0"))/100),("Сумма скидки",document["discount_rub"]),("Итого, тест. ₽",document["total_rub"])]
     for offset,(label,value) in enumerate(summaries):
@@ -194,8 +213,8 @@ def xlsx(document):
     number(sheet,summary+3,6,Decimal(document.get("discount_percent","0"))/100,"percent")
     formula(sheet,summary+4,6,f"=ROUND((G{summary+1}+G{summary+3})*G{summary+4},2)",document["discount_rub"])
     formula(sheet,summary+5,6,f"=G{summary+1}+G{summary+3}-G{summary+5}",document["total_rub"],"total")
-    sheet.data_validation(summary+1,6,summary+1,6,{"validate":"decimal","criteria":"between","minimum":0,"maximum":10})
-    sheet.data_validation(summary+3,6,summary+3,6,{"validate":"decimal","criteria":"between","minimum":0,"maximum":1})
+    numeric_input(sheet,summary+1,summary+1,6,f"G{summary+2}",10,6,percent=True)
+    numeric_input(sheet,summary+3,summary+3,6,f"G{summary+4}",1,6,percent=True)
     end=summary+7
     if document.get("notes"):
         sheet.merge_range(end,0,end,6,"Примечания",styles["label"]);end+=1
@@ -220,7 +239,8 @@ def xlsx(document):
             formula(internal,row,2,f"='Смета'!E{row+1}",item["quantity"],"quantity")
             formula(internal,row,3,f"='Смета'!F{row+1}",item["price_rub"])
             number(internal,row,4,item["cost_rub"],"input_money")
-            formula(internal,row,5,f"=ROUND(C{row+1}*E{row+1},2)",item["cost_total_rub"]);formula(internal,row,6,f"=ROUND(C{row+1}*D{row+1},2)",item["total_rub"])
+            formula(internal,row,5,f"=ROUND(ROUND(C{row+1},4)*ROUND(E{row+1},2),2)",item["cost_total_rub"]);formula(internal,row,6,f"=ROUND(ROUND(C{row+1},4)*ROUND(D{row+1},2),2)",item["total_rub"])
+        numeric_input(internal,9,last,4,"E10",100000000,2)
         internal.autofilter(8,0,last,6)
         for offset,(label,value) in enumerate((("Итого для клиента",document["total_rub"]),("Себестоимость",document["cost_rub"]),("Плановая прибыль",document["profit_rub"]))):
             internal.merge_range(summary+offset,1,summary+offset,5,label,styles["label"])

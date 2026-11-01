@@ -17,7 +17,7 @@ from .states import Registration, HelpRequest, Review, Billing
 from .keyboards import *
 from .billing import create_pending_invoice
 from . import games as game_service
-from .chat_notifications import chat_notification_chunks
+from .chat_notifications import chat_notification_chunks, notice_chunks
 from .features import GAMES_ENABLED, GAMES_PAUSED_MESSAGE
 from . import help_achievements
 from . import bot_work_ui
@@ -237,6 +237,27 @@ def stars(value) -> str:
     return "⭐" * int(round(value)) + f" ({value:.1f}/5)"
 
 
+def _request_plain(req):
+    author=get_user(req["requester_id"])
+    return "\n".join((str(req["what"]),"Кому нужна помощь: "+str(author["name"] if author else "Участник"),
+        "Категория: "+CATEGORIES.get(req["category"],CATEGORIES["other"]),"Где: "+str(req["place"]),
+        "Когда: "+str(req["time_needed"]),"Срочность: "+str(req["urgency"]),"Детали: "+str(req["details"]),
+        request_reward_note(req) if int(req["reward_rub"] or 0) else ""))
+
+
+async def _send_notice(bot,user_id,title,text,reply_markup=None):
+    chunks=notice_chunks(title,text)
+    for index,part in enumerate(chunks):
+        await bot.send_message(user_id,part,reply_markup=reply_markup if index==len(chunks)-1 else None)
+
+
+async def _answer_notice(message,title,text,reply_markup=None,edit=False):
+    chunks=notice_chunks(title,text)
+    for index,part in enumerate(chunks):
+        send=message.edit_text if edit and index==0 else message.answer
+        await send(part,reply_markup=reply_markup if index==len(chunks)-1 else None)
+
+
 def request_text(req) -> str:
     category = CATEGORIES.get(req["category"], CATEGORIES["other"])
     return (
@@ -266,11 +287,9 @@ async def notify_match(bot: Bot, request_id: int) -> None:
 
     if helper["tg_user_id"]:
         try:
-            await bot.send_message(
-                helper["tg_user_id"],
-                "🤝 <b>Вы нашли, кому помочь!</b>\n\n"
-                f"{request_text(req)}\n\n"
-                f"<b>Кому помогаете:</b> {user_link(requester)}\n\n"
+            await _send_notice(bot,helper["tg_user_id"],"🤝 Вы нашли, кому помочь!",
+                _request_plain(req)+"\n\n"
+                f"Кому помогаете: {requester['name']}\n\n"
                 "Свяжитесь с человеком на сайте или отправьте /chat ТЕКСТ. После оказания помощи заявку завершит её автор.",
                 reply_markup=request_chat_kb(request_id),
             )
@@ -279,11 +298,9 @@ async def notify_match(bot: Bot, request_id: int) -> None:
 
     if requester["tg_user_id"]:
         try:
-            await bot.send_message(
-                requester["tg_user_id"],
-                "🎉 <b>Для вашей заявки нашёлся помощник!</b>\n\n"
-                f"{request_text(req)}\n\n"
-                f"<b>Ваш помощник:</b> {user_link(helper)}\n\n"
+            await _send_notice(bot,requester["tg_user_id"],"🎉 Для вашей заявки нашёлся помощник!",
+                _request_plain(req)+"\n\n"
+                f"Ваш помощник: {helper['name']}\n\n"
                 "Помощник свяжется с вами. Можно ответить на сайте или командой /chat ТЕКСТ. Когда помощь будет оказана, нажмите «Завершить помощь». После этого можно оставить оценку.",
                 reply_markup=finish_kb(request_id),
             )
@@ -310,9 +327,9 @@ async def notify_helper_offer(bot: Bot, request_id: int, helper_id: int) -> None
         await bot.send_message(
             helper["tg_user_id"],
             "🤝 <b>Вас выбрали как помощника</b>\n\n"
-            f"{request_text(request)}\n\n"
+            f"{_helper_card(request)}\n\n"
             f"<b>Кому нужна помощь:</b> {user_link(requester)}\n\n"
-            "Подтвердите, что готовы помочь. До вашего согласия заявка никому не назначена.",
+            "Подтвердите, что готовы помочь. До вашего согласия заявка никому не назначена. Точный адрес и детали откроются после подтверждения.",
             reply_markup=helper_offer_kb(request_id, offer["offer_token"] or ""),
         )
     except Exception:
@@ -1026,7 +1043,7 @@ async def _show_candidates(message: Message, request_id: int, *, edit: bool = Fa
         await message.answer("Эта заявка принадлежит другому пользователю.")
         return
     if req["status"] != STATUS_OPEN:
-        text = "Кандидатов можно подбирать только для открытой заявки.\n\n" + request_text(req)
+        text = "Кандидатов можно подбирать только для открытой заявки.\n\n" + _helper_card(req)
         if edit:
             await message.edit_text(text, reply_markup=main_menu_kb())
         else:
@@ -1040,7 +1057,7 @@ async def _show_candidates(message: Message, request_id: int, *, edit: bool = Fa
         text = (
             "⚡ <b>Подбор кандидатов</b>\n\n"
             "Пока нет доступных кандидатов. Попробуйте обновить подбор позже.\n\n"
-            f"{request_text(req)}{waiting}"
+            f"{_helper_card(req)}{waiting}"
         )
         markup = candidates_navigation_kb(request_id, offer)
         if edit:
@@ -1127,7 +1144,7 @@ async def show_request_management(message,user_id,request_id=None):
         rows.append([InlineKeyboardButton(text="Отменить помощь",callback_data="cancel_req:"+str(request_id))])
     rows.extend(request_chat_kb(request_id).inline_keyboard)
     rows.append([InlineKeyboardButton(text="Все мои заявки",callback_data="bot:requests")])
-    await message.answer(request_text(request),reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await _answer_notice(message,"Ваша заявка",_request_plain(request),reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @router.message(StateFilter(None),F.text == BOT_REQUESTS_BUTTON)
@@ -1207,7 +1224,7 @@ async def cb_candidate_assign(callback: CallbackQuery, bot: Bot) -> None:
         pass
     await callback.message.answer(
         "⏳ <b>Ждём подтверждение помощника</b>\n\n"
-        f"{request_text(req)}\n\n"
+        f"{_helper_card(req)}\n\n"
         f"<b>Вы выбрали:</b> {user_link(candidate)}\n\n"
         "Помощник сам подтвердит или отклонит предложение. Чат появится только после его согласия.",
         reply_markup=candidates_navigation_kb(request_id, get_current_helper_offer(request_id)),
@@ -1329,7 +1346,7 @@ async def cb_candidate_back(callback: CallbackQuery) -> None:
         await callback.answer("Заявка недоступна.", show_alert=True)
         return
     await callback.answer()
-    await callback.message.edit_text(request_text(req), reply_markup=cancel_request_kb(request_id) if req["status"] == STATUS_OPEN else main_menu_kb())
+    await _answer_notice(callback.message,"Ваша заявка",_request_plain(req),reply_markup=cancel_request_kb(request_id) if req["status"] == STATUS_OPEN else main_menu_kb(),edit=True)
 
 
 @router.message(StateFilter(None), F.text == BTN_NEED_HELP)
@@ -1417,8 +1434,8 @@ async def q_details(message: Message, state: FSMContext, bot: Bot) -> None:
         return
     await state.clear()
     req = get_request(request_id)
-    await message.answer(
-        f"✅ Заявка создана!\n\n{request_text(req)}\n\n"
+    await _answer_notice(message,"✅ Заявка создана!",
+        _request_plain(req)+"\n\n"
         "Откройте кандидатов и выберите помощника. Он сам подтвердит согласие.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Подобрать помощника",callback_data="matchreq:"+str(request_id))],
@@ -1428,11 +1445,16 @@ async def q_details(message: Message, state: FSMContext, bot: Bot) -> None:
     await message.answer("Если помощь больше не нужна:", reply_markup=cancel_request_kb(request_id))
 
 
+def _bot_excerpt(value, limit):
+    value=str(value or "")
+    return value if len(value)<=limit else value[:limit-1]+"…"
+
+
 def _helper_card(request, distance=None):
     """Public matching summary; exact address and private details stay in chat."""
-    text=(f"🤝 <b>{escape(str(request['what']))}</b>\n"
+    text=(f"🤝 <b>{escape(_bot_excerpt(request['what'],160))}</b>\n"
           f"Кому нужна помощь: {request_author_name(request)}\n"
-          f"{escape(CATEGORIES.get(request['category'],CATEGORIES['other']))} · {escape(str(request['time_needed']))}")
+          f"{escape(CATEGORIES.get(request['category'],CATEGORIES['other']))} · {escape(_bot_excerpt(request['time_needed'],120))}")
     if distance is not None:text+=f"\nОколо {distance:g} км от сохранённой точки"
     text+="\n"+escape(request_reward_note(request))
     return text
@@ -1442,11 +1464,12 @@ async def show_helper_status(message,user_id):
     active=get_active_help(user_id)
     applications=get_helper_applications(user_id)
     offers=get_helper_offers(user_id,limit=5)
+    counts={row["status"]:row["n"] for row in db.execute("SELECT rc.status,COUNT(*) n FROM request_candidates rc JOIN requests r ON r.id=rc.request_id WHERE rc.candidate_id=? AND rc.status IN ('applied','offered') AND r.status='open' GROUP BY rc.status",(user_id,)).fetchall()}
     ready=is_in_queue(user_id)
     rows=[]
     lines=["🤝 <b>Хочу помочь</b>","Готовность к новым приглашениям: "+("включена" if ready else "на паузе")]
     if active:
-        lines.extend(["", "Сейчас вы помогаете: <b>"+escape(str(active["what"]))+"</b>",
+        lines.extend(["", "Сейчас вы помогаете: <b>"+escape(_bot_excerpt(active["what"],160))+"</b>",
                       "Завершение подтверждает автор. Новую помощь можно взять после текущей."])
         rows.extend(request_chat_kb(active["id"]).inline_keyboard)
         rows.append([InlineKeyboardButton(text="Помощь не состоялась · отменить",callback_data="cancel_req:"+str(active["id"]))])
@@ -1455,15 +1478,18 @@ async def show_helper_status(message,user_id):
         if not ready:rows.append([InlineKeyboardButton(text="Готов получать приглашения",callback_data="helper:ready")])
     if ready:rows.append([InlineKeyboardButton(text="Приостановить новые приглашения",callback_data="leave_queue")])
     if offers:
-        lines.append("\nПриглашений от авторов: "+str(len(offers)))
+        lines.append("\nПриглашений от авторов: "+str(counts.get("offered",0)))
         for offer in offers:rows.append([InlineKeyboardButton(text="Приглашение · "+str(offer["what"])[:40],callback_data="helper:view:"+str(offer["request_id"]))])
     if applications:
-        lines.append("Ожидают выбора автора: "+str(len(applications)))
+        lines.append("Ожидают выбора автора: "+str(counts.get("applied",0)))
         for application in applications[:5]:rows.append([InlineKeyboardButton(text=str(application["what"])[:45],callback_data="helper:view:"+str(application["request_id"]))])
     closed=db.execute("SELECT r.what,r.status FROM requests r WHERE (r.helper_id=? OR EXISTS(SELECT 1 FROM request_candidates rc WHERE rc.request_id=r.id AND rc.candidate_id=?)) AND r.status IN ('done','cancelled') ORDER BY r.id DESC LIMIT 3",(user_id,user_id)).fetchall()
     if closed:
-        lines.append("\nПоследняя помощь:")
-        lines.extend(("✅ " if row["status"]=="done" else "↩️ ")+escape(str(row["what"])) for row in closed)
+        lines.append("\nНедавние заявки:")
+        lines.extend(("✅ " if row["status"]=="done" else "↩️ ")+escape(_bot_excerpt(row["what"],100)) for row in closed)
+    if counts.get("offered",0)>5 or counts.get("applied",0)>5:
+        lines.append("\nПоказаны первые 5 приглашений и откликов. Остальные доступны на сайте.")
+        rows.append([InlineKeyboardButton(text="Все приглашения и отклики на сайте",url=WEB_PUBLIC_URL.rstrip("/")+"/#/help")])
     lines.append("\nИзменения, сообщения и важные уведомления приходят бесплатно, в том числе после окончания PRO.")
     rows.append([InlineKeyboardButton(text="Обновить статус",callback_data="helper:status")])
     rows.append([InlineKeyboardButton(text="Навыки и место на сайте",url=WEB_PUBLIC_URL.rstrip("/")+"/#/help")])

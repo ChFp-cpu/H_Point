@@ -14,7 +14,7 @@ from .database import db, get_user, get_user_by_email, create_web_user, get_requ
 from .config import *
 from .games_page import GAMES_PAGE
 from .theme import SYSTEM_THEME_CSS, APP_THEME_CSS, SYSTEM_THEME_META
-from .chat_notifications import chat_notification_chunks
+from .chat_notifications import chat_notification_chunks, notice_chunks
 from .services import *
 from .billing import create_pending_invoice, create_request_reward_invoice, create_payment, fulfill_invoice, purchase_with_points, purchase_with_wallet, verify_robokassa_result
 from .keyboards import helper_offer_kb, candidate_kb, application_kb, finish_kb, rating_kb, request_chat_kb
@@ -82,6 +82,29 @@ def notify_telegram_user(user_id, text, reply_markup=None):
             logging.warning("Telegram notification failed")
 
     future.add_done_callback(report_failure)
+    return future
+
+def process_lifecycle_notifications():
+    from . import lifecycle_notifications as notices
+    if _telegram_bot is None or _telegram_loop is None:return 0
+    pending=notices.claim(database.db)
+    for notice in pending:
+        user=get_user(notice["recipient_id"])
+        if not user or user["is_blocked"] or not user["email_verified"] or not user["email"] or not user["tg_user_id"]:
+            notices.finish(database.db,notice,True);continue
+        future=notify_telegram_user(user["tg_user_id"],notices.message(notice,WEB_PUBLIC_URL))
+        if future is None:
+            notices.finish(database.db,notice,False);continue
+        def complete(result, item=notice):
+            try:
+                try:result.result();delivered=True
+                except Exception:delivered=False
+                notices.finish(database.db,item,delivered)
+            except Exception:logging.warning("Lifecycle notice acknowledgement failed")
+            finally:
+                if isinstance(database.db,(database.SQLiteConnection,database.PostgresConnection)):database.db.close()
+        future.add_done_callback(complete)
+    return len(pending)
 
 def now(): return dt.datetime.now(dt.timezone.utc)
 def ph(password, salt=None):
@@ -1622,7 +1645,7 @@ _page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRI
 PAGE = PAGE.replace("</head>", SYSTEM_THEME_META + "<script>window.hpointGamesEnabled="+json.dumps(GAMES_ENABLED)+";document.documentElement.dataset.gamesEnabled=String(window.hpointGamesEnabled);</script><style>@media(max-width:700px){html[data-games-enabled=false] #sitePrimaryNav{grid-template-columns:repeat(4,minmax(0,1fr))}}</style></head>", 1)
 
 ASSETS.update({name:(Path(__file__).resolve().parent.parent/"assets"/name,"application/javascript;charset=utf-8") for name in ("hpoint-workflows.js","hpoint-media.js","hpoint-commercial.js","hpoint-subscriptions.js","hpoint-organizations.js","hpoint-public.js","hpoint-professional.js","hpoint-help-categories.js","hpoint-league.js","hpoint-visuals.js","hpoint-personal.js")})
-PAGE=PAGE.replace("</body>",'<script>window.hpointHelpCategoriesData='+json.dumps({"catalog":CATEGORY_CATALOG,"groups":CATEGORY_GROUPS},ensure_ascii=False).replace("<","\\u003c")+';</script><script src="/assets/hpoint-workflows.js?v=20261030-work5"></script><script src="/assets/hpoint-media.js?v=20261030-work5"></script><script src="/assets/hpoint-visuals.js?v=20261030-work5"></script><script src="/assets/hpoint-professional.js?v=20261030-work5"></script><script src="/assets/hpoint-commercial.js?v=20261030-work5"></script><script src="/assets/hpoint-subscriptions.js?v=20261030-work5"></script><script src="/assets/hpoint-organizations.js?v=20261030-work5"></script><script src="/assets/hpoint-help-categories.js?v=20261030-work5"></script><script src="/assets/hpoint-league.js?v=20261030-work5"></script><script src="/assets/hpoint-personal.js?v=20261030-work5"></script><script>window.hpointStart();</script></body>')
+PAGE=PAGE.replace("</body>",'<script>window.hpointHelpCategoriesData='+json.dumps({"catalog":CATEGORY_CATALOG,"groups":CATEGORY_GROUPS},ensure_ascii=False).replace("<","\\u003c")+';</script><script src="/assets/hpoint-workflows.js?v=20261101-finish6"></script><script src="/assets/hpoint-media.js?v=20261101-finish6"></script><script src="/assets/hpoint-visuals.js?v=20261101-finish6"></script><script src="/assets/hpoint-professional.js?v=20261101-finish6"></script><script src="/assets/hpoint-commercial.js?v=20261101-finish6"></script><script src="/assets/hpoint-subscriptions.js?v=20261101-finish6"></script><script src="/assets/hpoint-organizations.js?v=20261101-finish6"></script><script src="/assets/hpoint-help-categories.js?v=20261101-finish6"></script><script src="/assets/hpoint-league.js?v=20261101-finish6"></script><script src="/assets/hpoint-personal.js?v=20261101-finish6"></script><script>window.hpointStart();</script></body>')
 
 # Hide server-rendered legacy hooks before the first paint. Reveal only the
 # current workspace/landing, once its modules and initial data are ready.
@@ -1635,7 +1658,7 @@ PAGE=PAGE.replace('<body>','<body><div id="hpointBootScreen" role="status" aria-
 ASSETS.update(visuals.assets())
 ASSETS["hpoint-editorial.css"]=(Path(__file__).resolve().parents[1]/"assets"/"hpoint-editorial.css","text/css;charset=utf-8")
 ASSETS["photo-sources.json"]=(Path(__file__).resolve().parents[1]/"assets"/"photo-sources.json","application/json;charset=utf-8")
-PAGE=PAGE.replace("</head>",'<link rel="stylesheet" href="/assets/hpoint-editorial.css?v=20261030-work5"></head>',1)
+PAGE=PAGE.replace("</head>",'<link rel="stylesheet" href="/assets/hpoint-editorial.css?v=20261101-finish6"></head>',1)
 PAGE=PAGE.replace("<body>",'<body class="hpEditorial">',1)
 PAGE=PAGE.replace("window.hpointHelpCategoriesData=","window.hpointPhotoCatalog="+json.dumps(visuals.catalog(),ensure_ascii=False).replace("<",r"\u003c")+";window.hpointHelpCategoriesData=",1)
 
@@ -1948,7 +1971,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=="/api/helper/offers":
                 u=auth(self)
                 if not u:return
-                return reply(self,{"ok":True,"offers":[{**dict(row),"reward_quote":workflow.reward_quote(row)} for row in get_helper_offers(u["user_id"])]})
+                return reply(self,{"ok":True,"offers":[{**dict(row),"place":"","details":"","lat":None,"lon":None,"reward_quote":workflow.reward_quote(row)} for row in get_helper_offers(u["user_id"])]})
             if p.path=="/api/support":
                 u=auth(self)
                 if not u:return
@@ -2594,11 +2617,11 @@ class Handler(BaseHTTPRequestHandler):
                 if candidate and candidate["tg_user_id"]:
                     notify_telegram_user(
                         candidate["tg_user_id"],
-                        f"🤝 <b>Вас выбрали как помощника</b>\n\n"
-                        f"Заявка №{rid}: {escape(r['what'])}\n"
-                        f"Где: {escape(r['place'])}\nКогда: {escape(r['time_needed'])}\n\n"
-                        f"{escape(request_reward_note(r))}\n\n"
-                        "Подтвердите, что готовы помочь. До вашего согласия заявка никому не назначена.",
+                        notice_chunks("Вас выбрали как помощника",
+                        f"Заявка №{rid}: {r['what']}\n"
+                        f"Направление: {CATEGORIES.get(r['category'],'Другое')}\nКогда: {r['time_needed']}\n\n"
+                        f"{request_reward_note(r)}\n\n"
+                        "Подтвердите, что готовы помочь. Точный адрес и детали доступны после согласия. До вашего согласия заявка никому не назначена."),
                         reply_markup=helper_offer_kb(rid,offer["offer_token"] if offer else ""),
                     )
                 if u["tg_user_id"]:
@@ -2661,7 +2684,7 @@ class Handler(BaseHTTPRequestHandler):
                     return reply(self,{"ok":False,"error":"Отменить текущую заявку могут её участники. Завершённую помощь отменить нельзя."},409)
                 for recipient in recipients-{None,u["user_id"]}:
                     person=get_user(recipient)
-                    if person and person["tg_user_id"]:notify_telegram_user(person["tg_user_id"],"Помощь «"+escape(closing["what"])+"» отменена."+("\nПричина: "+escape(reason) if reason else "")+"\nМожно выбрать другую заявку на сайте.")
+                    if person and person["tg_user_id"]:notify_telegram_user(person["tg_user_id"],notice_chunks("Помощь отменена",closing["what"]+("\nПричина: "+reason if reason else "")+"\nМожно выбрать другую заявку на сайте."))
                 return reply(self,{"ok":True,"request_id":rid})
             if p.path=="/api/requests/dispute":
                 u=auth(self)
@@ -2849,6 +2872,7 @@ def create_server():
                 try:
                     expire_open_requests()
                     maintain_personal_schedules()
+                    process_lifecycle_notifications()
                 except Exception:logging.exception("Request maintenance failed")
                 finally:database.db.close()
         worker=threading.Thread(target=maintain,name="hpoint-request-expiry",daemon=True)

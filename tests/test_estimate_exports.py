@@ -6,6 +6,8 @@ import json
 import os
 import re
 import sqlite3
+import struct
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 import uuid
@@ -142,7 +144,7 @@ class EstimateCases:
             self.assertNotIn(private,combined)
         self.assertIn("Клиент Ирина",combined);self.assertIn("Квартира на Лесной · Лесная, 10",combined)
         main=sheets[0];self.assertEqual(value(main,"E10"),"2.5");self.assertEqual(value(main,"F10"),"100.13")
-        self.assertEqual(formula(main,"G10"),"ROUND(E10*F10,2)");self.assertEqual(value(main,"G10"),"250.33")
+        self.assertEqual(formula(main,"G10"),"ROUND(ROUND(E10,4)*ROUND(F10,2),2)");self.assertEqual(value(main,"G10"),"250.33")
         self.assertEqual(formula(main,"G18"),"G13+G15-G17");self.assertEqual(Decimal(value(main,"G18")),Decimal("418.97"))
         self.assertEqual(cells(main)["F5"].get("t"),None,"Issue date is a native numeric Excel date")
         self.assertIsNotNone(main.find("s:sheetViews/s:sheetView/s:pane",NS));self.assertIsNotNone(main.find("s:autoFilter",NS))
@@ -153,12 +155,30 @@ class EstimateCases:
         texts,sheets,_=workbook(result["body"]);self.assertEqual(len(sheets),2)
         internal=sheets[1]
         self.assertEqual(formula(internal,"C10"),"'Смета'!E10");self.assertEqual(formula(internal,"D10"),"'Смета'!F10")
-        self.assertEqual(formula(internal,"F10"),"ROUND(C10*E10,2)")
+        self.assertEqual(formula(internal,"F10"),"ROUND(ROUND(C10,4)*ROUND(E10,2),2)")
         self.assertEqual(formula(internal,"G13"),"'Смета'!G18")
         self.assertEqual(formula(internal,"G14"),"SUM(F10:F11)")
         self.assertEqual(formula(internal,"G15"),"G13-G14")
         self.assertEqual(Decimal(value(internal,"G15")),Decimal("178.67"))
         self.assertNotIn("PRIVATE-CLIENT-NOTES"," ".join(texts))
+
+    def test_workbook_edits_use_server_precision_and_native_input_bounds(self):
+        item=self.save(items=[{"title":"Fractional quantity","quantity":"2.5001","price_rub":"100.125","cost_rub":"60.125"}])
+        row=self.row(item)
+        self.assertEqual(row["items"][0]["total_rub"],"250.34")
+        self.assertEqual(row["items"][0]["cost_total_rub"],"150.33")
+        _,sheets,_=workbook(team.export_estimate(self.db,1,item,1,"xlsx","internal")["body"])
+        self.assertEqual(value(sheets[0],"G10"),"250.34")
+        self.assertEqual(value(sheets[1],"F10"),"150.33")
+        self.assertEqual(formula(sheets[0],"G10"),"ROUND(ROUND(E10,4)*ROUND(F10,2),2)")
+        self.assertEqual(formula(sheets[1],"G10"),"ROUND(ROUND(C10,4)*ROUND(D10,2),2)")
+        rules={node.get("sqref"):node.find("s:formula1",NS).text for node in sheets[0].findall("s:dataValidations/s:dataValidation",NS)}
+        self.assertIn("E10<=1000000",rules["E10"])
+        self.assertIn("ROUND(E10,4)=E10",rules["E10"])
+        self.assertIn("F10<=100000000",rules["F10"])
+        self.assertIn("ROUND(F10,2)=F10",rules["F10"])
+        rules={node.get("sqref"):node.find("s:formula1",NS).text for node in sheets[1].findall("s:dataValidations/s:dataValidation",NS)}
+        self.assertIn("ROUND(E10,2)=E10",rules["E10"])
 
     def test_all_user_text_remains_text_and_never_creates_links_or_formulas(self):
         item=self.save(title='=HYPERLINK("https://example.test","open")',notes="@malicious text",number="+1+1",
@@ -180,6 +200,22 @@ class EstimateCases:
         self.assertGreaterEqual(len(re.findall(rb"/Type\s*/Page\b",result["body"])),3)
         self.assertNotIn(b"PRIVATE-CLIENT",result["body"])
 
+    def test_pdf_uses_static_readable_manrope_weights_and_unbroken_kind_label(self):
+        from hpoint import estimate_exports
+        from reportlab.pdfbase import pdfmetrics
+        estimate_exports._register_font()
+        assets=Path(estimate_exports.__file__).resolve().parent.parent/"assets"
+        for filename,weight in (("manrope-regular.ttf",400),("manrope-semibold.ttf",600)):
+            body=(assets/filename).read_bytes()
+            count=struct.unpack_from(">H",body,4)[0]
+            tables={body[12+i*16:16+i*16]:struct.unpack_from(">I",body,20+i*16)[0] for i in range(count)}
+            self.assertNotIn(b"fvar",tables,"PDF embeds a fixed weight, not ExtraLight base outlines")
+            self.assertEqual(struct.unpack_from(">H",body,tables[b"OS/2"]+4)[0],weight)
+        self.assertLess(pdfmetrics.stringWidth("Материалы",estimate_exports.FONT,8),54)
+        body=team.export_estimate(self.db,1,self.save(),1,"pdf")["body"]
+        self.assertIn(b"Manrope-Regular",body)
+        self.assertIn(b"Manrope-SemiBold",body)
+
     def test_export_tenant_role_membership_and_expired_subscription_guards(self):
         item=self.save()
         with self.assertRaises(PermissionError):team.export_estimate(self.db,2,item,1,"xlsx","internal")
@@ -190,7 +226,14 @@ class EstimateCases:
         team.member_action(self.db,1,{"user_id":2},"remove",1)
         with self.assertRaises(PermissionError):team.export_estimate(self.db,2,item,1,"pdf")
         self.db.execute("UPDATE commercial_profiles SET trial_until='2000-01-01T00:00:00+00:00' WHERE user_id=1")
-        with self.assertRaises(ValueError):team.export_estimate(self.db,1,item,1,"pdf")
+        self.assertTrue(team.export_estimate(self.db,1,item,1,"pdf")["body"].startswith(b"%PDF-"))
+        self.assertTrue(team.export_estimate(self.db,3,item,1,"xlsx","internal")["body"].startswith(b"PK"))
+        with self.assertRaises(PermissionError):team.export_estimate(self.db,2,item,1,"xlsx")
+        before=dict(c._owned(self.db,"commercial_estimates",1,item))
+        for action,data in ((team.quote_estimate,self.data()),(team.save_estimate,self.data(id=item)),
+                            (team.estimate_status,{"id":item,"status":"completed"}),(team.duplicate_estimate,{"id":item})):
+            with self.subTest(action=action.__name__),self.assertRaises(ValueError):action(self.db,1,data,1)
+        self.assertEqual(dict(c._owned(self.db,"commercial_estimates",1,item)),before)
         self.assertEqual(self.row(item)["total_rub"],"418.97")
 
     def test_parallel_pdf_documents_do_not_share_dynamic_font_subsets(self):

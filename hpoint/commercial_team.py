@@ -344,7 +344,10 @@ def export_estimate(db,uid,item_id,owner_id=None,format="pdf",audience="client")
             for key in ("cost_rub","profit_rub"):document.pop(key,None)
             document["items"]=[{key:value for key,value in line.items() if key not in ("cost_rub","cost_total_rub")} for line in row["items"]]
         return document
-    document=c._mutate(db,uid,snapshot,owner_id)
+    # Expiry freezes changes, not access to documents the organisation saved.
+    # Membership, blocked accounts and internal-finance permissions are still
+    # checked while taking the same consistent authorised snapshot.
+    document=c._mutate(db,uid,snapshot,owner_id,allow_expired=True)
     from . import estimate_exports
     body=estimate_exports.pdf(document) if format=="pdf" else estimate_exports.xlsx(document)
     title=re.sub(r'[\\/:*?"<>|\r\n]','-',document["title"]).strip(" .")[:70] or "Смета"

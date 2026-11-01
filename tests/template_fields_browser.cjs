@@ -23,6 +23,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   for(const [key,id]of Object.entries(ids)){assert.equal(await page.locator('#'+id).inputValue(),String(fields[key]),key+' restored into form');checks++}
   await page.waitForFunction(()=>hpointPersonal.currentQuote()?.total_rub===1419);
   assert.match(await page.locator('#requestDuration').innerText(),/73/);assert.match(await page.locator('#rewardValue').innerText(),/1\s*234/);assert.match(await page.locator('#personalRequestQuote').innerText(),/1\s*419/);checks+=3;
+  await page.locator('#requestBack').click();await page.locator('#qp').fill('Изменённый адрес');await page.locator('#requestNext').click();assert.match(await page.locator('#personalTemplatePreview').innerText(),/Изменённый адрес/);await page.locator('#requestBack').click();await page.locator('#qp').fill(fields.place);await page.locator('#requestNext').click();checks++;
   assert.equal(await page.locator('#rewardRub').isVisible(),true);assert.equal(await page.locator('#requestScheduledAt').inputValue(),'');checks+=2;
   // Saving and applying a second set of draft conditions must preserve them too.
   await page.locator('#qd').fill('Новые подробности\nс двумя строками');await page.locator('#rewardRub').fill('2468');await page.locator('#requestHours').fill('12');

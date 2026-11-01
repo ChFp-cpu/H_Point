@@ -22,6 +22,8 @@ def _add_pricing_column(db, name, definition):
 
 
 def initialize_schema(db):
+    from . import lifecycle_notifications
+    lifecycle_notifications.initialize_schema(db)
     # Defaults classify pre-existing agreements without changing their amounts,
     # payments, wallet sources or already recorded commission/payout snapshots.
     _add_pricing_column(db, "reward_pricing_version", "TEXT NOT NULL DEFAULT 'legacy_v1'")

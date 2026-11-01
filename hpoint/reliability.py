@@ -87,6 +87,8 @@ def refund_locked_reserve(db, request, add_entry, reason):
 
 def close_locked_request(db, request, actor_id, reason, event_type, add_entry):
     """Caller owns the transaction and request row lock. Refund a reserve once."""
+    from . import lifecycle_notifications
+    lifecycle_notifications.queue_closed(db,request,event_type,reason)
     rid = request["id"]
     db.execute("UPDATE requests SET status='cancelled',cancel_reason=?,cancelled_at=CURRENT_TIMESTAMP WHERE id=?", (reason, rid))
     db.execute("UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND status IN ('pending','applied','offered')", (rid,))

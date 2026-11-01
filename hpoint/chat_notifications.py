@@ -24,6 +24,15 @@ def chat_notification_chunks(request_id: int,sender_name: str,text: str,request_
     No subscription checks or promotional text belong in message delivery.
     """
     header,footer=_parts(request_id,sender_name,request_title,chat_id)
+    return _escaped_chunks(text,header,footer)
+
+
+def notice_chunks(title: str, text: str) -> list[str]:
+    """Full lifecycle/form text, with valid escaped HTML in each payload."""
+    return _escaped_chunks(text,"<b>"+escape(str(title)[:160])+"</b>\n\n","")
+
+
+def _escaped_chunks(text,header,footer):
     budget=3800-len(header)-len(footer)
     chunks=[];current=[];length=0
     for char in str(text):
