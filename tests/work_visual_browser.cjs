@@ -21,7 +21,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   }
   await page.setViewportSize({width:1440,height:1000});await page.emulateMedia({colorScheme:'light'});await page.evaluate(()=>scrollTo(0,0));await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,'work-creation-visual-desktop.png'),fullPage:true});
   await form.locator('[name=kind]').selectOption('trainer');await form.locator('button[type=submit]').click();await page.waitForURL('**/#/work');await page.locator('.professionalWelcome').waitFor();
-  assert.match(await page.locator('.professionalWelcome h2').textContent(),/людей/);assert.equal(await page.locator('.commercialFocusMetrics').count(),0);assert.match(await page.locator('.professionalNextWork').textContent(),/первую запись/);checks+=3;
+  assert.match(await page.locator('.professionalWelcome h2').textContent(),/людей/);assert.equal(await page.locator('.commercialFocusMetrics').count(),0);assert.match(await page.locator('.commercialDayDesk').textContent(),/Здесь появятся записи и смены/);checks+=3;
   assert.equal(await page.locator('.professionalWelcome .professionalPhotoLabel').textContent(),'Фото направления');checks++;
   const photo=page.locator('.professionalWelcome img');assert.equal(await photo.count(),1);assert.match(await photo.getAttribute('src'),/^\/assets\/.*\.webp$/);assert.ok(await photo.getAttribute('width'));assert.ok(await photo.getAttribute('height'));checks+=4;
   for(const width of [320,375,768,1024,1440])for(const colorScheme of ['light','dark']){
@@ -30,8 +30,8 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   }
   // A picture is not a fake case: only actual saved records enter this overview.
   await post('/api/commercial/clients',{name:'Синтетический клиент',active:true});const data=await(await context.request.get(base+'/api/commercial')).json(),client=data.commercial.clients[0];
-  await post('/api/commercial/bookings',{client_id:client.id,title:'Тестовая тренировка в расписании',starts_at:'2030-05-01T10:00:00+00:00',duration_minutes:60,price_rub:0,status:'planned'});await page.evaluate(()=>hpointCommercial.refresh());assert.match(await page.locator('.professionalNextWork').textContent(),/Тестовая тренировка/);checks++;
-  await page.locator('.professionalQuickLinks [data-tab=bookings]').click();await page.locator('[data-commercial-form=bookings]').waitFor();assert.equal(await page.locator('.professionalWelcome').count(),0);checks++;
+  await post('/api/commercial/bookings',{client_id:client.id,title:'Тестовая тренировка в расписании',starts_at:new Date(new Date().setHours(12,0,0,0)).toISOString(),duration_minutes:60,price_rub:0,status:'planned'});await page.evaluate(()=>hpointCommercial.refresh());assert.match(await page.locator('.commercialDayDesk').textContent(),/Тестовая тренировка/);checks++;
+  await page.locator('.commercialDayDesk [data-commercial-action=tab][data-tab=bookings]').click();await page.locator('[data-commercial-form=bookings]').waitFor();assert.equal(await page.locator('.professionalWelcome').count(),0);checks++;
   await workTab(page,'overview');await page.locator('.professionalWelcome').waitFor();await workTab(page,'professional:athletes');await page.locator('[data-commercial-form="professional/athletes"]').waitFor();assert.equal(await page.locator('.professionalWelcome').count(),0);checks++;
   assert.deepEqual(errors,[]);console.log(JSON.stringify({ok:true,checks,errors,photoChooser:true,realDataOnly:true,existingToolsPreserved:true}));
  }finally{await context.close();await browser.close()}

@@ -1,4 +1,4 @@
-> Current mode: verified-email registration/login and test money only. Telegram is an optional linked client. Paid help reserves within5minutes and pays the helper85% after requester confirmation. Commercial workspaces have7free days, then490test RUB per30days. See [release behaviour and checks](RELIABILITY_QA.md).
+> Current mode: verified-email registration/login and test money only. Telegram is an optional linked client. New paid requests reserve the helper reward plus a 15% service fee within five minutes; completion requires requester confirmation. Existing agreements preserve their original terms. Commercial workspaces have seven free days, then 490 test RUB per 30 days. See [subscription terms](SUBSCRIPTIONS.md).
 
 # H-Point
 
@@ -6,6 +6,9 @@
 объекты, задачи, смены, записи клиентов, сметы, показатели работы и публичные
 страницы услуг. Доступ, публикация и проверочные сценарии описаны в
 [WORKSPACE_QA.md](WORKSPACE_QA.md).
+
+Обзор рабочего дня, поиск по кабинету, быстрые связанные записи и экспорт
+расписания в календарь описаны в [проверках удобства кабинета](WORKSPACE_MODERNIZATION_QA.md).
 
 Доступны девять профессиональных профилей со своими инструментами: тренировки и
 замеры подопечных, уроки и домашние задания, процедуры, ремонтные заказы, этапы

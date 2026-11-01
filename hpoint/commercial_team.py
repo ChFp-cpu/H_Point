@@ -563,8 +563,15 @@ def enrich_dashboard(db,uid,owner,role,data):
     members=_members(db,owner);data["members"]=members
     if role in ("owner","admin"):
         data["invitations"]=[dict(r) for r in db.execute("SELECT id,email,role,status,expires_at FROM commercial_invitations WHERE owner_id=? ORDER BY id DESC LIMIT 200",(owner,)).fetchall()]
-    for key,table,order in (("objects","commercial_objects","id DESC"),("tasks","commercial_tasks","id DESC"),("estimates","commercial_estimates","id DESC"),("shifts","commercial_shifts","starts_at DESC,id DESC")):
-        data[key]=[dict(r) for r in db.execute("SELECT * FROM "+table+" WHERE owner_id=? ORDER BY "+order+" LIMIT 1000",(owner,)).fetchall()]
+    data["record_counts"]={"bookings":db.execute("SELECT COUNT(*) n FROM commercial_bookings WHERE owner_id=?",(owner,)).fetchone()["n"],"clients":len(data["clients"]),"services":len(data["services"])}
+    for key,table,order in (("objects","commercial_objects","CASE WHEN status IN ('planned','active') THEN 0 ELSE 1 END,id DESC"),("tasks","commercial_tasks","CASE WHEN status IN ('todo','in_progress') THEN 0 ELSE 1 END,CASE WHEN due_at IS NULL THEN 1 ELSE 0 END,due_at,id DESC"),("estimates","commercial_estimates","id DESC"),("shifts","commercial_shifts","starts_at DESC,id DESC")):
+        args=(owner,)
+        if key=="shifts":
+            order="CASE WHEN ends_at>=? THEN 0 ELSE 1 END,CASE WHEN ends_at>=? THEN starts_at END ASC,starts_at DESC,id DESC"
+            args=(owner,(c._now()-timedelta(days=1)).isoformat(),(c._now()-timedelta(days=1)).isoformat())
+        data[key]=[dict(r) for r in db.execute("SELECT * FROM "+table+" WHERE owner_id=? ORDER BY "+order+" LIMIT 1000",args).fetchall()]
+        data["record_counts"][key]=db.execute("SELECT COUNT(*) n FROM "+table+" WHERE owner_id=?",(owner,)).fetchone()["n"]
+    data["search_limited"]=any(total>len(data[key]) for key,total in data["record_counts"].items())
     data["estimates"]=[shape_estimate(row) for row in data["estimates"]]
     for service in data["services"]:service["published"]=bool(service["published"])
     names={m["user_id"]:m["name"] for m in members};objects={r["id"]:r["title"] for r in data["objects"]}

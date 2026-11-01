@@ -1645,7 +1645,7 @@ _page_replace("load();\n</script></body></html>", UI_OVERRIDES+ACCOUNT_UI_OVERRI
 PAGE = PAGE.replace("</head>", SYSTEM_THEME_META + "<script>window.hpointGamesEnabled="+json.dumps(GAMES_ENABLED)+";document.documentElement.dataset.gamesEnabled=String(window.hpointGamesEnabled);</script><style>@media(max-width:700px){html[data-games-enabled=false] #sitePrimaryNav{grid-template-columns:repeat(4,minmax(0,1fr))}}</style></head>", 1)
 
 ASSETS.update({name:(Path(__file__).resolve().parent.parent/"assets"/name,"application/javascript;charset=utf-8") for name in ("hpoint-workflows.js","hpoint-media.js","hpoint-commercial.js","hpoint-subscriptions.js","hpoint-organizations.js","hpoint-public.js","hpoint-professional.js","hpoint-help-categories.js","hpoint-league.js","hpoint-visuals.js","hpoint-personal.js")})
-PAGE=PAGE.replace("</body>",'<script>window.hpointHelpCategoriesData='+json.dumps({"catalog":CATEGORY_CATALOG,"groups":CATEGORY_GROUPS},ensure_ascii=False).replace("<","\\u003c")+';</script><script src="/assets/hpoint-workflows.js?v=20261101-finish6"></script><script src="/assets/hpoint-media.js?v=20261101-finish6"></script><script src="/assets/hpoint-visuals.js?v=20261101-finish6"></script><script src="/assets/hpoint-professional.js?v=20261101-finish6"></script><script src="/assets/hpoint-commercial.js?v=20261101-finish6"></script><script src="/assets/hpoint-subscriptions.js?v=20261101-finish6"></script><script src="/assets/hpoint-organizations.js?v=20261101-finish6"></script><script src="/assets/hpoint-help-categories.js?v=20261101-finish6"></script><script src="/assets/hpoint-league.js?v=20261101-finish6"></script><script src="/assets/hpoint-personal.js?v=20261101-finish6"></script><script>window.hpointStart();</script></body>')
+PAGE=PAGE.replace("</body>",'<script>window.hpointHelpCategoriesData='+json.dumps({"catalog":CATEGORY_CATALOG,"groups":CATEGORY_GROUPS},ensure_ascii=False).replace("<","\\u003c")+';</script><script src="/assets/hpoint-workflows.js?v=20261101-work7"></script><script src="/assets/hpoint-media.js?v=20261101-work7"></script><script src="/assets/hpoint-visuals.js?v=20261101-work7"></script><script src="/assets/hpoint-professional.js?v=20261101-work7"></script><script src="/assets/hpoint-commercial.js?v=20261101-work7"></script><script src="/assets/hpoint-subscriptions.js?v=20261101-work7"></script><script src="/assets/hpoint-organizations.js?v=20261101-work7"></script><script src="/assets/hpoint-help-categories.js?v=20261101-work7"></script><script src="/assets/hpoint-league.js?v=20261101-work7"></script><script src="/assets/hpoint-personal.js?v=20261101-work7"></script><script>window.hpointStart();</script></body>')
 
 # Hide server-rendered legacy hooks before the first paint. Reveal only the
 # current workspace/landing, once its modules and initial data are ready.
@@ -1658,7 +1658,7 @@ PAGE=PAGE.replace('<body>','<body><div id="hpointBootScreen" role="status" aria-
 ASSETS.update(visuals.assets())
 ASSETS["hpoint-editorial.css"]=(Path(__file__).resolve().parents[1]/"assets"/"hpoint-editorial.css","text/css;charset=utf-8")
 ASSETS["photo-sources.json"]=(Path(__file__).resolve().parents[1]/"assets"/"photo-sources.json","application/json;charset=utf-8")
-PAGE=PAGE.replace("</head>",'<link rel="stylesheet" href="/assets/hpoint-editorial.css?v=20261101-finish6"></head>',1)
+PAGE=PAGE.replace("</head>",'<link rel="stylesheet" href="/assets/hpoint-editorial.css?v=20261101-work7"></head>',1)
 PAGE=PAGE.replace("<body>",'<body class="hpEditorial">',1)
 PAGE=PAGE.replace("window.hpointHelpCategoriesData=","window.hpointPhotoCatalog="+json.dumps(visuals.catalog(),ensure_ascii=False).replace("<",r"\u003c")+";window.hpointHelpCategoriesData=",1)
 
@@ -1897,6 +1897,21 @@ class Handler(BaseHTTPRequestHandler):
                     ).fetchall()
                     candidates=[dict(row) for row in candidate_rows]
                 return reply(self,{"ok":True,"request":request_payload(request_row),"events":[dict(row) for row in events],"candidates":candidates})
+            if p.path=="/api/commercial/calendar/export":
+                u=auth(self)
+                if not u:return
+                if not verified_community_account(self,u):return
+                query=parse_qs(p.query)
+                try:
+                    from . import work_calendar
+                    document=work_calendar.export_calendar(db,u["user_id"],owner_id=query.get("owner_id",[None])[0],starts_on=query.get("from",[None])[0],ends_on=query.get("to",[None])[0],person=query.get("person",[None])[0],kind=query.get("type",["all"])[0],timezone_minutes=query.get("timezone_minutes",["0"])[0])
+                except PermissionError as error:return reply(self,{"ok":False,"error":str(error)},403)
+                except (ValueError,LookupError) as error:return reply(self,{"ok":False,"error":str(error)},400)
+                payload=document["body"]
+                self.send_response(200);self.send_header("Content-Type",document["content_type"]);self.send_header("Content-Disposition",'attachment; filename="'+document["filename"]+'"');self.send_header("Content-Length",str(len(payload)));self.send_header("Cache-Control","private, no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("Referrer-Policy","same-origin")
+                try:self.end_headers();self.wfile.write(payload)
+                except (BrokenPipeError,ConnectionResetError,ConnectionAbortedError):pass
+                return
             if p.path=="/api/commercial/estimates/export":
                 u=auth(self)
                 if not u:return

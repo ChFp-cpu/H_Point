@@ -350,15 +350,17 @@ def save_booking(db,uid,data,owner_id=None):
     title=_text(data,"title",160,True)
     notes=_text(data,"notes",4000)
     try:starts=_date(data.get("starts_at"))
-    except (ValueError,TypeError):raise ValueError("Укажите дату и время записи с часовым поясом.")
+    except (ValueError,TypeError,OverflowError):raise ValueError("Укажите дату и время записи с часовым поясом.")
     price=_integer(data.get("price_rub",0),0,1_000_000)
     duration=_integer(data.get("duration_minutes",60),5,1440)
+    try:ends=starts+timedelta(minutes=duration)
+    except OverflowError:raise ValueError("Проверьте дату и длительность записи.")
     def save(owner):
         from . import commercial_team
         assignee= commercial_team.assignee(db,owner,data.get("assignee_id"))
         obj= commercial_team.object_id(db,owner,data.get("object_id"))
         if assignee is not None and status=="planned":
-            commercial_team.check_booking_overlap(db,owner,assignee,starts,starts+timedelta(minutes=duration),item_id)
+            commercial_team.check_booking_overlap(db,owner,assignee,starts,ends,item_id)
         _owned(db,"commercial_clients",owner,client_id)
         if service_id:_owned(db,"commercial_services",owner,service_id)
         if item_id:
@@ -397,7 +399,11 @@ def _dashboard_core(db,uid):
     services=[dict(r) for r in db.execute("SELECT * FROM commercial_services WHERE owner_id=? ORDER BY active DESC,id DESC",(uid,)).fetchall()]
     clients=[dict(r) for r in db.execute("SELECT * FROM commercial_clients WHERE owner_id=? ORDER BY active DESC,name,id",(uid,)).fetchall()]
     bookings=[dict(r) for r in db.execute("""SELECT b.*,c.name client_name FROM commercial_bookings b
-        JOIN commercial_clients c ON c.id=b.client_id WHERE b.owner_id=? ORDER BY b.starts_at DESC,b.id DESC LIMIT 300""",(uid,)).fetchall()]
+        JOIN commercial_clients c ON c.id=b.client_id WHERE b.owner_id=?
+        ORDER BY CASE WHEN b.status='planned' AND b.starts_at>=? THEN 0
+                      WHEN b.status='planned' THEN 1 ELSE 2 END,
+                 CASE WHEN b.status='planned' AND b.starts_at>=? THEN b.starts_at END ASC,
+                 b.starts_at DESC,b.id DESC LIMIT 300""",(uid,(now-timedelta(days=1)).isoformat(),(now-timedelta(days=1)).isoformat())).fetchall()]
     totals=db.execute("""SELECT COUNT(*) total,
         COALESCE(SUM(CASE WHEN status='planned' THEN 1 ELSE 0 END),0) planned,
         COALESCE(SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END),0) completed,
