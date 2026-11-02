@@ -4,7 +4,7 @@
   if (window.HPointMedia) return;
   const $ = id => document.getElementById(id);
   const escape = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-  let requestFiles = [], requestField = null, enhancementQueued = false, mediaOwner = null;
+  let requestFiles = [], requestField = null, enhancementQueued = false, mediaOwner = null, participantLoad = 0;
   const chatFiles = new Map();
   const currentChat = () => Number(window.hpointWorkspace?.state?.threadId || window.hpointWorkspace?.state?.chat?.id || window.hpointWorkspace?.state?.chatId || 0);
   const notify = message => typeof window.toast === 'function' ? window.toast(message) : console.warn(message);
@@ -64,13 +64,15 @@
     const get = () => kind === 'request' ? requestFiles : (chatFiles.get(Number(widget.dataset.chatId)) || []);
     const set = values => kind === 'request' ? (requestFiles = values) : chatFiles.set(Number(widget.dataset.chatId), values);
     widget.querySelector('input').addEventListener('change', async event => {
-      const files = [...event.target.files], status = widget.querySelector('[role="status"]');
+      const files = [...event.target.files], status = widget.querySelector('[role="status"]'), owner = String(window.hpointWorkspace?.state?.data?.current_user_id || ''), field = requestField;
+      const current = () => widget.isConnected && owner === String(window.hpointWorkspace?.state?.data?.current_user_id || '') && (kind === 'request' ? field === requestField && field === $('qw') && $('modal')?.style.display !== 'none' : Number(widget.dataset.chatId) === currentChat());
       try {
         if (get().length + files.length > 3) throw new Error('Можно прикрепить до трёх фотографий.');
         event.target.disabled = true; status.textContent = 'Подготавливаем фото…';
         const added = await Promise.all(files.map(resizePhoto));
+        if (!current()) return;
         set([...get(), ...added]); preview(widget, get()); status.textContent = 'Фото прикреплены. Они отправятся вместе с ' + (kind === 'request' ? 'заявкой.' : 'сообщением.');
-      } catch (error) { status.textContent = error.message; }
+      } catch (error) { if (current()) status.textContent = error.message; }
       finally { event.target.disabled = false; event.target.value = ''; }
     });
     widget.addEventListener('click', event => {
@@ -120,13 +122,19 @@
   }
 
   async function showParticipants(id) {
+    const modal = $('modal'), body = $('modalbody');
+    if (!modal || !body) return;
+    const version = ++participantLoad, owner = String(window.hpointWorkspace?.state?.data?.current_user_id || '');
+    body.innerHTML = '<h2>Участники</h2><p class="muted" role="status">Загружаем список…</p>';
+    const loading = body.lastElementChild;
+    modal.style.display = 'flex';
+    const current = () => version === participantLoad && owner === String(window.hpointWorkspace?.state?.data?.current_user_id || '') && modal.style.display !== 'none' && loading.parentElement === body;
     try {
-      const data = await api('/api/events/participants?id=' + Number(id)), modal = $('modal'), body = $('modalbody');
-      if (!modal || !body) return;
-      modal.style.display = 'flex';
+      const data = await api('/api/events/participants?id=' + Number(id));
+      if (!current()) return;
       body.innerHTML = '<h2>Участники · ' + escape(data.title) + '</h2><p class="muted">Записались на мероприятие</p><div class="hpointParticipantList">' +
         ((data.participants || []).map(person => '<button class="hpointParticipant btn light" type="button" data-participant-profile="' + Number(person.profile_id) + '"><span class="hpointParticipantAvatar">' + escape((person.name || '?').slice(0, 1)) + '</span><span>' + escape(person.name || 'Участник') + '</span></button>').join('') || '<p class="muted">Пока никто не записался.</p>') + '</div>';
-    } catch (error) { notify(error.message); }
+    } catch (error) { if (current()) { body.innerHTML = '<h2>Участники</h2><p class="muted">' + escape(error.message || 'Не удалось загрузить список.') + '</p><button class="btn light" type="button" data-event-participants="' + Number(id) + '">Повторить</button>'; } }
   }
 
   // Existing eventCard is a global renderer. Decorate it after inline app

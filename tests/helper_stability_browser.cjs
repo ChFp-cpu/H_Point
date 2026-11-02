@@ -13,6 +13,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  async function settings(a){await a.page.goto(base+'/#/help');await a.page.evaluate(()=>hpointWorkspace.refresh());await openHelpTab(a.page,'open');await a.page.locator('[data-ws-action="help-tab"][data-tab="preferences"]').first().click();await a.page.locator('#helperPreferencesForm').waitFor()}
  try{
   const helper=await actor('mobile-helper'),author=await actor('theme-browser-data'),page=helper.page;
+  await post(author,'/api/payments/hp',{item_type:'pro',purchase_key:'helper-browser-pro'});
   const jobs=(await get(author,'/api/sync')).requests,first=jobs.find(r=>r.status==='open').id;
   const next=await post(author,'/api/requests',{what:'Вторая заявка для отклика',place:'Тестовый район',time_needed:'сегодня',urgency:'обычная',category:'tech',details:'Только синтетические данные'});
   await post(helper,'/api/requests/apply',{request_id:first});await post(helper,'/api/requests/apply',{request_id:next.request_id});

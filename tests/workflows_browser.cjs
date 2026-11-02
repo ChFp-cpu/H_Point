@@ -11,6 +11,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  async function refresh(actor){await actor.page.evaluate(()=>hpointWorkspace.refresh())}
  try{
   const author=await login('theme-browser-data'),helper=await login('mobile-helper');
+  await post(author,'/api/payments/hp',{item_type:'pro',purchase_key:'workflows-browser-pro'});await author.page.evaluate(()=>hpointWorkspace.refresh());
   for(const endpoint of ['/api/auth/telegram/start','/api/payments/create','/api/requests/reward/pay']){const r=await author.context.request.post(base+endpoint,{data:{}});assert.ok([409,410].includes(r.status()));checks++}
   // An explicit mode replaces location permission prompts.
   await helper.page.goto(base+'/#/help');await helper.page.evaluate(()=>helper());await helper.page.locator('#hpHelperLocation').fill('Тестовый район');await helper.page.locator('#hpEnterHelper').click();
@@ -21,11 +22,11 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await author.page.locator('#qw').fill('Настройка ноутбука с резервом');await author.page.locator('#qc').selectOption('tech');await author.page.locator('#requestNext').click();
   await author.page.locator('#qp').fill('Тестовый адрес');await author.page.locator('#requestNext').click();
   await author.page.locator('.requestStep[data-request-step="2"] summary').click();await author.page.locator('#rewardRub').fill('400');await author.page.locator('#createRequestButton').click();
-  await author.page.locator('#hpCreateReserve').waitFor();assert.match(await author.page.locator('#modalbody').innerText(),/340 тест/);checks++;
+  await author.page.locator('#hpCreateReserve').waitFor();assert.match(await author.page.locator('#modalbody').innerText(),/400 тест/);checks++;
   const job=(await get(author,'/api/sync')).requests.find(r=>r.what==='Настройка ноутбука с резервом'),rid=job.id;
   assert.ok(Date.parse(job.reserve_deadline_at)-Date.now()<=300000);assert.ok(Date.parse(job.reserve_deadline_at)>Date.now());checks+=2;
   await author.page.locator('#hpCreateReserve').click();await author.page.locator('#modal').waitFor({state:'hidden'});
-  assert.equal((await get(author,'/api/wallet')).wallet.balance_rub,100);checks++;
+  assert.equal((await get(author,'/api/wallet')).wallet.test_balance_rub,40);checks++;
   await author.page.evaluate(id=>openRequestTracking(id),rid);await author.page.getByRole('heading',{name:'Настройка ноутбука с резервом',exact:true}).waitFor();await author.page.evaluate(()=>closeModal());checks++;
   await helper.page.goto(base+'/#/help');await refresh(helper);await openHelpTab(helper.page,'open');
   const card=helper.page.locator('.workspaceRequest').filter({hasText:'Настройка ноутбука с резервом'});assert.doesNotMatch(await card.innerText(),/#\d|№\s*\d/);assert.match(await card.innerText(),/Тестовый участник/);checks+=2;
@@ -36,7 +37,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   author.page.once('dialog',d=>d.accept());await author.page.locator('[data-ws-action="finish"][data-id="'+rid+'"]').click();
   await author.page.getByRole('heading',{name:'Как прошло взаимодействие?',exact:true}).waitFor();await author.page.locator('#hpSendReview').click();await author.page.locator('#modal').waitFor({state:'hidden'});checks++;
   await refresh(helper);await helper.page.getByRole('heading',{name:'Как прошло взаимодействие?',exact:true}).waitFor();await helper.page.locator('[name="hpReviewRating"][value="4"]').check();await helper.page.locator('#hpSendReview').click();await helper.page.locator('#modal').waitFor({state:'hidden'});checks++;
-  assert.equal((await get(helper,'/api/wallet')).wallet.test_balance_rub,340);assert.equal((await get(author,'/api/admin/dashboard')).platform_income.earned_test_rub,60);checks+=2;
+  assert.equal((await get(helper,'/api/wallet')).wallet.test_balance_rub,400);assert.equal((await get(author,'/api/admin/dashboard')).platform_income.earned_test_rub,60);checks+=2;
   const another=await post(author,'/api/requests',{what:'Отменяемая помощь',place:'Тест',time_needed:'сегодня',urgency:'обычная',details:'Тест'});
   await refresh(author);await openHelpTab(author.page,'mine');author.page.on('dialog',d=>d.accept(d.type()==='prompt'?'Планы изменились':undefined));
   await author.page.locator('.workspaceRequest').filter({hasText:'Отменяемая помощь'}).getByRole('button',{name:'Отменить',exact:true}).click();

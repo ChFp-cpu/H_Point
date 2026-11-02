@@ -1,0 +1,26 @@
+/* Activity and photo callbacks must stay with the modal/account that opened them. */
+'use strict';
+const {chromium}=require('playwright'),assert=require('node:assert/strict');
+const {emailLogin}=require('./email_browser_login.cjs');
+const base=process.env.HPOINT_QA_URL;
+if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Disposable localhost only');
+(async()=>{
+ const browser=await chromium.launch({channel:'msedge',headless:true}),context=await browser.newContext({viewport:{width:390,height:844}}),page=await context.newPage(),errors=[];let checks=0;
+ await context.route('**/*',route=>new URL(route.request().url()).origin===base?route.continue():route.abort());page.on('pageerror',e=>errors.push(e.message));
+ try{
+  await emailLogin(page,'theme-browser-data');const made=await context.request.post(base+'/api/events',{data:{title:'Проверка стабильности события',place:'Тестовый район',starts_at:new Date(Date.now()+86400000).toISOString()}});assert.equal(made.status(),200,await made.text());const id=(await made.json()).event_id;
+  async function delayedParticipants(next){let release,seen;const gate=new Promise(r=>release=r),started=new Promise(r=>seen=r),handler=async route=>{seen();await gate;await route.continue()};await context.route('**/api/events/participants?*',handler);const pending=page.evaluate(id=>HPointMedia.showParticipants(id),id);await started;await page.locator('#modal').waitFor({state:'visible'});await next();release();await pending;await context.unroute('**/api/events/participants?*',handler)}
+  await delayedParticipants(()=>page.evaluate(()=>closeModal()));assert.equal(await page.locator('#modal').isVisible(),false);checks++;
+  await delayedParticipants(async()=>{await page.evaluate(()=>requestForm());await page.locator('#qw').fill('Новый черновик после участников')});assert.equal(await page.locator('#qw').inputValue(),'Новый черновик после участников');assert.equal(await page.locator('.hpointParticipantList').count(),0);checks+=2;
+  await page.evaluate(()=>closeModal());await page.evaluate(id=>HPointMedia.showParticipants(id),id);await page.locator('.hpointParticipantList').waitFor();assert.match(await page.locator('#modalbody').innerText(),/Пока никто/);checks++;
+  await context.route('**/api/events/participants?*',route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({ok:false,error:'Проверочный сбой списка'})}));await page.evaluate(id=>HPointMedia.showParticipants(id),id);await page.locator('#modalbody [data-event-participants]').waitFor();assert.match(await page.locator('#modalbody').innerText(),/Проверочный сбой/);checks++;
+  await context.unroute('**/api/events/participants?*');await page.locator('#modalbody [data-event-participants]').click();await page.locator('.hpointParticipantList').waitFor();checks++;
+  const file={name:'synthetic.png',mimeType:'image/png',buffer:Buffer.from(await page.evaluate(()=>{const c=document.createElement('canvas');c.width=80;c.height=60;c.getContext('2d').fillRect(0,0,80,60);return c.toDataURL('image/png').split(',')[1]}),'base64')};
+  await page.evaluate(()=>{const Reader=window.FileReader;window.FileReader=class extends Reader{readAsDataURL(file){if(window.deferMediaRead)window.releaseMediaRead=()=>super.readAsDataURL(file);else super.readAsDataURL(file)}}});
+  async function pendingPhoto(){await page.evaluate(()=>{requestForm();window.deferMediaRead=true});await page.locator('#requestPhotoPicker input').waitFor({state:'attached'});await page.evaluate(()=>{window.oldPhotoInput=document.querySelector('#requestPhotoPicker input')});await page.locator('#requestPhotoPicker input').setInputFiles(file);await page.waitForFunction(()=>Boolean(window.releaseMediaRead))}
+  await pendingPhoto();await page.evaluate(()=>{closeModal();requestForm();window.deferMediaRead=false;window.releaseMediaRead();window.releaseMediaRead=null});await page.waitForFunction(()=>!window.oldPhotoInput.disabled);assert.equal(await page.evaluate(()=>HPointMedia.requestPhotos().length),0);assert.equal(await page.locator('#requestPhotoPicker .hpointPhotoPreviews img').count(),0);checks+=2;
+  await page.locator('#requestPhotoPicker input').setInputFiles(file);await page.locator('#requestPhotoPicker .hpointPhotoPreviews img').waitFor({state:'attached'});assert.equal(await page.evaluate(()=>HPointMedia.requestPhotos().length),1);checks++;
+  await pendingPhoto();await page.evaluate(()=>{window.mediaTestOwner=hpointWorkspace.state.data.current_user_id;hpointWorkspace.state.data.current_user_id=905;HPointMedia.enhance();window.deferMediaRead=false;window.releaseMediaRead();window.releaseMediaRead=null});await page.waitForFunction(()=>!window.oldPhotoInput.disabled);assert.equal(await page.evaluate(()=>HPointMedia.requestPhotos().length),0);checks++;await page.evaluate(()=>{hpointWorkspace.state.data.current_user_id=window.mediaTestOwner;HPointMedia.enhance();closeModal()});
+  assert.deepEqual(errors,[]);checks++;console.log(JSON.stringify({ok:true,checks,lateParticipantsIgnored:true,retryWorks:true,photoDraftIsolation:true,accountIsolation:true,errors}));
+ }finally{await context.close();await browser.close()}
+})().catch(e=>{console.error(e.stack);process.exitCode=1});

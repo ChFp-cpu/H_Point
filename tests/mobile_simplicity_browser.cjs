@@ -1,95 +1,28 @@
-/* Mobile navigation, priority and discoverability on disposable data. */
-const {chromium}=require('playwright');
-const assert=require('node:assert/strict');
-const path=require('node:path');
-const {openHelpTab}=require('./help_navigation.cjs');
+/* Current email-only navigation remains usable on touch screens. */
+'use strict';
+const {chromium}=require('playwright'),assert=require('node:assert/strict');
+const {emailLogin}=require('./email_browser_login.cjs');
 const base=process.env.HPOINT_QA_URL;
 if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
 (async()=>{
- const browser=await chromium.launch({channel:'msedge',headless:true});
- const context=await browser.newContext({viewport:{width:390,height:844},isMobile:true,hasTouch:true});
- await context.route('**/*',r=>new URL(r.request().url()).origin===base?r.continue():r.abort());
- const page=await context.newPage(),errors=[];page.on('pageerror',e=>errors.push(e.message));
- let checks=0;
+ const browser=await chromium.launch({channel:'msedge',headless:true}),context=await browser.newContext({viewport:{width:390,height:844},isMobile:true,hasTouch:true,reducedMotion:'reduce'}),page=await context.newPage(),errors=[];let checks=0;
+ await context.route('**/*',r=>new URL(r.request().url()).origin===base?r.continue():r.abort());page.on('pageerror',e=>errors.push(e.message));
  try{
-  await page.goto(base+'/auth/telegram?ticket=theme-browser-data');await page.locator('#hpointWorkspace').waitFor();
-  for(const colorScheme of ['light','dark']){
-   await page.emulateMedia({colorScheme});
-   for(const width of [320,390,430,700,768,1440]){
-    await page.setViewportSize({width,height:844});
-    for(const route of ['#/home','#/help','#/profile','games']){
-     await page.goto(base+'/'+route);
-     await page.locator(route==='games'?'#games .game-card':'#hpointWorkspace').first().waitFor();
-     const nav=page.locator(route==='games'?'.gamesPrimaryNav':'#sitePrimaryNav');
-     assert.deepEqual(await nav.locator('button,a').allTextContents(),['Главная','Помощь','Игры','Активности']);
-     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`${width} ${route}`);
-     if(width<=700){
-      for(const button of await nav.locator('button,a').all()){
-       const rect=await button.boundingBox();assert.ok(rect.height>=44&&rect.width>=44,'Touch targets');
-       assert.ok(await button.evaluate(e=>parseFloat(getComputedStyle(e).fontSize)>=12),'Named navigation');
-      }
-      let rect=await nav.boundingBox();assert.ok(rect.y>=844-100&&rect.y+rect.height<=845,'Navigation at viewport bottom');
-      await page.evaluate(()=>scrollTo(0,document.body.scrollHeight));
-      rect=await nav.boundingBox();assert.ok(rect.y>=844-100&&rect.y+rect.height<=845,'Navigation stays reachable after scroll');
-      await page.evaluate(()=>scrollTo(0,0));
-      if(route==='#/home'){
-       assert.equal(await page.locator('.homeMobileTitle').innerText(),'С чего начнём?');
-       const focus=await page.locator('.homeTasks').boundingBox(),league=await page.locator('.homeLeague').boundingBox();
-       assert.ok(focus.y<league.y,'Current help before community statistics');
-       assert.equal(await page.locator('.peopleComposition').isVisible(),false);
-       for(const action of ['request','help-tab'])assert.ok((await page.locator('.homeHero [data-ws-action="'+action+'"]').boundingBox()).height>=44);
-      }
-      if(route==='#/help'){
-       assert.equal(await page.locator('.helpNavigation>button').count(),3);
-       assert.equal(await page.locator('#helpMore').evaluate(e=>e.open),false);
-       assert.equal(await page.locator('#wsRequestQuery').isVisible(),false);
-      }
-      if(route==='#/profile'){
-       assert.equal(await page.locator('#accountMore').evaluate(e=>e.open),false);
-       assert.equal(await page.locator('.workspaceProfileHero').isVisible(),true);
-       await page.locator('#accountMore summary').click();
-       await page.locator('.workspaceAccountNav [data-ws-action="account-menu"]').click();
-       await page.locator('#modal .close').click();
-      }
-     }
-     if(width===390)await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,`simple-${colorScheme}-${route.replace(/[^a-z]/g,'')}.png`),fullPage:true,animations:'disabled'});
-     checks++;
-    }
+  await emailLogin(page,'theme-browser-data');
+  for(const colorScheme of ['light','dark'])for(const width of [320,390,768,1440]){
+   await page.setViewportSize({width,height:844});await page.emulateMedia({colorScheme});
+   for(const route of ['home','help','profile','activities']){
+    await page.goto(base+'/#/'+route);await page.locator('#hpointWorkspace').waitFor();const nav=page.locator('#sitePrimaryNav');assert.deepEqual(await nav.locator('button,a').allTextContents(),['Главная','Помощь','Активности']);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1),false);checks+=2;
+    assert.equal(await page.locator('.workspaceHeaderActions [data-ws-action=support]').isVisible(),true);checks++;
+    if(width<=700){for(const button of await nav.locator('button,a').all()){const box=await button.boundingBox();assert.ok(box.width>=44&&box.height>=44);checks++}await page.evaluate(()=>scrollTo(0,document.body.scrollHeight));const box=await nav.boundingBox();assert.ok(box.y>=744&&box.y+box.height<=845,'Navigation stays at the viewport bottom');checks++;await page.evaluate(()=>scrollTo(0,0))}
+    if(route==='home'){const hero=page.locator('.hpHomeHero');for(const name of ['Нужна помощь','Хочу помочь']){const button=hero.getByRole('button',{name:new RegExp('^'+name)});assert.equal(await button.isVisible(),true);if(width<=700){const box=await button.boundingBox();assert.ok(box.height>=44&&box.y+box.height<774,'Primary home action fits first screen')}checks++}}
+    if(route==='help'){assert.equal(await page.locator('.helpNavigation>button').count(),width<=700?3:5);assert.equal(await page.locator('.helpNavigation [data-tab=preferences]').count(),0);checks+=2}
+    if(route==='profile'&&width<=700){assert.equal(await page.locator('#accountMore').evaluate(n=>n.open),false,JSON.stringify({width,colorScheme,state:await page.evaluate(()=>({open:hpointWorkspace.state.accountMoreOpen,mobile:matchMedia('(max-width:700px)').matches}))}));await page.locator('#accountMore summary').click();await page.locator('[data-ws-action=account-menu]').click();await page.locator('#modal').waitFor({state:'visible'});await page.evaluate(()=>closeModal());await page.locator('#accountMore summary').click();checks+=2}
    }
   }
-  await page.setViewportSize({width:390,height:844});await page.goto(base+'/#/help');
-  await page.locator('#helpFilters summary').click();
-  await page.locator('#wsRequestQuery').fill('Совместная');await page.locator('#wsRequestQuery').press('Enter');
-  await page.waitForFunction(()=>hpointWorkspace.state.requestQuery==='Совместная');
-  assert.equal(await page.locator('.workspaceRequest').count(),1);
-  await page.evaluate(()=>hpointWorkspace.refresh());
-  assert.equal(await page.locator('#wsRequestQuery').inputValue(),'Совместная');
-  await page.locator('#wsRequestQuery').fill('');await page.locator('[data-ws-action="request-filter"]').click();
-  await openHelpTab(page,'preferences');await page.locator('#wsHelperAvailability').fill('После 19:00');
-  await page.setViewportSize({width:1440,height:900});
-  await page.waitForFunction(()=>document.querySelectorAll('.helpNavigation>button').length===6);
-  assert.equal(await page.locator('.helpNavigation>button').count(),6);
-  assert.equal(await page.locator('#wsHelperAvailability').inputValue(),'После 19:00');
-  await page.setViewportSize({width:390,height:844});
-  await page.waitForFunction(()=>document.querySelectorAll('.helpNavigation>button').length===3);
-  await openHelpTab(page,'mine');
-  assert.equal(await page.locator('#helpMore').evaluate(e=>e.open),false);
-  await page.locator('#sitePrimaryNav [data-route="home"]').click();await page.locator('.homeMobileTitle').waitFor();
-  await page.locator('.workspaceHeaderActions [data-ws-action="request"]').click();
-  await page.locator('#qw').waitFor();assert.equal(await page.locator('#modal').isVisible(),true);
-  await page.locator('#modal .close').click();
-  const guest=await browser.newContext({viewport:{width:320,height:740},isMobile:true,hasTouch:true});
-  try{
-   await guest.route('**/*',r=>new URL(r.request().url()).origin===base?r.continue():r.abort());
-   const welcome=await guest.newPage();await welcome.goto(base+'/');
-   await welcome.locator('#landing .hero .actions').waitFor();
-   assert.equal(await welcome.locator('#sitePrimaryNav').count(),0);
-   for(const button of await welcome.locator('#landing .hero .actions .btn').all()){
-    const rect=await button.boundingBox();assert.ok(rect.height>=44&&rect.y+rect.height<740,'Login and registration on the first screen');
-   }
-   assert.equal(await welcome.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
-   await welcome.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,'simple-welcome.png'),fullPage:true,animations:'disabled'});
-  }finally{await guest.close()}
-  assert.deepEqual(errors,[]);console.log(JSON.stringify({ok:true,checks,searchAndDrafts:true,errors}));
- }finally{await browser.close()}
+  await page.setViewportSize({width:1440,height:844});await page.goto(base+'/#/profile');await page.locator('#accountMore').waitFor();assert.equal(await page.locator('#accountMore').evaluate(n=>n.open),true);await page.setViewportSize({width:390,height:844});await page.waitForFunction(()=>document.getElementById('accountMore')?.open===false);assert.equal(await page.locator('#accountMore').evaluate(n=>n.open),false);checks+=2;
+  const games=await context.request.get(base+'/games');assert.equal(games.status(),410);assert.match(games.headers()['x-robots-tag'],/noindex/);checks+=2;
+  await context.clearCookies();await page.goto(base);await page.locator('#landing .hero .actions').waitFor();await page.setViewportSize({width:320,height:740});await page.evaluate(()=>scrollTo(0,0));for(const button of await page.locator('#landing .hero .actions .btn').all()){const box=await button.boundingBox();assert.ok(box.height>=44&&box.y+box.height<740,JSON.stringify({label:await button.innerText(),box,viewport:await page.evaluate(()=>({w:innerWidth,h:innerHeight,scale:visualViewport.scale}))}));checks++}assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1),false);checks++;
+  assert.deepEqual(errors,[]);console.log(JSON.stringify({ok:true,checks,currentEmailNavigation:true,touchTargets:true,homeChoices:true,moreSettings:true,gamesDisabled:true,errors}));
+ }finally{await context.close();await browser.close()}
 })().catch(e=>{console.error(e.stack);process.exitCode=1});

@@ -21,6 +21,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  }
  try{
   const author=await actor('theme-browser-data'),helper=await actor('mobile-helper'),other=await actor('theme-browser-empty'),page=author.page;
+  await post(author,'/api/payments/hp',{item_type:'pro',purchase_key:'archive-browser-pro'});
   const first=await create(author,'Private archived help A'),second=await create(author,'Independent help B');
   await post(helper,'/api/requests/apply',{request_id:first});await post(other,'/api/requests/apply',{request_id:second});
   const ca=(await get(helper,'/api/chats?request_id='+first)).chats[0].id,cb=(await get(other,'/api/chats?request_id='+second)).chats[0].id;

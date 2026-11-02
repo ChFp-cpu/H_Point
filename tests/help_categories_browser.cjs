@@ -12,6 +12,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  async function settings(actor){await actor.page.goto(base+'/#/help');await actor.page.evaluate(()=>hpointWorkspace.refresh());await openHelpTab(actor.page,'open');await openHelpTab(actor.page,'preferences');await actor.page.locator('#helperPreferencesForm').waitFor()}
  try{
   const author=await actor('theme-browser-data'),helper=await actor('mobile-helper'),page=author.page;
+  const pro=await author.context.request.post(base+'/api/payments/wallet',{data:{item_type:'pro',purchase_key:'qa-categories-browser-pro-20261101'}});assert.equal(pro.status(),200,await pro.text());await page.evaluate(()=>hpointWorkspace.refresh());
   const catalog=await page.evaluate(()=>hpointHelpCategories.catalog);assert.equal(catalog.length,28);assert.equal(new Set(catalog.map(item=>item.key)).size,28);checks+=2;
   await page.evaluate(()=>requestForm());
   assert.equal(await page.locator('#qc').inputValue(),'');assert.equal(await page.locator('#qc option[value="other"]').count(),1);assert.equal(await page.locator('#qc optgroup').count(),5);checks+=3;

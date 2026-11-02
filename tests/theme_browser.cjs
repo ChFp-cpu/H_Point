@@ -16,9 +16,9 @@ async function loadPhotos(page){
     await Promise.all(photos.map(photo=>photo.decode().catch(()=>{})));
     await document.fonts.ready;
   });
-  for(const photo of await page.locator('.welcomeComposition img,.peopleComposition img,.homeTogether img,.communityPhotoStory img').all()){
+  for(const photo of await page.locator('.hpPhotoImage').all()){
     assert.ok(await photo.evaluate(e=>e.complete&&e.naturalWidth>0),'Real photographs must load');
-    assert.equal(await photo.evaluate(e=>getComputedStyle(e).objectFit),'contain','Keep the complete photograph visible');
+    assert.equal(await photo.evaluate(e=>getComputedStyle(e).objectFit),'cover','The photo fills its frame without stretching');
   }
 }
 (async()=>{
@@ -72,8 +72,8 @@ async function loadPhotos(page){
             assert.equal(await page.locator('#workspaceHistory').getAttribute('open'),null);
             assert.equal(await page.locator('#workspaceMapSlot').count(),0,'Map does not force scrolling on the requests screen');
           }
-          if(route==='#/profile/billing')assert.equal(await page.locator('.workspaceProduct').count(),2);
-          if(route==='#/league')assert.equal(await page.locator('.leagueCategoryTop').first().evaluate(e=>getComputedStyle(e).color),colorScheme==='light'?'rgb(35, 51, 44)':'rgb(232, 239, 234)');
+          if(route==='#/profile/billing'){assert.ok(await page.locator('[data-item="pro"]').count()>0);assert.equal(await page.locator('[data-item="more_responses"],[data-item="boost"],[data-item="verification"]').count(),0)}
+          if(route==='#/league')assert.equal(await page.locator('#leagueBoardTitle').evaluate(e=>getComputedStyle(e).color),colorScheme==='light'?'rgb(35, 51, 44)':'rgb(232, 239, 234)');
         }
       }
       console.log('Responsive screens passed:',colorScheme);
@@ -110,7 +110,7 @@ async function loadPhotos(page){
     for(const colorScheme of ['light','dark']){
       await page.emulateMedia({colorScheme});
       await page.screenshot({path:path.join(output,`${colorScheme}-profile-edit.png`),fullPage:true});
-      await page.getByRole('button',{name:'+ Заявка',exact:true}).click();
+      await page.locator('.workspaceHeaderActions [data-ws-action=request]').click();
       await page.locator('#qw').fill('Черновик заявки');
       await page.emulateMedia({colorScheme:colorScheme==='light'?'dark':'light'});
       assert.equal(await page.locator('#qw').inputValue(),'Черновик заявки');
@@ -263,6 +263,7 @@ async function loadPhotos(page){
     assert.equal(await page.getByRole('button',{name:'Панель администратора',exact:true}).count(),1);
     assert.equal(await page.getByRole('button',{name:'Сменить аккаунт',exact:true}).count(),1);
     assert.equal(await page.getByRole('button',{name:'Выйти из аккаунта',exact:true}).count(),1);
+    if(!await page.getByRole('button',{name:'Панель администратора',exact:true}).isVisible())await page.locator('#accountMore summary').click();
     await page.getByRole('button',{name:'Панель администратора',exact:true}).click();await page.locator('.adminMetrics').first().waitFor();
     for(const colorScheme of ['light','dark']){
       await page.emulateMedia({colorScheme});
@@ -308,8 +309,8 @@ async function loadPhotos(page){
       await loadPhotos(guestPage);
       await guestPage.screenshot({path:path.join(output,`${colorScheme}-guest-320.png`),fullPage:true,animations:'disabled'});
       assert.equal(await guestPage.locator('.peopleCover img').count(),2);
-      assert.equal(await guestPage.locator('.peopleCover img').first().getAttribute('src'),'/assets/welcome-help.jpg');
-      assert.equal(await guestPage.locator('.peopleCover img').last().getAttribute('src'),'/assets/welcome-grow.jpg');
+      assert.match(await guestPage.locator('.peopleCover img').first().getAttribute('src'),/^\/assets\/home-(480|960|1600)\.webp$/);
+      assert.match(await guestPage.locator('.peopleCover img').last().getAttribute('src'),/^\/assets\/trainer-(480|960|1600)\.webp$/);
       assert.equal(await guestPage.locator('#landing img[src*="community-"]').count(),0,'Welcome photos differ from the signed-in home');
       assert.equal(await guestPage.locator('#sitePrimaryNav').count(),0,'Private navigation must not appear before confirmation');
       assert.equal(await guestPage.locator('header button:visible,#nav a:visible').count(),0,'Guest header contains no registration or login buttons');

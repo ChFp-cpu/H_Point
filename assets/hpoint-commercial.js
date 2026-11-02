@@ -78,7 +78,7 @@
       html.hpWorkPrinting,body.hpWorkPrinting{height:auto!important;min-height:0!important;overflow:visible!important;margin:0!important;padding:0!important;background:white!important;color:#17251f!important}
       body.hpWorkPrinting *{display:none!important}
       body.hpWorkPrinting [data-hpoint-print-root]{display:block!important;position:static!important;inset:auto!important;width:auto!important;max-width:none!important;min-width:0!important;height:auto!important;min-height:0!important;overflow:visible!important;margin:0!important;padding:0!important;border:0!important;box-shadow:none!important;background:transparent!important}
-      body.hpWorkPrinting #app{padding:0!important;margin:0!important}
+      html body.hpWorkPrinting #app.workspaceApp{padding:0!important;margin:0!important}
       body.hpWorkPrinting .commercialEstimateSelected,body.hpWorkPrinting .commercialEstimateSelected *{display:revert!important;visibility:visible!important;color:#17251f!important;background:transparent!important;box-shadow:none!important;opacity:1!important;text-shadow:none!important}
       body.hpWorkPrinting .commercialEstimateSelected{display:block!important;position:static!important;width:100%!important;margin:0!important;padding:16px!important;border:0!important}
       body.hpWorkPrinting .commercialEstimateSelected .commercialActions,body.hpWorkPrinting .commercialEstimateSelected .commercialEstimateInternal,body.hpWorkPrinting .commercialEstimateSelected button,body.hpWorkPrinting .commercialEstimateSelected .estimateMore,body.hpWorkPrinting .commercialEstimateSelected .estimatePreview>summary{display:none!important}

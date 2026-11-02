@@ -17,6 +17,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  async function post(actor,route,data){let r=await actor.context.request.post(base+route,{data});assert.equal(r.status(),200,await r.text());return r.json()}
  try{
   const author=await login('theme-browser-data'),helper=await login('mobile-helper'),outsider=await login('theme-browser-empty');
+  await post(author,'/api/payments/wallet',{item_type:'pro',purchase_key:'qa-media-browser-pro-20261101'});await author.page.evaluate(()=>hpointWorkspace.refresh());
   const photo=await author.page.evaluate(()=>{const canvas=document.createElement('canvas');canvas.width=240;canvas.height=160;const c=canvas.getContext('2d');c.fillStyle='#b8f36b';c.fillRect(0,0,240,160);c.fillStyle='#172417';c.font='20px sans-serif';c.fillText('Synthetic photo',20,80);return canvas.toDataURL('image/png')});
   const file={name:'synthetic-photo.png',mimeType:'image/png',buffer:Buffer.from(photo.split(',')[1],'base64')};
   await author.page.locator('.workspaceHeaderActions [data-ws-action="request"]').click();

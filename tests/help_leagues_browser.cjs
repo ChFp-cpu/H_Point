@@ -12,6 +12,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local disposable Q
   async function category(page,key){await page.locator('#leagueCategoryFilter').selectOption(key);await page.waitForFunction(key=>document.getElementById('progressData')?.dataset.category===key,key)}
   try{
     const helper=await actor('mobile-helper'),author=await actor('theme-browser-data'),page=helper.page;
+    await post(author,'/api/payments/wallet',{item_type:'pro',purchase_key:'qa-leagues-browser-pro-20261101'});
     await page.goto(base+'/#/league');await page.locator('.hpLeagueLevels').waitFor();
     assert.equal(await page.locator('.hpLeagueLevel').count(),6);assert.match(await page.locator('#leaguePersonalTitle').innerText(),/Новичок/);checks+=2;
     assert.equal(await page.locator('#leagueCategoryFilter option').count(),29);assert.equal(await page.locator('#leagueCategoryFilter optgroup').count(),5);checks+=2;

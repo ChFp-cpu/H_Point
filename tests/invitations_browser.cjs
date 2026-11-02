@@ -1,3 +1,4 @@
+const {emailLogin}=require('./email_browser_login.cjs');
 const {openHelpTab}=require('./help_navigation.cjs');
 /* Real two-sided invitation flows against the disposable local QA database. */
 const {chromium}=require('playwright');
@@ -12,7 +13,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   const context=await browser.newContext({viewport:{width:390,height:844}});contexts.push(context);
   await context.route('**/*',route=>new URL(route.request().url()).origin===base?route.continue():route.abort());
   const page=await context.newPage();page.on('pageerror',error=>errors.push(error.message));
-  await page.goto(base+'/auth/telegram?ticket='+ticket);await page.locator('#hpointWorkspace').waitFor();
+  await emailLogin(page,ticket);
   return {context,page};
  }
  async function get(actor,route){const response=await actor.context.request.get(base+route);assert.equal(response.status(),200);return response.json()}

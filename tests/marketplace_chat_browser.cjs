@@ -16,6 +16,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  async function delayedSend(a,send){let release,observed,continued;const gate=new Promise(r=>release=r),seen=new Promise(r=>observed=r),handled=new Promise(r=>continued=r);const handler=async route=>{if(route.request().method()!=='POST')return route.continue();observed();await gate;try{await route.continue()}finally{continued()}};await a.page.route(base+'/api/chats/send',handler);await send();await seen;return async()=>{release();await handled;await a.page.unroute(base+'/api/chats/send',handler)}}
  try{
   const author=await actor('theme-browser-data'),a=await actor('mobile-helper'),b=await actor('theme-browser-empty'),page=author.page;
+  await post(author,'/api/payments/hp',{item_type:'pro',purchase_key:'market-browser-pro'});
   const rid=await create(author,'Помощь с несколькими откликами'),next=await create(author,'Вторая помощь для того же помощника');
   const first=await apply(a,rid),second=await apply(b,rid),later=await apply(a,next);
   assert.notEqual(first,second);assert.equal((await get(a,'/api/sync')).my_applications.length,2);assert.equal((await get(author,'/api/sync')).requests.find(r=>r.id===rid).status,'open');checks+=3;

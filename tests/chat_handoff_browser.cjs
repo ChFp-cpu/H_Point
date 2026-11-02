@@ -1,3 +1,4 @@
+const {emailLogin}=require('./email_browser_login.cjs');
 /* Two-sided chat handoff after explicit consent, on disposable QA data. */
 const {openHelpTab}=require('./help_navigation.cjs');
 const {chromium}=require('playwright');
@@ -12,7 +13,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   const context=await browser.newContext({viewport:{width:390,height:844}});contexts.push(context);
   await context.route('**/*',r=>new URL(r.request().url()).origin===base?r.continue():r.abort());
   const page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));
-  await page.goto(base+'/auth/telegram?ticket='+ticket);await page.locator('#hpointWorkspace').waitFor();
+  await emailLogin(page,ticket);
   return {context,page};
  }
  async function post(actor,route,data){const res=await actor.context.request.post(base+route,{data});assert.equal(res.status(),200,await res.text());return res.json()}
