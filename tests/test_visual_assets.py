@@ -28,7 +28,7 @@ def public_profile(**changes):
         "contact": "Публичный контакт организации",
         "address": "Публичный район работы",
         "url": "/organizations/synthetic-studio",
-        "services": [{"title": "Разбор техники упражнений", "description": "По договорённости.",
+        "services": [{"id": 1, "title": "Разбор техники упражнений", "description": "По договорённости.",
                       "price_rub": 1200, "duration_minutes": 45}],
         "currency": "TEST_RUB",
     }
@@ -143,7 +143,7 @@ class PublicOrganizationVisuals(unittest.TestCase):
             clients=[{"name": "PRIVATE CRM CLIENT"}],
             notes="PRIVATE HEALTH NOTE",
             staff_email="private@example.test",
-            services=[{"title": 'Service <script>alert("service")</script>',
+            services=[{"id": 2, "title": 'Service <script>alert("service")</script>',
                        "description": "<b>Public description</b>", "price_rub": 700, "duration_minutes": 60,
                        "private_notes": "PRIVATE SERVICE NOTE"}],
         )
@@ -161,7 +161,7 @@ class PublicOrganizationVisuals(unittest.TestCase):
         self.assertIn("prefers-color-scheme:dark", html)
         self.assertIn("prefers-reduced-motion:reduce", html)
         self.assertIn("@media(max-width:640px)", html)
-        self.assertIn('/assets/hpoint-editorial.css?v=20261102-full9', html)
+        self.assertIn('/assets/hpoint-editorial.css?v=20261103-pitch10', html)
         self.assertIn('name="viewport"', html)
         self.assertIn('href="/#/activities"', html)
         self.assertNotIn("fonts.googleapis.com", html)

@@ -69,6 +69,8 @@ def initialize_schema(db):
     commercial_team.initialize_schema(db)
     from . import work_profiles
     work_profiles.initialize_schema(db)
+    from . import work_inquiries
+    work_inquiries.initialize_schema(db)
 
 
 def _now():
@@ -457,6 +459,8 @@ def summary(db,uid,owner_id=None):
     if owner is None:return {"exists":False}
     data = _summary_core(db,owner)
     data.update(owner_id=owner,role=role)
+    from . import work_inquiries
+    data["incoming_count"]=work_inquiries.dashboard(db,uid,owner,include_items=False)["incoming_count"]
     return data
 
 

@@ -104,6 +104,8 @@ def initialize_schema(db):
 
 
 def erase_workspace(db,owner):
+    from . import work_inquiries
+    work_inquiries.erase_workspace(db,owner)
     for table in ("commercial_shifts","commercial_tasks","commercial_estimates","commercial_objects",
                   "commercial_public_profiles","commercial_invitations","commercial_members"):
         db.execute("DELETE FROM "+table+" WHERE owner_id=?",(owner,))
@@ -427,7 +429,7 @@ def member_action(db,uid,data,action,owner_id=None):
             db.execute("UPDATE commercial_members SET role=? WHERE owner_id=? AND user_id=?",(role,owner,target))
         else:
             db.execute("DELETE FROM commercial_members WHERE owner_id=? AND user_id=?",(owner,target))
-            for table in ("commercial_bookings","commercial_tasks","commercial_objects","commercial_professional_records"):
+            for table in ("commercial_bookings","commercial_tasks","commercial_objects","commercial_professional_records","commercial_inquiries"):
                 db.execute("UPDATE "+table+" SET assignee_id=NULL WHERE owner_id=? AND assignee_id=?",(owner,target))
             db.execute("DELETE FROM commercial_shifts WHERE owner_id=? AND assignee_id=?",(owner,target))
         return {"user_id":target,"left":action=="leave","removed":action=="remove"}
@@ -580,6 +582,10 @@ def enrich_dashboard(db,uid,owner,role,data):
             row["assignee_name"]=names.get(row.get("assignee_id"),"")
             row["object_title"]=objects.get(row.get("object_id"),"")
     data["performance"]=_performance(db,owner,members)
+    from . import work_inquiries
+    inquiries=work_inquiries.dashboard(db,uid,owner,include_items=False)
+    data["inquiry_counts"]=inquiries["counts"]
+    data["incoming_count"]=inquiries["incoming_count"]
     public=db.execute("SELECT slug,published,description,contact,address FROM commercial_public_profiles WHERE owner_id=?",(owner,)).fetchone()
     data["public_profile"]=dict(public) if public else dict(slug="org-"+str(abs(owner)),published=False,description="",contact="",address="")
     data["public_profile"]["published"]=bool(data["public_profile"]["published"])

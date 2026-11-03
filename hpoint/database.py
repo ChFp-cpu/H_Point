@@ -395,6 +395,8 @@ def init_db():
     workflow.initialize_schema(db)
     media.initialize_schema(db)
     commercial.initialize_schema(db)
+    from . import pilot_analytics
+    pilot_analytics.initialize_schema(db)
     from .work_bot import initialize_schema as initialize_work_bot
     initialize_work_bot(db)
     from .personal import initialize_schema as initialize_personal

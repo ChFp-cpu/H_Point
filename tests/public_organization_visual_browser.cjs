@@ -37,7 +37,7 @@ const base=process.env.HPOINT_QA_URL;if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base
   assert.equal(await fallback.locator('img').count(),0);assert.equal(await fallback.getAttribute('role'),'img');assert.match(await fallback.getAttribute('aria-label'),/тренер/i);assert.match(await fallback.evaluate(frame=>getComputedStyle(frame,'::after').content),/H·Point/);checks+=4;
   for(const colorScheme of ['light','dark']){await page.emulateMedia({colorScheme});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1),false);assert.ok((await fallback.boundingBox()).height>=250);checks+=2}
   await page.locator('.orgActions [href="#orgServices"]').click();assert.equal(await page.evaluate(()=>location.hash),'#orgServices');assert.equal(await page.locator('.orgService').count(),1);checks+=2;
-  await page.locator('.orgService [href="#orgContacts"]').click();assert.equal(await page.evaluate(()=>location.hash),'#orgContacts');assert.equal(await page.locator('.orgContacts').isVisible(),true);checks+=2;
+  assert.match(await page.locator('.orgService [href*="service="]').getAttribute('href'),/^\/\?service=\d+#\/activities$/);await page.locator('.orgActions [href="#orgContacts"]').click();assert.equal(await page.evaluate(()=>location.hash),'#orgContacts');assert.equal(await page.locator('.orgContacts').isVisible(),true);checks+=3;
   assert.deepEqual(errors,[]);console.log(JSON.stringify({ok:true,checks,errors,localImages:true,publicAllowlist:true,responsiveThemes:true,emptyUseful:true,failedPhotoFallback:true}));
  }finally{for(const context of contexts)await context.close();await browser.close()}
 })().catch(error=>{console.error(error.stack);process.exitCode=1});

@@ -8,7 +8,7 @@
         Referrer-Policy "same-origin"
         Permissions-Policy "geolocation=(self), camera=(), microphone=()"
     }
-    @photo_uploads path /api/requests /api/chats/send
+    @photo_uploads path /api/requests /api/chats/send /api/work-inquiries
     request_body @photo_uploads {
         max_size 14680064
     }
@@ -21,7 +21,7 @@
         max_size 128KB
     }
     @small_requests {
-        not path /api/requests /api/chats/send /api/events /api/commercial/estimates /api/commercial/estimates/quote
+        not path /api/requests /api/chats/send /api/work-inquiries /api/events /api/commercial/estimates /api/commercial/estimates/quote
     }
     request_body @small_requests {
         max_size 32KB
