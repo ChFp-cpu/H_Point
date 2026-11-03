@@ -582,6 +582,17 @@ def enrich_dashboard(db,uid,owner,role,data):
             row["assignee_name"]=names.get(row.get("assignee_id"),"")
             row["object_title"]=objects.get(row.get("object_id"),"")
     data["performance"]=_performance(db,owner,members)
+    # Internal estimate economics follow the same manager-only policy as the
+    # internal PDF/Excel exports; hiding the controls in JS is not sufficient.
+    if role not in ("owner","admin"):
+        for estimate in data["estimates"]:
+            for key in ("cost_rub","profit_rub"):
+                estimate.pop(key,None)
+            estimate["items"]=[{key:value for key,value in line.items()
+                                if key not in ("cost_rub","cost_total_rub")}
+                               for line in estimate["items"]]
+        for key in ("cost_total_rub","profit_total_rub"):
+            data["performance"].pop(key,None)
     from . import work_inquiries
     inquiries=work_inquiries.dashboard(db,uid,owner,include_items=False)
     data["inquiry_counts"]=inquiries["counts"]

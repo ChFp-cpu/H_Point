@@ -99,7 +99,7 @@ def normalize_schedule(value):
         value=datetime.fromisoformat(str(value).replace("Z","+00:00"))
         if value.tzinfo is None:raise ValueError("timezone required")
         return value.astimezone(timezone.utc).isoformat()
-    except (TypeError,ValueError):raise ValueError("Укажите дату и время с часовым поясом.")
+    except (TypeError,ValueError,OverflowError):raise ValueError("Укажите дату и время с часовым поясом.")
 
 
 def matches_helper_preferences(request, helper, distance):
@@ -170,6 +170,32 @@ def remove_from_queue(user_id: int) -> None:
     db.execute("DELETE FROM helper_queue WHERE user_id = ?", (user_id,))
 
 
+def _open_for_responses(request):
+    """A stale tab cannot bypass deadlines between maintenance worker ticks.
+
+    Check under the caller's request lock. Active agreements keep their own
+    lifecycle; publication expiry only closes the window for a new match.
+    """
+    if not request or request["status"] != STATUS_OPEN:
+        return False
+    deadlines = [request["expires_at"]]
+    if int(request["reward_rub"] or 0) > 0 and request["reward_payment_status"] == "none":
+        deadlines.append(request["reserve_deadline_at"])
+    at = datetime.now(timezone.utc)
+    for value in deadlines:
+        if not value:
+            continue
+        try:
+            deadline = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            if deadline <= at:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+    return True
+
+
 def accept_open_request(request_id: int, helper_id: int, author_id: int | None = None, application_token: str | None = None) -> str:
     """An explicit response to a published request is consent, not another application."""
     try:
@@ -186,7 +212,7 @@ def accept_open_request(request_id: int, helper_id: int, author_id: int | None =
         if request["status"] == STATUS_IN_PROGRESS and request["helper_id"] == helper_id:
             get_or_create_chat_for_request(request_id)
             db.execute("COMMIT");return "existing"
-        if request["status"] != STATUS_OPEN or request["helper_id"] is not None or get_active_help(helper_id):
+        if not _open_for_responses(request) or request["helper_id"] is not None or get_active_help(helper_id):
             db.execute("ROLLBACK");return "unavailable"
         if int(request["reward_rub"] or 0) > 0 and request["reward_payment_status"] != "paid":
             db.execute("ROLLBACK");return "awaiting_funds"
@@ -210,7 +236,7 @@ def apply_to_request(request_id: int, helper_id: int) -> str:
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
         request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
         helper = db.execute("SELECT * FROM users WHERE user_id=?" + (" FOR NO KEY UPDATE" if lock else ""), (helper_id,)).fetchone()
-        if not helper or helper["is_blocked"] or not request or request["status"] != STATUS_OPEN or request["requester_id"] == helper_id:
+        if not helper or helper["is_blocked"] or not _open_for_responses(request) or request["requester_id"] == helper_id:
             db.execute("ROLLBACK")
             return "unavailable"
         existing = db.execute("SELECT * FROM request_candidates WHERE request_id=? AND candidate_id=?" + lock, (request_id, helper_id)).fetchone()
@@ -343,7 +369,7 @@ def offer_helper(request_id: int, helper_id: int, replace_offer_token: str | Non
         ).fetchone()
         categories = get_helper_categories(helper_id)
         applied = db.execute("SELECT 1 FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='applied'", (request_id, helper_id)).fetchone()
-        if not request or request["status"] != STATUS_OPEN or request["requester_id"] == helper_id or not available or busy or (categories and request["category"] not in categories and not applied):
+        if not _open_for_responses(request) or request["requester_id"] == helper_id or not available or busy or (categories and request["category"] not in categories and not applied):
             db.execute("ROLLBACK")
             return False
 
@@ -417,7 +443,7 @@ def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool, offer
             (request_id, helper_id),
         ).fetchone()
         reward_ready = (int(request["reward_rub"] or 0) == 0 or request["reward_payment_status"] == "paid") if request else False
-        if not offer or not request or request["status"] != STATUS_OPEN or (accept and not reward_ready) or (offer_token is not None and (offer["offer_token"] or "") != offer_token):
+        if not offer or not request or request["status"] != STATUS_OPEN or (accept and (not reward_ready or not _open_for_responses(request))) or (offer_token is not None and (offer["offer_token"] or "") != offer_token):
             db.execute("ROLLBACK")
             return False
         if not accept:
@@ -493,11 +519,16 @@ def try_assign_helper(request_id: int, helper_id: int) -> bool:
     try:
         db.execute("BEGIN IMMEDIATE")
         if getattr(db, "is_postgres", False):
-            db.execute("SELECT id FROM requests WHERE id=? FOR UPDATE",(request_id,)).fetchone()
+            request = db.execute("SELECT * FROM requests WHERE id=? FOR UPDATE",(request_id,)).fetchone()
             # Serialize assignments for one helper across distinct requests.
             if not db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (helper_id,)).fetchone():
                 db.execute("ROLLBACK")
                 return False
+        else:
+            request = get_request(request_id)
+        if not _open_for_responses(request):
+            db.execute("ROLLBACK")
+            return False
         cur = db.execute(
             """UPDATE requests SET helper_id = ?, status = ?
             WHERE id = ? AND status = ? AND helper_id IS NULL AND requester_id != ?
@@ -663,7 +694,7 @@ def complete_request(request_id: int, helper_id: int, confirmed_by: int | None =
 
 
 def set_rating(request_id: int, user_id: int, rating: int) -> bool:
-    if not 1 <= rating <= 5:
+    if isinstance(rating, bool) or not isinstance(rating, int) or not 1 <= rating <= 5:
         return False
     request=get_request(request_id)
     if not request or request["requester_id"]!=user_id or request["status"]!=STATUS_DONE or not request["helper_id"]:
@@ -687,7 +718,7 @@ def set_rating(request_id: int, user_id: int, rating: int) -> bool:
 
 
 def set_helper_rating(request_id: int, user_id: int, rating: int) -> bool:
-    if not 1 <= rating <= 5:
+    if isinstance(rating, bool) or not isinstance(rating, int) or not 1 <= rating <= 5:
         return False
     cur = db.execute(
         "UPDATE requests SET helper_rating = ? WHERE id = ? AND helper_id = ? AND status = ? AND helper_rating IS NULL",

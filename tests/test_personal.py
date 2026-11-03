@@ -207,6 +207,27 @@ class PersonalScenarios:
         self.assertEqual(personal.list_templates(1), [])
         self.assertEqual(personal.list_schedules(1), [])
 
+    def test_structured_input_and_oversized_ids_are_validation_errors_without_partial_writes(self):
+        self.pro()
+        for changes in ({"category": []}, {"category": {}}, {"lat": 10**1000, "lon": 0}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.template(**changes)
+        self.assertEqual(personal.list_templates(1), [])
+        template = self.template()
+        for fields in ({"frequency": []}, {"frequency": {}}, {"status": []}, {"status": {}}, {"time": []}):
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                personal.save_schedule(1, {"template_id": template["id"], **fields})
+        self.assertEqual(personal.list_schedules(1), [])
+        schedule = personal.save_schedule(1, {"template_id": template["id"]})
+        for status in ([], {}):
+            with self.subTest(status=status), self.assertRaises(ValueError):
+                personal.set_schedule_status(1, schedule["id"], status)
+        for identifier in (2**63, "9"*100, 1.5, True):
+            for read in (personal.get_template, personal.get_schedule):
+                with self.subTest(identifier=identifier, read=read.__name__), self.assertRaises(ValueError):
+                    read(1, identifier)
+        self.assertEqual(personal.get_schedule(1, schedule["id"])["status"], "active")
+
     def test_scheduled_conditions_do_not_change_when_the_source_template_is_edited(self):
         self.pro()
         schedule = self.schedule(what="Первоначальные условия", reward_rub=500)

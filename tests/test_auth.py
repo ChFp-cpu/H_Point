@@ -64,6 +64,15 @@ class EmailActivation(unittest.TestCase):
         self.assertIsNotNone(web.password_error("Ab1" + "x" * 254))
         self.assertIsNone(web.password_error("Ab1" + "x" * 253))
 
+    def test_json_payload_requires_an_object_before_any_field_access(self):
+        for route in ("/api/auth/register", "/api/auth/login", "/api/auth/password/reset/request",
+                      "/api/auth/password/reset/confirm", "/api/support", "/api/events"):
+            for payload in ([], "text", True, 2):
+                with self.subTest(route=route, payload=payload):
+                    status, data, _ = self.request(route, payload)
+                    self.assertEqual(status, 400)
+                    self.assertFalse(data["ok"])
+
     def test_mail_not_configured_creates_neither_account_nor_session(self):
         self.configured.return_value = False
         status, result, headers = self.register()

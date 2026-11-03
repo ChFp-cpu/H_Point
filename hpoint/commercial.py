@@ -359,12 +359,18 @@ def save_booking(db,uid,data,owner_id=None):
     except OverflowError:raise ValueError("Проверьте дату и длительность записи.")
     def save(owner):
         from . import commercial_team
+        previous=_owned(db,"commercial_bookings",owner,item_id) if item_id else None
         assignee= commercial_team.assignee(db,owner,data.get("assignee_id"))
         obj= commercial_team.object_id(db,owner,data.get("object_id"))
         if assignee is not None and status=="planned":
             commercial_team.check_booking_overlap(db,owner,assignee,starts,ends,item_id)
-        _owned(db,"commercial_clients",owner,client_id)
-        if service_id:_owned(db,"commercial_services",owner,service_id)
+        client=_owned(db,"commercial_clients",owner,client_id)
+        if not client["active"] and (previous is None or previous["client_id"]!=client_id):
+            raise ValueError("Выберите активного клиента или восстановите его из архива.")
+        if service_id:
+            service=_owned(db,"commercial_services",owner,service_id)
+            if not service["active"] and (previous is None or previous["service_id"]!=service_id):
+                raise ValueError("Выберите доступную услугу или восстановите её из архива.")
         if item_id:
             _owned(db,"commercial_bookings",owner,item_id)
             db.execute("UPDATE commercial_bookings SET client_id=?,service_id=?,title=?,starts_at=?,duration_minutes=?,price_rub=?,status=?,notes=?,assignee_id=?,object_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND owner_id=?",(client_id,service_id,title,starts.isoformat(),duration,price,status,notes,assignee,obj,item_id,owner))

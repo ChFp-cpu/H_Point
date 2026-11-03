@@ -107,6 +107,46 @@ class OrganizationCases:
         with self.assertRaises(PermissionError):self.post("/objects",dict(title="Hijacked tenant"),uid=-303)
         with self.assertRaises(ValueError):c.save_booking(self.db,-101,dict(client_id=self.client(),service_id=service,title="Foreign service booking",starts_at="2030-01-01T12:00:00+00:00"))
 
+    def test_internal_estimate_economics_never_reach_member_dashboard(self):
+        self.join();self.join(-303,"admin")
+        item=self.post("/estimates",self.estimate(status="approved"))["id"]
+        for actor in (-101,-303):
+            state=c.dashboard(self.db,actor,-101)
+            estimate=next(row for row in state["estimates"] if row["id"]==item)
+            self.assertIn("cost_rub",estimate)
+            self.assertIn("cost_rub",estimate["items"][0])
+            self.assertIn("profit_total_rub",state["performance"])
+        for expired in (False,True):
+            if expired:self.db.execute("UPDATE commercial_profiles SET trial_until='2000-01-01T00:00:00+00:00' WHERE user_id=-101")
+            state=c.dashboard(self.db,-202,-101)
+            estimate=next(row for row in state["estimates"] if row["id"]==item)
+            self.assertEqual(estimate["total_rub"],"1.02")
+            for field in ("cost_rub","profit_rub"):self.assertNotIn(field,estimate)
+            for line in estimate["items"]:
+                self.assertNotIn("cost_rub",line);self.assertNotIn("cost_total_rub",line)
+            for field in ("cost_total_rub","profit_total_rub"):self.assertNotIn(field,state["performance"])
+            self.assertEqual(team.export_estimate(self.db,-202,item,-101,"xlsx")["content_type"],"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            with self.assertRaises(PermissionError):team.export_estimate(self.db,-202,item,-101,"xlsx","internal")
+        self.assertEqual(c.dashboard(self.db,-101)["estimates"][0]["cost_rub"],"0.30")
+
+    def test_archived_references_cannot_create_new_bookings_but_history_is_editable(self):
+        client=self.client();active_client=self.client();archived_client=self.client()
+        service=c.save_service(self.db,-101,dict(title="Old service",price_rub=700))["id"]
+        payload=dict(client_id=client,service_id=service,title="Original booking",starts_at="2030-01-01T12:00:00+00:00")
+        booking=c.save_booking(self.db,-101,payload)["id"]
+        for item in (client,archived_client):c.save_client(self.db,-101,dict(id=item,name="Archived contact",active=False))
+        c.save_service(self.db,-101,dict(id=service,title="Archived service",active=False))
+        before=dict(c._owned(self.db,"commercial_bookings",-101,booking))
+        for changes in ({"client_id":client,"service_id":None},
+                        {"client_id":active_client,"service_id":service},
+                        {"id":booking,"client_id":archived_client}):
+            with self.subTest(changes=changes),self.assertRaises(ValueError):
+                c.save_booking(self.db,-101,{**payload,**changes})
+        self.assertEqual(dict(c._owned(self.db,"commercial_bookings",-101,booking)),before)
+        c.save_booking(self.db,-101,{**payload,"id":booking,"notes":"Correct a historical note"})
+        self.assertEqual(c._owned(self.db,"commercial_bookings",-101,booking)["notes"],"Correct a historical note")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM commercial_bookings WHERE owner_id=-101").fetchone()["n"],1)
+
     def test_schedule_conflicts_are_atomic_and_scoped_to_assigned_person(self):
         self.join();client=self.client();obj=self.obj()
         booking=dict(title="Work booking",client_id=client,object_id=obj,assignee_id=-202,starts_at="2030-01-01T10:00:00+00:00",duration_minutes=60,price_rub=500)

@@ -1,5 +1,7 @@
 /* Games are paused; real help grants one shared, server-confirmed achievement. */
 const {chromium}=require('playwright'),assert=require('node:assert/strict'),path=require('node:path');
+const {emailLogin}=require('./email_browser_login.cjs');
+const {openHelpTab}=require('./help_navigation.cjs');
 const base=process.env.HPOINT_QA_URL;
 if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local disposable QA only');
 (async()=>{
@@ -9,12 +11,13 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local disposable Q
   await context.route('**/*',route=>new URL(route.request().url()).origin===base?route.continue():route.abort());
   await context.addInitScript(()=>Object.defineProperty(navigator,'geolocation',{configurable:true,value:{getCurrentPosition(ok){ok({coords:{latitude:55.75,longitude:37.61,accuracy:20}})}}}));
   const page=await context.newPage();page.on('pageerror',error=>errors.push(error.message));
-  await page.goto(base+'/auth/telegram?ticket='+ticket);await page.locator('#hpointWorkspace').waitFor();return {context,page};
+  await emailLogin(page,ticket);return {context,page};
  }
  async function get(actor,route){const response=await actor.context.request.get(base+route);assert.equal(response.status(),200,await response.text());return response.json()}
  async function post(actor,route,data){const response=await actor.context.request.post(base+route,{data});assert.equal(response.status(),200,await response.text());return response.json()}
  try{
   const author=await login('theme-browser-data'),helper=await login('mobile-helper'),legacy=await login('theme-browser-empty');
+  await post(author,'/api/payments/hp',{item_type:'pro',purchase_key:'help-achievements-author-pro'});
   for(const colorScheme of ['light','dark'])for(const width of [320,390,768,1440]){
    await helper.page.setViewportSize({width,height:844});await helper.page.emulateMedia({colorScheme});
    await helper.page.goto(base+'/#/home');await helper.page.locator('#sitePrimaryNav').waitFor();
@@ -28,13 +31,20 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local disposable Q
   await author.page.evaluate(()=>go('requests'));
   const job=await post(author,'/api/requests',{what:'Проверка доброго дела',place:'Тест',time_needed:'Сегодня',urgency:'обычная',details:'Вымышленный сценарий',category:'tech'});
   await helper.page.setViewportSize({width:390,height:844});await helper.page.goto(base+'/#/help');await helper.page.evaluate(()=>hpointWorkspace.refresh());
-  await helper.page.locator('.helpNavigation [data-tab="open"]').click();
-  await helper.page.locator('.workspaceRequest').filter({hasText:'#'+job.request_id+' ·'}).getByRole('button',{name:'Хочу помочь',exact:true}).click();
+  await openHelpTab(helper.page,'open');
+  await helper.page.locator('.workspaceRequest').filter({hasText:'Проверка доброго дела'}).getByRole('button',{name:'Хочу помочь',exact:true}).click();
+  await helper.page.locator('#hpEnterHelper').click();
   await helper.page.locator('#wsChatText').waitFor();
   assert.equal(await helper.page.evaluate(()=>hpointWorkspace.state.chatId),job.request_id);checks++;
-  await post(helper,'/api/requests/finish',{request_id:job.request_id});
+  await author.page.evaluate(id=>hpointWorkspace.openChat(id),job.request_id);
+  author.page.once('dialog',dialog=>dialog.accept());await author.page.locator('[data-ws-action="chat-select"]').click();
+  await author.page.waitForFunction(id=>hpointWorkspace.state.data.requests.find(row=>row.id===id)?.status==='in_progress',job.request_id);
+  const forbidden=await helper.context.request.post(base+'/api/requests/finish',{data:{request_id:job.request_id}});
+  assert.equal(forbidden.status(),403);assert.equal((await get(helper,'/api/sync')).user.balance,before);checks+=2;
+  await post(author,'/api/requests/finish',{request_id:job.request_id});
   assert.equal((await get(helper,'/api/sync')).user.balance,before+20);checks++;
   await post(author,'/api/reviews',{request_id:job.request_id,side:'requester',rating:5});
+  await post(helper,'/api/reviews',{request_id:job.request_id,side:'helper',rating:5});
   let state=await get(helper,'/api/sync');
   assert.equal(state.user.balance,before+30);assert.equal(state.help_achievements.unlocked_count,1);checks+=2;
   assert.equal(state.features.games,false);checks++;
@@ -57,8 +67,8 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local disposable Q
    assert.equal(response.status(),503);assert.equal((await response.json()).code,'games_paused');checks++;
   }
   assert.equal((await get(helper,'/api/sync')).user.balance,unchanged);checks++;
-  const paused=await helper.page.goto(base+'/games');assert.equal(paused.status(),503);
-  await helper.page.getByRole('heading',{name:'Игры пока на паузе'}).waitFor();
+  const paused=await helper.page.goto(base+'/games');assert.equal(paused.status(),410);
+  await helper.page.getByRole('heading',{name:'Этот раздел закрыт',exact:true}).waitFor();
   assert.equal(await helper.page.locator('canvas').count(),0);checks+=2;
   assert.deepEqual(errors,[]);console.log(JSON.stringify({ok:true,checks,gamesPaused:true,helpAwards:true,sharedBalance:true,errors}));
  }finally{for(const context of contexts)await context.close();await browser.close()}

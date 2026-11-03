@@ -31,7 +31,7 @@ def _date(value):
     try:
         result = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         return result.replace(tzinfo=timezone.utc) if result.tzinfo is None else result.astimezone(timezone.utc)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -189,9 +189,12 @@ def initialize_schema(connection):
 
 
 def _id(value):
-    if isinstance(value, bool) or not re.fullmatch(r"[1-9][0-9]*", str(value or "")):
+    if isinstance(value, bool) or not re.fullmatch(r"[1-9][0-9]{0,18}", str(value or "")):
         raise ValueError("Некорректный идентификатор.")
-    return int(value)
+    identifier = int(value)
+    if identifier > 2**63 - 1:
+        raise ValueError("Некорректный идентификатор.")
+    return identifier
 
 
 def _integer(value, minimum, maximum, label):
@@ -216,7 +219,7 @@ def sanitize_fields(fields):
     if len(clean["what"]) < 3 or len(clean["place"]) < 2:
         raise ValueError("Опишите задачу минимум 3 символами и укажите место минимум 2 символами.")
     category = fields.get("category", "other")
-    if category not in CATEGORIES:
+    if not isinstance(category, str) or category not in CATEGORIES:
         raise ValueError("Выберите направление помощи.")
     clean["category"] = category
     duration = fields.get("expires_in_hours")
@@ -237,7 +240,7 @@ def sanitize_fields(fields):
             lat, lon = float(lat), float(lon)
             if not math.isfinite(lat) or not math.isfinite(lon) or not -90 <= lat <= 90 or not -180 <= lon <= 180:
                 raise ValueError()
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError("Некорректные координаты.")
         clean.update(lat=lat, lon=lon)
     return clean
@@ -298,7 +301,7 @@ def delete_template(user_id, template_id, db_connection=None):
 def next_run(frequency, local_time, weekday=0, day_of_month=1, now=None):
     """Always strictly future; monthly day 31 clamps without drifting its anchor."""
     at = _now(now).astimezone(MOSCOW)
-    if frequency not in {"daily", "weekly", "monthly"} or not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", str(local_time)):
+    if not isinstance(frequency, str) or frequency not in {"daily", "weekly", "monthly"} or not isinstance(local_time, str) or not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", local_time):
         raise ValueError("Выберите период и время публикации по Москве.")
     weekday = _integer(weekday, 0, 6, "День недели — от 0 до 6.")
     day_of_month = _integer(day_of_month, 1, 31, "День месяца — от 1 до 31.")
@@ -360,7 +363,7 @@ def save_schedule(user_id, data, schedule_id=None, db_connection=None):
         weekday = _integer(data.get("weekday", previous.get("weekday", 0)), 0, 6, "Проверьте день недели.")
         day = _integer(data.get("day_of_month", previous.get("day_of_month", 1)), 1, 31, "Проверьте день месяца.")
         status = data.get("status", previous.get("status", "active"))
-        if status not in {"active", "paused", "disabled"}:
+        if not isinstance(status, str) or status not in {"active", "paused", "disabled"}:
             raise ValueError("Некорректное состояние расписания.")
         next_at = next_run(frequency, local_time, weekday, day)
         at = _now().isoformat()
@@ -376,7 +379,7 @@ def save_schedule(user_id, data, schedule_id=None, db_connection=None):
 
 
 def set_schedule_status(user_id, schedule_id, status, db_connection=None):
-    if status not in {"active", "paused", "disabled"}:
+    if not isinstance(status, str) or status not in {"active", "paused", "disabled"}:
         raise ValueError("Некорректное состояние расписания.")
     connection = _db(db_connection)
     with owner_transaction(user_id, connection):
