@@ -33,7 +33,7 @@ class Web(unittest.TestCase):
  def test_current_pro_catalog_is_shared_without_retired_request_ads_or_purchase(self):
   self.add_user(42,"Web",tg_user_id=42,web_verified=True);token=web.new_sess(42)
   before=database.get_user(42)["balance"]
-  catalog={"pro":{**web.MONETIZATION_ITEMS["pro"],"rub":163,"hp":99}}
+  catalog={"pro":{**web.MONETIZATION_ITEMS["pro"],"rub":263,"hp":None,"payments":["wallet"]}}
   server=ThreadingHTTPServer(("127.0.0.1",0),web.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
   try:
    with patch.object(web,"MONETIZATION_ITEMS",catalog):
@@ -41,7 +41,8 @@ class Web(unittest.TestCase):
     with urllib.request.urlopen(request,timeout=3) as response:synced=json.load(response)
    self.assertIsNone(synced["request_promotion"])
    self.assertEqual(set(synced["paid_catalog"]),{"pro"})
-   self.assertEqual((synced["paid_catalog"]["pro"]["rub"],synced["paid_catalog"]["pro"]["hp"]),(163,99))
+   self.assertEqual((synced["paid_catalog"]["pro"]["rub"],synced["paid_catalog"]["pro"]["hp"]),(263,None))
+   self.assertEqual(synced["paid_catalog"]["pro"]["payments"],["wallet"])
    self.assertEqual(database.get_user(42)["balance"],before)
    self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM billing_invoices").fetchone()["n"],0)
   finally:server.shutdown();thread.join(timeout=3);server.server_close()
@@ -642,7 +643,7 @@ class Web(unittest.TestCase):
    self.assertIsNotNone(web.chat_for_request(target))
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
- def test_points_purchase_and_device_profile_switching(self):
+ def test_points_purchase_is_disabled_and_device_profile_switching_still_works(self):
   self.add_user(1,"First");self.add_user(2,"Second")
   self.db.execute("UPDATE users SET balance=1000 WHERE user_id=1")
   device="shared-device";first=web.new_sess(1,device);web.new_sess(2,device)
@@ -651,8 +652,13 @@ class Web(unittest.TestCase):
   try:
    def post(path,payload,cookie_value=cookie):
     return urllib.request.urlopen(urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers={"Content-Type":"application/json","Cookie":cookie_value},method="POST"),timeout=3)
-   with post("/api/payments/hp",{"item_type":"pro","purchase_key":"test-hp-one"}) as response:self.assertTrue(json.load(response)["created"])
-   self.assertEqual(database.get_user(1)["balance"],910)
+   before=dict(database.get_user(1))
+   with self.assertRaises(urllib.error.HTTPError) as denied:post("/api/payments/hp",{"item_type":"pro","purchase_key":"test-hp-one"})
+   self.assertEqual(denied.exception.code,409)
+   self.assertIn("Покупка за HP недоступна",json.load(denied.exception)["error"])
+   denied.exception.close()
+   self.assertEqual(dict(database.get_user(1)),before)
+   self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM billing_invoices").fetchone()["n"],0)
    with urllib.request.urlopen(urllib.request.Request(base+"/api/profiles",headers={"Cookie":cookie}),timeout=3) as response:self.assertEqual(len(json.load(response)["profiles"]),2)
    with post("/api/profiles/switch",{"user_id":2}) as response: switched=response.headers["Set-Cookie"].split(";",1)[0]
    with urllib.request.urlopen(urllib.request.Request(base+"/api/me",headers={"Cookie":switched+"; hpoint_device="+device}),timeout=3) as response:self.assertEqual(json.load(response)["user"]["id"],2)

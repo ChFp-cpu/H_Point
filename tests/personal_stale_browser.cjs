@@ -11,7 +11,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Disposable localho
  const post=async(path,data)=>{const r=await context.request.post(base+path,{data});assert.equal(r.status(),200,await r.text());return r.json()};
  async function delayed(pattern){let ready,release;const seen=new Promise(r=>ready=r),gate=new Promise(r=>release=r);let calls=0;const route=async route=>{if(calls++)return route.continue();const result=await route.fetch();ready();await gate;await route.fulfill({response:result})};await context.route(pattern,route);return{seen,release,remove:()=>context.unroute(pattern,route)}}
  try{
-  await emailLogin(page,'theme-browser-data');await post('/api/payments/hp',{item_type:'pro',purchase_key:'personal-stale-pro'});
+  await emailLogin(page,'theme-browser-data');await post('/api/payments/wallet',{item_type:'pro',purchase_key:'personal-stale-pro'});
   await post('/api/personal/templates',{name:'PRIVATE OLD ACCOUNT TEMPLATE',fields:{what:'Private old help',place:'PRIVATE OLD ADDRESS',category:'tech',time_needed:'Tomorrow',urgency:'Normal',details:'PRIVATE DETAILS',expires_in_hours:48,reward_rub:0}});
   await page.evaluate(()=>hpointWorkspace.refresh());await page.goto(base+'/#/help');await page.evaluate(()=>{hpointWorkspace.state.helpTab='mine';hpointWorkspace.refresh()});await page.locator('.personalTools>summary').click();
   const list=await delayed('**/api/personal');await page.locator('[data-personal-action=templates]').click();await list.seen;

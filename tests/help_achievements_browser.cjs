@@ -17,7 +17,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local disposable Q
  async function post(actor,route,data){const response=await actor.context.request.post(base+route,{data});assert.equal(response.status(),200,await response.text());return response.json()}
  try{
   const author=await login('theme-browser-data'),helper=await login('mobile-helper'),legacy=await login('theme-browser-empty');
-  await post(author,'/api/payments/hp',{item_type:'pro',purchase_key:'help-achievements-author-pro'});
+  await post(author,'/api/payments/wallet',{item_type:'pro',purchase_key:'help-achievements-author-pro'});
   for(const colorScheme of ['light','dark'])for(const width of [320,390,768,1440]){
    await helper.page.setViewportSize({width,height:844});await helper.page.emulateMedia({colorScheme});
    await helper.page.goto(base+'/#/home');await helper.page.locator('#sitePrimaryNav').waitFor();

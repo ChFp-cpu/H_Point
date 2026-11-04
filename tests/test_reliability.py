@@ -86,11 +86,11 @@ class Scenarios:
         self.db.execute("DELETE FROM schema_migrations WHERE version='006_wallet_sources'")
         before = [reliability.wallet_balances(self.db, u)[0] for u in (1, 2)]
         reliability.migrate_wallet_sources(self.db)
-        self.assertEqual([reliability.wallet_balances(self.db, u) for u in (1, 2)], [(100, 100), (191, 191)])
-        self.assertEqual(before, [100, 191])
+        self.assertEqual([reliability.wallet_balances(self.db, u) for u in (1, 2)], [(100, 100), (91, 91)])
+        self.assertEqual(before, [100, 91])
         reliability.migrate_wallet_sources(self.db)
         self.assertEqual(database.get_request(rid)["reward_test_rub"], 400)
-        self.assertEqual(reliability.wallet_balances(self.db, 2), (191, 191))
+        self.assertEqual(reliability.wallet_balances(self.db, 2), (91, 91))
 
     def test_real_payment_reserve_does_not_spend_test_balance(self):
         database.grant_registration_bonus(1, 500)

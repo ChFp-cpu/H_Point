@@ -347,8 +347,8 @@ class PersonalScenarios:
         self.assertLessEqual(remaining.total_seconds(), 300)
 
     def test_renewal_after_expiry_pauses_schedules_before_the_worker_can_observe_expiry(self):
-        database.wallet_add_entry(1, 1000, "test", "Synthetic renewal funds", "expiry-renew-wallet", test_amount_rub=1000)
         for uid in (1, 2):
+            database.wallet_add_entry(uid, 1000, "test", "Synthetic renewal funds", "expiry-renew-wallet-"+str(uid), test_amount_rub=1000)
             self.pro(uid)
             future = self.schedule(uid)
             overdue = self.schedule(uid)
@@ -356,8 +356,7 @@ class PersonalScenarios:
             self.pro(uid, active=False)
             # No process_due call between expiry and purchase: the purchase
             # transaction itself must retain the required explicit-resume step.
-            purchase = billing.purchase_with_wallet if uid == 1 else billing.purchase_with_points
-            purchase(uid, "pro", {}, "expired-before-worker-"+str(uid))
+            billing.purchase_with_wallet(uid, "pro", {}, "expired-before-worker-"+str(uid))
             self.assertTrue(personal.is_pro(uid))
             for schedule in (future, overdue):
                 saved = personal.get_schedule(uid, schedule["id"])
@@ -369,10 +368,11 @@ class PersonalScenarios:
         self.assertGreater(personal._date(resumed["next_run_at"]), datetime.now(timezone.utc))
 
     def test_early_renewal_does_not_pause_a_still_active_schedule(self):
+        database.wallet_add_entry(1, 1000, "test", "Synthetic renewal funds", "early-renew-wallet", test_amount_rub=1000)
         self.pro()
         schedule = self.schedule()
         previous = database.get_user(1)["pro_until"]
-        billing.purchase_with_points(1, "pro", {"renew": True, "expected_until": previous}, "early-renew-schedule")
+        billing.purchase_with_wallet(1, "pro", {"renew": True, "expected_until": previous}, "early-renew-schedule")
         saved = personal.get_schedule(1, schedule["id"])
         self.assertEqual(saved["status"], "active")
         self.assertIsNone(saved["last_reason"])
@@ -398,16 +398,17 @@ class PersonalScenarios:
         invoice, created = billing.purchase_with_wallet(1, "pro", {}, "personal-first")
         first = database.get_user(1)["pro_until"]
         self.assertTrue(created)
-        self.assertEqual(database.get_invoice(invoice)["amount_rub"], 149)
+        self.assertEqual(database.get_invoice(invoice)["amount_rub"], 249)
         self.assertEqual(billing.purchase_with_wallet(1, "pro", {}, "personal-first"), (invoice, False))
         metadata = {"renew": True, "expected_until": first}
-        second, _ = billing.purchase_with_points(1, "pro", metadata, "personal-renew")
-        self.assertEqual(database.get_invoice(second)["amount_rub"], 90)
+        second, _ = billing.purchase_with_wallet(1, "pro", metadata, "personal-renew")
+        self.assertEqual(database.get_invoice(second)["amount_rub"], 249)
         until = personal._date(database.get_user(1)["pro_until"])
         self.assertEqual(until-personal._date(first), timedelta(days=30))
-        self.assertEqual(billing.purchase_with_points(1, "pro", metadata, "personal-renew"), (second, False))
+        self.assertEqual(billing.purchase_with_wallet(1, "pro", metadata, "personal-renew"), (second, False))
         self.assertEqual(database.get_user(1)["business_until"], "2090-01-01T00:00:00+00:00")
-        self.assertEqual(database.get_user(1)["balance"], 910)
+        self.assertEqual(database.get_user(1)["balance"], 1000)
+        self.assertEqual(database.wallet_summary(1)["test_balance_rub"], 502)
 
     def test_concurrent_renewal_token_allows_only_one_extension_and_debit(self):
         database.wallet_add_entry(1, 1000, "test", "Synthetic test funds", "renew-wallet", test_amount_rub=1000)
@@ -417,7 +418,28 @@ class PersonalScenarios:
         result = self.race(lambda: billing.purchase_with_wallet(1, "pro", metadata, "renew-one"), lambda: billing.purchase_with_wallet(1, "pro", metadata, "renew-two"))
         self.assertEqual(sum(isinstance(row, tuple) for row in result), 1)
         self.assertEqual(personal._date(database.get_user(1)["pro_until"])-personal._date(initial), timedelta(days=30))
-        self.assertEqual(database.wallet_summary(1)["test_balance_rub"], 851)
+        self.assertEqual(database.wallet_summary(1)["test_balance_rub"], 751)
+
+    def test_pro_points_rejection_and_historical_paid_replay_preserve_every_balance_and_right(self):
+        self.pro()
+        schedule = self.schedule()
+        before = dict(database.get_user(1))
+        metadata = {"renew": True, "expected_until": before["pro_until"]}
+        with self.assertRaisesRegex(ValueError, "points payment unavailable"):
+            billing.purchase_with_points(1, "pro", metadata, "new-hp-renewal")
+        pending = database.insert_id("INSERT INTO billing_invoices(user_id,item_type,amount_rub,currency,payload) VALUES(1,'pro',90,'HP','legacy-hp-pending')", ())
+        old = dict(database.get_invoice(pending))
+        with self.assertRaisesRegex(ValueError, "points payment unavailable"):
+            billing.fulfill_invoice(pending)
+        self.assertEqual(dict(database.get_invoice(pending)), old)
+        paid = database.insert_id("INSERT INTO billing_invoices(user_id,item_type,amount_rub,currency,payload,status,paid_at) VALUES(1,'pro',90,'HP','hpoint:hp:legacy-hp-paid','paid',CURRENT_TIMESTAMP)", ())
+        self.assertEqual(billing.purchase_with_points(1, "pro", {}, "legacy-hp-paid"), (paid, False))
+        self.assertEqual(billing.fulfill_invoice(paid), (True, "already_paid"))
+        self.assertEqual(dict(database.get_user(1)), before)
+        self.assertEqual(personal.get_schedule(1, schedule["id"]), schedule)
+        self.assertEqual(database.wallet_summary(1)["test_balance_rub"], 0)
+        for table in ("wallet_transactions", "billing_events", "subscriptions"):
+            self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM "+table).fetchone()["n"], 0)
 
     def test_retired_products_cannot_issue_new_invoices_or_debit_any_currency(self):
         from hpoint.config import LEGACY_MONETIZATION_ITEMS, MONETIZATION_ITEMS

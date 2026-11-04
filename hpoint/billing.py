@@ -41,7 +41,8 @@ def subscription_state(user_id, *, include_history=True, include_promotions=True
         "renewal_token": user["pro_until"],
         "days_remaining": max(0, math.ceil((end-now).total_seconds()/86400)) if end else 0,
         "auto_renew": False, "renewal_days": 30,
-        "price_test_rub": int(item["rub"]), "price_hp": int(item["hp"]),
+        "price_test_rub": int(item["rub"]), "price_hp": item.get("hp"),
+        "payments": list(item["payments"]),
         "effects": {"helper_priority": 8 if active else 0, "request_priority": 10 if active else 0},
         "available_effects": {"helper_priority": 8, "request_priority": 10},
     }
@@ -113,6 +114,7 @@ def _lock_buyer(user_id):
         db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (user_id,))
 
 def create_pending_invoice(user_id,item_type,metadata=None):
+    _reject_pro_points(item_type, PAYMENT_CURRENCY)
     _validate_active_purchase(user_id, item_type, metadata or {})
     item=MONETIZATION_ITEMS.get(item_type)
     if not item: raise ValueError("unknown billing item")
@@ -157,11 +159,19 @@ def _reward_invoice_matches(invoice, request):
         return quote["version"]==workflow.LEGACY_PRICING_VERSION
     return isinstance(stored,dict) and all(stored.get(key)==quote[key] for key in ("version","helper_rub","commission_rub","total_rub"))
 
+def _reject_pro_points(item_type, currency):
+    # Existing paid HP invoices remain immutable and replayable. This guard
+    # only prevents creating or fulfilling a new HP-funded PRO purchase.
+    if item_type == "pro" and currency == "HP":
+        raise ValueError("points payment unavailable")
+
+
 def create_payment(invoice_id):
-    if TEST_MONEY_ONLY:raise ValueError("Сейчас доступны только тестовые средства.")
     inv=get_invoice(invoice_id)
     if not inv: raise ValueError("invoice not found")
     if inv["status"]!="pending": raise ValueError("invoice already processed")
+    _reject_pro_points(inv["item_type"], inv["currency"])
+    if TEST_MONEY_ONLY:raise ValueError("Сейчас доступны только тестовые средства.")
     if not ROBOKASSA_MERCHANT_LOGIN or not ROBOKASSA_PASSWORD_1 or not ROBOKASSA_PASSWORD_2:
         raise RuntimeError("Robokassa is not configured: set ROBOKASSA_MERCHANT_LOGIN, ROBOKASSA_PASSWORD_1 and ROBOKASSA_PASSWORD_2")
     amount=f'{inv["amount_rub"]:.2f}'
@@ -175,6 +185,7 @@ def create_payment(invoice_id):
         lock=" FOR UPDATE" if getattr(db,"is_postgres",False) else ""
         inv=db.execute("SELECT * FROM billing_invoices WHERE id=?"+lock,(invoice_id,)).fetchone()
         if inv["status"]!="pending":raise ValueError("invoice already processed")
+        _reject_pro_points(inv["item_type"], inv["currency"])
         meta=json.loads(inv["metadata"] or "{}")
         if inv["item_type"]=="request_reward":
             request=db.execute("SELECT * FROM requests WHERE id=?"+lock,(meta.get("request_id"),)).fetchone()
@@ -216,6 +227,8 @@ def fulfill_invoice(invoice_id,payment_id=None):
             db.execute("ROLLBACK");return False,"payment_mismatch"
         if inv["status"]=="paid":
             db.execute("COMMIT");return True,"already_paid"
+        if inv["status"]=="pending":
+            _reject_pro_points(inv["item_type"], inv["currency"])
         if inv["status"]!="pending" or inv["currency"]!="RUB":
             db.execute("ROLLBACK");return False,"already_processed"
         meta=json.loads(inv["metadata"] or "{}")
@@ -261,15 +274,11 @@ def purchase_with_points(user_id, item_type, metadata=None, idempotency_key=None
     A client retry uses the same idempotency key and returns the original
     invoice without charging the balance a second time.
     """
-    item = MONETIZATION_ITEMS.get(item_type)
-    if not item or "hp" not in item:
-        raise ValueError("unknown billing item")
     metadata = dict(metadata or {})
     key = str(idempotency_key or "").strip()
     if not key or len(key) > 100:
         raise ValueError("invalid purchase key")
     payload = f"hpoint:hp:{key}"
-    price = int(item["hp"])
 
     # Validate inputs before taking a balance lock.  The entitlement function
     # then applies the same mutation inside the transaction below.
@@ -293,6 +302,13 @@ def purchase_with_points(user_id, item_type, metadata=None, idempotency_key=None
             _check_replayed_purchase(existing,user_id,"HP",item_type,metadata)
             db.execute("COMMIT")
             return existing["id"], False
+        _reject_pro_points(item_type, "HP")
+        item = MONETIZATION_ITEMS.get(item_type)
+        if not item or "hp" not in item:
+            raise ValueError("unknown billing item")
+        if item["hp"] is None or int(item["hp"]) <= 0:
+            raise ValueError("points payment unavailable")
+        price = int(item["hp"])
         _validate_active_purchase(user_id, item_type, metadata, lock=True)
         changed = db.execute(
             "UPDATE users SET balance=balance-? WHERE user_id=? AND balance>=?",

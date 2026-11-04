@@ -17,7 +17,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  try{
   await emailLogin(page,'theme-browser-data');
   const before=await get('/api/sync'),billingBefore=await get('/api/billing');
-  assert.deepEqual(Object.keys(billingBefore.catalog),['pro']);assert.equal(billingBefore.catalog.pro.rub,149);assert.equal(billingBefore.catalog.pro.hp,90);checks+=3;
+  assert.deepEqual(Object.keys(billingBefore.catalog),['pro']);assert.equal(billingBefore.catalog.pro.rub,249);assert.equal(billingBefore.catalog.pro.hp,null);checks+=3;
   for(const scheme of ['light','dark'])for(const width of [320,375,768,1440]){
    await page.emulateMedia({colorScheme:scheme});await page.setViewportSize({width,height:844});await mine();
    assert.equal(await page.locator('.workspaceRequestPromo').count(),0,'No per-request promotion offered');checks++;await audit('Help own '+width+' '+scheme);
@@ -32,7 +32,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   const navigatePayments=paymentRequests;
   await page.locator('.homePaidOptions [data-item="pro"]').click();await page.locator('.subscriptionPlanGrid').waitFor();
   assert.match(page.url(),/#\/profile\/billing$/);assert.equal(await page.locator('.subscriptionPlanGrid > .workspaceProduct').count(),3);assert.deepEqual(await page.locator('.subscriptionPlanGrid > .workspaceProduct h3').allTextContents(),['Бесплатно','H-Point PRO','Для работы']);checks+=3;
-  const plans=page.locator('.subscriptionPlanGrid');assert.match(await plans.innerText(),/1 собственная активная заявка/);assert.match(await plans.innerText(),/2 публикации активностей/);assert.match(await plans.innerText(),/10 собственных активных заявок/);assert.match(await plans.innerText(),/149 тест\. ₽ или 90 HP/);assert.match(await plans.innerText(),/490 тест\. ₽/);assert.match(await plans.innerText(),/7 дней бесплатно/);checks+=6;
+  const plans=page.locator('.subscriptionPlanGrid');assert.match(await plans.innerText(),/1 собственная активная заявка/);assert.match(await plans.innerText(),/2 публикации активностей/);assert.match(await plans.innerText(),/10 собственных активных заявок/);assert.match(await plans.innerText(),/249 тест\. ₽ \/ месяц/);assert.match(await plans.innerText(),/490 тест\. ₽/);assert.match(await plans.innerText(),/7 дней бесплатно/);assert.equal(await plans.locator('[data-item="pro"][data-method="hp"]').count(),0);assert.deepEqual(billingBefore.catalog.pro.payments,['wallet']);checks+=8;
   assert.equal(paymentRequests,navigatePayments,'Reading PRO conditions never purchases anything');assert.equal((await get('/api/billing')).history.length,billingBefore.history.length);assert.equal((await get('/api/me')).user.balance,before.user.balance);assert.equal((await get('/api/sync')).wallet.test_balance_rub,before.wallet.test_balance_rub);checks+=4;
   for(const scheme of ['light','dark'])for(const width of [320,375,768,1440]){await page.emulateMedia({colorScheme:scheme});await page.setViewportSize({width,height:844});await audit('Billing '+width+' '+scheme)}
   for(const endpoint of ['/api/payments/hp','/api/payments/wallet'])for(const item of retired){

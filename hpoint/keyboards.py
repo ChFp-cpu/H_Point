@@ -88,7 +88,7 @@ def settings_categories_kb(selected: set[str]):
 
 def billing_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="H-Point PRO · 149 тестовых ₽ / 90 HP · 30 дней",callback_data="buy:pro")],
+        [InlineKeyboardButton(text=f"H-Point PRO · {PRICE_PRO_RUB} тестовых ₽ · 30 дней",callback_data="buy:pro")],
         [InlineKeyboardButton(text="Для работы · профессиональный кабинет",url=WEB_PUBLIC_URL.rstrip("/")+"/#/profile")],
     ])
 

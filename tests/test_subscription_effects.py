@@ -93,7 +93,7 @@ class SubscriptionEffects(unittest.TestCase):
         self.assertTrue(created)
         self.assertEqual(datetime.fromisoformat(database.get_user(1)["pro_until"])-datetime.fromisoformat(until),timedelta(days=30))
         self.assertEqual(billing.purchase_with_wallet(1,"pro",metadata,"renew-next-term"),(invoice,False))
-        self.assertEqual(database.wallet_summary(1)["test_balance_rub"],1000-298)
+        self.assertEqual(database.wallet_summary(1)["test_balance_rub"],1000-498)
         self.assertEqual(billing.subscription_state(1)["pro"]["days_remaining"],60)
         with self.assertRaisesRegex(ValueError,"subscription changed"):
             billing.purchase_with_wallet(1,"pro",metadata,"other-tab-term")
@@ -101,8 +101,10 @@ class SubscriptionEffects(unittest.TestCase):
         self.assertEqual(billing.subscription_state(1)["history"][0]["status"],"scheduled")
 
     def test_purchase_key_cannot_change_the_product_owner_or_metadata(self):
-        self.db.execute("UPDATE users SET balance=1000 WHERE user_id=1")
-        billing.purchase_with_points(1,"pro",{},"bound-product-key")
+        # A historical paid HP purchase remains replayable, but its key cannot
+        # be reused by a different user or with changed renewal instructions.
+        self.db.execute("UPDATE users SET balance=910 WHERE user_id=1")
+        self.db.execute("INSERT INTO billing_invoices(user_id,item_type,amount_rub,currency,payload,status,paid_at) VALUES(1,'pro',90,'HP','hpoint:hp:bound-product-key','paid',CURRENT_TIMESTAMP)")
         for uid,metadata in ((1,{"renew":True}),(2,{})):
             with self.assertRaisesRegex(ValueError,"purchase key already used"):
                 billing.purchase_with_points(uid,"pro",metadata,"bound-product-key")
@@ -115,7 +117,7 @@ class SubscriptionEffects(unittest.TestCase):
         billing.purchase_with_wallet(1,"pro",{},"wallet-bound-key")
         with self.assertRaisesRegex(ValueError,"purchase key already used"):
             billing.purchase_with_wallet(1,"pro",{"renew":True},"wallet-bound-key")
-        self.assertEqual(database.wallet_summary(1)["test_balance_rub"],851)
+        self.assertEqual(database.wallet_summary(1)["test_balance_rub"],751)
 
     def test_promotion_retry_after_request_closes_returns_original_invoice(self):
         rid=self.request()

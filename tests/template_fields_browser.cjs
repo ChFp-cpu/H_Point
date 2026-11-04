@@ -10,7 +10,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  const get=async path=>(await context.request.get(base+path)).json();
  async function post(path,data){const r=await context.request.post(base+path,{data});assert.equal(r.status(),200,await r.text());return r.json()}
  try{
-  await emailLogin(page,'theme-browser-empty');await post('/api/payments/hp',{item_type:'pro',purchase_key:'template-fields-pro'});
+  await emailLogin(page,'theme-browser-empty');await post('/api/payments/wallet',{item_type:'pro',purchase_key:'template-fields-pro'});
   const fields={what:'Полный перенос условий шаблона',place:'Тестовый район',time_needed:'В четверг после 17:30',urgency:'Особый срок',details:'Нужны инструменты.\nВторая строка подробностей.',category:'tools',expires_in_hours:73,reward_rub:1234,lat:55.75,lon:37.62};
   const quote=(await get('/api/requests/quote?reward_rub=1234')).quote;
   const original=await post('/api/requests',{...fields,pricing_version:quote.version,expected_total_rub:quote.total_rub});

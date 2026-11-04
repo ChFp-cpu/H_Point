@@ -351,6 +351,35 @@ body{font-weight:450}
 .hpFormHelp{color:var(--hp-text-secondary);opacity:1}
 .hpTestLabel{background:var(--hp-hover)!important;color:var(--hp-accent-text)!important}
 
+/* Own the three header slots explicitly. A zero-minimum middle track alone
+   cannot contain an intrinsic-width flex menu: its centred children spill
+   over both the brand and the account actions as navigation grows. */
+.nav:not(.guestHeader) .in{width:min(1360px,100%);grid-template-columns:max-content minmax(0,1fr) max-content!important;gap:12px!important}
+.nav:not(.guestHeader) .brandLogo{justify-self:start;width:max-content;max-width:100%}
+.nav:not(.guestHeader) .sp,.nav:not(.guestHeader) #nav,.nav:not(.guestHeader) .workspaceHeaderActions{min-width:0}
+.nav:not(.guestHeader) .workspaceHeaderActions{flex-wrap:nowrap;justify-self:end}
+.nav:not(.guestHeader) #sitePrimaryNav .adminNavFull{display:none}
+.nav:not(.guestHeader) #sitePrimaryNav .adminNavShort{display:inline}
+@media(min-width:1280px){
+ .nav:not(.guestHeader) .in{padding:10px 24px;min-height:76px;grid-template-areas:"brand spacer actions"!important}
+ .nav:not(.guestHeader) #sitePrimaryNav{display:flex!important;flex-wrap:nowrap!important;justify-content:center!important;gap:4px!important;width:100%;overflow:visible!important}
+ .nav:not(.guestHeader) #sitePrimaryNav>button,.nav:not(.guestHeader) #sitePrimaryNav>a{flex:0 0 auto!important;width:auto!important;min-width:max-content!important;min-height:40px;padding:8px 10px!important;white-space:nowrap!important}
+}
+@media(min-width:1440px){
+ .nav:not(.guestHeader) #sitePrimaryNav .adminNavFull{display:inline}
+ .nav:not(.guestHeader) #sitePrimaryNav .adminNavShort{display:none}
+}
+@media(min-width:701px) and (max-width:1279px){
+ .nav:not(.guestHeader) .in{grid-template-columns:minmax(0,1fr) max-content!important;grid-template-areas:"brand actions" "spacer spacer"!important;padding:8px 24px;gap:6px 12px!important}
+ .nav:not(.guestHeader) .sp{display:block!important;width:100%;grid-area:spacer}
+ .nav:not(.guestHeader) #sitePrimaryNav{display:flex!important;position:static!important;flex-wrap:nowrap!important;justify-content:center!important;gap:4px!important;width:100%;overflow:visible!important}
+ .nav:not(.guestHeader) #sitePrimaryNav>button,.nav:not(.guestHeader) #sitePrimaryNav>a{display:inline-flex!important;flex:0 0 auto!important;width:auto!important;min-width:max-content!important;min-height:40px!important;height:auto!important;padding:8px 12px!important;font-size:12px!important;white-space:nowrap!important}
+ .nav:not(.guestHeader) #sitePrimaryNav>button:before,.nav:not(.guestHeader) #sitePrimaryNav>a:before{content:none!important}
+}
+@media(max-width:700px){
+ .nav:not(.guestHeader) .in{grid-template-columns:minmax(0,1fr) max-content!important;grid-template-areas:"brand actions"!important;gap:6px!important}
+ .nav:not(.guestHeader) #sitePrimaryNav{grid-template-columns:repeat(var(--hp-nav-count,4),minmax(max-content,1fr))!important}
+}
 '''
 
 GAME_THEME_CSS = r'''

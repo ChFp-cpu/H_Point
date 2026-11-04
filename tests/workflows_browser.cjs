@@ -11,7 +11,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  async function refresh(actor){await actor.page.evaluate(()=>hpointWorkspace.refresh())}
  try{
   const author=await login('theme-browser-data'),helper=await login('mobile-helper');
-  await post(author,'/api/payments/hp',{item_type:'pro',purchase_key:'workflows-browser-pro'});await author.page.evaluate(()=>hpointWorkspace.refresh());
+  await post(author,'/api/payments/wallet',{item_type:'pro',purchase_key:'workflows-browser-pro'});await author.page.evaluate(()=>hpointWorkspace.refresh());
   for(const endpoint of ['/api/auth/telegram/start','/api/payments/create','/api/requests/reward/pay']){const r=await author.context.request.post(base+endpoint,{data:{}});assert.ok([409,410].includes(r.status()));checks++}
   // An explicit mode replaces location permission prompts.
   await helper.page.goto(base+'/#/help');await helper.page.evaluate(()=>helper());await helper.page.locator('#hpHelperLocation').fill('Тестовый район');await helper.page.locator('#hpEnterHelper').click();

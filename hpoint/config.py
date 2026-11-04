@@ -178,14 +178,14 @@ PAYMENT_FAIL_URL = os.getenv("PAYMENT_FAIL_URL", WEB_PUBLIC_URL + "/payment/resu
 
 PRICE_BOOST_RUB = 49
 PRICE_MORE_RESPONSES_RUB = 79
-PRICE_PRO_RUB = 149
+PRICE_PRO_RUB = 249
 PRICE_VERIFICATION_RUB = 99
 PRICE_FAVORITES_RUB = 149
 PRICE_BUSINESS_RUB = 999
 PRICE_BUSINESS_PRO_RUB = 1499
 PRICE_AD_RUB = 199
 MONETIZATION_ITEMS = {
-    "pro":{"title":"H-Point PRO","description":"Для личных задач: до 10 активных заявок, активности без месячного лимита, шаблоны и повторы по расписанию. Управление помощью через Telegram и мягкий приоритет среди подходящих вариантов.","rub":PRICE_PRO_RUB,"hp":90,"term":"30 дней · без автопродления","benefits":["До 10 собственных активных заявок вместо 1","Активности без месячного лимита вместо 2 публикаций","Личные шаблоны и повторы по расписанию","Управление заявками через привязанный Telegram","Мягкий приоритет; без гарантии помощников или откликов"]},
+    "pro":{"title":"H-Point PRO","description":"Для личных задач: до 10 активных заявок, активности без месячного лимита, шаблоны и повторы по расписанию. Управление помощью через Telegram и мягкий приоритет среди подходящих вариантов.","rub":PRICE_PRO_RUB,"hp":None,"payments":["wallet"],"term":"30 дней · без автопродления","benefits":["До 10 собственных активных заявок вместо 1","Активности без месячного лимита вместо 2 публикаций","Личные шаблоны и повторы по расписанию","Управление заявками через привязанный Telegram","Мягкий приоритет; без гарантии помощников или откликов"]},
 }
 # Historical invoice descriptions only. Never offer these for a new purchase;
 # existing invoices and paid entitlements must remain fulfillable.

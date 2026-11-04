@@ -18,7 +18,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  async function refresh(actor){await actor.page.evaluate(()=>hpointWorkspace.refresh())}
  try{
   const author=await login('theme-browser-data'),helper=await login('mobile-helper');
-  await post(author,'/api/payments/hp',{item_type:'pro',purchase_key:'reliability-browser-pro'});
+  await post(author,'/api/payments/wallet',{item_type:'pro',purchase_key:'reliability-browser-pro'});
   let wallet=(await get(author,'/api/wallet')).wallet;
   assert.equal(wallet.test_only,true);assert.equal(wallet.test_balance_rub,500);checks+=2;
   await author.page.goto(base+'/#/profile/wallet');await author.page.getByRole('heading',{name:'Тестовый кошелёк',exact:true}).waitFor();

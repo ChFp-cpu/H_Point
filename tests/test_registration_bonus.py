@@ -48,10 +48,10 @@ class RegistrationBonus(unittest.TestCase):
         database.create_user(100, "Telegram")
         invoice, created = billing.purchase_with_wallet(100, "pro", {}, "test-bonus-pro")
         self.assertTrue(created)
-        self.assertEqual(self.balance(100), 351)
+        self.assertEqual(self.balance(100), 251)
         self.assertFalse(database.grant_registration_bonus(100))
         self.assertEqual(billing.purchase_with_wallet(100, "pro", {}, "test-bonus-pro"), (invoice, False))
-        self.assertEqual(self.balance(100), 351)
+        self.assertEqual(self.balance(100), 251)
 
     def test_existing_balance_is_added_to_and_not_reset(self):
         with patch.object(database, "REGISTRATION_BONUS_RUB", 0):

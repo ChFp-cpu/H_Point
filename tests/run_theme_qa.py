@@ -11,6 +11,20 @@ from urllib.request import urlopen
 
 def main():
     root = Path(__file__).resolve().parents[1]
+    script = sys.argv[1] if len(sys.argv) > 1 else "tests/theme_browser.cjs"
+    # These fixtures buy PRO to reach the workflow under test. Fund only that
+    # synthetic buyer, separately from money reserved for paid-help scenarios.
+    pro_buyers = {
+        "chat_archive_browser.cjs": 901,
+        "helper_stability_browser.cjs": 901,
+        "help_achievements_browser.cjs": 901,
+        "marketplace_chat_browser.cjs": 901,
+        "paid_help_current_browser.cjs": 901,
+        "personal_stale_browser.cjs": 901,
+        "reliability_browser.cjs": 901,
+        "template_fields_browser.cjs": 905,
+        "workflows_browser.cjs": 901,
+    }
     output = root / ".theme-qa"
     output.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="database-", dir=output) as task_dir:
@@ -23,6 +37,7 @@ def main():
                    BOT_TOKEN="", BOT_USERNAME="", RUN_TELEGRAM_BOT="0", SESSION_COOKIE_SECURE="0",
                    SMTP_HOST="", SMTP_PASSWORD="", BREVO_API_KEY="", YANDEX_MAPS_API_KEY="browser-qa-placeholder",
                    HPOINT_QA_URL=base, HPOINT_QA_OUTPUT=str(output), APP_ENV="development",
+                   HPOINT_QA_PRO_FIXTURE_USER=str(pro_buyers.get(Path(script).name, 0)),
                    HPOINT_QA_MAIL=str(Path(task_dir) / "mail.json"),REGISTRATION_BONUS_RUB="0")
         seed = '''
 from hpoint import database, services, web
@@ -51,6 +66,10 @@ if os.environ.get("HPOINT_QA_TEST_FUNDS") == "1":
     database.grant_registration_bonus(901,500)
 if os.environ.get("HPOINT_QA_PAID_FLOW") == "1":
     database.wallet_add_entry(901,500,"test","Synthetic wallet funds","paid-browser-seed")
+pro_buyer = int(os.environ.get("HPOINT_QA_PRO_FIXTURE_USER", "0"))
+if pro_buyer:
+    assert pro_buyer in (901, 905)
+    database.wallet_add_entry(pro_buyer,249,"test","Synthetic PRO purchase funds","pro-browser-seed")
 if os.environ.get("HPOINT_QA_HELP_AWARDS") == "1":
     # Historical reviewed help, predating achievements; synthetic local DB only.
     legacy=services.create_request(903,{**payload,"what":"Synthetic historical help"})
@@ -99,7 +118,6 @@ web.run()
                     time.sleep(0.1)
             else:
                 raise RuntimeError("Local QA server did not become ready")
-            script = sys.argv[1] if len(sys.argv) > 1 else "tests/theme_browser.cjs"
             subprocess.run(["node", script], cwd=root, env=env, check=True)
         finally:
             if os.name == "nt":

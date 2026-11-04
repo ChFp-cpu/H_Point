@@ -25,6 +25,27 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  async function refresh(){await page.evaluate(()=>hpointWorkspace.refresh())}
  async function header(){return page.evaluate(()=>{const box=node=>{const r=node.getBoundingClientRect();return {x:r.x,y:r.y,w:r.width,h:r.height}};return {nav:box(document.querySelector('.nav')),primary:box(document.getElementById('sitePrimaryNav')),actions:box(document.querySelector('.workspaceHeaderActions')),balance:box(document.querySelector('.workspaceBalance')),profile:document.querySelector('.workspaceHeaderActions [data-route=profile]')?.textContent,legacy:document.querySelectorAll('#globalBalance').length,navItems:[...document.querySelectorAll('#sitePrimaryNav [data-route]')].map(node=>node.dataset.route)}})}
  function sameShape(current,expected,message){for(const key of ['nav','primary','actions','balance'])for(const property of ['x','y','w','h'])assert.ok(Math.abs(current[key][property]-expected[key][property])<=1,message+' '+key+'.'+property+' expected '+expected[key][property]+' got '+current[key][property]);assert.equal(current.legacy,0);assert.deepEqual(current.navItems,expected.navItems);checks+=3}
+ async function geometry(label){
+  const issues=await page.evaluate(()=>{
+   const visible=node=>{const r=node.getBoundingClientRect(),s=getComputedStyle(node);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'},rect=node=>{const r=node.getBoundingClientRect();return {left:r.left,top:r.top,right:r.right,bottom:r.bottom,width:r.width,height:r.height}},name=node=>node.getAttribute('aria-label')||node.innerText||node.alt;
+   const primary=document.querySelector('#sitePrimaryNav'),primaryRect=rect(primary),navRect=rect(document.querySelector('.nav')),issues=[],nodes=[...document.querySelectorAll('.brandLogo img,#sitePrimaryNav>button,#sitePrimaryNav>a,.workspaceHeaderActions>button')].filter(visible);
+   if(document.documentElement.scrollWidth>innerWidth+1)issues.push({type:'document overflow',width:document.documentElement.scrollWidth});
+   for(const node of nodes){const b=rect(node),label=name(node),isPrimary=node.parentElement===primary;
+    if(b.left<-.5||b.right>innerWidth+.5)issues.push({type:'control outside viewport',label,b});
+    if(node.tagName!=='IMG'&&(b.height<40||b.width<40))issues.push({type:'small control',label,b});
+    const owner=isPrimary?primaryRect:navRect;if(b.left<owner.left-.5||b.right>owner.right+.5||b.top<owner.top-.5||b.bottom>owner.bottom+.5)issues.push({type:'control outside slot',label,b,owner});
+    if(node.tagName==='IMG')continue;
+    const walk=document.createTreeWalker(node,NodeFilter.SHOW_TEXT);let text;while(text=walk.nextNode()){
+     if(!text.textContent.trim()||!visible(text.parentElement)||parseFloat(getComputedStyle(text.parentElement).fontSize)===0)continue;
+     const range=document.createRange();range.selectNodeContents(text);for(const r of range.getClientRects())if(r.width>.1&&(r.left<b.left+.5||r.right>b.right-.5||r.top<b.top-.5||r.bottom>b.bottom+.5))issues.push({type:'text outside button',label,text:text.textContent,font:getComputedStyle(text.parentElement).fontSize,b,textRect:{left:r.left,right:r.right,top:r.top,bottom:r.bottom}});
+    }
+    const hit=document.elementFromPoint(b.left+b.width/2,b.top+b.height/2);if(hit&&!node.contains(hit))issues.push({type:'control covered',label,coveredBy:hit.tagName+'.'+hit.className});
+   }
+   for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){const a=rect(nodes[i]),b=rect(nodes[j]);if(Math.min(a.right,b.right)-Math.max(a.left,b.left)>.5&&Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top)>.5)issues.push({type:'overlap',a:name(nodes[i]),b:name(nodes[j]),aRect:a,bRect:b})}
+   return issues;
+  });
+  assert.deepEqual(issues,[],label+' has distinct, readable header controls');checks++;
+ }
  try{
   await emailLogin(page,'theme-browser-data');await refresh();
   const created=await context.request.post(base+'/api/commercial/profile',{data:{kind:'organization',title:'Тестовая организация интерфейса',description:'Только тестовая база',contact:''}});assert.equal(created.status(),200);checks++;
@@ -44,14 +65,26 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   const syncHandler=async route=>{const response=await route.fetch(),data=await response.json();data.wallet={...data.wallet,balance_rub:37,test_balance_rub:37};await route.fulfill({response,json:data})};await page.route(base+'/api/sync',syncHandler);await refresh();
   assert.match(await page.locator('.workspaceBalance').innerText(),/37\s*₽/);sameShape(await header(),baseline,'Changed wallet header');checks++;
   await page.unroute(base+'/api/sync',syncHandler);await refresh();
-  for(const colorScheme of ['light','dark'])for(const width of [320,360,375,390,1440]){
-   await page.emulateMedia({colorScheme});await page.setViewportSize({width,height:width===390?844:1000});await page.locator('.workspaceHeaderActions').waitFor();
-   await page.locator('.workspaceAccountNav [data-route=wallet]').click();await page.locator('.workspaceWalletGrid').waitFor();const walletHeader=await header();
-   await page.locator('.workspaceAccountNav [data-route=billing]').click();await page.locator('.workspaceBillingGrid').waitFor();await refresh();sameShape(await header(),walletHeader,'Same viewport billing/wallet');
-   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);checks++;
-   const outside=await page.locator('#sitePrimaryNav button').evaluateAll(buttons=>buttons.flatMap(button=>{const b=button.getBoundingClientRect(),walk=document.createTreeWalker(button,NodeFilter.SHOW_TEXT),fail=[];let text;while(text=walk.nextNode()){if(!text.textContent.trim()||!text.parentElement.getClientRects().length)continue;const range=document.createRange();range.selectNodeContents(text);for(const r of range.getClientRects())if(r.left<b.left+1||r.right>b.right-1)fail.push({label:text.textContent,font:getComputedStyle(button).fontSize,buttonWidth:b.width,textWidth:r.width,buttonLeft:b.left,textLeft:r.left})}return fail}));assert.deepEqual(outside,[],'Every navigation label stays inside its own button at '+width);checks++;
-   await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,'header-'+width+'-'+colorScheme+'.png'),fullPage:true});
+  // An administrator who owns an organization has the longest primary menu.
+  // PRO adds a badge to the other side of the header. Check both roles and
+  // organization states; scrollWidth alone misses controls drawn on each other.
+  let scenario={admin:true,work:true};
+  const headerSync=async route=>{const response=await route.fetch(),data=await response.json();data.user={...data.user,role:scenario.admin?'admin':'user',pro_active:true,pro_until:'2099-01-01T00:00:00+00:00'};await route.fulfill({response,json:data})};
+  const headerWork=async route=>{const response=await route.fetch(),data=await response.json();data.summary={...data.summary,exists:scenario.work};await route.fulfill({response,json:data})};
+  await page.route(base+'/api/sync',headerSync);await page.route(base+'/api/billing',headerSync);await page.route(base+'/api/commercial/summary',headerWork);
+  const widths=[320,360,375,390,420,700,701,768,900,901,1024,1100,1101,1120,1121,1200,1279,1280,1366,1439,1440,1600,1920];
+  for(const admin of [true,false])for(const work of [true,false]){
+   scenario={admin,work};await refresh();
+   for(const colorScheme of ['light','dark'])for(const width of widths){
+    const label=[admin?'admin':'member',work?'organization':'no organization',colorScheme,width].join(' ');
+    await page.emulateMedia({colorScheme});await page.setViewportSize({width,height:width<701?844:1000});await page.evaluate(()=>go('home'));await page.locator('.homeHero').waitFor();await geometry(label+' home');const homeHeader=await header();
+    assert.deepEqual(homeHeader.navItems,['home','help',...(work?['work']:[]),'activities',...(admin?['admin']:[])]);checks++;
+    if(admin){assert.equal(await page.locator('#sitePrimaryNav [data-route=admin]').getAttribute('aria-label'),'Панель администратора');assert.equal(await page.locator('#sitePrimaryNav [data-route=admin]').innerText(),width>=1440?'Панель администратора':'Админ');checks+=2}
+    await page.evaluate(()=>go('billing'));await page.locator('.workspaceBillingGrid').waitFor();await geometry(label+' billing');sameShape(await header(),homeHeader,label+' same home/billing header');
+    if(admin&&work&&[320,1121,1280,1440,1920].includes(width))await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,'header-'+width+'-'+colorScheme+'.png'),fullPage:true});
+   }
   }
+  await page.unroute(base+'/api/sync',headerSync);await page.unroute(base+'/api/billing',headerSync);await page.unroute(base+'/api/commercial/summary',headerWork);await refresh();
   const frames=await page.evaluate(()=>window.qaHeaderFrames);assert.deepEqual(frames.oldHeader,[]);assert.deepEqual(frames.legacyPanels,[]);assert.equal(frames.oldHeaderWrites,0);checks+=3;
   // Delaying the first feature module leaves only the neutral boot state. The
   // obsolete app and undecorated landing page must never become visible.

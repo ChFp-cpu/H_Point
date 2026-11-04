@@ -290,11 +290,25 @@ class PersonalBot(unittest.IsolatedAsyncioTestCase):
         callback = self.callback("buy:pro")
         await handlers.cb_buy(callback, self.state)
         text = callback.message.answer.await_args.args[0]
-        self.assertIn("149", text)
-        self.assertIn("90 HP", text)
+        self.assertIn("249 тестовых ₽", text)
+        self.assertIn("30 дней", text)
+        self.assertNotIn("HP", text)
+        self.assertNotIn("149", text)
         markup = callback.message.answer.await_args.kwargs["reply_markup"]
         self.assertTrue(any("item=pro" in b.url for row in markup.inline_keyboard for b in row))
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM billing_invoices").fetchone()[0], 0)
+
+    async def test_billing_screen_and_keyboard_share_wallet_only_pro_price(self):
+        message = self.message("/billing")
+        await handlers.show_billing(message, self.state)
+        text = message.answer.await_args.args[0]
+        self.assertIn("249 тестовых ₽", text)
+        self.assertIn("до 10 активных", text)
+        self.assertNotIn("90 HP", text)
+        markup = message.answer.await_args.kwargs["reply_markup"]
+        button = next(b for row in markup.inline_keyboard for b in row if b.callback_data == "buy:pro")
+        self.assertIn("249 тестовых ₽", button.text)
+        self.assertNotIn("HP", button.text)
 
     async def test_old_telegram_registration_never_creates_an_account(self):
         before = self.db.execute("SELECT COUNT(*) FROM users").fetchone()[0]

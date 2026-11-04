@@ -18,8 +18,11 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  try{
   await emailLogin(page,'theme-browser-data');
   const before=await get('/api/billing'),walletBefore=(await get('/api/sync')).wallet.test_balance_rub;
-  assert.equal(before.subscription.pro.active,false);assert.ok(walletBefore>=298,'Run with HPOINT_QA_TEST_FUNDS=1');checks+=2;
+  assert.equal(before.subscription.pro.active,false);assert.ok(walletBefore>=498,'Run with HPOINT_QA_TEST_FUNDS=1');checks+=2;
+  const hpBefore=before.user.balance;assert.equal(before.catalog.pro.rub,249);assert.equal(before.catalog.pro.hp,null);assert.deepEqual(before.catalog.pro.payments,['wallet']);checks+=3;
+  const deniedHp=await post('/api/payments/hp',{item_type:'pro',metadata:{},purchase_key:'pro-hp-disabled-browser'});assert.equal(deniedHp.status,409);assert.match(deniedHp.data.error,/HP.*недоступна/);assert.equal((await get('/api/billing')).history.length,before.history.length);assert.equal((await get('/api/me')).user.balance,hpBefore);assert.equal((await get('/api/sync')).wallet.test_balance_rub,walletBefore);checks+=5;
   await billing();await currentPlansOnly();assert.equal(await page.locator('[data-pro-status="inactive"]').count(),1);
+  assert.equal(await proCard().locator('[data-method="hp"]').count(),0);assert.match(await proCard().locator('.workspaceProductPrice').innerText(),/249 тест\. ₽ \/ месяц/);assert.doesNotMatch(await proCard().innerText(),/HP/);checks+=3;
   assert.equal(await page.locator('[data-header-pro]:not([hidden])').count(),0);checks+=2;
   // Follow the real home advert: its remembered promotion context must not
   // replace the post-purchase renewal controls with another purchase offer.
@@ -32,6 +35,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await page.locator('[data-pro-status="active"]').waitFor();
   const bought=await get('/api/billing'),until=bought.subscription.pro.ends_at;
   assert.equal(bought.subscription.pro.days_remaining,30);
+  assert.equal((await get('/api/sync')).wallet.test_balance_rub,walletBefore-249);assert.equal((await get('/api/me')).user.balance,hpBefore);checks+=2;
   assert.equal(bought.history.length,before.history.length+1);
   assert.equal(bought.subscription.history[0].invoice_id,bought.history[0].id);checks+=3;
   assert.match(await page.locator('[data-pro-status="active"]').innerText(),/PRO активен/);
@@ -57,6 +61,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await proCard().locator('[data-method="wallet"]').click();
   await page.waitForFunction(previous=>hpointWorkspace.state.data.user.pro_until!==previous,until);
   const renewed=await get('/api/billing');
+  assert.equal((await get('/api/sync')).wallet.test_balance_rub,walletBefore-498);assert.equal((await get('/api/me')).user.balance,hpBefore);checks+=2;
   assert.equal(new Date(renewed.subscription.pro.ends_at)-new Date(until),30*86400000);
   assert.equal(renewed.subscription.pro.days_remaining,60);
   assert.equal(renewed.history.length,bought.history.length+1);
