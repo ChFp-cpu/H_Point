@@ -89,3 +89,5 @@ jobs:
           python -m unittest discover -s tests -p 'test_work_inquiries.py' -v
           python -m unittest discover -s tests -p 'test_pilot_analytics.py' -v
           python -m unittest discover -s tests -p 'test_help_boundaries.py' -v
+          python -m unittest discover -s tests -p 'test_support.py' -v
+          python -m unittest discover -s tests -p 'test_bot_sync.py' -v

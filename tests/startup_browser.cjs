@@ -40,7 +40,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   const keys=await page.evaluate(()=>['+','-','='].map(key=>{const event=new KeyboardEvent('keydown',{key,ctrlKey:true,bubbles:true,cancelable:true});document.dispatchEvent(event);return event.defaultPrevented}));assert.deepEqual(keys,[true,true,true]);checks++;
   await page.setViewportSize({width:390,height:844});
   await emailLogin(page,'theme-browser-data');await page.evaluate(()=>hpointWorkspace.refresh());
-  assert.deepEqual(await page.locator('#sitePrimaryNav button').allTextContents(),['Главная','Помощь','Активности']);checks++;
+  assert.deepEqual(await page.locator('#sitePrimaryNav button').evaluateAll(nodes=>nodes.map(node=>node.dataset.route)),['home','help','activities','admin']);checks++;
   await page.goto(base+'/#/help');await page.locator('.helpNavigation').waitFor();
   assert.deepEqual(external,[]);checks++;
   await page.locator('#helpMore summary').click();await page.locator('[data-ws-action=help-tab][data-tab=map]').click();

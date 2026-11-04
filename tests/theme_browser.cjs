@@ -58,7 +58,7 @@ async function loadPhotos(page){
           checks++;
           if(audit.outside.length||audit.overlap||audit.overflow||audit.scheme!==colorScheme)failures.push({width,route,colorScheme,...audit});
           const primaryNav=page.locator(route==='games'?'.gamesPrimaryNav':'#sitePrimaryNav');
-          assert.deepEqual(await primaryNav.locator('button,a').allTextContents(),gamesEnabled?['Главная','Помощь','Игры','Активности']:['Главная','Помощь','Активности']);
+          assert.deepEqual(await primaryNav.locator('button,a').evaluateAll(nodes=>nodes.map(node=>node.getAttribute('aria-label')||node.textContent)),gamesEnabled?['Главная','Помощь','Игры','Активности','Панель администратора']:['Главная','Помощь','Активности','Панель администратора']);
           if(route!=='games'){
             assert.equal(await page.locator('#hpointWorkspace [data-route="activities"]').count(),0,'Activities are available in the primary navigation');
             assert.equal(await page.locator('#hpointWorkspace [data-route="league"]').count(),route==='#/home'?1:0,'The league opens only from the home summary');
@@ -97,7 +97,7 @@ async function loadPhotos(page){
     // Changing only the emulated system preference must preserve the exact DOM
     // input, draft, route and game session (no reload or rerender).
     await page.goto(base+'/#/profile');
-    await page.getByRole('button',{name:'Редактировать профиль',exact:true}).click();
+    await page.locator('#workspaceProfileEditor #wsBio').waitFor();
     await page.locator('#wsBio').fill('Черновик при смене системной темы');
     const draft=await page.locator('#wsBio').elementHandle();
     const routeBefore=page.url();
@@ -255,16 +255,17 @@ async function loadPhotos(page){
     assert.equal(await page.locator('#workspaceMapSlot #mapTools').count(),1);
     assert.equal(await page.getByRole('button',{name:'◎ Показать меня',exact:true}).isVisible(),true);
     await page.goto(base+'/#/profile');
-    if(!(await page.locator('#wsName').isVisible()))await page.getByRole('button',{name:'Редактировать профиль',exact:true}).click();
+    await page.locator('#workspaceProfileEditor #wsName').waitFor();
     await page.locator('#wsName').fill('Проверенный профиль');await page.locator('#wsCity').fill('Новый город');
-    await page.locator('#wsBio').fill('Профиль сохранён через интерфейс');await page.getByRole('button',{name:'Сохранить профиль',exact:true}).click();
+    await page.locator('#wsBio').fill('Профиль сохранён через интерфейс');await page.locator('[data-profile-save]').click();
     await page.getByRole('heading',{name:'Проверенный профиль',exact:true}).waitFor();
     const saved=await context.request.get(base+'/api/me').then(r=>r.json());assert.equal(saved.user.city,'Новый город');assert.equal(saved.user.bio,'Профиль сохранён через интерфейс');
     assert.equal(await page.getByRole('button',{name:'Панель администратора',exact:true}).count(),1);
     assert.equal(await page.getByRole('button',{name:'Сменить аккаунт',exact:true}).count(),1);
     assert.equal(await page.getByRole('button',{name:'Выйти из аккаунта',exact:true}).count(),1);
     if(!await page.getByRole('button',{name:'Панель администратора',exact:true}).isVisible())await page.locator('#accountMore summary').click();
-    await page.getByRole('button',{name:'Панель администратора',exact:true}).click();await page.locator('.adminMetrics').first().waitFor();
+    await page.getByRole('button',{name:'Панель администратора',exact:true}).click();await page.locator('#workspaceAdminSlot .supportAdmin').waitFor();
+    await page.locator('#workspaceAdminSlot [data-support-legacy]').click();await page.locator('.adminMetrics').first().waitFor();
     for(const colorScheme of ['light','dark']){
       await page.emulateMedia({colorScheme});
       for(const width of [390,1440]){
@@ -275,7 +276,7 @@ async function loadPhotos(page){
       }
     }
     await page.locator('#modal .close').click();
-    await page.getByRole('button',{name:'Сменить аккаунт',exact:true}).click();await page.getByRole('heading',{name:'Профили на этом устройстве',exact:true}).waitFor();
+    await page.goto(base+'/#/profile');await page.getByRole('button',{name:'Сменить аккаунт',exact:true}).click();await page.getByRole('heading',{name:'Профили на этом устройстве',exact:true}).waitFor();
     await page.locator('#modal .close').click();
     await page.goto(base+'/#/activities');await page.getByRole('button',{name:'+ Создать событие',exact:true}).click();
     await page.locator('#eventTitle').fill('Проверочная встреча соседей');await page.locator('#eventPlace').fill('Тестовый общественный сад');

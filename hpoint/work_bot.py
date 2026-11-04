@@ -200,7 +200,8 @@ def collect_reminders(db, at=None, limit=30):
         for org in paid_organizations(db,uid,at):
             owner=org["owner_id"]
             for kind,(table,field,_,_) in ITEMS.items():
-                rows=db.execute("SELECT id,"+field+" scheduled_at FROM "+table+" WHERE owner_id=? AND "+field+" IS NOT NULL AND "+field+">? AND "+field+"<=? AND (assignee_id=? OR (assignee_id IS NULL AND owner_id=?)) ORDER BY "+field+",id LIMIT 30",(owner,at.isoformat(),(at+timedelta(minutes=user["lead_minutes"])).isoformat(),uid,uid)).fetchall()
+                status=" AND status='planned'" if kind=="booking" else " AND status IN ('todo','in_progress')" if kind=="task" else ""
+                rows=db.execute("SELECT id,"+field+" scheduled_at FROM "+table+" WHERE owner_id=?"+status+" AND "+field+" IS NOT NULL AND "+field+">? AND "+field+"<=? AND (assignee_id=? OR (assignee_id IS NULL AND owner_id=?)) ORDER BY "+field+",id LIMIT 30",(owner,at.isoformat(),(at+timedelta(minutes=user["lead_minutes"])).isoformat(),uid,uid)).fetchall()
                 for row in rows:
                     job=claim_reminder(db,uid,owner,kind,row["id"],row["scheduled_at"],at)
                     if job:jobs.append(job)

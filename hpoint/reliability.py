@@ -97,6 +97,8 @@ def close_locked_request(db, request, actor_id, reason, event_type, add_entry):
         db.execute("UPDATE requests SET reward_payment_status='wallet_refunded' WHERE id=?", (rid,))
     db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)", (rid, actor_id, event_type, reason))
     db.execute("UPDATE support_tickets SET status='resolved' WHERE request_id=? AND status IN ('open','answered')", (rid,))
+    from . import support
+    support.record_request_closure(db,rid,actor_id,reason)
     db.execute("UPDATE requests SET dispute_status='resolved' WHERE id=? AND dispute_status='open'", (rid,))
 
 

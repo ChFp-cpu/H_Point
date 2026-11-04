@@ -9,7 +9,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  await context.route('**/*',route=>new URL(route.request().url()).origin===base?route.continue():route.abort());
  const page=await context.newPage();page.on('pageerror',error=>errors.push(error.message));
  const button=()=>page.locator('.workspaceHeaderActions [data-ws-action="support"]');
- async function open(){await button().click();await page.getByRole('heading',{name:'Поддержка',exact:true}).waitFor();assert.equal(await page.locator('#supportSubject').isVisible(),true);assert.equal(await page.locator('#supportMessage').isVisible(),true);await page.evaluate(()=>closeModal());checks+=2}
+ async function open(){await button().click();await page.getByRole('heading',{name:'Поддержка',exact:true}).waitFor();await page.locator('#supportSubject, .supportList .supportTicket').first().waitFor();if(!await page.locator('#supportSubject').isVisible())await page.locator('[data-support-new]').click();assert.equal(await page.locator('#supportSubject').isVisible(),true);assert.equal(await page.locator('#supportMessage').isVisible(),true);await page.evaluate(()=>closeModal());checks+=2}
  async function audit(label){
   assert.equal(await button().isVisible(),true,label);assert.equal(await button().getAttribute('aria-label'),'Поддержка');checks+=2;
   const geometry=await button().evaluate(node=>{const r=node.getBoundingClientRect();return {x:r.x,y:r.y,w:r.width,h:r.height,right:r.right,viewport:innerWidth}});
@@ -37,7 +37,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   const fallback=page.locator('.workspaceAccountNav [data-ws-action="support"]');if(!await fallback.isVisible())await page.locator('#accountMore summary').click();assert.equal(await fallback.isVisible(),true);await fallback.click();await page.locator('#supportSubject').waitFor();checks++;
   await page.locator('#supportSubject').fill('Проверка мобильной поддержки');await page.locator('#supportMessage').fill('Синтетическое обращение в локальной тестовой базе.');
   const sent=page.waitForResponse(response=>response.url()===base+'/api/support'&&response.request().method()==='POST');await page.locator('#modalbody').getByRole('button',{name:'Отправить',exact:true}).click();assert.equal((await sent).status(),200);
-  await page.locator('#supportTickets').getByText('Проверка мобильной поддержки',{exact:true}).waitFor();checks++;
+  await page.locator('[data-support-subject]').getByText('Проверка мобильной поддержки',{exact:true}).waitFor();checks++;
   await page.evaluate(()=>closeModal());const before=await page.locator('.nav').evaluate(node=>node.getBoundingClientRect().height);await page.evaluate(()=>{window.qaSupportButton=document.querySelector('.workspaceHeaderActions [data-ws-action="support"]')});await page.evaluate(()=>hpointWorkspace.refresh());
   assert.equal(await button().evaluate(node=>node===window.qaSupportButton),true);assert.equal(await page.locator('.nav').evaluate(node=>node.getBoundingClientRect().height),before);checks+=2;
   await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,'mobile-support-light.png'),fullPage:true});await page.emulateMedia({colorScheme:'dark'});await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,'mobile-support-dark.png'),fullPage:true});

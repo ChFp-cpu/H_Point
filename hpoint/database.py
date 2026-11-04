@@ -391,6 +391,8 @@ def init_db():
         ("support_tickets", "request_id", "INTEGER"),
     ]:
         _add_column(table, name, definition)
+    from . import support
+    support.initialize_schema(db)
     chat_threads.initialize_schema(db)
     workflow.initialize_schema(db)
     media.initialize_schema(db)
@@ -1179,9 +1181,13 @@ def create_request_dispute(request_id, user_id, message):
             raise ValueError("Обращение доступно участникам текущей заявки.")
         existing=db.execute("SELECT id FROM support_tickets WHERE request_id=? AND status IN ('open','answered') ORDER BY id DESC LIMIT 1",(request_id,)).fetchone()
         if existing:
+            from . import support
+            support.sync_legacy_ticket(db,existing["id"])
             db.execute("COMMIT")
             return existing["id"]
         ticket=insert_id("INSERT INTO support_tickets(user_id,request_id,subject,message) VALUES(?,?,?,?)",(user_id,request_id,f"Проблема по заявке №{request_id}",message))
+        from . import support
+        support.sync_legacy_ticket(db,ticket)
         db.execute("UPDATE requests SET dispute_status='open' WHERE id=?",(request_id,))
         db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",(request_id,user_id,"dispute_opened","Открыто обращение в поддержку. Завершение и выплата приостановлены до решения."))
         db.execute("COMMIT")
@@ -1202,6 +1208,9 @@ def resolve_request_dispute(admin_id, request_id, note):
             db.execute("ROLLBACK");return False
         db.execute("UPDATE requests SET dispute_status='resolved' WHERE id=?",(request_id,))
         db.execute("UPDATE support_tickets SET status='resolved',admin_reply=?,replied_by=?,replied_at=CURRENT_TIMESTAMP WHERE request_id=? AND status IN ('open','answered')",(str(note)[:2000],admin_id,request_id))
+        from . import support
+        for ticket in db.execute("SELECT id FROM support_tickets WHERE request_id=?",(request_id,)).fetchall():
+            support.sync_legacy_ticket(db,ticket["id"])
         db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",(request_id,admin_id,"dispute_resolved","Поддержка сняла ограничение завершения: "+str(note)[:300]))
         record_admin_action(admin_id,"dispute_resolved",row["requester_id"],{"request_id":request_id})
         db.execute("COMMIT");return True

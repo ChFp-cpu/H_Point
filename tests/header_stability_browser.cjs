@@ -29,7 +29,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await emailLogin(page,'theme-browser-data');await refresh();
   const created=await context.request.post(base+'/api/commercial/profile',{data:{kind:'organization',title:'Тестовая организация интерфейса',description:'Только тестовая база',contact:''}});assert.equal(created.status(),200);checks++;
   await refresh();await page.evaluate(()=>go('wallet'));await page.locator('.workspaceWalletGrid').waitFor();await refresh();
-  const baseline=await header();assert.deepEqual(baseline.navItems,['home','help','work','activities']);assert.match(baseline.profile,/Профиль.*5\.0/);assert.equal(baseline.legacy,0);checks+=3;
+  const baseline=await header();assert.deepEqual(baseline.navItems,['home','help','work','activities','admin']);assert.match(baseline.profile,/Профиль.*5\.0/);assert.equal(baseline.legacy,0);checks+=3;
   // A genuine delayed billing response used to replace the shared header with
   // the obsolete balance widget and force a second row.
   let observed;const held=new Promise(r=>releaseBilling=r),seen=new Promise(r=>observed=r);
@@ -44,11 +44,13 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   const syncHandler=async route=>{const response=await route.fetch(),data=await response.json();data.wallet={...data.wallet,balance_rub:37,test_balance_rub:37};await route.fulfill({response,json:data})};await page.route(base+'/api/sync',syncHandler);await refresh();
   assert.match(await page.locator('.workspaceBalance').innerText(),/37\s*₽/);sameShape(await header(),baseline,'Changed wallet header');checks++;
   await page.unroute(base+'/api/sync',syncHandler);await refresh();
-  for(const colorScheme of ['light','dark'])for(const width of [390,1440]){
+  for(const colorScheme of ['light','dark'])for(const width of [320,360,375,390,1440]){
    await page.emulateMedia({colorScheme});await page.setViewportSize({width,height:width===390?844:1000});await page.locator('.workspaceHeaderActions').waitFor();
    await page.locator('.workspaceAccountNav [data-route=wallet]').click();await page.locator('.workspaceWalletGrid').waitFor();const walletHeader=await header();
    await page.locator('.workspaceAccountNav [data-route=billing]').click();await page.locator('.workspaceBillingGrid').waitFor();await refresh();sameShape(await header(),walletHeader,'Same viewport billing/wallet');
-   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);checks++;await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,'header-'+width+'-'+colorScheme+'.png'),fullPage:true});
+   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);checks++;
+   const outside=await page.locator('#sitePrimaryNav button').evaluateAll(buttons=>buttons.flatMap(button=>{const b=button.getBoundingClientRect(),walk=document.createTreeWalker(button,NodeFilter.SHOW_TEXT),fail=[];let text;while(text=walk.nextNode()){if(!text.textContent.trim()||!text.parentElement.getClientRects().length)continue;const range=document.createRange();range.selectNodeContents(text);for(const r of range.getClientRects())if(r.left<b.left+1||r.right>b.right-1)fail.push({label:text.textContent,font:getComputedStyle(button).fontSize,buttonWidth:b.width,textWidth:r.width,buttonLeft:b.left,textLeft:r.left})}return fail}));assert.deepEqual(outside,[],'Every navigation label stays inside its own button at '+width);checks++;
+   await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,'header-'+width+'-'+colorScheme+'.png'),fullPage:true});
   }
   const frames=await page.evaluate(()=>window.qaHeaderFrames);assert.deepEqual(frames.oldHeader,[]);assert.deepEqual(frames.legacyPanels,[]);assert.equal(frames.oldHeaderWrites,0);checks+=3;
   // Delaying the first feature module leaves only the neutral boot state. The
@@ -61,6 +63,11 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   releaseAsset();await page.locator('#hpointWorkspace').waitFor();await page.locator('.workspaceBillingGrid').waitFor();await refresh();
   const after=await page.evaluate(()=>window.qaHeaderFrames);assert.deepEqual(after.oldHeader,[]);assert.deepEqual(after.legacyPanels,[]);assert.deepEqual(after.earlyLanding,[]);assert.equal(after.oldHeaderWrites,0);checks+=4;
   await page.screenshot({path:path.join(process.env.HPOINT_QA_OUTPUT,'stable-header-billing.png'),fullPage:true});
-  assert.deepEqual(errors,[]);console.log(JSON.stringify({ok:true,checks,errors,headerStable:true,noLegacyHeaderWrites:true,delayedBillingStable:true,walletUpdateStable:true,coldLoadNoFlash:true}));
+  for(const asset of ['hpoint-support.js','hpoint-profile.js']){
+   const pattern='**/assets/'+asset+'*',failure=route=>route.abort();await page.route(pattern,failure);await page.reload({waitUntil:'domcontentloaded'});await page.getByText('Не удалось загрузить H-Point',{exact:true}).waitFor();
+   assert.equal(await page.locator('#hpointWorkspace').isVisible(),false);assert.equal(await page.locator('#landing').isVisible(),false);assert.equal(await page.locator('#hpointBootScreen').getByRole('button',{name:'Повторить',exact:true}).isVisible(),true);checks+=3;
+   await page.unroute(pattern,failure);await page.reload();await page.locator('#hpointWorkspace').waitFor();checks++;
+  }
+  assert.deepEqual(errors,[]);console.log(JSON.stringify({ok:true,checks,errors,headerStable:true,noLegacyHeaderWrites:true,delayedBillingStable:true,walletUpdateStable:true,coldLoadNoFlash:true,failedNewModulesRecover:true}));
  }finally{closing=true;releaseBilling?.();releaseAsset?.();await context.close();await browser.close()}
 })().catch(error=>{console.error(error.stack);process.exitCode=1});

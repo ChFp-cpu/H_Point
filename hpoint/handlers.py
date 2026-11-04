@@ -161,6 +161,8 @@ BOT_START_OVERVIEW = (
 )
 BASIC_BOT_COMMANDS = {"/start", "/help", "/menu", "/website", "/chats", "/chat", "/problem", "/cancel", "/link", "/unlink", "/ask", "/billing", "/terms", "/paysupport"}
 PRO_BOT_ACTIONS = {BTN_NEED_HELP, BTN_WANT_HELP, BTN_FIND_CANDIDATES, BTN_MY_CANDIDATES, BOT_REQUESTS_BUTTON}
+RETIRED_IDENTITY_COMMANDS = {"/verifyme", "/verifications", "/verify", "/rejectverify"}
+IDENTITY_CLOSED_NOTICE = "Ручная проверка личности закрыта. Вход и привязка Telegram используют подтверждённый email. Изменить профиль можно на сайте."
 LEGACY_BOT_DESTINATIONS = {
     "/profile":"#/profile", "/history":"#/help", "/settings":"#/help",
     "/commercial":"#/profile", "/verifyme":"#/profile",
@@ -194,6 +196,10 @@ async def simplified_bot_message(event, data):
         await action(event,state)
         return True
     if command=="/ask":return not await require_pro_management(event,state)
+    if command in RETIRED_IDENTITY_COMMANDS:
+        if state:await state.clear()
+        await event.answer(IDENTITY_CLOSED_NOTICE,reply_markup=bot_website_keyboard("#/profile","Открыть профиль"))
+        return True
     if current_state in REQUEST_FORM_STATES and command not in BASIC_BOT_COMMANDS and text not in {BTN_CANCEL,BTN_WEBSITE,BTN_NAVIGATOR}:
         return not await require_pro_management(event,state)
     destination=LEGACY_BOT_DESTINATIONS.get(command,LEGACY_BOT_DESTINATIONS.get(text))
@@ -541,73 +547,18 @@ async def cmd_user_block(message: Message) -> None:
 
 @router.message(Command("verifications"))
 async def cmd_verifications(message: Message) -> None:
-    admin = get_user(resolve_profile_id(message.from_user.id))
-    if not admin or admin["role"] != "admin":
-        await message.answer("Команда доступна только администратору.")
-        return
-    rows = pending_identity_verifications()
-    if not rows:
-        await message.answer("Заявок на проверку личности нет.")
-        return
-    items = []
-    for row in rows:
-        username = f" @{escape(row['username'])}" if row["username"] else ""
-        items.append(f"• <b>{escape(row['name'])}</b>{username} · ID <code>{row['user_id']}</code>")
-    await message.answer(
-        "<b>Ожидают ручной проверки</b>\n\n" + "\n".join(items) +
-        "\n\nОдобрить: /verify USER_ID\nОтклонить: /rejectverify USER_ID причина"
-    )
+    await message.answer(IDENTITY_CLOSED_NOTICE,reply_markup=bot_website_keyboard("#/profile","Открыть профиль"))
 
 
 @router.message(Command("verify"))
 @router.message(Command("rejectverify"))
 async def cmd_review_identity(message: Message, bot: Bot) -> None:
-    admin = get_user(resolve_profile_id(message.from_user.id))
-    if not admin or admin["role"] != "admin":
-        await message.answer("Команда доступна только администратору.")
-        return
-    parts = (message.text or "").split(maxsplit=2)
-    if len(parts) < 2:
-        await message.answer("Укажите ID пользователя.")
-        return
-    try:
-        target_id = int(parts[1])
-    except ValueError:
-        await message.answer("ID должен быть числом.")
-        return
-    approved = parts[0].split("@", 1)[0] == "/verify"
-    note = parts[2] if len(parts) > 2 and not approved else ""
-    ok, status = review_identity_verification(resolve_profile_id(message.from_user.id), target_id, approved, note)
-    if not ok:
-        await message.answer("Заявка не найдена, уже обработана или доступ запрещён.")
-        return
-    target = get_user(target_id)
-    if target and target["tg_user_id"]:
-        try:
-            text = "✅ Ваша личность подтверждена на 365 дней." if approved else "ℹ️ Заявка на подтверждение личности отклонена."
-            if note:
-                text += f"\nПричина: {escape(note[:500])}"
-            await bot.send_message(target["tg_user_id"], text)
-        except Exception:
-            logging.exception("Не удалось сообщить пользователю результат проверки")
-    await message.answer("Личность подтверждена." if status == "approved" else "Заявка отклонена.")
+    await message.answer(IDENTITY_CLOSED_NOTICE,reply_markup=bot_website_keyboard("#/profile","Открыть профиль"))
 
 
 @router.message(Command("verifyme"))
 async def cmd_request_identity_verification(message: Message, state: FSMContext) -> None:
-    if not await ensure_registered(message, state):
-        return
-    ok, status = request_identity_verification(resolve_profile_id(message.from_user.id))
-    if not ok:
-        await message.answer("Сначала откройте бот в личном чате и завершите привязку Telegram.")
-        return
-    if status == "approved":
-        await message.answer("Ваша личность уже подтверждена.")
-        return
-    await message.answer(
-        "🔐 Заявка на ручную проверку отправлена. Telegram подтверждает владение аккаунтом; "
-        "решение по личности принимает администратор. Не присылайте документы в обычный чат."
-    )
+    await message.answer(IDENTITY_CLOSED_NOTICE,reply_markup=bot_website_keyboard("#/profile","Открыть профиль"))
 
 
 @router.message(Command("website"))
@@ -888,12 +839,6 @@ async def profile(message: Message, state: FSMContext) -> None:
     stats = get_user_stats(user["user_id"])
     achievements = help_achievements.achievement_state(user["user_id"])
     categories = get_helper_categories(user["user_id"])
-    identity = get_identity_verification(user["user_id"])
-    identity_text = "не запрошено — /verifyme" if not identity else {
-        "pending": "заявка на ручной проверке",
-        "approved": "подтверждена",
-        "rejected": "отклонена — /verifyme для новой заявки",
-    }.get(identity["status"], identity["status"])
     text = (
         f"👤 <b>{escape(user['name'])}</b>\n\n"
         f"💰 Баланс: <b>{user['balance']} HP</b>\n"
@@ -902,7 +847,7 @@ async def profile(message: Message, state: FSMContext) -> None:
         f"📥 Помощей получено: <b>{stats['received']}</b>\n"
         f"⭐ Оценка как помощника: <b>{stars(stats['helped_avg'])}</b>\n"
         f"⭐ Оценка как получателя: <b>{stars(stats['received_avg'])}</b>\n\n"
-        f"🔐 Личность: <b>{identity_text}</b>\n"
+        "✉️ Email подтверждён\n"
         f"🛠 Категории помощи: {', '.join(CATEGORIES[c] for c in categories) if categories else 'не настроены'}"
     )
     await message.answer(text, reply_markup=profile_kb())
@@ -1715,6 +1660,9 @@ async def finish_review(message: Message, state: FSMContext, side: str) -> None:
     request_id = data.get("review_request_id")
     if not request_id:
         await state.clear(); await show_main_menu(message); return
+    if not isinstance(message.text,str):
+        await message.answer(f"Напишите отзыв текстом: от 1 до {MAX_TEXT_LEN} символов, или нажмите «Пропустить».",reply_markup=cancel_kb(["Пропустить"]))
+        return
     review = message.text.strip()
     if review == "Пропустить":
         await state.clear()
@@ -1827,7 +1775,7 @@ async def confirm_telegram_link(callback: CallbackQuery,state: FSMContext):
 async def unlink_account(message: Message):
     """Detach the current Telegram identity so it can be linked to another site profile."""
     source=get_user(resolve_profile_id(message.from_user.id))
-    if not source or not source["tg_user_id"]:
+    if not source or source["tg_user_id"]!=message.from_user.id:
         await message.answer("Telegram не привязан. Войдите по email на сайте, получите код в профиле и отправьте /link КОД.")
         return
     detached=detach_telegram_to_web_profile(resolve_profile_id(message.from_user.id))

@@ -52,7 +52,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   assert.equal(frozen.status(),409);assert.equal((await get(helper,'/api/wallet')).wallet.test_balance_rub,0);checks+=2;
   const tickets=(await get(author,'/api/admin/dashboard')).tickets,ticket=tickets.find(t=>t.request_id===rid);
   assert.ok(ticket);checks++;
-  await author.page.evaluate(()=>openAdminSupport());
+  await author.page.evaluate(()=>openAdminDashboardLegacy());
   await author.page.locator('#adminReply'+ticket.id).fill('Результат согласован, разрешаю автору подтвердить помощь');
   author.page.once('dialog',d=>d.accept());
   await author.page.locator('.adminTicket').filter({has:author.page.locator('#adminReply'+ticket.id)}).getByRole('button',{name:'Разрешить завершение',exact:true}).click();

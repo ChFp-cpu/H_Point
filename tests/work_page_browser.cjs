@@ -14,7 +14,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   await emailLogin(page,'theme-browser-data');
   assert.deepEqual((await get('/api/commercial/summary')).summary,{exists:false});
   await page.evaluate(()=>hpointWorkspace.refresh());assert.equal(await page.locator('.homeWorkSummary').count(),0);checks+=2;
-  const navigation=await page.locator('#sitePrimaryNav [data-route]').evaluateAll(nodes=>nodes.map(e=>e.dataset.route));assert.deepEqual(navigation,['home','help','activities']);checks++;
+  const navigation=await page.locator('#sitePrimaryNav [data-route]').evaluateAll(nodes=>nodes.map(e=>e.dataset.route));assert.deepEqual(navigation,['home','help','activities','admin']);checks++;
   await page.evaluate(()=>go('profile'));
   await page.locator('#workspaceWorkCreationSlot').getByRole('button',{name:'Создать кабинет в профиле',exact:true}).click();
   await page.waitForURL('**/#/profile');

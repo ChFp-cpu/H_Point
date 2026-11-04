@@ -112,6 +112,26 @@ class WorkBotCases:
         self.assertEqual(work_bot.collect_reminders(self.db,self.at),[])
         self.assertEqual(work_bot.collect_reminders(self.db,self.at+timedelta(minutes=100)),[])
 
+    def test_closed_rows_cannot_hide_upcoming_live_reminders_behind_query_limit(self):
+        self.pay();work_bot.set_preferences(self.db,-101,True,60)
+        for kind,table,field,closed,live in (
+            ("booking","commercial_bookings","starts_at","cancelled","planned"),
+            ("task","commercial_tasks","due_at","done","todo"),
+        ):
+            with self.subTest(kind=kind):
+                client_column=",client_id" if kind=="booking" else ""
+                client_values=(self.client,) if kind=="booking" else ()
+                placeholders="?,?,?,?,?,?" if kind=="booking" else "?,?,?,?,?"
+                for index in range(30):
+                    self.db.execute("INSERT INTO "+table+"(owner_id,title,"+field+",assignee_id,status"+client_column+") VALUES("+placeholders+")",
+                        (-101,"Closed synthetic item",(self.at+timedelta(minutes=index+1)).isoformat(),-101,closed)+client_values)
+                self.db.execute("INSERT INTO "+table+"(owner_id,title,"+field+",assignee_id,status"+client_column+") VALUES("+placeholders+")",
+                    (-101,"Live upcoming item",(self.at+timedelta(minutes=50)).isoformat(),-101,live)+client_values)
+                jobs=work_bot.collect_reminders(self.db,self.at)
+                self.assertEqual(len(jobs),1)
+                self.assertEqual((jobs[0]["kind"],jobs[0]["title"]),(kind,"Live upcoming item"))
+                work_bot.finish_reminder(self.db,jobs[0],True)
+
     def test_failed_delivery_has_backoff_and_bounded_retries(self):
         self.pay();self.booking();work_bot.set_preferences(self.db,-101,True,60)
         for attempt in range(3):
@@ -183,6 +203,18 @@ class BotCompanionUI(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("PRIVATE HEALTH NOTE",bot.send_message.await_args.args[1])
         await work_bot.deliver_reminders(bot,self.db)
         self.assertEqual(bot.send_message.await_count,1)
+
+    async def test_unlink_after_collection_suppresses_fake_bot_delivery(self):
+        self.fixture.pay();self.fixture.booking();work_bot.set_preferences(self.db,-101,True)
+        original=work_bot.collect_reminders
+        def collect_then_unlink(connection):
+            jobs=original(connection)
+            connection.execute("UPDATE users SET tg_user_id=NULL WHERE user_id=-101")
+            return jobs
+        bot=type("FakeBot",(),{"send_message":AsyncMock()})()
+        with patch.object(work_bot,"collect_reminders",side_effect=collect_then_unlink):
+            await work_bot.deliver_reminders(bot,self.db)
+        bot.send_message.assert_not_awaited()
 
     async def test_an_old_reminder_can_be_disabled_after_subscription_expiry(self):
         self.fixture.pay();work_bot.set_preferences(self.db,-101,True)
