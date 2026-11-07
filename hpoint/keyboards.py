@@ -39,8 +39,10 @@ def finish_kb(request_id):
     return InlineKeyboardMarkup(inline_keyboard=request_chat_kb(request_id).inline_keyboard+[[action]])
 
 
-def request_chat_kb(request_id):
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Открыть чат заявки",url=WEB_PUBLIC_URL.rstrip("/")+"/#/help/chat/"+str(int(request_id)))]])
+def request_chat_kb(request_id, chat_id=None):
+    url=WEB_PUBLIC_URL.rstrip("/")+"/#/help/chat/"+str(int(request_id))
+    if chat_id is not None:url+="/"+str(int(chat_id))
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Открыть чат заявки",url=url)]])
 
 
 def confirm_paid_completion_kb(request_id):
@@ -103,15 +105,24 @@ def choose_match_request_kb(requests, prefix="matchreq"):
         for r in requests
     ])
 
-def candidate_kb(request_id, candidate_id):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🤝 Выбрать помощника", callback_data=f"candidate:assign:{request_id}:{candidate_id}")]
-    ])
+def candidate_kb(request_id, candidate_id, status="pending", token=""):
+    if status == "applied":
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🤝 Выбрать помощника", callback_data=f"cc:{request_id}:{candidate_id}:{token}")]])
+    if status == "offered":
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="↩️ Отменить приглашение", callback_data=f"offer:cancel:{request_id}:{token}")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📨 Предложить заявку", callback_data=f"candidate:invite:{request_id}:{candidate_id}")]])
 
 def application_kb(request_id, helper_id, token, for_author=True):
-    action=(InlineKeyboardButton(text="🤝 Выбрать помощника",callback_data=f"candidate:assign:{request_id}:{helper_id}")
+    action=(InlineKeyboardButton(text="🤝 Выбрать помощника",callback_data=f"cc:{request_id}:{helper_id}:{token}")
             if _request_owner_pro(request_id) else InlineKeyboardButton(text="Выбрать помощника на сайте",url=WEB_PUBLIC_URL.rstrip("/")+"/#/help"))
     rows = [[action]] if for_author else []
+    if for_author:
+        from . import database
+        chat=database.db.execute("SELECT id FROM chats WHERE request_id=? AND user_b_id=?",(request_id,helper_id)).fetchone()
+        if chat:rows=request_chat_kb(request_id,chat["id"]).inline_keyboard+rows
     rows.append([InlineKeyboardButton(text="Отклонить отклик" if for_author else "Отозвать отклик", callback_data=f"ac:{request_id}:{helper_id}:{token}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -119,14 +130,16 @@ def application_kb(request_id, helper_id, token, for_author=True):
 def helper_offer_kb(request_id, offer_token=""):
     suffix = f":{offer_token}" if offer_token else ""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Помогу", callback_data=f"offer:accept:{request_id}{suffix}"),
+        [InlineKeyboardButton(text="✅ Готов обсудить", callback_data=f"offer:accept:{request_id}{suffix}"),
          InlineKeyboardButton(text="↩️ Отклонить", callback_data=f"offer:decline:{request_id}{suffix}")]
     ])
 
 def candidates_navigation_kb(request_id, offer=None):
     rows = []
-    if offer:
-        rows.append([InlineKeyboardButton(text="↩️ Отменить приглашение", callback_data=f"offer:cancel:{request_id}:{offer['offer_token'] or ''}")])
+    offers = [offer] if offer and hasattr(offer,"keys") else list(offer or [])
+    for item in offers:
+        name = str(item["name"] if "name" in item.keys() and item["name"] else "помощнику")[:30]
+        rows.append([InlineKeyboardButton(text="↩️ Отменить приглашение · "+name, callback_data=f"offer:cancel:{request_id}:{item['offer_token'] or ''}")])
     rows.extend([
         [InlineKeyboardButton(text="🔄 Обновить кандидатов", callback_data=f"candidate:refresh:{request_id}")],
         [InlineKeyboardButton(text="⬅️ К заявке", callback_data=f"candidate:back:{request_id}")]

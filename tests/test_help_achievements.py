@@ -1,3 +1,4 @@
+from help_fixtures import choose_helper
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -33,7 +34,7 @@ class Fixtures:
 
     def completed(self,owner=1,category="tech",rating=None,helper=2):
         rid=services.create_request(owner,dict(what="Synthetic help",place="Test",time_needed="Today",urgency="Normal",details="No real data",category=category))
-        self.assertEqual(services.accept_open_request(rid,helper),"created")
+        self.assertEqual(choose_helper(rid,helper),"created")
         self.assertTrue(services.complete_request(rid,helper,confirmed_by=owner))
         if rating is not None:self.assertTrue(services.set_rating(rid,owner,rating))
         return rid

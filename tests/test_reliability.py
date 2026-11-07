@@ -1,3 +1,4 @@
+from help_fixtures import choose_helper
 """Settlement invariants, also exercised against PostgreSQL by test_postgres."""
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -48,14 +49,14 @@ class Scenarios:
 
     def finish(self, owner=1, helper=2):
         rid = self.request(owner)
-        self.assertEqual(services.accept_open_request(rid, helper), "created")
+        self.assertEqual(choose_helper(rid, helper), "created")
         self.assertTrue(services.complete_request(rid, helper, confirmed_by=owner))
         return rid
 
     def test_test_reward_stays_test_and_is_paid_once(self):
         rid = self.funded()
         self.assertEqual(database.wallet_summary(1)["test_reserved_rub"], 400)
-        self.assertEqual(services.accept_open_request(rid, 2), "created")
+        self.assertEqual(choose_helper(rid, 2), "created")
         self.assertEqual(database.wallet_summary(2)["test_incoming_rub"], 400)
         self.assertFalse(services.complete_request(rid, 2, confirmed_by=2))
         self.assertTrue(services.complete_request(rid, 2, confirmed_by=1))
@@ -78,7 +79,7 @@ class Scenarios:
 
     def test_migration_replays_transfers_without_changing_totals(self):
         rid = self.funded()
-        services.accept_open_request(rid, 2)
+        choose_helper(rid, 2)
         services.complete_request(rid, 2, confirmed_by=1)
         billing.purchase_with_wallet(2, "pro", {}, "synthetic-pro")
         self.db.execute("UPDATE wallet_transactions SET test_amount_rub=0")
@@ -107,7 +108,7 @@ class Scenarios:
         rid=self.request(reward=400)
         invoice,_,_=billing.create_request_reward_invoice(1,rid)
         billing.fulfill_invoice(invoice)
-        services.accept_open_request(rid,2)
+        choose_helper(rid,2)
         services.complete_request(rid,2,confirmed_by=1)
         self.db.execute("UPDATE wallet_transactions SET test_amount_rub=0")
         self.db.execute("DELETE FROM schema_migrations WHERE version='006_wallet_sources'")
@@ -206,7 +207,7 @@ class Scenarios:
 
     def test_dispute_freezes_completion_until_admin_resolution(self):
         rid = self.funded()
-        services.accept_open_request(rid, 2)
+        choose_helper(rid, 2)
         with self.assertRaises(ValueError):database.create_request_dispute(rid, 3, "Not a participant")
         ticket = database.create_request_dispute(rid, 2, "Synthetic problem")
         self.db.execute("UPDATE support_tickets SET status='answered' WHERE id=?", (ticket,))
@@ -219,7 +220,7 @@ class Scenarios:
 
     def test_admin_can_cancel_dispute_and_return_test_funds(self):
         rid = self.funded()
-        services.accept_open_request(rid, 2)
+        choose_helper(rid, 2)
         ticket = database.create_request_dispute(rid, 1, "Synthetic problem")
         self.assertTrue(database.admin_cancel_request(4, rid, "Cancelled by agreement")[0])
         self.assertFalse(database.admin_cancel_request(4, rid)[0])

@@ -77,6 +77,11 @@ class PersonalBot(unittest.IsolatedAsyncioTestCase):
         return services.create_request(uid or self.owner, {"what": title, "category": "other", "place": "Synthetic place",
                                        "time_needed": "По договорённости", "urgency": "🕊 Не срочно", "details": "Synthetic conditions"})
 
+    def assign(self, rid, helper):
+        self.assertEqual(services.apply_to_request(rid, helper), "created")
+        token = self.db.execute("SELECT offer_token FROM request_candidates WHERE request_id=? AND candidate_id=?", (rid, helper)).fetchone()[0]
+        self.assertEqual(services.accept_open_request(rid, helper, author_id=database.get_request(rid)["requester_id"], application_token=token), "created")
+
     def real_message(self, text):
         return Message(message_id=1, date=datetime.now(), chat=Chat(id=self.tg(self.owner), type="private"),
                        from_user=User(id=self.tg(self.owner), is_bot=False, first_name="Synthetic"), text=text)
@@ -202,8 +207,9 @@ class PersonalBot(unittest.IsolatedAsyncioTestCase):
         callback = self.callback(f"offer:accept:{rid}:{offer['offer_token']}", self.helper)
         await handlers.cb_helper_offer_response(callback, self.bot)
         request = database.get_request(rid)
-        self.assertEqual(request["status"], "in_progress")
-        self.assertEqual(request["helper_id"], self.helper)
+        self.assertEqual(request["status"], "open")
+        self.assertIsNone(request["helper_id"])
+        self.assertEqual(self.db.execute("SELECT status FROM request_candidates WHERE request_id=? AND candidate_id=?", (rid, self.helper)).fetchone()[0], "applied")
         self.assertNotIn("PRO", callback.answer.await_args.args[0])
 
     async def test_helper_can_withdraw_response_without_pro(self):
@@ -217,7 +223,7 @@ class PersonalBot(unittest.IsolatedAsyncioTestCase):
     async def test_free_chat_ignores_own_open_request_and_preserves_pending_draft(self):
         self.access()
         rid = self.request(title="Ongoing task")
-        self.assertEqual(services.accept_open_request(rid, self.helper), "created")
+        self.assign(rid, self.helper)
         self.request(title="New open task")
         self.access(active=False)
         await self.state.set_state(HelpRequest.details)
@@ -232,8 +238,8 @@ class PersonalBot(unittest.IsolatedAsyncioTestCase):
     async def test_multiple_free_chats_require_explicit_target_and_never_misdeliver(self):
         self.access()
         first, second = self.request(title="First conversation"), self.request(title="Second conversation")
-        self.assertEqual(services.accept_open_request(first, self.helper), "created")
-        self.assertEqual(services.accept_open_request(second, self.other), "created")
+        self.assign(first, self.helper)
+        self.assign(second, self.other)
         self.access(active=False)
         message = self.message("/chat Choose safely")
         await handlers.cmd_chat(message, self.state, self.bot)
@@ -246,7 +252,7 @@ class PersonalBot(unittest.IsolatedAsyncioTestCase):
 
     async def test_oversize_chat_is_rejected_without_silent_truncation(self):
         rid = self.request()
-        self.assertEqual(services.accept_open_request(rid, self.helper), "created")
+        self.assign(rid, self.helper)
         message = self.message("/chat " + "x" * 1001)
         await handlers.cmd_chat(message, self.state, self.bot)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM chat_messages").fetchone()[0], 0)
@@ -255,7 +261,7 @@ class PersonalBot(unittest.IsolatedAsyncioTestCase):
 
     async def test_chat_notification_chunks_deliver_every_character_after_pro_expiry(self):
         rid = self.request(title="Escaped <title>")
-        self.assertEqual(services.accept_open_request(rid, self.helper), "created")
+        self.assign(rid, self.helper)
         self.access(active=False)
         text = "<&>" * 333 + "🙂"
         self.assertEqual(len(text), 1000)

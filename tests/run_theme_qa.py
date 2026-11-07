@@ -73,7 +73,7 @@ if pro_buyer:
 if os.environ.get("HPOINT_QA_HELP_AWARDS") == "1":
     # Historical reviewed help, predating achievements; synthetic local DB only.
     legacy=services.create_request(903,{**payload,"what":"Synthetic historical help"})
-    services.accept_open_request(legacy,905)
+    services.try_assign_helper(legacy,905)
     services.complete_request(legacy,905,confirmed_by=903)
     database.db.execute("UPDATE requests SET requester_rating=5,rating=5 WHERE id=?",(legacy,))
     # Preserve an archived game while all running web game endpoints are paused.

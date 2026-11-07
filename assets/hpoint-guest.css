@@ -1,0 +1,24 @@
+/* Visitor content shares the current workspace tokens, themes and imagery. */
+.guestAuthReason{padding:12px 15px;border-radius:12px;background:var(--hp-hover);color:var(--hp-text-primary);font-size:14px;line-height:1.6}
+.guestHeaderActions{display:flex;flex-wrap:nowrap;align-items:center;gap:8px}.guestWelcome{display:flex;align-items:center;justify-content:space-between;gap:24px;margin:14px 0 38px}.guestWelcome h2{margin:8px 0 10px}.guestWelcome p{margin:0;max-width:690px}.guestSection{margin:38px 0}.guestSection>h2{margin-bottom:20px}.guestServiceGrid,.guestEventGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.guestService,.guestEvent{margin-top:0!important;min-width:0}.guestService h3,.guestEvent h3{font-size:22px;line-height:1.35;overflow-wrap:anywhere}.guestService p{white-space:pre-line;overflow-wrap:anywhere}.guestServiceBottom{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:18px 0}.guestService .hpTextLink{display:inline-block;margin-top:10px}.guestFilter{margin-bottom:22px}.guestFilter form{display:grid;grid-template-columns:minmax(180px,1fr) minmax(180px,1.5fr) auto;align-items:end;gap:12px}.guestFilter label{font-size:13px;color:var(--hp-text-secondary)}.guestFilter .input{display:block;width:100%;margin-top:7px}.guestFilter .workspaceActions{margin-top:16px}.guestProgress{display:flex;align-items:center;justify-content:space-between;gap:26px;margin:34px 0}.guestProgress b{display:block;font-size:36px;font-weight:750;line-height:1.3;color:var(--hp-text-primary)}.guestProgress span{display:block;font-size:13px;color:var(--hp-text-secondary)}.guestWorkKinds{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:25px;margin-top:24px}.guestWorkKinds b,.guestWorkKinds span{display:block}.guestWorkKinds b{color:var(--hp-text-primary);margin-bottom:9px}.guestWorkKinds span{font-size:14px;line-height:1.7;color:var(--hp-text-secondary)}.guestLeagueCategories{margin-top:24px}.guestLeagueRow{display:flex;align-items:center;justify-content:space-between;width:100%;gap:15px;border:0;border-bottom:1px solid var(--hp-border);background:transparent;color:var(--hp-text-primary);font:inherit;text-align:left;padding:14px 0;cursor:pointer}.guestLeagueRow:hover{color:var(--hp-accent)}.guestLeagueRow b{font-size:14px}.hpointGuest #hpointWorkspace>.workspaceRequestList{margin-bottom:36px}.hpointGuest .workspaceRequestMain b{overflow-wrap:anywhere}.guestLoadError{margin:36px 0}
+@media(max-width:760px){.guestHeaderActions .btn{padding:10px 12px;font-size:12px;white-space:nowrap;min-height:42px}.guestWelcome{display:block;margin:10px 0 28px}.guestWelcome .btn{margin-top:18px}.guestWelcome h2{font-size:24px}.guestServiceGrid,.guestEventGrid{grid-template-columns:1fr;gap:14px}.guestFilter form{grid-template-columns:1fr}.guestFilter form>.btn{justify-self:start}.guestProgress{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.guestProgress b{font-size:29px}.guestProgress h2{font-size:23px}.guestWorkKinds{grid-template-columns:1fr;gap:20px}.guestSection{margin:28px 0}.guestEnter{width:100%}.guestService h3,.guestEvent h3{font-size:21px}.hpointGuest #sitePrimaryNav{grid-template-columns:repeat(4,minmax(0,1fr))!important}}
+@media(max-width:420px){.guestHeaderActions{gap:5px}.guestHeaderActions .btn{font-size:11px;padding:9px 10px}.guestProgress{gap:18px}.guestProgress span{font-size:12px}}
+
+/* The signed-in mobile toolbar replaces some labels with icons. Guests need text. */
+.nav #nav:has(> .guestHeaderActions) {
+  display: flex !important;
+  grid-area: actions;
+  justify-content: flex-end;
+}
+@media (max-width: 760px) {
+  .nav .guestHeaderActions .btn[data-guest-auth] {
+    display: inline-flex !important;
+    flex: 0 0 auto !important;
+    width: auto !important;
+    min-width: 0 !important;
+    min-height: 42px !important;
+    padding: 8px 10px !important;
+    font-size: 12px !important;
+    white-space: nowrap;
+  }
+}

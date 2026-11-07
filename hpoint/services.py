@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from .config import *
 from .help_achievements import award_locked
 from . import reliability, workflow, chat_threads
-from .database import db, get_request, get_user, get_active_help, save_request_candidates, get_request_candidates, insert_id, request_identity_verification, wallet_add_entry, get_or_create_chat_for_request
+from .database import db, get_request, get_user, get_active_help, insert_id, request_identity_verification, wallet_add_entry, get_or_create_chat_for_request
 
 
 def infer_category(what: str) -> str:
@@ -83,11 +83,12 @@ def save_helper_preferences(user_id, categories, availability="", ready=False, r
             helper_available_from=?,helper_available_until=? WHERE user_id=?""",
             (json.dumps(categories,ensure_ascii=False),availability,radius,available_from,available_until,user_id))
         active=bool(get_active_help(user_id))
-        if ready and not active:add_to_queue(user_id)
+        if ready:add_to_queue(user_id)
         else:remove_from_queue(user_id)
         db.execute("COMMIT")
         return {"helper_categories":categories,"helper_availability":availability,"helper_radius_km":radius,
-            "helper_available_from":available_from,"helper_available_until":available_until,"helper_ready":bool(ready and not active)}
+            "helper_available_from":available_from,"helper_available_until":available_until,"helper_ready":ready,
+            "helper_busy":active}
     except BaseException:
         db.execute("ROLLBACK")
         raise
@@ -102,13 +103,34 @@ def normalize_schedule(value):
     except (TypeError,ValueError,OverflowError):raise ValueError("Укажите дату и время с часовым поясом.")
 
 
-def matches_helper_preferences(request, helper, distance):
+def matches_helper_preferences(request, helper, distance, *, require_location=True):
     radius=int(helper["helper_radius_km"] or 0)
-    if radius and helper["lat"] is not None and (request["lat"] is None or distance>radius):return False
-    at=request["scheduled_at"] or datetime.now(timezone.utc).isoformat()
-    if helper["helper_available_from"] and request["scheduled_at"] and at<helper["helper_available_from"]:return False
-    if helper["helper_available_until"] and at>helper["helper_available_until"]:return False
+    if radius:
+        if distance is None and require_location:return False
+        if distance is not None and distance>radius:return False
+    try:
+        at=_schedule_datetime(request["scheduled_at"]) or datetime.now(timezone.utc)
+        start=_schedule_datetime(helper["helper_available_from"])
+        end=_schedule_datetime(helper["helper_available_until"])
+    except (TypeError,ValueError,OverflowError):return False
+    if start and at<start:return False
+    if end and at>end:return False
     return True
+
+
+def _schedule_datetime(value):
+    if not value:return None
+    date=datetime.fromisoformat(str(value).replace("Z","+00:00"))
+    if date.tzinfo is None:date=date.replace(tzinfo=timezone.utc)
+    return date.astimezone(timezone.utc)
+
+
+def _location_known(request,helper):
+    try:
+        values=[request["lat"],request["lon"],helper["lat"],helper["lon"]]
+        if any(value is None or isinstance(value,bool) for value in values):return False
+        return all(-limit<=float(value)<=limit for value,limit in zip(values,(90,180,90,180)))
+    except (TypeError,ValueError,OverflowError):return False
 
 
 def create_request(user_id: int, data: dict) -> int:
@@ -197,7 +219,9 @@ def _open_for_responses(request):
 
 
 def accept_open_request(request_id: int, helper_id: int, author_id: int | None = None, application_token: str | None = None) -> str:
-    """An explicit response to a published request is consent, not another application."""
+    """Only the author can select a consenting candidate; helpers merely apply."""
+    if author_id is None:
+        return apply_to_request(request_id,helper_id)
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db,"is_postgres",False) else ""
@@ -205,25 +229,25 @@ def accept_open_request(request_id: int, helper_id: int, author_id: int | None =
         helper = db.execute("SELECT * FROM users WHERE user_id=?" + (" FOR NO KEY UPDATE" if lock else ""),(helper_id,)).fetchone()
         if not helper or helper["is_blocked"] or not request or request["requester_id"] == helper_id:
             db.execute("ROLLBACK");return "unavailable"
-        if author_id is not None:
-            application=db.execute("SELECT status,offer_token FROM request_candidates WHERE request_id=? AND candidate_id=?"+lock,(request_id,helper_id)).fetchone()
-            if request["requester_id"] != author_id or not application or application["status"] != "applied" or application["offer_token"] != application_token:
-                db.execute("ROLLBACK");return "unavailable"
         if request["status"] == STATUS_IN_PROGRESS and request["helper_id"] == helper_id:
+            if request["requester_id"]!=author_id:
+                db.execute("ROLLBACK");return "unavailable"
             get_or_create_chat_for_request(request_id)
             db.execute("COMMIT");return "existing"
+        application=db.execute("SELECT status,offer_token FROM request_candidates WHERE request_id=? AND candidate_id=?"+lock,(request_id,helper_id)).fetchone()
+        if request["requester_id"] != author_id or not application or application["status"] != "applied" or not application_token or application["offer_token"] != application_token:
+            db.execute("ROLLBACK");return "unavailable"
         if not _open_for_responses(request) or request["helper_id"] is not None or get_active_help(helper_id):
             db.execute("ROLLBACK");return "unavailable"
         if int(request["reward_rub"] or 0) > 0 and request["reward_payment_status"] != "paid":
             db.execute("ROLLBACK");return "awaiting_funds"
         db.execute("UPDATE requests SET helper_id=?,status=? WHERE id=?",(helper_id,STATUS_IN_PROGRESS,request_id))
-        remove_from_queue(helper_id)
         db.execute("""INSERT INTO request_candidates(request_id,candidate_id,score,status,offer_token,updated_at)
                       VALUES(?,?,0,'accepted',NULL,CURRENT_TIMESTAMP)
                       ON CONFLICT(request_id,candidate_id) DO UPDATE SET status='accepted',offer_token=NULL,updated_at=CURRENT_TIMESTAMP""",(request_id,helper_id))
         db.execute("UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND candidate_id!=? AND status IN ('pending','applied','offered')",(request_id,helper_id))
         get_or_create_chat_for_request(request_id)
-        db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",(request_id,helper_id,"helper_accepted","Помощник принял опубликованную заявку. Чат создан без повторного выбора кандидата."))
+        db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",(request_id,author_id,"helper_accepted","Автор выбрал помощника из откликов. Заявка в работе."))
         db.execute("COMMIT");return "created"
     except Exception:
         db.execute("ROLLBACK");raise
@@ -240,14 +264,17 @@ def apply_to_request(request_id: int, helper_id: int) -> str:
             db.execute("ROLLBACK")
             return "unavailable"
         existing = db.execute("SELECT * FROM request_candidates WHERE request_id=? AND candidate_id=?" + lock, (request_id, helper_id)).fetchone()
-        if existing and existing["status"] in ("applied", "offered"):
+        if existing and existing["status"] == "applied":
             chat_threads.ensure_chat(db,request_id,helper_id)
             db.execute("COMMIT")
             return existing["status"]
+        # Clicking a request-specific response is consent even after an invitation.
+        # Keep its token so another concurrent tab cannot revive a stale choice.
+        token=existing["offer_token"] if existing and existing["status"]=="offered" else secrets.token_hex(8)
         db.execute("""INSERT INTO request_candidates(request_id,candidate_id,score,status,offer_token,seen_at,updated_at)
                       VALUES(?,?,?,'applied',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
                       ON CONFLICT(request_id,candidate_id) DO UPDATE SET score=excluded.score,status='applied',offer_token=excluded.offer_token,updated_at=CURRENT_TIMESTAMP""",
-                   (request_id, helper_id, match_score(request, helper_id), secrets.token_hex(8)))
+                   (request_id, helper_id, match_score(request, helper_id), token))
         chat_threads.ensure_chat(db,request_id,helper_id)
         db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)", (request_id, helper_id, "helper_applied", "Помощник откликнулся на заявку. Автор может выбрать его в подборе."))
         db.execute("COMMIT")
@@ -279,17 +306,17 @@ def get_request_applications(requester_id: int, limit: int = 100):
         except (TypeError, ValueError):
             cats = []
         request = {"lat": row["request_lat"], "lon": row["request_lon"], "scheduled_at": row["scheduled_at"], "category": row["category"]}
-        distance = haversine_km(request["lat"], request["lon"], row["lat"], row["lon"])
+        distance = haversine_km(request["lat"], request["lon"], row["lat"], row["lon"]) if _location_known(request,row) else None
         category_match = not cats or request["category"] in cats
         available = matches_helper_preferences(request, row, distance) and not row["helper_busy"]
         fitness = 100 if category_match else 0
         fitness += 20 if available else 0
-        fitness += float(row["helper_rating"]) * 12 + (max(0, 30-distance*3) if distance < 10 else 0)
+        fitness += float(row["helper_rating"]) * 12 + (max(0, 30-distance*3) if distance is not None else 0)
         fitness += 12 if _entitlement_active(row["verified_until"]) else 0
         active = _entitlement_active(row["pro_until"])
         # The same small live bonus as matching, never an unconditional PRO-first
         # tier. Category, availability, reputation and distance retain weight.
-        result.append({**{field: row[field] for field in fields}, "pro_active": active, "score": round(fitness + (8 if active and category_match and available else 0), 1)})
+        result.append({**{field: row[field] for field in fields}, "helper_busy":bool(row["helper_busy"]),"can_select":not bool(row["helper_busy"]),"pro_active": active, "score": round(fitness + (8 if active and category_match and available else 0), 1)})
     result.sort(key=lambda row: (row["score"], row["updated_at"], row["request_id"]), reverse=True)
     return result[:max(1, min(int(limit), 1000))]
 
@@ -322,8 +349,8 @@ def cancel_request_application(request_id: int, helper_id: int, actor_id: int, t
         raise
 
 
-def get_current_helper_offer(request_id: int):
-    """Return the one helper currently deciding on a request, if any."""
+def get_request_helper_offers(request_id: int):
+    """Pending invitations are independent; inviting someone never replaces another."""
     return db.execute(
         """SELECT rc.request_id, rc.candidate_id, rc.status, rc.updated_at, rc.offer_token,
                   u.name, u.username, u.tg_user_id
@@ -331,9 +358,20 @@ def get_current_helper_offer(request_id: int):
            JOIN users u ON u.user_id = rc.candidate_id
            JOIN requests r ON r.id = rc.request_id
            WHERE rc.request_id = ? AND rc.status = 'offered' AND r.status = ?
-           ORDER BY rc.updated_at DESC LIMIT 1""",
+           ORDER BY rc.updated_at DESC,rc.candidate_id""",
         (request_id, STATUS_OPEN),
-    ).fetchone()
+    ).fetchall()
+
+
+def get_helper_offer(request_id: int, helper_id: int):
+    return next((row for row in get_request_helper_offers(request_id) if row["candidate_id"]==helper_id),None)
+
+
+def get_current_helper_offer(request_id: int, helper_id: int | None = None):
+    """Compatibility accessor; use the full list when rendering a request."""
+    if helper_id is not None:return get_helper_offer(request_id,helper_id)
+    rows=get_request_helper_offers(request_id)
+    return rows[0] if rows else None
 
 
 def get_helper_offers(helper_id: int, limit: int = 20):
@@ -353,41 +391,26 @@ def get_helper_offers(helper_id: int, limit: int = 20):
 
 
 def offer_helper(request_id: int, helper_id: int, replace_offer_token: str | None = None) -> bool:
-    """Let a requester invite one available volunteer without assigning them yet."""
+    """Invite a matching ready helper; each invitation requires their consent."""
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
         request = db.execute("SELECT * FROM requests WHERE id = ?" + lock, (request_id,)).fetchone()
-        if lock:
-            db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (helper_id,)).fetchone()
-        available = db.execute("""SELECT 1 FROM users u WHERE u.user_id=? AND u.is_blocked=0
-            AND (EXISTS(SELECT 1 FROM helper_queue q WHERE q.user_id=u.user_id)
-            OR EXISTS(SELECT 1 FROM request_candidates rc WHERE rc.request_id=? AND rc.candidate_id=u.user_id AND rc.status='applied'))""", (helper_id,request_id)).fetchone()
-        busy = db.execute(
-            "SELECT 1 FROM requests WHERE helper_id = ? AND status = ?",
-            (helper_id, STATUS_IN_PROGRESS),
-        ).fetchone()
-        categories = get_helper_categories(helper_id)
-        applied = db.execute("SELECT 1 FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='applied'", (request_id, helper_id)).fetchone()
-        if not _open_for_responses(request) or request["requester_id"] == helper_id or not available or busy or (categories and request["category"] not in categories and not applied):
+        helper=db.execute("SELECT * FROM users WHERE user_id=?"+(" FOR NO KEY UPDATE" if lock else ""),(helper_id,)).fetchone()
+        if not _open_for_responses(request) or request["requester_id"]==helper_id or not helper or helper["is_blocked"] or not is_in_queue(helper_id) or get_active_help(helper_id):
             db.execute("ROLLBACK")
             return False
-
-        current = get_current_helper_offer(request_id)
-        # A stale tab must not silently replace an invitation the author did
-        # not see. Replacing one requires its exact confirmed token.
-        if current:
-            if current["candidate_id"] == helper_id or replace_offer_token is None or (current["offer_token"] or "") != replace_offer_token:
-                db.execute("ROLLBACK")
-                return False
-        elif replace_offer_token is not None:
-            db.execute("ROLLBACK")
-            return False
-        db.execute(
-            "UPDATE request_candidates SET status='withdrawn', updated_at=CURRENT_TIMESTAMP "
-            "WHERE request_id=? AND status='offered' AND candidate_id!=?",
-            (request_id, helper_id),
-        )
+        if int(request["reward_rub"] or 0)>0 and request["reward_payment_status"]!="paid":
+            db.execute("ROLLBACK");return False
+        categories=get_helper_categories(helper_id)
+        distance=haversine_km(request["lat"],request["lon"],helper["lat"],helper["lon"]) if _location_known(request,helper) else None
+        if (categories and request["category"] not in categories) or not matches_helper_preferences(request,helper,distance):
+            db.execute("ROLLBACK");return False
+        existing=db.execute("SELECT status FROM request_candidates WHERE request_id=? AND candidate_id=?"+lock,(request_id,helper_id)).fetchone()
+        if existing and existing["status"] in ("offered","applied","accepted","declined"):
+            db.execute("ROLLBACK");return False
+        # The old replacement token is deliberately not used to revoke anybody:
+        # a stale browser can only add an independent invitation now.
         db.execute(
             """INSERT INTO request_candidates(request_id,candidate_id,score,status,offer_token,seen_at,updated_at)
                VALUES(?,?,?,'offered',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
@@ -431,19 +454,18 @@ def withdraw_helper_offer(request_id: int, requester_id: int, helper_id: int, of
 
 
 def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool, offer_token: str | None = None) -> bool:
-    """Accept or decline an invitation atomically, keeping the queue shared."""
+    """A positive answer is an application, never an automatic assignment."""
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
         request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
-        if lock:
-            db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (helper_id,)).fetchone()
+        helper=db.execute("SELECT user_id,is_blocked FROM users WHERE user_id=?"+(" FOR NO KEY UPDATE" if lock else ""),(helper_id,)).fetchone()
         offer = db.execute(
             "SELECT * FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='offered'" + lock,
             (request_id, helper_id),
         ).fetchone()
         reward_ready = (int(request["reward_rub"] or 0) == 0 or request["reward_payment_status"] == "paid") if request else False
-        if not offer or not request or request["status"] != STATUS_OPEN or (accept and (not reward_ready or not _open_for_responses(request))) or (offer_token is not None and (offer["offer_token"] or "") != offer_token):
+        if not offer or not helper or helper["is_blocked"] or not request or request["status"] != STATUS_OPEN or (accept and (not reward_ready or not _open_for_responses(request))) or (offer_token is not None and (offer["offer_token"] or "") != offer_token):
             db.execute("ROLLBACK")
             return False
         if not accept:
@@ -459,33 +481,15 @@ def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool, offer
             db.execute("COMMIT")
             return True
 
-        current = db.execute(
-            """UPDATE requests SET helper_id=?, status=?
-               WHERE id=? AND status=? AND helper_id IS NULL AND requester_id!=?
-               AND NOT EXISTS (
-                 SELECT 1 FROM requests active
-                 WHERE active.helper_id=? AND active.status=?
-               )""",
-            (helper_id, STATUS_IN_PROGRESS, request_id, STATUS_OPEN, helper_id, helper_id, STATUS_IN_PROGRESS),
-        )
-        if current.rowcount != 1:
-            db.execute("ROLLBACK")
-            return False
-        remove_from_queue(helper_id)
         db.execute(
-            "UPDATE request_candidates SET status='accepted', updated_at=CURRENT_TIMESTAMP "
+            "UPDATE request_candidates SET status='applied', updated_at=CURRENT_TIMESTAMP "
             "WHERE request_id=? AND candidate_id=?",
             (request_id, helper_id),
         )
-        db.execute(
-            "UPDATE request_candidates SET status='withdrawn', updated_at=CURRENT_TIMESTAMP "
-            "WHERE request_id=? AND candidate_id!=? AND status IN ('pending','applied','offered')",
-            (request_id, helper_id),
-        )
-        get_or_create_chat_for_request(request_id)
+        chat_threads.ensure_chat(db,request_id,helper_id)
         db.execute(
             "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
-            (request_id, helper_id, "helper_accepted", "Помощник подтвердил участие. Заявка в работе."),
+            (request_id, helper_id, "helper_applied", "Помощник принял приглашение. Автор может обсудить помощь и выбрать исполнителя."),
         )
         db.execute("COMMIT")
         return True
@@ -500,18 +504,7 @@ def find_best_open_request_for(helper_id: int):
 
 
 def find_best_queued_helper(request):
-    rows = db.execute(
-        "SELECT user_id FROM helper_queue WHERE user_id != ? ORDER BY joined_at, user_id",
-        (request["requester_id"],),
-    ).fetchall()
-    candidates = []
-    for row in rows:
-        helper_id = row["user_id"]
-        if get_active_help(helper_id) is None:
-            candidates.append(helper_id)
-    if not candidates:
-        return None
-    return max(candidates, key=lambda uid: match_score(request, uid))
+    return next((candidate["user_id"] for candidate in smart_match(request["id"]) if candidate["can_invite"]),None)
 
 
 def try_assign_helper(request_id: int, helper_id: int) -> bool:
@@ -540,7 +533,6 @@ def try_assign_helper(request_id: int, helper_id: int) -> bool:
             (helper_id, STATUS_IN_PROGRESS, request_id, STATUS_OPEN, helper_id, helper_id, STATUS_IN_PROGRESS),
         )
         if cur.rowcount == 1:
-            remove_from_queue(helper_id)
             db.execute(
                 "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
                 (request_id, helper_id, "helper_assigned", "Помощник назначен. Заявка в работе."),
@@ -848,88 +840,119 @@ def add_favorite(user_id: int, favorite_user_id: int) -> bool:
     cur = db.execute("INSERT OR IGNORE INTO favorites(user_id,favorite_user_id) VALUES(?,?)", (user_id,favorite_user_id))
     return cur.rowcount == 1
 
-def match_score(request, helper_id: int) -> int:
-    score = 0
-    categories = get_helper_categories(helper_id)
-    if not categories or request["category"] in categories:
-        score += 100
-    if request["urgency"] == URGENCY_OPTIONS[0]: score += 15
-    elif request["urgency"] == URGENCY_OPTIONS[1]: score += 10
-    score += max(0, 20 - int(request["id"]) % 20)
-    score += int(request["priority_boost"] or 0)
-    if is_pro(request["requester_id"]): score += 10
-    if is_pro(helper_id): score += 8
-    return score
+def _stored_categories(helper):
+    try:
+        categories=json.loads(helper["helper_categories"] or "[]")
+        return [category for category in categories if category in CATEGORIES] if isinstance(categories,list) else []
+    except (TypeError,ValueError):return []
+
+
+def _match_factors(request,helper,rating=0,reviews=0,query="",*,require_location=True):
+    """Explainable ranking points, not a probability of successful help."""
+    categories=_stored_categories(helper)
+    explicit=request["category"] in categories
+    category_match=explicit or not categories
+    known=_location_known(request,helper)
+    distance=haversine_km(request["lat"],request["lon"],helper["lat"],helper["lon"]) if known else None
+    available=matches_helper_preferences(request,helper,distance,require_location=require_location)
+    text=" ".join(str(helper[field] or "") for field in ("name","username","city","bio"))
+    text+=" "+" ".join(str(CATEGORIES[category]) for category in categories)
+    words=_query_terms(text)
+    terms=_query_terms(query)
+    hits=sum(any(term==word or (len(term)>=4 and len(word)>=4 and (term.startswith(word) or word.startswith(term))) for word in words) for term in terms)
+    query_match=not terms or hits==len(terms)
+    score=(100 if explicit else 45 if category_match else 0)+(20 if available else 0)
+    score+=float(rating)*12+min(int(reviews),10)
+    score+=max(0,30-distance*3) if distance is not None else 0
+    verified=_entitlement_active(helper["verified_until"])
+    pro=_entitlement_active(helper["pro_until"])
+    score+=12 if verified else 0
+    score+=8 if pro and category_match and available else 0
+    score+=min(24,hits*8) if query_match else 0
+    reasons=[]
+    if explicit:reasons.append("подходит по категории")
+    elif not categories:reasons.append("готов помогать в разных категориях")
+    else:reasons.append("категория вне настроек помощника")
+    if distance is None:reasons.append("расстояние неизвестно: точка не указана")
+    else:reasons.append("рядом" if distance<=3 else "расстояние до заявки известно")
+    if not available:
+        reasons.append("вне указанного времени или радиуса")
+    else:
+        if helper["helper_radius_km"] and distance is not None:
+            reasons.append("в пределах радиуса помощника")
+        if helper["helper_available_from"] or helper["helper_available_until"]:
+            reasons.append("подходит по времени")
+    if reviews:reasons.append("есть рейтинг за завершённую помощь")
+    if verified:reasons.append("Личность подтверждена")
+    if terms and query_match:reasons.append("соответствует уточнению")
+    return {"score":round(score,1),"category_match":category_match,"profile_match":explicit,
+            "available":available,"query_match":query_match,"distance_km":round(distance,2) if distance is not None else None,
+            "location_known":known,"pro_active":pro,"verified":verified,"reasons":reasons}
+
+
+def match_score(request, helper_id: int) -> float:
+    helper=get_user(helper_id)
+    if not helper:return 0
+    stats=db.execute("SELECT AVG(requester_rating) avg,COUNT(*) n FROM requests WHERE helper_id=? AND status=? AND requester_rating IS NOT NULL",(helper_id,STATUS_DONE)).fetchone()
+    return _match_factors(request,helper,stats["avg"] or 0,stats["n"] or 0)["score"]+(10 if is_pro(request["requester_id"]) else 0)
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
     from math import radians, sin, cos, asin, sqrt
     if None in (lat1,lon1,lat2,lon2): return 999.0
+    lat1,lon1,lat2,lon2=map(float,(lat1,lon1,lat2,lon2))
     dlat=radians(lat2-lat1); dlon=radians(lon2-lon1)
     a=sin(dlat/2)**2+cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
-    return 6371*2*asin(sqrt(a))
+    return 6371*2*asin(sqrt(min(1,max(0,a))))
 
 def _query_terms(query):
-    return {word for word in re.findall(r"[\wа-яё-]{3,}", (query or "").lower())}
+    stop={"мне","нам","нужен","нужна","нужно","нужны","ищу","ищем","помощь","помочь","человек","для","кто","как","или","это"}
+    return {word for word in re.findall(r"[a-zа-я0-9]{3,}",str(query or "").lower().replace("ё","е")) if word not in stop}
 
 def smart_match(request_id, limit=20, query=""):
     req=get_request(request_id)
-    if not req: return []
-    rows=db.execute("""SELECT u.*, r.id request_id, r.category request_category, r.what, r.lat request_lat, r.lon request_lon
+    if not _open_for_responses(req) or (int(req["reward_rub"] or 0)>0 and req["reward_payment_status"]!="paid"):return []
+    rows=db.execute("""SELECT u.*,q.user_id queue_user_id,rc.status candidate_status,rc.offer_token,
+                       EXISTS(SELECT 1 FROM requests active WHERE active.helper_id=u.user_id AND active.status='in_progress') helper_busy,
+                       COALESCE(stats.rating,0) helper_rating,COALESCE(stats.reviews,0) helper_reviews
                        FROM users u
                        LEFT JOIN helper_queue q ON q.user_id=u.user_id
-                       CROSS JOIN (SELECT id,category,what,lat,lon FROM requests WHERE id=?) r
+                       LEFT JOIN request_candidates rc ON rc.candidate_id=u.user_id AND rc.request_id=?
+                       LEFT JOIN (SELECT helper_id,AVG(requester_rating) rating,COUNT(*) reviews FROM requests
+                         WHERE status='done' AND requester_rating IS NOT NULL GROUP BY helper_id) stats ON stats.helper_id=u.user_id
                        WHERE u.user_id != ? AND u.user_id IS NOT NULL AND u.is_blocked=0
-                       AND (q.user_id IS NOT NULL OR EXISTS(SELECT 1 FROM request_candidates applied
-                         WHERE applied.request_id=r.id AND applied.candidate_id=u.user_id AND applied.status='applied'))
+                       AND (q.user_id IS NOT NULL OR rc.status IN ('applied','offered'))
                        """,(request_id,req["requester_id"])).fetchall()
-    applied_ids = {row["candidate_id"] for row in db.execute("SELECT candidate_id FROM request_candidates WHERE request_id=? AND status='applied'", (request_id,)).fetchall()}
-    unavailable_for_request = {
-        row["candidate_id"] for row in db.execute(
-            "SELECT candidate_id FROM request_candidates WHERE request_id=? AND status IN ('declined','offered')",
-            (request_id,),
-        ).fetchall()
-    }
     out=[]
-    terms = _query_terms(query)
     for u in rows:
-        busy = get_active_help(u["user_id"]) is not None
-        if u["user_id"] in unavailable_for_request or (u["user_id"] not in applied_ids and busy): continue
-        cats=get_helper_categories(u["user_id"])
-        if cats and req["category"] not in cats and u["user_id"] not in applied_ids: continue
-        category_bonus=100 if (not cats or req["category"] in cats) else 0
-        distance=haversine_km(req["lat"],req["lon"],u["lat"],u["lon"])
-        available = matches_helper_preferences(req,u,distance)
-        if u["user_id"] not in applied_ids and not available:continue
-        stats=db.execute("""SELECT AVG(requester_rating) avg,COUNT(*) n FROM requests
-                            WHERE helper_id=? AND status=? AND requester_rating IS NOT NULL""",(u["user_id"],STATUS_DONE)).fetchone()
-        rating=float(stats["avg"]) if stats["avg"] is not None else 0.0
-        rating_bonus=rating*12
-        verified_bonus=12 if is_verified(u["user_id"]) else 0
-        pro_active=is_pro(u["user_id"])
-        pro_bonus=8 if pro_active and category_bonus and available and not busy else 0
-        distance_bonus=max(0,30-distance*3) if distance < 10 else 0
-        profile_text=" ".join(str(u.get(field) or "") if isinstance(u, dict) else str(u[field] or "") for field in ("name","username","city","bio","helper_categories")).lower()
-        query_bonus=min(25, 8 * sum(term in profile_text for term in terms))
-        score=category_bonus+rating_bonus+verified_bonus+pro_bonus+distance_bonus+query_bonus+int(req["priority_boost"] or 0)
-        reasons=[]
-        if u["user_id"] in applied_ids: reasons.append("откликнулся на вашу заявку")
-        if category_bonus: reasons.append("подходит по категории")
-        if distance_bonus: reasons.append("рядом")
-        if rating_bonus: reasons.append("есть рейтинг")
-        if verified_bonus: reasons.append("Личность подтверждена")
-        if query_bonus: reasons.append("соответствует уточнению")
+        status=u["candidate_status"] or "pending"
+        applied,offered=status=="applied",status=="offered"
+        if status in ("declined","accepted"):continue
+        busy=bool(u["helper_busy"])
+        ready=u["queue_user_id"] is not None
+        rating=float(u["helper_rating"] or 0)
+        factors=_match_factors(req,u,rating,u["helper_reviews"],query)
+        suitable=factors["category_match"] and factors["available"] and factors["query_match"] and not busy
+        # Existing conversations remain manageable even after a preference or
+        # availability change. They are visibly distinct from recommendations.
+        if not (applied or offered) and not (ready and suitable):continue
+        reasons=factors.pop("reasons")
+        if applied:reasons.insert(0,"откликнулся на вашу заявку")
+        elif offered:reasons.insert(0,"приглашение отправлено, ожидается ответ")
+        if busy:reasons.append("сейчас занят другой помощью")
+        elif not ready:reasons.append("автоматический подбор приостановлен")
         out.append({"user_id":u["user_id"],"name":u["name"],"username":u["username"],"rating":round(rating,1),
-                    "reviews":int(stats["n"] or 0),"verified":is_verified(u["user_id"]),"distance_km":round(distance,2) if distance<999 else None,
-                    "score":round(score,1),"applied":u["user_id"] in applied_ids,"pro_active":pro_active,
+                    "reviews":int(u["helper_reviews"] or 0),**factors,"applied":applied,"offered":offered,
+                    "status":status,"application_status":status,"helper_ready":ready,"helper_busy":busy,
+                    "eligible":not busy and (applied or (ready and suitable)),"can_select":applied and not busy,
+                    "can_invite":ready and suitable and not (applied or offered),
+                    "application_token":u["offer_token"] if applied else None,"offer_token":u["offer_token"] if offered else None,
                     # A requester only needs the distance to compare helpers.
                     # Publishing even rounded coordinates would expose a
                     # helper's neighbourhood before they accept the task.
-                    "lat":None,"lon":None,"availability":u["helper_availability"] or "По договорённости","reasons":reasons})
-    out.sort(key=lambda x:(x["applied"],x["score"],x["rating"],-(x["distance_km"] or 999)),reverse=True)
-    out = out[:limit]
-    save_request_candidates(request_id, out)
-    return out
+                    "lat":None,"lon":None,"availability":u["helper_availability"] or "По договорённости","reasons":reasons,"match_reasons":reasons})
+    out.sort(key=lambda x:(not x["helper_busy"],x["applied"],x["offered"],x["category_match"],x["available"],x["score"],x["rating"],-(x["distance_km"] if x["distance_km"] is not None else float("inf")),-x["user_id"]),reverse=True)
+    return out[:max(1,min(int(limit),200))]
 
 def get_candidates_for_request(request_id, limit=20):
     """Return the same candidate pool used by the website and Telegram."""
@@ -943,7 +966,7 @@ def get_candidates_for_request(request_id, limit=20):
 def smart_requests_for_helper(helper_id, limit=20):
     expire_open_requests()
     helper=get_user(helper_id)
-    if not helper or helper["is_blocked"]:return []
+    if not helper or helper["is_blocked"] or get_active_help(helper_id):return []
     categories=get_helper_categories(helper_id)
     sql="SELECT * FROM requests WHERE status=? AND requester_id!=? AND (reward_rub=0 OR reward_payment_status='paid')"
     args=[STATUS_OPEN,helper_id]
@@ -951,9 +974,16 @@ def smart_requests_for_helper(helper_id, limit=20):
         sql+=" AND category IN ("+",".join("?" for _ in categories)+")";args+=categories
     result=[]
     for row in db.execute(sql,args).fetchall():
-        distance=haversine_km(row["lat"],row["lon"],helper["lat"],helper["lon"])
-        if not matches_helper_preferences(row,helper,distance):continue
-        score=match_score(row,helper_id)+(max(0,30-distance*3) if distance<999 else 0)
-        result.append((score,row,distance))
+        if not _open_for_responses(row):continue
+        candidate=db.execute("SELECT status FROM request_candidates WHERE request_id=? AND candidate_id=?",(row["id"],helper_id)).fetchone()
+        if candidate and candidate["status"] in ("declined","accepted"):continue
+        # The manual feed can show tasks at unknown distances. Automatic
+        # invitations still require a known point when a radius is set.
+        factors=_match_factors(row,helper,require_location=False)
+        if not factors["available"]:continue
+        # A request's own subscription priority is meaningful when ranking
+        # requests, never a constant added to every candidate of one request.
+        score=factors["score"]+min(10,max(0,int(row["priority_boost"] or 0)))+(10 if is_pro(row["requester_id"]) else 0)
+        result.append((score,row,factors))
     result.sort(key=lambda item:(item[0],item[1]["created_at"]),reverse=True)
-    return [{"request":dict(row),"score":round(score,1),"distance_km":round(distance,2) if distance<999 else None} for score,row,distance in result[:max(1,min(int(limit),100))]]
+    return [{"request":dict(row),"score":round(score,1),"distance_km":factors["distance_km"],"reasons":factors["reasons"],"match_reasons":factors["reasons"]} for score,row,factors in result[:max(1,min(int(limit),100))]]

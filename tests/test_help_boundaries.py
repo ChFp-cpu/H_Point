@@ -9,6 +9,7 @@ import uuid
 
 from hpoint import database, services
 from test_invitations import InvitationData
+from help_fixtures import choose_helper
 
 
 class HelpLifecycleBoundaries(InvitationData, unittest.TestCase):
@@ -52,14 +53,14 @@ class HelpLifecycleBoundaries(InvitationData, unittest.TestCase):
         self.assertIsNone(database.get_request(self.rid)["helper_id"])
 
     def test_running_help_may_finish_after_publication_expiry_and_repeated_accept_is_safe(self):
-        self.assertEqual(services.accept_open_request(self.rid, 2), "created")
+        self.assertEqual(choose_helper(self.rid, 2), "created")
         self.expire()
-        self.assertEqual(services.accept_open_request(self.rid, 2), "existing")
+        self.assertEqual(choose_helper(self.rid, 2), "existing")
         self.assertTrue(services.complete_request(self.rid, 2, confirmed_by=1))
         self.assertEqual(database.get_request(self.rid)["status"], "done")
 
     def test_only_integer_star_ratings_are_persisted(self):
-        self.assertEqual(services.accept_open_request(self.rid, 2), "created")
+        self.assertEqual(choose_helper(self.rid, 2), "created")
         self.assertTrue(services.complete_request(self.rid, 2, confirmed_by=1))
         for value in (True, False, 4.9, 5.0, "5", None, [], {}, 0, 6):
             with self.subTest(value=value):

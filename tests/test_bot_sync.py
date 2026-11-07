@@ -49,6 +49,11 @@ class BotSyncCases:
     def request(self, **fields):
         return services.create_request(self.owner,dict(what="Synthetic help",place="Synthetic place",time_needed="Today",urgency="Normal",details="Synthetic conditions",category="tech",**fields))
 
+    def assign(self, rid, helper):
+        self.assertEqual(services.apply_to_request(rid, helper), "created")
+        token=self.db.execute("SELECT offer_token FROM request_candidates WHERE request_id=? AND candidate_id=?",(rid,helper)).fetchone()[0]
+        self.assertEqual(services.accept_open_request(rid,helper,author_id=self.owner,application_token=token),"created")
+
     async def test_unlinked_transport_cannot_unlink_a_colliding_legacy_profile(self):
         database.create_user(123,"Synthetic legacy profile",email="legacy-sync@example.test",tg_user_id=999999,web_verified=True)
         self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=123")
@@ -79,7 +84,7 @@ class BotSyncCases:
         self.assertEqual(database.get_request(rid)["requester_id"],old_id)
 
     async def test_non_text_review_preserves_state_and_a_later_text_is_shared(self):
-        rid=self.request();self.assertEqual(services.accept_open_request(rid,self.helper),"created")
+        rid=self.request();self.assign(rid,self.helper)
         self.assertTrue(services.complete_request(rid,self.helper,confirmed_by=self.owner))
         await self.state.set_state(handlers.Review.requester_review)
         await self.state.update_data(review_request_id=rid,review_side="requester")
@@ -96,8 +101,8 @@ class BotSyncCases:
     async def test_free_chat_with_multiple_active_requests_requires_explicit_target(self):
         self.pro(self.owner)
         first=self.request();second=self.request()
-        self.assertEqual(services.accept_open_request(first,self.helper),"created")
-        self.assertEqual(services.accept_open_request(second,self.other),"created")
+        self.assign(first,self.helper)
+        self.assign(second,self.other)
         self.pro(self.owner,False)
         ambiguous=self.message("/chat Which conversation?")
         await handlers.cmd_chat(ambiguous,self.state,self.bot)
@@ -115,7 +120,7 @@ class BotSyncCases:
         database.wallet_add_entry(self.owner,2000,"test","Synthetic test funds","bot-sync-credit",test_amount_rub=2000)
         rid=self.request(reward_rub=1000)
         self.assertTrue(services.reserve_request_reward(rid,self.owner,1150))
-        self.assertEqual(services.accept_open_request(rid,self.helper),"created")
+        self.assign(rid,self.helper)
         helper_attempt=self.callback("finish:"+str(rid),self.helper)
         await handlers.cb_finish(helper_attempt,self.bot)
         self.assertIn("автор",helper_attempt.answer.await_args.args[0])

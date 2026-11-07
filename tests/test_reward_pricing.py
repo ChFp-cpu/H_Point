@@ -1,3 +1,4 @@
+from help_fixtures import choose_helper
 """Whole-RUB escrow snapshots, preserved legacy obligations and race safety."""
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -97,7 +98,7 @@ class MoneyScenarios:
 
     def test_single_full_payout_commission_and_no_paid_hp(self):
         rid = self.funded()
-        self.assertEqual(services.accept_open_request(rid, 2), "created")
+        self.assertEqual(choose_helper(rid, 2), "created")
         self.assertEqual(workflow.test_wallet_summary(database.wallet_summary(2))["incoming_rub"], 1000)
         self.assertFalse(services.complete_request(rid, 2, confirmed_by=2))
         self.assertTrue(services.complete_request(rid, 2, confirmed_by=1))
@@ -118,7 +119,7 @@ class MoneyScenarios:
                 self.funds(1150)
                 rid = self.request()
                 services.reserve_request_reward(rid, 1, 1150)
-                if path == "helper": services.accept_open_request(rid, 2)
+                if path == "helper": choose_helper(rid, 2)
                 if path == "admin": self.assertTrue(database.admin_cancel_request(4, rid)[0])
                 elif path == "expiry":
                     self.db.execute("UPDATE requests SET expires_at=? WHERE id=?", ((datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat(), rid))
@@ -132,7 +133,7 @@ class MoneyScenarios:
 
     def test_dispute_blocks_payout_until_resolution(self):
         rid = self.funded()
-        services.accept_open_request(rid, 2)
+        choose_helper(rid, 2)
         self.assertTrue(database.create_request_dispute(rid, 1, "Synthetic dispute"))
         self.assertFalse(services.complete_request(rid, 2, confirmed_by=1))
         self.assertEqual(reliability.wallet_balances(self.db, 2), (0, 0))
@@ -140,7 +141,7 @@ class MoneyScenarios:
         self.assertTrue(services.complete_request(rid, 2, confirmed_by=1))
 
     def test_failed_payout_rolls_back_completion_and_commission(self):
-        rid = self.funded(); services.accept_open_request(rid, 2)
+        rid = self.funded(); choose_helper(rid, 2)
         with patch.object(services, "wallet_add_entry", return_value=False):
             with self.assertRaisesRegex(ValueError, "payout already"): services.complete_request(rid, 2, confirmed_by=1)
         self.assertEqual(database.get_request(rid)["status"], "in_progress")
@@ -158,7 +159,7 @@ class MoneyScenarios:
     def test_legacy_test_deduction_is_not_repriced(self):
         self.funds(400); rid = self.legacy()
         services.reserve_request_reward(rid, 1, 400)
-        services.accept_open_request(rid, 2)
+        choose_helper(rid, 2)
         self.assertEqual(workflow.reward_quote(database.get_request(rid))["helper_rub"], 340)
         self.assertTrue(services.complete_request(rid, 2, confirmed_by=1))
         self.assertEqual(reliability.wallet_balances(self.db, 2), (340, 340))
@@ -171,7 +172,7 @@ class MoneyScenarios:
                 if test_part: self.funds(test_part)
                 rid = self.legacy(reward_payment_status="paid", reward_test_rub=test_part)
                 database.wallet_add_entry(1, -400, "reward_reserve", "Historical reserve", f"request:{rid}:reserve", rid, test_amount_rub=-test_part)
-                services.accept_open_request(rid, 2)
+                choose_helper(rid, 2)
                 before = reliability.wallet_balances(self.db, 2)
                 self.assertTrue(services.complete_request(rid, 2, confirmed_by=1))
                 self.assertEqual(reliability.wallet_balances(self.db, 2), (before[0]+400, before[1]+test_part))
@@ -211,9 +212,9 @@ class MoneyScenarios:
     def test_own_request_does_not_block_help_but_helper_concurrency_remains_one(self):
         self.request(0, owner=2)
         first = self.request(0)
-        self.assertEqual(services.accept_open_request(first, 2), "created")
+        self.assertEqual(choose_helper(first, 2), "created")
         other = self.request(0, owner=3)
-        self.assertEqual(services.accept_open_request(other, 2), "unavailable")
+        self.assertEqual(choose_helper(other, 2), "unavailable")
 
     def test_pro_helper_bonus_is_live_small_and_never_beats_wrong_category(self):
         rid = self.request(0)
@@ -270,7 +271,7 @@ class MoneyScenarios:
         with self.assertRaisesRegex(ValueError, "insufficient wallet"): services.reserve_request_reward(other, 1, 1150)
 
     def test_parallel_complete_and_cancel_has_one_conserving_result(self):
-        rid = self.funded(); services.accept_open_request(rid, 2)
+        rid = self.funded(); choose_helper(rid, 2)
         result = self.race(lambda: services.complete_request(rid, 2, confirmed_by=1), lambda: services.cancel_request(rid, 1))
         self.assertEqual(sum(result), 1)
         self.assertEqual(sum(reliability.wallet_balances(self.db, uid)[0] for uid in (1, 2))+workflow.platform_income(self.db)["earned_test_rub"], 1150)
@@ -290,7 +291,7 @@ class MoneyScenarios:
         self.assertEqual(database.wallet_summary(1)["test_reserved_rub"], 1150)
 
     def test_parallel_completion_never_duplicates_payout_or_commission(self):
-        rid = self.funded(); services.accept_open_request(rid, 2)
+        rid = self.funded(); choose_helper(rid, 2)
         self.assertEqual(sum(self.race(lambda: services.complete_request(rid, 2, confirmed_by=1), lambda: services.complete_request(rid, 2, confirmed_by=1))), 1)
         self.assertEqual(reliability.wallet_balances(self.db, 2), (1000, 1000))
         self.assertEqual(workflow.platform_income(self.db)["earned_test_rub"], 150)

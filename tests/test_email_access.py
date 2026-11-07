@@ -121,7 +121,7 @@ class EmailAccess(unittest.TestCase):
         database.grant_registration_bonus(owner,500)
         rid=services.create_request(owner,dict(what="Synthetic help",place="Test",time_needed="Today",urgency="Normal",details="Test",reward_rub=400))
         services.reserve_request_reward(rid,owner,460)
-        services.accept_open_request(rid,123)
+        services.try_assign_helper(rid,123)  # historical agreement before Telegram cleanup
         until=(datetime.now(timezone.utc)+timedelta(days=1)).isoformat()
         for uid in (owner,pure_email,123):
             self.db.execute("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)",(str(uid),uid,until))

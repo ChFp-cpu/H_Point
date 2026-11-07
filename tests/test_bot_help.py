@@ -52,6 +52,11 @@ class HelperBot(unittest.IsolatedAsyncioTestCase):
         return services.create_request(uid or self.author,{**dict(what="Помочь с компьютером",category="tech",place="Private exact address",
             time_needed="По договорённости",urgency="Обычная",details="Private task details",reward_rub=0),**extra})
 
+    def assign(self,rid,helper):
+        self.assertEqual(services.apply_to_request(rid,helper),"created")
+        token=self.db.execute("SELECT offer_token FROM request_candidates WHERE request_id=? AND candidate_id=?",(rid,helper)).fetchone()[0]
+        self.assertEqual(services.accept_open_request(rid,helper,author_id=database.get_request(rid)["requester_id"],application_token=token),"created")
+
     def body(self,message):return "\n".join(str(call.args[0]) for call in message.answer.await_args_list)
 
     async def action(self,name,uid=None):
@@ -168,7 +173,7 @@ class HelperBot(unittest.IsolatedAsyncioTestCase):
         self.assertIn("недоступна",foreign.answer.await_args.args[0])
 
     async def test_busy_helper_cannot_join_second_job_but_status_stays_useful(self):
-        active=self.request();services.accept_open_request(active,self.helper)
+        active=self.request();self.assign(active,self.helper)
         second=self.request(self.other)
         await self.action(f"apply:{second}")
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM request_candidates WHERE request_id=?",(second,)).fetchone()[0],0)
@@ -196,12 +201,120 @@ class HelperBot(unittest.IsolatedAsyncioTestCase):
         token=services.get_current_helper_offer(rid)["offer_token"]
         self.pro(self.helper,False)
         await handlers.cb_helper_offer_response(self.callback(f"offer:accept:{rid}:{token}"),self.bot)
+        self.assertIsNone(database.get_request(rid)["helper_id"])
+        self.assertEqual(database.get_request(rid)["status"],"open")
+        self.assertEqual(self.db.execute("SELECT status FROM request_candidates WHERE request_id=? AND candidate_id=?",(rid,self.helper)).fetchone()[0],"applied")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM chats WHERE request_id=?",(rid,)).fetchone()[0],1)
+        self.assertEqual([call.args[0] for call in self.bot.send_message.await_args_list],[self.tg(self.author)])
+
+    async def test_several_invitations_open_separate_chats_and_only_author_selects(self):
+        self.pro(self.author)
+        rid=self.request()
+        for uid in (self.helper,self.other):
+            services.add_to_queue(uid)
+            await handlers.cb_candidate_assign(self.callback(f"candidate:invite:{rid}:{uid}",self.author),self.bot)
+        offers=services.get_request_helper_offers(rid)
+        self.assertEqual({item["candidate_id"] for item in offers},{self.helper,self.other})
+        for uid in (self.helper,self.other):
+            offer=services.get_helper_offer(rid,uid)
+            notice=[call for call in self.bot.send_message.await_args_list if call.args[0]==self.tg(uid)][-1]
+            self.assertIn(offer["offer_token"],str(notice.kwargs["reply_markup"]))
+        tokens={item["candidate_id"]:item["offer_token"] for item in offers}
+        for uid in (self.helper,self.other):
+            await handlers.cb_helper_offer_response(self.callback(f"offer:accept:{rid}:{tokens[uid]}",uid),self.bot)
+            self.assertEqual(database.get_request(rid)["status"],"open")
+            self.assertIsNone(database.get_request(rid)["helper_id"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM chats WHERE request_id=?",(rid,)).fetchone()[0],2)
+        # A helper cannot select themselves, even when their PRO is active.
+        await handlers.cb_candidate_assign(self.callback(f"candidate:choose:{rid}:{self.helper}:{tokens[self.helper]}"),self.bot)
+        self.assertIsNone(database.get_request(rid)["helper_id"])
+        await handlers.cb_candidate_assign(self.callback(f"candidate:choose:{rid}:{self.other}:{tokens[self.other]}",self.author),self.bot)
+        request=database.get_request(rid)
+        self.assertEqual((request["status"],request["helper_id"]),("in_progress",self.other))
+        self.assertFalse(self.db.execute("SELECT 1 FROM request_candidates WHERE request_id=? AND status IN ('offered','applied')",(rid,)).fetchone())
+
+    async def test_cancel_specific_invitation_keeps_the_other_pending(self):
+        self.pro(self.author)
+        rid=self.request()
+        for uid in (self.helper,self.other):
+            services.add_to_queue(uid)
+            self.assertTrue(services.offer_helper(rid,uid))
+        first=services.get_helper_offer(rid,self.helper)
+        await handlers.cb_helper_offer_response(self.callback(f"offer:cancel:{rid}:{first['offer_token']}",self.author),self.bot)
+        self.assertIsNone(services.get_helper_offer(rid,self.helper))
+        self.assertIsNotNone(services.get_helper_offer(rid,self.other))
+        self.assertEqual(database.get_request(rid)["status"],"open")
+        self.assertEqual(self.bot.send_message.await_args.args[0],self.tg(self.helper))
+
+    async def test_old_invitation_button_or_stale_choice_cannot_assign(self):
+        self.pro(self.author)
+        rid=self.request()
+        services.apply_to_request(rid,self.helper)
+        token=self.db.execute("SELECT offer_token FROM request_candidates WHERE request_id=? AND candidate_id=?",(rid,self.helper)).fetchone()[0]
+        for action in (f"candidate:assign:{rid}:{self.helper}",f"candidate:invite:{rid}:{self.helper}",f"candidate:choose:{rid}:{self.helper}:stale-token"):
+            await handlers.cb_candidate_assign(self.callback(action,self.author),self.bot)
+            self.assertIsNone(database.get_request(rid)["helper_id"])
+        self.assertTrue(services.cancel_request_application(rid,self.helper,self.helper,token))
+        services.apply_to_request(rid,self.helper)
+        await handlers.cb_candidate_assign(self.callback(f"candidate:choose:{rid}:{self.helper}:{token}",self.author),self.bot)
+        self.assertIsNone(database.get_request(rid)["helper_id"])
+        self.bot.send_message.assert_not_awaited()
+
+    async def test_busy_helper_can_keep_explicit_readiness_without_new_assignments(self):
+        rid=self.request();self.assign(rid,self.helper)
+        await self.action("ready")
+        self.assertTrue(services.is_in_queue(self.helper))
         self.assertEqual(database.get_request(rid)["helper_id"],self.helper)
         self.assertEqual(database.get_request(rid)["status"],"in_progress")
-        self.assertGreaterEqual(self.bot.send_message.await_count,2)
+        self.assertFalse(services.get_candidates_for_request(self.request(self.other)))
+
+    async def test_matching_card_explains_reasons_without_fake_percent(self):
+        text=await handlers._candidate_card(dict(name="<Synthetic>",rating=4.7,reviews=3,score=137,
+            match_reasons=["Подходит категория", "Расстояние < 2 км"],distance_km=1.5))
+        self.assertNotIn("%",text)
+        self.assertIn("Подходит категория",text)
+        self.assertIn("Расстояние &lt; 2 км",text)
+        self.assertIn("&lt;Synthetic&gt;",text)
+
+    async def test_candidate_chat_replies_are_free_before_assignment(self):
+        rid=self.request();services.apply_to_request(rid,self.helper)
+        self.pro(self.helper,False)
+        await handlers.cmd_chat(self.message(text="/chat Обсудим задачу"),self.state,self.bot)
+        self.assertIsNone(database.get_request(rid)["helper_id"])
+        row=self.db.execute("SELECT c.user_b_id,m.text FROM chat_messages m JOIN chats c ON c.id=m.chat_id WHERE c.request_id=?",(rid,)).fetchone()
+        self.assertEqual((row["user_b_id"],row["text"]),(self.helper,"Обсудим задачу"))
+        self.assertEqual(self.bot.send_message.await_args.args[0],self.tg(self.author))
+
+    async def test_two_candidates_on_one_request_need_exact_chat_and_never_cross_send(self):
+        rid=self.request()
+        for uid in (self.helper,self.other):services.apply_to_request(rid,uid)
+        ambiguous=self.message(self.author,text=f"/chat #{rid} Кому сообщение?")
+        await handlers.cmd_chat(ambiguous,self.state,self.bot)
+        self.assertIn("несколько",self.body(ambiguous))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM chat_messages").fetchone()[0],0)
+        chat=self.db.execute("SELECT id FROM chats WHERE request_id=? AND user_b_id=?",(rid,self.other)).fetchone()[0]
+        await handlers.cmd_chat(self.message(self.author,text=f"/chat c{chat} Только второму"),self.state,self.bot)
+        rows=self.db.execute("SELECT c.user_b_id,m.text FROM chat_messages m JOIN chats c ON c.id=m.chat_id").fetchall()
+        self.assertEqual([(row["user_b_id"],row["text"]) for row in rows],[(self.other,"Только второму")])
+        self.assertEqual(self.bot.send_message.await_args.args[0],self.tg(self.other))
+        foreign=self.message(self.helper,text=f"/chat c{chat} Чужая переписка")
+        await handlers.cmd_chat(foreign,self.state,self.bot)
+        self.assertIn("Не удалось",self.body(foreign))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM chat_messages").fetchone()[0],1)
+
+    def test_candidate_keyboards_separate_invitation_from_token_bound_selection(self):
+        invite=keyboards.candidate_kb(5,self.helper)
+        choose=keyboards.candidate_kb(5,self.helper,"applied","specific-token")
+        pending=keyboards.candidate_kb(5,self.helper,"offered","specific-token")
+        self.assertEqual(invite.inline_keyboard[0][0].callback_data,f"candidate:invite:5:{self.helper}")
+        self.assertEqual(choose.inline_keyboard[0][0].callback_data,f"cc:5:{self.helper}:specific-token")
+        self.assertEqual(pending.inline_keyboard[0][0].callback_data,"offer:cancel:5:specific-token")
+        self.assertLessEqual(len(choose.inline_keyboard[0][0].callback_data.encode("utf-8")),64)
+        longest=keyboards.candidate_kb(9223372036854775807,-9223372036854775808,"applied","a"*16)
+        self.assertLessEqual(len(longest.inline_keyboard[0][0].callback_data.encode("utf-8")),64)
 
     async def test_helper_cancellation_notifies_free_author_and_retains_history(self):
-        rid=self.request();services.accept_open_request(rid,self.helper)
+        rid=self.request();self.assign(rid,self.helper)
         await handlers.cb_cancel_request(self.callback("cancel_req:"+str(rid)),self.bot)
         self.assertEqual(database.get_request(rid)["status"],"cancelled")
         self.assertEqual(self.bot.send_message.await_args.args[0],self.tg(self.author))
@@ -212,7 +325,7 @@ class HelperBot(unittest.IsolatedAsyncioTestCase):
         rid=self.request(reward_rub=1000)
         database.wallet_add_entry(self.author,2000,"test","Synthetic funds","paid-help-cancel")
         services.reserve_request_reward(rid,self.author,1150)
-        self.assertEqual(services.accept_open_request(rid,self.helper),"created")
+        self.assign(rid,self.helper)
         await handlers.cb_cancel_request(self.callback("cancel_req:"+str(rid)),self.bot)
         self.assertEqual(database.wallet_summary(self.author)["test_balance_rub"],2000)
         self.assertEqual(database.wallet_summary(self.helper)["test_balance_rub"],0)
@@ -229,7 +342,7 @@ class HelperBot(unittest.IsolatedAsyncioTestCase):
         await handlers.cb_cancel_request(self.callback("cancel_req:"+str(rid),self.author),self.bot)
         self.assertEqual(self.bot.send_message.await_count,1)
 
-    async def test_invitation_keeps_private_fields_until_consent_then_delivers_full_notice(self):
+    async def test_invitation_keeps_private_fields_until_author_selects_then_delivers_full_notice(self):
         place="PRIVATE-PLACE-"+"<"*480
         details="PRIVATE-DETAILS-"+"&"*480
         rid=self.request(what="&"*500,place=place,details=details,time_needed='"'*500,urgency="&"*500)
@@ -241,6 +354,13 @@ class HelperBot(unittest.IsolatedAsyncioTestCase):
         self.bot.send_message.reset_mock()
         token=services.get_current_helper_offer(rid)["offer_token"]
         await handlers.cb_helper_offer_response(self.callback(f"offer:accept:{rid}:{token}"),self.bot)
+        self.assertIsNone(database.get_request(rid)["helper_id"])
+        for call in self.bot.send_message.await_args_list:
+            self.assertNotIn("PRIVATE-PLACE",call.args[1])
+            self.assertNotIn("PRIVATE-DETAILS",call.args[1])
+        self.bot.send_message.reset_mock()
+        self.assertEqual(services.accept_open_request(rid,self.helper,self.author,token),"created")
+        await handlers.notify_match(self.bot,rid)
         helper_parts=[call.args[1] for call in self.bot.send_message.await_args_list if call.args[0]==self.tg(self.helper)]
         self.assertGreater(len(helper_parts),1)
         restored="".join(unescape(part.split("</b>\n\n",1)[1]) for part in helper_parts)

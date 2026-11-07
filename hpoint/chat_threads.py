@@ -116,6 +116,11 @@ def _payload(db,chat,uid,messages=False):
     selected=request["helper_id"]==chat["user_b_id"]
     author=uid==request["requester_id"]
     active=request["status"]=="in_progress" and selected
+    can_select=author and request["status"]=="open" and candidate_status=="applied"
+    if can_select:
+        funded=not request["reward_rub"] or request["reward_payment_status"]=="paid"
+        busy=db.execute("SELECT 1 FROM requests WHERE helper_id=? AND status='in_progress' LIMIT 1",(chat["user_b_id"],)).fetchone()
+        can_select=bool(funded and not busy)
     last=db.execute("SELECT id,text,created_at FROM chat_messages WHERE chat_id=? ORDER BY id DESC LIMIT 1",(chat["id"],)).fetchone()
     result={**dict(chat),"chat_id":chat["id"],"what":request["what"],"status":request["status"],
         "requester_id":request["requester_id"],"helper_id":request["helper_id"],"other_id":other_id,"other_name":other["name"] if other else "Участник",
@@ -123,7 +128,7 @@ def _payload(db,chat,uid,messages=False):
         "reward_rub":int(request["reward_rub"] or 0),"reward_payment_status":request["reward_payment_status"],
         "can_send":active or (request["status"]=="open" and candidate_status in ("applied","offered")),
         "can_complete":active and author,"can_cancel":request["status"] in ("open","in_progress") and (author or active),
-        "can_select":author and request["status"]=="open" and candidate_status=="applied",
+        "can_select":can_select,
         "can_withdraw":not author and request["status"]=="open" and candidate_status=="applied",
         "can_decline":not author and request["status"]=="open" and candidate_status=="offered",
         "last_message":last["text"] if last else None,"last_message_id":last["id"] if last else 0,

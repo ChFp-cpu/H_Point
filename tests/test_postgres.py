@@ -9,6 +9,7 @@ import uuid
 from hpoint import database, services, billing, reliability, workflow
 from scripts.set_test_balances import set_test_balances
 from test_reliability import Scenarios
+from help_fixtures import choose_helper
 
 
 class IsolatedPostgres(database.PostgresConnection):
@@ -89,7 +90,7 @@ class Postgres(Scenarios, unittest.TestCase):
     def test_legacy_postgres_chat_unique_constraint_migrates_without_losing_history(self):
         from hpoint import chat_threads
         rid=self.request()
-        self.assertEqual(services.accept_open_request(rid,2),"created")
+        self.assertEqual(choose_helper(rid,2),"created")
         cid=database.get_or_create_chat_for_request(rid)
         chat_threads.send_message(self.db,2,"Legacy history",chat_id=cid)
         self.db.execute("ALTER TABLE chats ADD CONSTRAINT legacy_one_chat_per_request UNIQUE(request_id)")
@@ -101,20 +102,20 @@ class Postgres(Scenarios, unittest.TestCase):
 
     def test_race_two_helpers_one_request(self):
         rid = self.request()
-        result = self.race(lambda: services.accept_open_request(rid,2), lambda: services.accept_open_request(rid,3))
+        result = self.race(lambda: choose_helper(rid,2), lambda: choose_helper(rid,3))
         self.assertEqual(result.count("created"),1)
         self.assertIn(database.get_request(rid)["helper_id"],(2,3))
 
     def test_race_one_helper_two_requests(self):
         first, second = self.request(), self.request(owner=3)
-        result = self.race(lambda:services.accept_open_request(first,2),lambda:services.accept_open_request(second,2))
+        result = self.race(lambda:choose_helper(first,2),lambda:choose_helper(second,2))
         self.assertEqual(result.count("created"),1)
         self.assertEqual(self.db.execute("SELECT COUNT(*) n FROM requests WHERE helper_id=2 AND status='in_progress'").fetchone()["n"],1)
 
     def test_race_reverse_pair_gets_one_hp_settlement(self):
         first, second = self.request(), self.request(owner=2)
-        services.accept_open_request(first,2)
-        services.accept_open_request(second,1)
+        choose_helper(first,2)
+        choose_helper(second,1)
         result = self.race(lambda:services.complete_request(first,2,confirmed_by=1),lambda:services.complete_request(second,1,confirmed_by=2))
         self.assertEqual(result,[True,True])
         self.assertEqual(self.db.execute("SELECT SUM(hp_settled) n FROM requests WHERE status='done'").fetchone()["n"],1)
@@ -122,7 +123,7 @@ class Postgres(Scenarios, unittest.TestCase):
 
     def test_race_complete_and_admin_cancel_settles_once(self):
         rid = self.funded()
-        services.accept_open_request(rid,2)
+        choose_helper(rid,2)
         result = self.race(lambda:services.complete_request(rid,2,confirmed_by=1),lambda:database.admin_cancel_request(4,rid)[0])
         self.assertEqual(sum(result),1)
         self.assertEqual(sum(reliability.wallet_balances(self.db,u)[0] for u in (1,2))+workflow.platform_income(self.db)["earned_test_rub"],500)
@@ -215,7 +216,7 @@ class Postgres(Scenarios, unittest.TestCase):
     def test_race_expiry_and_acceptance_never_refunds_active_help(self):
         rid=self.funded()
         self.db.execute("UPDATE requests SET expires_at='2020-01-01T00:00:00+00:00' WHERE id=?",(rid,))
-        self.race(services.expire_open_requests,lambda:services.accept_open_request(rid,2))
+        self.race(services.expire_open_requests,lambda:choose_helper(rid,2))
         row=database.get_request(rid)
         if row["status"]=="in_progress":
             self.assertEqual(row["reward_payment_status"],"paid")
@@ -226,7 +227,7 @@ class Postgres(Scenarios, unittest.TestCase):
 
     def test_race_dispute_and_completion_is_atomic(self):
         rid=self.funded()
-        services.accept_open_request(rid,2)
+        choose_helper(rid,2)
         def dispute():
             try:return database.create_request_dispute(rid,2,"Synthetic dispute")
             except ValueError:return None

@@ -42,9 +42,13 @@ class Core(unittest.TestCase):
         self.assertTrue(services.offer_helper(second,2))
         self.assertEqual(len(services.get_helper_offers(2)),2)
         self.assertTrue(services.respond_to_helper_offer(first,2,True))
-        self.assertFalse(services.respond_to_helper_offer(second,2,True))
+        self.assertTrue(services.respond_to_helper_offer(second,2,True))
         self.assertEqual(database.get_request(own)["status"],"open")
         self.assertEqual(database.get_request(second)["status"],"open")
+        self.assertEqual(database.get_request(first)["status"],"open")
+        token=services.get_helper_applications(2)[0]["application_token"]
+        application=next(row for row in services.get_request_applications(1) if row["request_id"]==first)
+        self.assertEqual(services.accept_open_request(first,2,author_id=1,application_token=application["application_token"]),"created")
         self.assertEqual(database.get_request(first)["helper_id"],2)
     def test_match_uses_reviews_of_helper_and_selected_categories(self):
         self.add(1);self.add(2);services.add_to_queue(2)
@@ -70,9 +74,12 @@ class Core(unittest.TestCase):
         services.add_to_queue(3)
         self.assertTrue(services.offer_helper(rid,3))
         self.assertTrue(services.respond_to_helper_offer(rid,3,True))
+        self.assertEqual(database.get_request(rid)["status"],"open")
+        application=services.get_request_applications(1)[0]
+        self.assertEqual(services.accept_open_request(rid,3,author_id=1,application_token=application["application_token"]),"created")
         self.assertEqual(database.get_request(rid)["status"],"in_progress")
         self.assertEqual(database.get_request(rid)["helper_id"],3)
-        self.assertFalse(services.is_in_queue(3))
+        self.assertTrue(services.is_in_queue(3))
     def test_auth_attempts_are_rate_limited_and_clear_on_success(self):
         self.assertFalse(database.auth_is_rate_limited("login","person@example.com",3))
         for _ in range(3): database.record_auth_failure("login","person@example.com")

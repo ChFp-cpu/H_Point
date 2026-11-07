@@ -623,11 +623,15 @@ class Web(unittest.TestCase):
    with urllib.request.urlopen(urllib.request.Request(base+"/api/helper/offers",headers=headers),timeout=3) as response:self.assertEqual(json.load(response)["offers"][0]["request_id"],rid)
    response_request=urllib.request.Request(base+"/api/helper/offers/respond",data=json.dumps({"request_id":rid,"accept":True,"offer_token":services.get_current_helper_offer(rid)["offer_token"]}).encode(),headers=headers,method="POST")
    with urllib.request.urlopen(response_request,timeout=3) as response:self.assertTrue(json.load(response)["accepted"])
-   request=database.get_request(rid);self.assertEqual(request["helper_id"],2);self.assertEqual(request["status"],"in_progress")
+   request=database.get_request(rid);self.assertIsNone(request["helper_id"]);self.assertEqual(request["status"],"open")
+   application=services.get_request_applications(1)[0]
+   choose=urllib.request.Request(base+"/api/requests/response/accept",data=json.dumps({"request_id":rid,"helper_id":2,"application_token":application["application_token"]}).encode(),headers=requester_headers,method="POST")
+   with urllib.request.urlopen(choose,timeout=3) as response:self.assertTrue(json.load(response)["matched"])
+   self.assertEqual(database.get_request(rid)["helper_id"],2)
    self.assertIsNotNone(web.chat_for_request(rid))
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
- def test_helper_with_own_request_can_accept_another_request(self):
+ def test_helper_with_own_request_can_respond_to_another_request(self):
   self.add_user(1,"Requester");self.add_user(2,"Busy helper")
   target=services.create_request(1,{"what":"Нужна помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
   services.create_request(2,{"what":"Моя активная заявка","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
@@ -636,11 +640,13 @@ class Web(unittest.TestCase):
   try:
    base=f"http://127.0.0.1:{server.server_address[1]}";headers={"Cookie":f"hpoint_session={token}","Content-Type":"application/json"}
    req=urllib.request.Request(base+"/api/requests/accept",data=json.dumps({"request_id":target}).encode(),headers=headers,method="POST")
-   with urllib.request.urlopen(req,timeout=3) as response:self.assertTrue(json.load(response)["matched"])
+   with urllib.request.urlopen(req,timeout=3) as response:
+    result=json.load(response)
+    self.assertFalse(result["matched"]);self.assertTrue(result["chat_id"])
    self.assertFalse(services.is_in_queue(2))
-   self.assertEqual(database.get_request(target)["status"],"in_progress")
-   self.assertEqual(database.get_request(target)["helper_id"],2)
-   self.assertIsNotNone(web.chat_for_request(target))
+   self.assertEqual(database.get_request(target)["status"],"open")
+   self.assertIsNone(database.get_request(target)["helper_id"])
+   self.assertEqual(services.get_helper_applications(2)[0]["request_id"],target)
   finally:
    server.shutdown();thread.join(timeout=3);server.server_close()
  def test_points_purchase_is_disabled_and_device_profile_switching_still_works(self):

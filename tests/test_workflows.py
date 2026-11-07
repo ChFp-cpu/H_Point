@@ -1,3 +1,4 @@
+from help_fixtures import choose_helper
 import sqlite3
 import unittest
 from unittest.mock import patch
@@ -49,7 +50,7 @@ class Workflows(unittest.TestCase):
     def test_commission_is_exactly_once_and_helper_receives_whole_reward(self):
         rid=self.request()
         services.reserve_request_reward(rid,1,460)
-        services.accept_open_request(rid,2)
+        choose_helper(rid,2)
         self.assertTrue(services.complete_request(rid,2,confirmed_by=1))
         self.assertFalse(services.complete_request(rid,2,confirmed_by=1))
         self.assertEqual(database.wallet_summary(2)['test_balance_rub'],400)
@@ -60,7 +61,7 @@ class Workflows(unittest.TestCase):
     def test_either_participant_can_cancel_active_help_and_refund_once(self):
         rid=self.request()
         services.reserve_request_reward(rid,1,460)
-        services.accept_open_request(rid,2)
+        choose_helper(rid,2)
         self.assertFalse(services.cancel_request(rid,3))
         self.assertTrue(services.cancel_request(rid,2,'Plans changed'))
         self.assertFalse(services.cancel_request(rid,1))
