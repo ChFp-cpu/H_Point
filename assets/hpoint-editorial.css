@@ -40,6 +40,30 @@
 .hpEditorial .workspaceRequestMain>b{font-size:17px;line-height:1.5}.hpEditorial .workspaceRequestAuthor{font-size:12px;margin:7px 0}.hpEditorial .workspaceRequestMeta{font-size:12px;line-height:1.7}.hpEditorial .workspaceRequestActions{max-width:245px;gap:8px;flex-wrap:wrap}.hpEditorial .workspaceRequestActions .btn{font-size:12px;white-space:normal}
 .hpEditorial .workspaceCandidate{border:0;padding:20px;background:var(--hp-surface-secondary);border-radius:18px;gap:15px}.hpEditorial .workspaceCandidateAvatar,.hpEditorial .workspaceProfileAvatar{background:var(--hp-hover);color:var(--hp-accent-text);box-shadow:none;border:0;font-style:normal}
 .hpEditorial .workspaceCandidateCopy>b{font-size:17px}.hpEditorial .workspaceCandidateCopy>span{font-size:12px;line-height:1.8}
+.workspaceMatchForm label{display:grid;gap:5px;color:var(--hp-ink);font-size:13px;font-weight:700}
+.workspaceMatchForm label[for]{display:flex;align-items:baseline;flex-wrap:wrap;gap:6px}
+.workspaceMatchForm label small{color:var(--hp-muted);font-weight:500}
+.workspaceMatchForm textarea{resize:vertical}
+.workspaceMatchButtons{display:flex;flex-wrap:wrap;gap:8px}
+.workspaceMatchResults{margin-top:24px}
+.workspaceMatchResults h3+.workspaceEmpty,.workspaceMatchResults .workspaceRequestList{margin-top:10px}
+.workspaceMatchLoading{min-height:100px}
+.hpEditorial .workspaceMatchCandidate{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:start}
+.workspaceMatchCandidateHeading{display:flex;align-items:center;flex-wrap:wrap;gap:8px;color:var(--hp-ink);overflow-wrap:anywhere}
+.workspaceMatchCandidateHeading b{white-space:normal;font-size:16px}
+.workspaceMatchPercent{padding:4px 8px;border-radius:9px;background:var(--hp-hover);color:var(--hp-accent-text);font-size:15px;font-weight:800;white-space:nowrap}
+.workspaceMatchFactors{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 15px;margin:12px 0 0}
+.workspaceMatchFactors>div{min-width:0;padding-top:8px;border-top:1px solid var(--hp-line);overflow-wrap:anywhere}
+.workspaceMatchFactors dt{color:var(--hp-ink);font-size:12px;font-weight:700}
+.workspaceMatchFactors dt span{display:inline-block;margin-left:3px;color:var(--hp-muted);font-size:11px;font-weight:600}
+.workspaceMatchFactors dt span[data-match-status=matched]{color:var(--hp-accent-text)}
+.workspaceMatchFactors dd{margin:3px 0 0;color:var(--hp-muted);font-size:12px;line-height:1.45}
+@media(max-width:600px){
+  .hpEditorial .workspaceMatchCandidate{grid-template-columns:auto minmax(0,1fr)}
+  .workspaceMatchCandidate>.btn{grid-column:1/-1}
+  .workspaceMatchFactors{grid-template-columns:1fr;gap:6px}
+}
+@media(max-width:420px){.workspaceMatchButtons .btn{width:100%}}
 .hpEditorial .homeTasks{margin-top:8px}.hpEditorial .workspaceFocus{background:var(--hp-surface)!important;min-height:230px;border:0;box-shadow:var(--hp-shadow)}
 .hpEditorial .workspaceFocus h2{font-size:30px;line-height:1.3;margin:14px 0}.hpEditorial .workspaceFocus p{font-size:14px;max-width:600px;line-height:1.8}
 .hpEditorial .workspaceStatus{font-size:10px;letter-spacing:.09em;color:var(--hp-accent-text)}.hpEditorial .workspaceFocus:before,.hpEditorial .workspaceFocus:after{display:none}

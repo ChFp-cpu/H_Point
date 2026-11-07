@@ -269,11 +269,18 @@ class HelperBot(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(services.get_candidates_for_request(self.request(self.other)))
 
     async def test_matching_card_explains_reasons_without_fake_percent(self):
-        text=await handlers._candidate_card(dict(name="<Synthetic>",rating=4.7,reviews=3,score=137,
-            match_reasons=["Подходит категория", "Расстояние < 2 км"],distance_km=1.5))
-        self.assertNotIn("%",text)
-        self.assertIn("Подходит категория",text)
-        self.assertIn("Расстояние &lt; 2 км",text)
+        candidate=dict(name="<Synthetic>",rating=4.7,reviews=3,score=137,
+            match_percent=81,distance_km=1.5,match_factors=[
+                dict(label="Категория",detail="Техника",status="matched"),
+                dict(label="Расстояние",detail="< 2 км",status="matched"),
+                dict(label="Время",detail="Не задано",status="not_applicable"),
+            ])
+        text=await handlers._candidate_card(candidate)
+        self.assertIn("81% совпадения",text)
+        self.assertNotIn("137%",text)
+        self.assertIn("Категория — Техника",text)
+        self.assertIn("Расстояние — &lt; 2 км",text)
+        self.assertNotIn("Не задано",text)
         self.assertIn("&lt;Synthetic&gt;",text)
 
     async def test_candidate_chat_replies_are_free_before_assignment(self):

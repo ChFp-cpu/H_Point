@@ -251,6 +251,7 @@ class Scenarios:
         for _ in range(105):self.request(lat=59.93, lon=30.31)
         self.db.execute("UPDATE users SET lat=55.751,lon=37.621,helper_radius_km=10,helper_available_from='2030-01-01T08:00:00+00:00',helper_available_until='2030-01-01T10:00:00+00:00' WHERE user_id=2")
         self.assertEqual([r["request"]["id"] for r in services.smart_requests_for_helper(2)], [target])
+        services.set_helper_categories(2,["tech"])
         services.add_to_queue(2)
         self.assertIn(2, [r["user_id"] for r in services.smart_match(target)])
         self.db.execute("UPDATE users SET helper_available_until='2030-01-01T08:30:00+00:00' WHERE user_id=2")

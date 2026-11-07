@@ -120,8 +120,8 @@ class Billing(unittest.TestCase):
  def test_pro_new_price_duration_and_real_priority_without_rating_changes(self):
   rid=self.request()
   database.create_user(2,"helper")
-  services.add_to_queue(1);services.add_to_queue(2)
-  helper_request=services.create_request(2,{"what":"Помощь","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test"})
+  services.add_to_queue(1);services.add_to_queue(2);services.set_helper_categories(1,["tech"])
+  helper_request=services.create_request(2,{"what":"Помощь с компьютером","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test","category":"tech"})
   before_score=services.match_score(database.get_request(rid),2)
   before_candidate=next(row for row in services.smart_match(helper_request) if row["user_id"]==1)["score"]
   database.wallet_add_entry(1,500,"test","test","wallet-test")

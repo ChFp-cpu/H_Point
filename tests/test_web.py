@@ -359,7 +359,7 @@ class Web(unittest.TestCase):
     return urllib.request.urlopen(urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers={"Content-Type":"application/json","Cookie":cookie},method="POST"),timeout=3)
    with post("/api/helper/queue",{"lat":55.752,"lon":37.62},f"hpoint_session={helper_token}") as response:
     self.assertTrue(json.load(response)["ok"])
-   with urllib.request.urlopen(urllib.request.Request(base+f"/api/smart-match?request_id={rid}",headers={"Cookie":f"hpoint_session={requester_token}"}),timeout=3) as response:
+   with urllib.request.urlopen(urllib.request.Request(base+f"/api/smart-match?request_id={rid}&mode=manual",headers={"Cookie":f"hpoint_session={requester_token}"}),timeout=3) as response:
     candidate=json.load(response)["matches"][0]
    self.assertIsNotNone(candidate["distance_km"]);self.assertIsNone(candidate["lat"]);self.assertIsNone(candidate["lon"])
    with urllib.request.urlopen(urllib.request.Request(base+"/api/map/active",headers={"Cookie":f"hpoint_session={helper_token}"}),timeout=3) as response:

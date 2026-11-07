@@ -437,15 +437,16 @@ async def cmd_ask(message: Message, state: FSMContext) -> None:
     if not request or request["status"] != STATUS_OPEN:
         await message.answer("Сначала создайте открытую заявку через «🆘 Мне нужна помощь». Затем напишите, например: /ask нужен человек с опытом техники.")
         return
-    matches = smart_match(request["id"], limit=3, query=question)
+    matches = [candidate for candidate in smart_match(request["id"], limit=3, query=question) if candidate["can_invite"]]
     if not matches:
-        await message.answer("Пока подходящих свободных помощников нет. Попробуйте позже или расширьте описание заявки.")
+        await message.answer("Пока подходящих свободных помощников нет. Попробуйте изменить уточнение или повторить подбор позже.")
         return
     text = "⚡ <b>Подбор кандидатов</b>\n\n"
     for index, candidate in enumerate(matches, start=1):
-        reasons = ", ".join(candidate.get("reasons") or ["по параметрам заявки"])
-        distance = f" · {candidate['distance_km']} км" if candidate.get("distance_km") is not None else ""
-        text += f"{index}. <b>{escape(candidate['name'])}</b> — {escape(reasons)}{distance}\n"
+        fit, factors = _candidate_match_fit(candidate)
+        reasons = " · ".join(factors[:3])
+        fit_suffix = f" — {fit}" if fit else ""
+        text += f"{index}. <b>{escape(candidate['name'])}</b>{fit_suffix}\n{reasons}\n"
     text += "\nОткройте «⚡ Подобрать кандидатов», чтобы пригласить людей и обсудить задачу перед выбором."
     await message.answer(text, reply_markup=main_menu_kb())
 
@@ -965,20 +966,37 @@ async def cb_set_category(callback: CallbackQuery) -> None:
     await callback.message.edit_reply_markup(reply_markup=settings_categories_kb(selected))
 
 
+def _candidate_match_fit(candidate: dict) -> tuple[str, list[str]]:
+    percent = candidate.get("match_percent")
+    fit = f"<b>{percent}% совпадения</b>" if percent is not None else ""
+    factors = [
+        escape(f"{factor['label']} — {factor['detail']}")
+        for factor in candidate.get("match_factors", [])
+        if factor["status"] != "not_applicable"
+    ]
+    if not factors:
+        factors = [
+            escape(reason)
+            for reason in candidate.get("match_reasons") or candidate.get("reasons") or []
+            if isinstance(reason, str)
+        ]
+    return fit, factors
+
+
 async def _candidate_card(candidate: dict) -> str:
     verified = (" ✓" if candidate.get("verified") else "")+(" · PRO" if candidate.get("pro_active") else "")
     rating = candidate.get("rating") or 0
     reviews = int(candidate.get("reviews") or 0)
     distance = candidate.get("distance_km")
     distance_text = f"{distance} км" if distance is not None else "расстояние неизвестно"
-    reasons = candidate.get("match_reasons") or candidate.get("reasons") or []
-    reasons = [str(item) for item in reasons if isinstance(item, str)]
-    explanation = "\n" + "\n".join("• " + escape(reason) for reason in reasons[:4]) if reasons else ""
+    fit, factors = _candidate_match_fit(candidate)
+    explanation = "\n" + "\n".join("• " + reason for reason in factors) if factors else ""
     username = f" (@{escape(candidate['username'])})" if candidate.get("username") else ""
     return (
         ("📨 <b>Откликнулся на вашу заявку</b>\n" if candidate.get("applied") else "")
         + f"👤 <b>{escape(candidate.get('name') or 'Пользователь')}</b>{verified}{username}\n"
-        f"⭐ {rating:.1f}/5 · {reviews} отзывов\n"
+        + (fit + "\n" if fit else "")
+        + f"⭐ {rating:.1f}/5 · {reviews} отзывов\n"
         f"📍 {distance_text}{explanation}"
     )
 
@@ -999,7 +1017,7 @@ async def _show_candidates(message: Message, request_id: int, *, edit: bool = Fa
             await message.answer(text, reply_markup=main_menu_kb())
         return
 
-    matches = get_candidates_for_request(request_id, limit=20)
+    matches = [candidate for candidate in get_candidates_for_request(request_id) if not candidate["offered"]]
     offers = get_request_helper_offers(request_id)
     waiting = (f"\n\n⏳ Приглашений без ответа: {len(offers)}. Можно предложить заявку нескольким людям, обсудить детали и выбрать одного исполнителя." if offers else "")
     if not matches:
@@ -1015,10 +1033,13 @@ async def _show_candidates(message: Message, request_id: int, *, edit: bool = Fa
             await message.answer(text, reply_markup=markup)
         return
 
+    recommended = sum(candidate["can_invite"] for candidate in matches)
+    applications = sum(candidate["applied"] for candidate in matches)
     header = (
         f"⚡ <b>Кандидаты для помощи «{request_title(request_id)}»</b>\n\n"
         f"{escape(req['what'])}\n\n"
-        f"Найдено: <b>{len(matches)}</b>. Сначала обсудите задачу с подходящими людьми. Только вы выбираете исполнителя из откликнувшихся.{waiting}"
+        f"Рекомендаций: <b>{recommended}</b>. Откликов: <b>{applications}</b>. "
+        f"Сначала обсудите задачу с подходящими людьми. Только вы выбираете исполнителя из откликнувшихся.{waiting}"
     )
     if edit:
         await message.edit_text(header)

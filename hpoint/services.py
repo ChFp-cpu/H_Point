@@ -108,6 +108,10 @@ def matches_helper_preferences(request, helper, distance, *, require_location=Tr
     if radius:
         if distance is None and require_location:return False
         if distance is not None and distance>radius:return False
+    return _matches_helper_schedule(request,helper)
+
+
+def _matches_helper_schedule(request, helper):
     try:
         at=_schedule_datetime(request["scheduled_at"]) or datetime.now(timezone.utc)
         start=_schedule_datetime(helper["helper_available_from"])
@@ -847,20 +851,14 @@ def _stored_categories(helper):
     except (TypeError,ValueError):return []
 
 
-def _match_factors(request,helper,rating=0,reviews=0,query="",*,require_location=True):
-    """Explainable ranking points, not a probability of successful help."""
+def _match_factors(request,helper,rating=0,reviews=0,*,require_location=True):
+    """Keep historical ranking points separate from the match percentage."""
     categories=_stored_categories(helper)
     explicit=request["category"] in categories
     category_match=explicit or not categories
     known=_location_known(request,helper)
     distance=haversine_km(request["lat"],request["lon"],helper["lat"],helper["lon"]) if known else None
     available=matches_helper_preferences(request,helper,distance,require_location=require_location)
-    text=" ".join(str(helper[field] or "") for field in ("name","username","city","bio"))
-    text+=" "+" ".join(str(CATEGORIES[category]) for category in categories)
-    words=_query_terms(text)
-    terms=_query_terms(query)
-    hits=sum(any(term==word or (len(term)>=4 and len(word)>=4 and (term.startswith(word) or word.startswith(term))) for word in words) for term in terms)
-    query_match=not terms or hits==len(terms)
     score=(100 if explicit else 45 if category_match else 0)+(20 if available else 0)
     score+=float(rating)*12+min(int(reviews),10)
     score+=max(0,30-distance*3) if distance is not None else 0
@@ -868,7 +866,6 @@ def _match_factors(request,helper,rating=0,reviews=0,query="",*,require_location
     pro=_entitlement_active(helper["pro_until"])
     score+=12 if verified else 0
     score+=8 if pro and category_match and available else 0
-    score+=min(24,hits*8) if query_match else 0
     reasons=[]
     if explicit:reasons.append("подходит по категории")
     elif not categories:reasons.append("готов помогать в разных категориях")
@@ -884,9 +881,8 @@ def _match_factors(request,helper,rating=0,reviews=0,query="",*,require_location
             reasons.append("подходит по времени")
     if reviews:reasons.append("есть рейтинг за завершённую помощь")
     if verified:reasons.append("Личность подтверждена")
-    if terms and query_match:reasons.append("соответствует уточнению")
     return {"score":round(score,1),"category_match":category_match,"profile_match":explicit,
-            "available":available,"query_match":query_match,"distance_km":round(distance,2) if distance is not None else None,
+            "available":available,"distance_km":round(distance,2) if distance is not None else None,
             "location_known":known,"pro_active":pro,"verified":verified,"reasons":reasons}
 
 
@@ -905,13 +901,119 @@ def haversine_km(lat1, lon1, lat2, lon2):
     a=sin(dlat/2)**2+cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
     return 6371*2*asin(sqrt(min(1,max(0,a))))
 
-def _query_terms(query):
-    stop={"мне","нам","нужен","нужна","нужно","нужны","ищу","ищем","помощь","помочь","человек","для","кто","как","или","это"}
-    return {word for word in re.findall(r"[a-zа-я0-9]{3,}",str(query or "").lower().replace("ё","е")) if word not in stop}
+SMART_MATCH_LIMIT = 5
+MANUAL_MATCH_LIMIT = 20
+_MATCH_CONTACT = re.compile(r"(?:https?://|www\.)\S+|[\w.+%'-]+@(?:[\w-]+\.)+[\w-]+", re.IGNORECASE)
+_MATCH_STOP = frozenset({
+    "мне", "нам", "нужен", "нужна", "нужно", "нужны", "надо", "ищу", "ищем", "помощь", "помощник",
+    "помочь", "человек", "для", "кто", "как", "или", "это", "чтобы", "если", "есть", "может", "могу",
+    "просто", "срочно", "сегодня", "завтра", "сейчас", "пожалуйста", "сделать", "делать", "умеет", "опытом",
+})
+_TASK_STOP = frozenset({"настроить", "починить", "заменить", "убрать", "принести", "собрать", "ремонт", "задача"})
 
-def smart_match(request_id, limit=20, query=""):
+
+def _match_terms(text, *, title=False):
+    # Ignore contacts an autofill manager may supply to the skill field.
+    text = _MATCH_CONTACT.sub(" ", str(text or "")).lower().replace("ё", "е")
+    words = set(re.findall(r"[a-zа-я0-9]{3,}", text))
+    return words - _MATCH_STOP - (_TASK_STOP if title else frozenset())
+
+
+def _matched_terms(terms, words):
+    return sorted(term for term in terms if any(
+        term == word or (min(len(term), len(word)) >= 4 and (term.startswith(word) or word.startswith(term)))
+        for word in words
+    ))
+
+
+def _request_match_fit(request, helper, base, task_terms, requirement_terms):
+    criteria = []
+
+    def add(key, label, detail, points, maximum, status):
+        criteria.append({"key": key, "label": label, "detail": detail,
+                         "points": points, "max_points": maximum, "status": status})
+
+    category = request["category"]
+    categories = _stored_categories(helper)
+    known_category = category in CATEGORIES and category != "other"
+    category_match = known_category and base["profile_match"]
+    if not known_category:
+        add("category", "Сфера помощи", "В заявке не указана специальная категория", 0, 0, "not_applicable")
+    elif category_match:
+        name = CATEGORIES[category].split(" ", 1)[1]
+        add("category", "Сфера помощи", f"Выбрал сферу «{name}»", 45, 45, "matched")
+    elif not categories:
+        add("category", "Сфера помощи", "Помощник не указал специализацию", 0, 45, "unknown")
+    else:
+        name = CATEGORIES[category].split(" ", 1)[1]
+        add("category", "Сфера помощи", f"Не выбрал сферу «{name}»", 0, 45, "mismatch")
+
+    bio = _match_terms(helper["bio"], title=True)
+    task_hits = _matched_terms(task_terms, bio)
+    if not task_terms:
+        add("profile", "Навыки по задаче", "В названии заявки нет конкретного навыка", 0, 0, "not_applicable")
+    elif task_hits:
+        add("profile", "Навыки по задаче", "В профиле есть слова по задаче: " + ", ".join(task_hits),
+            round(25 * len(task_hits) / len(task_terms)), 25,
+            "matched" if len(task_hits) == len(task_terms) else "partial")
+    else:
+        add("profile", "Навыки по задаче", "Совпадений с названием заявки в профиле нет", 0, 25,
+            "mismatch" if bio else "unknown")
+
+    requirement_hits = []
+    meets_requirements = True
+    if requirement_terms:
+        skills = _match_terms(helper["bio"]) | _match_terms(" ".join(CATEGORIES[item] for item in categories))
+        requirement_hits = _matched_terms(requirement_terms, skills)
+        hit_count = len(requirement_hits)
+        meets_requirements = hit_count >= max(min(len(requirement_terms), 2), (len(requirement_terms) + 1) // 2)
+        add("requirements", "Уточнение", "Совпало в профиле: " + ", ".join(requirement_hits)
+            if requirement_hits else "В профиле нет совпадений с уточнением",
+            round(25 * hit_count / len(requirement_terms)), 25,
+            "matched" if hit_count == len(requirement_terms) else "partial" if hit_count else "mismatch")
+
+    distance = base["distance_km"]
+    radius = int(helper["helper_radius_km"] or 0)
+    if not _location_known(request, request):
+        add("distance", "Расстояние", "В заявке не указана точка", 0, 0, "not_applicable")
+    elif distance is None:
+        add("distance", "Расстояние", "Помощник не указал точку", 0, 20, "unknown")
+    else:
+        distance_text = f"{distance:g}".replace(".", ",") + " км до заявки"
+        if radius and distance > radius:
+            add("distance", "Расстояние", distance_text + f" · вне радиуса {radius} км", 0, 20, "mismatch")
+        else:
+            points = round(20 * max(0, min(1, (30 - distance) / 27)))
+            if radius:
+                distance_text += f" · в радиусе {radius} км"
+            add("distance", "Расстояние", distance_text, points, 20,
+                "matched" if points == 20 else "partial" if points else "mismatch")
+
+    if not request["scheduled_at"]:
+        add("availability", "Время", "В заявке нет точного времени, согласуйте его в чате", 0, 0, "not_applicable")
+    elif not (helper["helper_available_from"] or helper["helper_available_until"]):
+        add("availability", "Время", "Помощник не указал часы доступности", 0, 10, "unknown")
+    elif _matches_helper_schedule(request, helper):
+        add("availability", "Время", "Время заявки входит в часы доступности", 10, 10, "matched")
+    else:
+        add("availability", "Время", "Время заявки вне часов доступности", 0, 10, "mismatch")
+
+    points = sum(criterion["points"] for criterion in criteria)
+    maximum = sum(criterion["max_points"] for criterion in criteria)
+    percent = round(100 * points / maximum) if maximum else 0
+    has_evidence = category_match or bool(task_hits) or bool(requirement_hits and meets_requirements)
+    return percent, criteria, has_evidence, meets_requirements
+
+
+def smart_match(request_id, limit=None, query="", *, mode="recommended"):
     req=get_request(request_id)
     if not _open_for_responses(req) or (int(req["reward_rub"] or 0)>0 and req["reward_payment_status"]!="paid"):return []
+    manual = mode == "manual"
+    cap = MANUAL_MATCH_LIMIT if manual else SMART_MATCH_LIMIT
+    if limit is not None:
+        cap = max(1, min(int(limit), cap))
+    task_terms = _match_terms(req["what"], title=True)
+    requirement_terms = _match_terms(query)
     rows=db.execute("""SELECT u.*,q.user_id queue_user_id,rc.status candidate_status,rc.offer_token,
                        EXISTS(SELECT 1 FROM requests active WHERE active.helper_id=u.user_id AND active.status='in_progress') helper_busy,
                        COALESCE(stats.rating,0) helper_rating,COALESCE(stats.reviews,0) helper_reviews
@@ -931,18 +1033,21 @@ def smart_match(request_id, limit=20, query=""):
         busy=bool(u["helper_busy"])
         ready=u["queue_user_id"] is not None
         rating=float(u["helper_rating"] or 0)
-        factors=_match_factors(req,u,rating,u["helper_reviews"],query)
-        suitable=factors["category_match"] and factors["available"] and factors["query_match"] and not busy
+        factors=_match_factors(req,u,rating,u["helper_reviews"])
+        percent,criteria,has_evidence,query_match = _request_match_fit(req,u,factors,task_terms,requirement_terms)
+        suitable=factors["category_match"] and factors["available"] and query_match and not busy
         # Existing conversations remain manageable even after a preference or
         # availability change. They are visibly distinct from recommendations.
-        if not (applied or offered) and not (ready and suitable):continue
+        if not (applied or offered) and not (ready and suitable and (manual or has_evidence)):continue
         reasons=factors.pop("reasons")
+        if requirement_terms and query_match:reasons.append("соответствует уточнению")
         if applied:reasons.insert(0,"откликнулся на вашу заявку")
         elif offered:reasons.insert(0,"приглашение отправлено, ожидается ответ")
         if busy:reasons.append("сейчас занят другой помощью")
         elif not ready:reasons.append("автоматический подбор приостановлен")
         out.append({"user_id":u["user_id"],"name":u["name"],"username":u["username"],"rating":round(rating,1),
                     "reviews":int(u["helper_reviews"] or 0),**factors,"applied":applied,"offered":offered,
+                    "match_percent":percent,"match_factors":criteria,"query_match":query_match,
                     "status":status,"application_status":status,"helper_ready":ready,"helper_busy":busy,
                     "eligible":not busy and (applied or (ready and suitable)),"can_select":applied and not busy,
                     "can_invite":ready and suitable and not (applied or offered),
@@ -951,10 +1056,12 @@ def smart_match(request_id, limit=20, query=""):
                     # Publishing even rounded coordinates would expose a
                     # helper's neighbourhood before they accept the task.
                     "lat":None,"lon":None,"availability":u["helper_availability"] or "По договорённости","reasons":reasons,"match_reasons":reasons})
-    out.sort(key=lambda x:(not x["helper_busy"],x["applied"],x["offered"],x["category_match"],x["available"],x["score"],x["rating"],-(x["distance_km"] if x["distance_km"] is not None else float("inf")),-x["user_id"]),reverse=True)
-    return out[:max(1,min(int(limit),200))]
+    out.sort(key=lambda x:(not x["helper_busy"],x["applied"],x["offered"],x["category_match"],x["available"],x["match_percent"],x["score"],x["rating"],-(x["distance_km"] if x["distance_km"] is not None else float("inf")),-x["user_id"]),reverse=True)
+    existing = [row for row in out if row["applied"] or row["offered"]]
+    new = [row for row in out if not row["applied"] and not row["offered"]]
+    return existing + new[:cap]
 
-def get_candidates_for_request(request_id, limit=20):
+def get_candidates_for_request(request_id, limit=None):
     """Return the same candidate pool used by the website and Telegram."""
     req = get_request(request_id)
     if not req:

@@ -71,6 +71,45 @@ class HelpMatching(unittest.TestCase):
         self.assertEqual(services.smart_match(rid,query="автомеханик"),[])
         self.assertEqual([row["user_id"] for row in services.smart_match(rid,query="компьютер")],[2])
 
+    def test_shortlist_ranks_fit_and_does_not_consume_existing_conversation_slots(self):
+        at=datetime.now(timezone.utc)+timedelta(hours=4)
+        rid=self.request(what="Настроить ноутбук",lat=55.75,lon=37.62,scheduled_at=at.isoformat())
+        self.ready(2,available_until=(at+timedelta(hours=1)).isoformat())
+        self.db.execute("UPDATE users SET bio='Ремонт ноутбуков и компьютеров' WHERE user_id=2")
+        for uid in range(3,9):
+            self.ready(uid)
+        self.ready(9,categories=[])
+        self.ready(11,categories=[])
+        self.assertEqual(services.apply_to_request(rid,10),"created")
+        self.assertTrue(services.offer_helper(rid,11))
+        matches=services.smart_match(rid)
+        self.assertEqual([row["user_id"] for row in matches if row["applied"] or row["offered"]],[10,11])
+        fresh=[row for row in matches if row["can_invite"]]
+        self.assertEqual([row["user_id"] for row in fresh],[2,3,4,5,6])
+        self.assertEqual(fresh[0]["match_percent"],100)
+        self.assertLess(fresh[1]["match_percent"],100)
+        criteria={factor["key"]:factor for factor in fresh[0]["match_factors"]}
+        self.assertIn("Техника",criteria["category"]["detail"])
+        self.assertIn("ноутбук",criteria["profile"]["detail"])
+        self.assertEqual(criteria["availability"]["status"],"matched")
+        self.assertIn(9,[row["user_id"] for row in services.smart_match(rid,mode="manual")])
+        self.db.execute("UPDATE users SET pro_until='2099-01-01T00:00:00+00:00' WHERE user_id=3")
+        paid_match=next(row for row in services.smart_match(rid) if row["user_id"]==3)
+        self.assertEqual(paid_match["match_percent"],fresh[1]["match_percent"])
+
+    def test_generalist_needs_profile_evidence_and_autofilled_email_is_ignored(self):
+        rid=self.request(what="Настроить ноутбук")
+        self.ready(2,categories=[]);self.ready(3,categories=[])
+        self.db.execute("UPDATE users SET bio='Ремонт ноутбуков и настройка Windows' WHERE user_id=2")
+        matches=services.smart_match(rid,query="random.login@example.test")
+        self.assertEqual([row["user_id"] for row in matches],[2])
+        self.assertEqual(matches,services.smart_match(rid))
+        match=services.smart_match(rid,query="random.login@example.test windows")[0]
+        criteria={factor["key"]:factor for factor in match["match_factors"]}
+        self.assertEqual(criteria["requirements"]["status"],"matched")
+        self.assertEqual(criteria["category"]["status"],"unknown")
+        self.assertNotIn("example",criteria["requirements"]["detail"])
+
     def test_ready_is_persistent_opt_in_separate_from_current_busy_state(self):
         first=self.request();self.ready(2)
         self.assertEqual(services.apply_to_request(first,2),"created")

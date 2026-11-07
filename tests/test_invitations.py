@@ -29,6 +29,7 @@ class InvitationData:
             database.create_user(uid, f"User {uid}", tg_user_id=uid, web_verified=True)
             self.db.execute("UPDATE users SET email=?,email_verified=1 WHERE user_id=?",(f"user{uid}@example.test",uid))
             if uid != 1:
+                services.set_helper_categories(uid, ["tech"])
                 services.add_to_queue(uid)
         # These invitation suites exercise several author contracts; tariff tests are separate.
         self.db.execute("UPDATE users SET pro_until='2099-01-01T00:00:00+00:00' WHERE user_id=1")

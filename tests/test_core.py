@@ -28,7 +28,7 @@ class Core(unittest.TestCase):
         services.add_to_queue(2)
         self.db.execute("UPDATE users SET lat=55.75123,lon=37.61987 WHERE user_id=2")
         rid=services.create_request(1,{"what":"Помочь","place":"центр","time_needed":"сегодня","urgency":"🕊 Не срочно","details":"test","lat":55.75,"lon":37.62})
-        match=services.smart_match(rid)[0]
+        match=services.smart_match(rid,mode="manual")[0]
         self.assertEqual((match["lat"],match["lon"]),(None,None))
     def test_helpers_can_request_help_and_receive_multiple_invitations(self):
         for uid in (1,2,3): self.add(uid)
