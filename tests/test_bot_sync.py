@@ -9,6 +9,7 @@ import uuid
 
 from aiogram.types import Chat, Message, User
 from hpoint import chat_threads, database, handlers, services
+from help_fixtures import choose_helper
 from test_bot_personal import MemoryState
 
 
@@ -50,9 +51,7 @@ class BotSyncCases:
         return services.create_request(self.owner,dict(what="Synthetic help",place="Synthetic place",time_needed="Today",urgency="Normal",details="Synthetic conditions",category="tech",**fields))
 
     def assign(self, rid, helper):
-        self.assertEqual(services.apply_to_request(rid, helper), "created")
-        token=self.db.execute("SELECT offer_token FROM request_candidates WHERE request_id=? AND candidate_id=?",(rid,helper)).fetchone()[0]
-        self.assertEqual(services.accept_open_request(rid,helper,author_id=self.owner,application_token=token),"created")
+        self.assertEqual(choose_helper(rid,helper),"created")
 
     async def test_unlinked_transport_cannot_unlink_a_colliding_legacy_profile(self):
         database.create_user(123,"Synthetic legacy profile",email="legacy-sync@example.test",tg_user_id=999999,web_verified=True)
