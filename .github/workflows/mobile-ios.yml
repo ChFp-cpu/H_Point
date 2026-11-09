@@ -1,0 +1,107 @@
+name: Build H-Point for iOS
+
+on:
+  push:
+    branches: [main, codex/flutter-app]
+    paths: [mobile/**, .github/workflows/mobile-ios.yml]
+  pull_request:
+    branches: [main]
+    paths: [mobile/**, .github/workflows/mobile-ios.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hpoint-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: 3.47.9
+  FLUTTER_REVISION: c197ca5199e9ee5661e865596c9c07294dfab51c
+  FLUTTER_SUPPRESS_ANALYTICS: "true"
+  DART_SUPPRESS_ANALYTICS: "true"
+  BUNDLE_ID: ru.gethpoint.hpoint
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Flutter and Xcode
+        run: |
+          flutter_dir="$RUNNER_TEMP/flutter"
+          git clone --quiet --depth 1 --single-branch --branch "$FLUTTER_VERSION" \
+            https://github.com/flutter/flutter.git "$flutter_dir"
+          test "$(git -C "$flutter_dir" rev-parse HEAD)" = "$FLUTTER_REVISION"
+          printf '%s\n' "$flutter_dir/bin" >> "$GITHUB_PATH"
+          "$flutter_dir/bin/flutter" --version
+          xcodebuild -version
+
+      - name: Analyze and test the mobile app
+        run: |
+          flutter pub get --enforce-lockfile
+          flutter analyze --no-pub
+          flutter test --no-pub
+
+      - name: Build the iPhone Simulator app
+        run: flutter build ios --simulator --debug --no-codesign --no-pub
+
+      - name: Install and launch on iPhone Simulator
+        run: |
+          device="$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          phones = [d for runtime, rows in devices.items() if ".iOS-" in runtime
+                    for d in rows if d["name"].startswith("iPhone")]
+          if not phones:
+              raise SystemExit("No available iPhone Simulator")
+          device = next((d for d in phones if d["state"] == "Booted"), phones[0])
+          print(device["udid"])
+          ')"
+          app=build/ios/iphonesimulator/Runner.app
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$app/Info.plist")" = "$BUNDLE_ID"
+          xcrun simctl bootstatus "$device" -b
+          xcrun simctl status_bar "$device" override --time '9:41' --batteryState unplugged --batteryLevel 100
+          xcrun simctl install "$device" "$app"
+          launch="$(xcrun simctl launch "$device" "$BUNDLE_ID")"
+          echo "$launch"
+          pid="${launch##*: }"
+          [[ "$pid" =~ ^[0-9]+$ ]]
+          sleep 12
+          kill -0 "$pid"
+          mkdir -p "$RUNNER_TEMP/hpoint-ios-simulator"
+          xcrun simctl io "$device" screenshot "$RUNNER_TEMP/hpoint-ios-simulator/H-Point-iPhone.png"
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/hpoint-ios-simulator/H-Point-Simulator.zip"
+          xcrun simctl shutdown "$device"
+
+      - name: Upload the verified Simulator build
+        uses: actions/upload-artifact@v7
+        with:
+          name: H-Point-iOS-Simulator
+          path: ${{ runner.temp }}/hpoint-ios-simulator/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Build the unsigned iPhone archive
+        run: |
+          flutter build ipa --release --no-codesign --no-pub
+          archive=build/ios/archive/Runner.xcarchive
+          app="$archive/Products/Applications/Runner.app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$app/Info.plist")" = "$BUNDLE_ID"
+          ditto -c -k --keepParent "$archive" "$RUNNER_TEMP/H-Point-iPhone-Unsigned.xcarchive.zip"
+
+      - name: Upload the unsigned iPhone archive
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ runner.temp }}/H-Point-iPhone-Unsigned.xcarchive.zip
+          archive: false
+          if-no-files-found: error

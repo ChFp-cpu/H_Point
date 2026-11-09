@@ -19,4 +19,20 @@ flutter build apk --release
 
 Результат — `build/app/outputs/flutter-apk/app-release.apk`. Текущая конфигурация подписывает установочную сборку тестовым ключом. Для публикации потребуется ключ загрузки проекта и соответствующая настройка подписи.
 
-Для проверки на отдельной базе можно передать `--dart-define=HPOINT_API_ORIGIN=http://10.0.2.2:8080` в `flutter run` на Android Emulator. HTTP разрешён только для локальных адресов в отладочной сборке. Для iOS используйте macOS с Xcode и настройте подпись Runner.
+Для проверки на отдельной базе можно передать `--dart-define=HPOINT_API_ORIGIN=http://10.0.2.2:8080` в `flutter run` на Android Emulator. HTTP разрешён только для локальных адресов в отладочной сборке.
+
+## Сборка iOS
+
+[Build H-Point for iOS](https://github.com/ChFp-cpu/H_Point/actions/workflows/mobile-ios.yml) собирает приложение на macOS. В артефактах успешного прогона доступны приложение для Simulator, снимок запуска и архив `.xcarchive` для iPhone без подписи.
+
+Локальная сборка на Mac из папки `mobile`:
+
+```sh
+flutter pub get --enforce-lockfile
+flutter build ios --simulator --debug
+open ios/Runner.xcworkspace
+```
+
+Для запуска на своём iPhone выберите команду в **Runner → Signing & Capabilities** в Xcode, подключите iPhone и нажмите **Run**. Для распространения через TestFlight нужен [Apple Developer Program](https://developer.apple.com/programs/) и подпись для Bundle ID `ru.gethpoint.hpoint`. Архив без подписи нельзя установить на iPhone.
+
+Если Mac и аккаунта разработчика нет, откройте [H-Point](https://gethpoint.ru) в Safari, нажмите **Поделиться → На экран «Домой»**, включите **Открывать как веб-приложение**, если этот переключатель доступен, и нажмите **Добавить**.

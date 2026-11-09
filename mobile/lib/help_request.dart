@@ -124,6 +124,7 @@ class _RequestFormState extends State<_RequestForm> {
     try {
       final file = await ImagePicker().pickImage(
         source: ImageSource.gallery,
+        requestFullMetadata: false,
         maxWidth: 1600,
         maxHeight: 1600,
         imageQuality: 86,

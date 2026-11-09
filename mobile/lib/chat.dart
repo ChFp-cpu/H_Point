@@ -314,6 +314,7 @@ class _ThreadPageState extends State<_ThreadPage> {
     try {
       final image = await _picker.pickImage(
         source: ImageSource.gallery,
+        requestFullMetadata: false,
         maxWidth: 1600,
         maxHeight: 1600,
         imageQuality: 80,
