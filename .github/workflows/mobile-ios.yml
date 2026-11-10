@@ -25,8 +25,13 @@ env:
 
 jobs:
   build:
+    name: iOS ${{ matrix.target }}
     runs-on: macos-26
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [simulator, iphone]
     defaults:
       run:
         shell: bash
@@ -46,18 +51,10 @@ jobs:
           "$flutter_dir/bin/flutter" --version
           xcodebuild -version
 
-      - name: Analyze and test the mobile app
+      - name: Start iPhone Simulator
+        if: matrix.target == 'simulator'
         run: |
-          flutter pub get --enforce-lockfile
-          flutter analyze --no-pub
-          flutter test --no-pub
-
-      - name: Build the iPhone Simulator app
-        run: flutter build ios --simulator --debug --no-codesign --no-pub
-
-      - name: Install and launch on iPhone Simulator
-        run: |
-          device="$(xcrun simctl list devices available -j | python3 -c '
+          selection="$(xcrun simctl list devices available -j | python3 -c '
           import json, sys
           devices = json.load(sys.stdin)["devices"]
           phones = [d for runtime, rows in devices.items() if ".iOS-" in runtime
@@ -65,12 +62,34 @@ jobs:
           if not phones:
               raise SystemExit("No available iPhone Simulator")
           device = next((d for d in phones if d["state"] == "Booted"), phones[0])
-          print(device["udid"])
+          print(device["udid"], device["state"])
           ')"
+          read -r device state <<< "$selection"
+          if [[ "$state" != Booted ]]; then
+            xcrun simctl boot "$device"
+          fi
+          printf 'IOS_SIMULATOR_UDID=%s\n' "$device" >> "$GITHUB_ENV"
+
+      - name: Get dependencies
+        run: flutter pub get --enforce-lockfile
+
+      - name: Analyze and test the mobile app
+        if: matrix.target == 'simulator'
+        run: |
+          flutter analyze --no-pub
+          flutter test --no-pub
+
+      - name: Build the iPhone Simulator app
+        if: matrix.target == 'simulator'
+        run: flutter build ios --simulator --debug --no-codesign --no-pub
+
+      - name: Install and launch on iPhone Simulator
+        if: matrix.target == 'simulator'
+        run: |
+          device="$IOS_SIMULATOR_UDID"
           app=build/ios/iphonesimulator/Runner.app
           test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$app/Info.plist")" = "$BUNDLE_ID"
           xcrun simctl bootstatus "$device" -b
-          xcrun simctl status_bar "$device" override --time '9:41' --batteryState unplugged --batteryLevel 100
           xcrun simctl install "$device" "$app"
           launch="$(xcrun simctl launch "$device" "$BUNDLE_ID")"
           echo "$launch"
@@ -84,6 +103,7 @@ jobs:
           xcrun simctl shutdown "$device"
 
       - name: Upload the verified Simulator build
+        if: matrix.target == 'simulator'
         uses: actions/upload-artifact@v7
         with:
           name: H-Point-iOS-Simulator
@@ -92,6 +112,7 @@ jobs:
           compression-level: 0
 
       - name: Build the unsigned iPhone archive
+        if: matrix.target == 'iphone'
         run: |
           flutter build ipa --release --no-codesign --no-pub
           archive=build/ios/archive/Runner.xcarchive
@@ -100,6 +121,7 @@ jobs:
           ditto -c -k --keepParent "$archive" "$RUNNER_TEMP/H-Point-iPhone-Unsigned.xcarchive.zip"
 
       - name: Upload the unsigned iPhone archive
+        if: matrix.target == 'iphone'
         uses: actions/upload-artifact@v7
         with:
           path: ${{ runner.temp }}/H-Point-iPhone-Unsigned.xcarchive.zip
