@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hpoint/api.dart';
 import 'package:hpoint/main.dart';
@@ -22,7 +23,26 @@ class _GuestApi extends HPointApi {
   }
 }
 
+class _UnavailableStorageApi extends _GuestApi {
+  @override
+  Future<void> restore() async {
+    throw PlatformException(
+      code: 'Unexpected security result code',
+      details: -34018,
+    );
+  }
+}
+
 void main() {
+  test('Guest data loads when secure storage cannot read a session', () async {
+    final session = HPointSession(_UnavailableStorageApi());
+    addTearDown(session.dispose);
+    await session.start();
+    expect(session.guest?['guest'], isTrue);
+    expect(session.error, isNull);
+    expect(session.signedIn, isFalse);
+  });
+
   testWidgets(
     'Guest can browse native screens and open email login on a narrow display',
     (tester) async {

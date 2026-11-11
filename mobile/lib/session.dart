@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
 import 'api.dart';
 
@@ -22,7 +23,16 @@ class HPointSession extends ChangeNotifier {
 
   Future<void> start() async {
     try {
-      await api.restore();
+      try {
+        await api.restore();
+      } on PlatformException catch (exception) {
+        if (kDebugMode) {
+          final status = exception.details;
+          debugPrint(
+            'H-Point session storage: ${exception.code} (${status is int ? status : 'unknown status'})',
+          );
+        }
+      }
       await refresh();
     } catch (exception) {
       error = exception is ApiException

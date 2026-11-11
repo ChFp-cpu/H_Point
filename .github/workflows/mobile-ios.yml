@@ -89,14 +89,25 @@ jobs:
           device="$IOS_SIMULATOR_UDID"
           app=build/ios/iphonesimulator/Runner.app
           test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$app/Info.plist")" = "$BUNDLE_ID"
+          # A Simulator build can use an ad hoc signature with its own Keychain group.
+          entitlements="$RUNNER_TEMP/hpoint-simulator.entitlements"
+          /usr/libexec/PlistBuddy \
+            -c "Add :application-identifier string SIMULATOR0.$BUNDLE_ID" \
+            -c "Add :keychain-access-groups array" \
+            -c "Add :keychain-access-groups:0 string SIMULATOR0.$BUNDLE_ID" "$entitlements"
+          codesign --force --sign - --entitlements "$entitlements" "$app"
+          codesign --verify "$app"
           xcrun simctl bootstatus "$device" -b
           xcrun simctl install "$device" "$app"
-          launch="$(xcrun simctl launch "$device" "$BUNDLE_ID")"
+          launch="$(xcrun simctl launch --stdout="$RUNNER_TEMP/hpoint-simulator.log" "$device" "$BUNDLE_ID")"
           echo "$launch"
           pid="${launch##*: }"
           [[ "$pid" =~ ^[0-9]+$ ]]
           sleep 12
           kill -0 "$pid"
+          if [[ -f "$RUNNER_TEMP/hpoint-simulator.log" ]]; then
+            grep -F 'H-Point session storage:' "$RUNNER_TEMP/hpoint-simulator.log" || true
+          fi
           mkdir -p "$RUNNER_TEMP/hpoint-ios-simulator"
           xcrun simctl io "$device" screenshot "$RUNNER_TEMP/hpoint-ios-simulator/H-Point-iPhone.png"
           ditto -c -k --keepParent "$app" "$RUNNER_TEMP/hpoint-ios-simulator/H-Point-Simulator.zip"
