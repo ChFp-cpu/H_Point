@@ -1,22 +1,22 @@
-> Current mode: verified-email registration/login and test money only. Telegram is an optional linked client. New paid requests reserve the helper reward plus a 15% service fee within five minutes; completion requires requester confirmation. Existing agreements preserve their original terms. Commercial workspaces have seven free days, then 490 test RUB per 30 days. See [subscription terms](SUBSCRIPTIONS.md).
+> Current mode: verified-email registration/login and test money only. Telegram is an optional linked client. New paid requests reserve the helper reward plus a 15% service fee within five minutes; completion requires requester confirmation. Existing agreements preserve their original terms. Commercial workspaces have seven free days, then 490 test RUB per 30 days. See [subscription terms](docs/SUBSCRIPTIONS.md).
 
 # H-Point
 
 «Для работы» поддерживает совместные кабинеты организаций: сотрудники и роли,
 объекты, задачи, смены, записи клиентов, сметы, показатели работы и публичные
 страницы услуг. Доступ, публикация и проверочные сценарии описаны в
-[WORKSPACE_QA.md](WORKSPACE_QA.md).
+[WORKSPACE_QA.md](docs/qa/WORKSPACE_QA.md).
 
 Обзор рабочего дня, поиск по кабинету, быстрые связанные записи и экспорт
-расписания в календарь описаны в [проверках удобства кабинета](WORKSPACE_MODERNIZATION_QA.md).
+расписания в календарь описаны в [проверках удобства кабинета](docs/qa/WORKSPACE_MODERNIZATION_QA.md).
 
 Из публичных услуг можно отправлять приватные обращения с фото. Организация
 отвечает во входящих, назначает сотрудника и создаёт клиента и запись.
 Администратору доступна воронка с отдельными группами пилота и демо.
-[Запуск локального демо и сценарий презентации](PITCH_RUNBOOK.md).
+[Запуск локального демо и сценарий презентации](docs/demo/PITCH_RUNBOOK.md).
 
-Для выступления подготовлены [речь и ответы жюри](DEMO_DAY_SPEECH.md),
-[план развития на 90 дней](DEVELOPMENT_ROADMAP.md).
+Для выступления подготовлены [речь и ответы жюри](docs/demo/DEMO_DAY_SPEECH.md),
+[план развития на 90 дней](docs/DEVELOPMENT_ROADMAP.md).
 Полный браузерный прогон на временных базах: `python tests/run_browser_qa.py`.
 
 Доступны девять профессиональных профилей со своими инструментами: тренировки и
@@ -115,7 +115,7 @@ python run_bot.py
 
 ## Развёртывание на VPS
 
-Для запуска production-версии на Ubuntu используйте [короткую инструкцию развёртывания](DEPLOYMENT.md): она запускает сайт, базу, Telegram-бота и HTTPS через Docker Compose. Устанавливать Nginx и Python-зависимости на VPS отдельно не требуется.
+Для запуска production-версии на Ubuntu используйте [короткую инструкцию развёртывания](docs/DEPLOYMENT.md): она запускает сайт, базу, Telegram-бота и HTTPS через Docker Compose. Устанавливать Nginx и Python-зависимости на VPS отдельно не требуется.
 
 ## Игры и достижения за помощь
 

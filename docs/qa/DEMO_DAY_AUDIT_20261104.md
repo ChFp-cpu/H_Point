@@ -102,8 +102,8 @@ Telegram бизнес-логика проверяется fake Bot, а polling �
 Копии находятся на том же VPS; независимое внешнее хранилище ещё не настроено.
 
 Результаты CI и проверки опубликованной версии фиксируются с точным SHA при
-выкладке. Полная речь: [DEMO_DAY_SPEECH.md](DEMO_DAY_SPEECH.md).
-Ближайшее развитие: [DEVELOPMENT_ROADMAP.md](DEVELOPMENT_ROADMAP.md).
+выкладке. Полная речь: [DEMO_DAY_SPEECH.md](../demo/DEMO_DAY_SPEECH.md).
+Ближайшее развитие: [DEVELOPMENT_ROADMAP.md](../DEVELOPMENT_ROADMAP.md).
 
 ## Что осталось сделать самому перед выходом
 
