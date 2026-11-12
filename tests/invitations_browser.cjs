@@ -1,3 +1,5 @@
+const {emailLogin}=require('./email_browser_login.cjs');
+const {openHelpTab}=require('./help_navigation.cjs');
 /* Real two-sided invitation flows against the disposable local QA database. */
 const {chromium}=require('playwright');
 const assert=require('node:assert/strict');
@@ -11,7 +13,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
   const context=await browser.newContext({viewport:{width:390,height:844}});contexts.push(context);
   await context.route('**/*',route=>new URL(route.request().url()).origin===base?route.continue():route.abort());
   const page=await context.newPage();page.on('pageerror',error=>errors.push(error.message));
-  await page.goto(base+'/auth/telegram?ticket='+ticket);await page.locator('#hpointWorkspace').waitFor();
+  await emailLogin(page,ticket);
   return {context,page};
  }
  async function get(actor,route){const response=await actor.context.request.get(base+route);assert.equal(response.status(),200);return response.json()}
@@ -20,7 +22,7 @@ if(!/^http:\/\/127\.0\.0\.1:\d+$/.test(base||''))throw Error('Local QA only');
  async function invite(helper){return post(author,'/api/smart-match/assign',{request_id:1,helper_id:helper})}
  async function match(){
   await author.page.goto(base+'/#/help');await author.page.locator('.helpNavigation').waitFor();
-  await author.page.locator('.helpNavigation [data-tab="match"]').click();
+  await openHelpTab(author.page,'match');
   await author.page.locator('[data-ws-action="match-load"]').waitFor({state:'visible'});
   await author.page.waitForFunction(()=>hpointWorkspace.state.matchLoading===false);
  }

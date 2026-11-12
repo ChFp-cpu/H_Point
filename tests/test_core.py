@@ -28,7 +28,7 @@ class Core(unittest.TestCase):
         services.add_to_queue(2)
         self.db.execute("UPDATE users SET lat=55.75123,lon=37.61987 WHERE user_id=2")
         rid=services.create_request(1,{"what":"Помочь","place":"центр","time_needed":"сегодня","urgency":"🕊 Не срочно","details":"test","lat":55.75,"lon":37.62})
-        match=services.smart_match(rid)[0]
+        match=services.smart_match(rid,mode="manual")[0]
         self.assertEqual((match["lat"],match["lon"]),(None,None))
     def test_helpers_can_request_help_and_receive_multiple_invitations(self):
         for uid in (1,2,3): self.add(uid)
@@ -42,14 +42,18 @@ class Core(unittest.TestCase):
         self.assertTrue(services.offer_helper(second,2))
         self.assertEqual(len(services.get_helper_offers(2)),2)
         self.assertTrue(services.respond_to_helper_offer(first,2,True))
-        self.assertFalse(services.respond_to_helper_offer(second,2,True))
+        self.assertTrue(services.respond_to_helper_offer(second,2,True))
         self.assertEqual(database.get_request(own)["status"],"open")
         self.assertEqual(database.get_request(second)["status"],"open")
+        self.assertEqual(database.get_request(first)["status"],"open")
+        token=services.get_helper_applications(2)[0]["application_token"]
+        application=next(row for row in services.get_request_applications(1) if row["request_id"]==first)
+        self.assertEqual(services.accept_open_request(first,2,author_id=1,application_token=application["application_token"]),"created")
         self.assertEqual(database.get_request(first)["helper_id"],2)
     def test_match_uses_reviews_of_helper_and_selected_categories(self):
         self.add(1);self.add(2);services.add_to_queue(2)
         payload={"what":"Компьютер","place":"центр","time_needed":"сегодня","urgency":"обычная","details":"test","category":"tech"}
-        done=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(done,2));self.assertTrue(services.complete_request(done,2))
+        done=services.create_request(1,payload);self.assertTrue(services.try_assign_helper(done,2));self.assertTrue(services.complete_request(done,2,confirmed_by=1))
         self.assertTrue(services.set_rating(done,1,5));self.assertTrue(services.set_helper_rating(done,2,2))
         services.add_to_queue(2);services.set_helper_categories(2,["tech"])
         rid=services.create_request(1,payload)
@@ -70,9 +74,12 @@ class Core(unittest.TestCase):
         services.add_to_queue(3)
         self.assertTrue(services.offer_helper(rid,3))
         self.assertTrue(services.respond_to_helper_offer(rid,3,True))
+        self.assertEqual(database.get_request(rid)["status"],"open")
+        application=services.get_request_applications(1)[0]
+        self.assertEqual(services.accept_open_request(rid,3,author_id=1,application_token=application["application_token"]),"created")
         self.assertEqual(database.get_request(rid)["status"],"in_progress")
         self.assertEqual(database.get_request(rid)["helper_id"],3)
-        self.assertFalse(services.is_in_queue(3))
+        self.assertTrue(services.is_in_queue(3))
     def test_auth_attempts_are_rate_limited_and_clear_on_success(self):
         self.assertFalse(database.auth_is_rate_limited("login","person@example.com",3))
         for _ in range(3): database.record_auth_failure("login","person@example.com")
@@ -87,6 +94,7 @@ class Core(unittest.TestCase):
         self.assertFalse(database.auth_is_rate_limited("login_ip","127.0.0.2",3))
     def test_telegram_link_code_is_hashed_and_single_use(self):
         uid=database.create_web_user("Web","secure-link@example.com","hash")
+        self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=?",(uid,))
         code=database.create_link_code(uid)
         row=database.get_user(uid)
         self.assertEqual(len(code),32)
@@ -97,23 +105,45 @@ class Core(unittest.TestCase):
         self.assertFalse(database.link_by_code(code,557,"user557")[0])
     def test_expired_telegram_link_code_cannot_link_account(self):
         uid=database.create_web_user("Web","expired@example.com","hash")
-        self.db.execute("UPDATE users SET verification_code='EXPIRED',verification_code_expires_at=? WHERE user_id=?",((datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat(),uid))
-        ok,_=database.link_by_code("EXPIRED",555,"user555")
+        self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=?",(uid,))
+        code=database.create_link_code(uid)
+        self.db.execute("UPDATE users SET verification_code_expires_at=? WHERE user_id=?",((datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat(),uid))
+        ok,_=database.link_by_code(code,555,"user555")
         self.assertFalse(ok)
     def test_atomic_completion_and_reviews(self):
         self.add(1);self.add(2);rid=services.create_request(1,{"what":"test","place":"x","time_needed":"x","urgency":"x","details":"x"})
-        self.assertTrue(services.try_assign_helper(rid,2));self.assertTrue(services.complete_request(rid,2));self.assertFalse(services.complete_request(rid,2))
+        self.assertTrue(services.try_assign_helper(rid,2));self.assertTrue(services.complete_request(rid,2,confirmed_by=1));self.assertFalse(services.complete_request(rid,2))
         self.assertEqual(database.get_user(1)["balance"],90);self.assertEqual(database.get_user(2)["balance"],120)
         self.assertTrue(services.set_rating(rid,1,5));self.assertTrue(services.set_helper_rating(rid,2,4))
         self.assertTrue(services.set_review(rid,1,"Отлично","requester"))
         self.assertTrue(services.set_review(rid,2,"Хорошо","helper"))
+    def test_only_requester_can_complete_free_help_and_award_points_once(self):
+        self.add(1);self.add(2);self.add(3)
+        rid=services.create_request(1,{"what":"test","place":"x","time_needed":"x","urgency":"x","details":"x"})
+        self.assertTrue(services.try_assign_helper(rid,2))
+        for actor in (None,2,3):
+            self.assertFalse(services.complete_request(rid,2,confirmed_by=actor))
+            self.assertEqual(database.get_request(rid)["status"],"in_progress")
+            self.assertEqual([database.get_user(uid)["balance"] for uid in (1,2)],[100,100])
+        self.assertEqual(services.request_help_completion(rid,2),"unavailable")
+        self.assertTrue(services.complete_request(rid,2,confirmed_by=1))
+        self.assertFalse(services.complete_request(rid,2,confirmed_by=1))
+        self.assertEqual([database.get_user(uid)["balance"] for uid in (1,2)],[90,120])
+        event=self.db.execute("SELECT actor_id FROM request_events WHERE request_id=? AND event_type='completed'",(rid,)).fetchone()
+        self.assertEqual(event["actor_id"],1)
+
     def test_paid_request_releases_rubles_without_changing_hpoints(self):
         self.add(1, 0);self.add(2, 17)
-        rid=services.create_request(1,{"what":"paid","place":"x","time_needed":"x","urgency":"x","details":"x","reward_rub":750})
+        # Preserve a real-money agreement made before new test-only pricing.
+        # New creation and full test reserves are exercised by reward_pricing.
+        rid=database.insert_id("INSERT INTO requests(requester_id,category,what,place,time_needed,urgency,details,reward_rub,status) VALUES(1,'other','paid','x','x','x','x',750,'open')")
         self.assertFalse(services.try_assign_helper(rid,2))
         self.db.execute("UPDATE requests SET reward_payment_status='paid' WHERE id=?",(rid,))
         self.assertTrue(services.try_assign_helper(rid,2))
-        self.assertTrue(services.complete_request(rid,2))
+        self.assertFalse(services.complete_request(rid,2))
+        self.assertEqual(services.request_help_completion(rid,2),"created")
+        self.assertEqual(database.wallet_summary(2)["balance_rub"],0)
+        self.assertTrue(services.complete_request(rid,2,confirmed_by=1))
         self.assertFalse(services.complete_request(rid,2))
         self.assertEqual(database.get_user(1)["balance"],0)
         self.assertEqual(database.get_user(2)["balance"],17)
@@ -190,6 +220,8 @@ class Core(unittest.TestCase):
             database.init_db()
             for uid in (1, 2, 3): database.create_user(uid, f"User {uid}")
             shared.execute("UPDATE users SET balance=10 WHERE user_id=1")
+            # The race concerns two valid PRO requests sharing only ten HP.
+            shared.execute("UPDATE users SET pro_until=? WHERE user_id=1", ((datetime.now(timezone.utc)+timedelta(days=30)).isoformat(),))
             requests = [services.create_request(1, {"what":str(i), "place":"x", "time_needed":"x", "urgency":"x", "details":"x"}) for i in range(2)]
             for rid, helper in zip(requests, (2, 3)): self.assertTrue(services.try_assign_helper(rid, helper))
             barrier = threading.Barrier(3)
@@ -197,7 +229,7 @@ class Core(unittest.TestCase):
             def complete(rid, helper):
                 try:
                     barrier.wait()
-                    outcomes.append(services.complete_request(rid, helper))
+                    outcomes.append(services.complete_request(rid, helper, confirmed_by=1))
                 finally:
                     shared.close()
             workers = [threading.Thread(target=complete, args=(rid, helper)) for rid, helper in zip(requests, (2, 3))]
@@ -212,14 +244,15 @@ class Core(unittest.TestCase):
             shared.close()
             database.db, services.db = old_db, old_service_db
             temp.cleanup()
-    def test_link_migrates_web_account_to_telegram_id(self):
+    def test_link_preserves_email_profile_id_and_existing_details(self):
         uid=database.create_web_user("Web","web@example.com","hash")
+        self.db.execute("UPDATE users SET email_verified=1 WHERE user_id=?",(uid,))
         self.db.execute("UPDATE users SET helper_availability='По вечерам' WHERE user_id=?",(uid,))
         self.db.execute("UPDATE users SET verification_code='ABCD1234',verification_code_expires_at=? WHERE user_id=?",((datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat(),uid))
         ok,msg=database.link_by_code("ABCD1234",555,"user555");self.assertTrue(ok)
-        u=database.get_user(555);self.assertIsNotNone(u);self.assertEqual(u["name"],"Web");self.assertEqual(u["tg_user_id"],555)
-        self.assertIsNone(database.get_user(uid))
-        self.assertEqual(database.get_user(555)["helper_availability"],"По вечерам")
+        u=database.get_user(uid);self.assertIsNotNone(u);self.assertEqual(u["name"],"Web");self.assertEqual(u["tg_user_id"],555)
+        self.assertIsNone(database.get_user(555))
+        self.assertEqual(database.get_user(uid)["helper_availability"],"По вечерам")
     def test_identity_verification_requires_manual_admin_review(self):
         self.add(1);self.add(99)
         self.db.execute("UPDATE users SET role='admin' WHERE user_id=99")

@@ -11,6 +11,20 @@ from urllib.request import urlopen
 
 def main():
     root = Path(__file__).resolve().parents[1]
+    script = sys.argv[1] if len(sys.argv) > 1 else "tests/theme_browser.cjs"
+    # These fixtures buy PRO to reach the workflow under test. Fund only that
+    # synthetic buyer, separately from money reserved for paid-help scenarios.
+    pro_buyers = {
+        "chat_archive_browser.cjs": 901,
+        "helper_stability_browser.cjs": 901,
+        "help_achievements_browser.cjs": 901,
+        "marketplace_chat_browser.cjs": 901,
+        "paid_help_current_browser.cjs": 901,
+        "personal_stale_browser.cjs": 901,
+        "reliability_browser.cjs": 901,
+        "template_fields_browser.cjs": 905,
+        "workflows_browser.cjs": 901,
+    }
     output = root / ".theme-qa"
     output.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="database-", dir=output) as task_dir:
@@ -23,14 +37,20 @@ def main():
                    BOT_TOKEN="", BOT_USERNAME="", RUN_TELEGRAM_BOT="0", SESSION_COOKIE_SECURE="0",
                    SMTP_HOST="", SMTP_PASSWORD="", BREVO_API_KEY="", YANDEX_MAPS_API_KEY="browser-qa-placeholder",
                    HPOINT_QA_URL=base, HPOINT_QA_OUTPUT=str(output), APP_ENV="development",
-                   HPOINT_QA_MAIL=str(Path(task_dir) / "mail.json"))
+                   HPOINT_QA_PRO_FIXTURE_USER=str(pro_buyers.get(Path(script).name, 0)),
+                   HPOINT_QA_MAIL=str(Path(task_dir) / "mail.json"),REGISTRATION_BONUS_RUB="0")
         seed = '''
-from hpoint import database, services
+from hpoint import database, services, web
+import os
 database.init_db()
 for uid, name in [(901,"Тестовый участник"),(902,"Тестовый помощник"),(903,"Автор заявки"),(904,"Кандидат"),(905,"Новый участник")]:
-    database.create_user(uid,name,tg_user_id=uid,web_verified=True)
+    database.create_user(uid,name,email=f"qa{uid}@example.test",password_hash=web.ph("SyntheticQa1"),tg_user_id=uid,web_verified=True)
     database.db.execute("UPDATE users SET email_verified=1,city='Тестовый город' WHERE user_id=?",(uid,))
 database.db.execute("UPDATE users SET role='admin' WHERE user_id=901")
+# Historical multi-request fixtures predate the tariff. Seed them under PRO,
+# then restore the free plan; expiry must retain all existing agreements.
+from datetime import datetime, timezone, timedelta
+database.db.execute("UPDATE users SET pro_until=? WHERE user_id IN (901,903)",((datetime.now(timezone.utc)+timedelta(days=1)).isoformat(),))
 payload={"what":"Настроить домашнюю технику","place":"Тестовый район","time_needed":"сегодня","urgency":"В течение дня","details":"Только тестовые данные","category":"tech"}
 services.create_request(901,payload)
 services.create_request(903,{**payload,"what":"Перенести коробки","category":"carry"})
@@ -39,9 +59,30 @@ services.try_assign_helper(active,902)
 database.get_or_create_chat_for_request(active)
 done=services.create_request(903,{**payload,"what":"Завершённая помощь"})
 services.try_assign_helper(done,901)
-services.complete_request(done,901)
+services.complete_request(done,901,confirmed_by=903)
 services.set_rating(done,903,5)
 services.add_to_queue(904)
+if os.environ.get("HPOINT_QA_TEST_FUNDS") == "1":
+    database.grant_registration_bonus(901,500)
+if os.environ.get("HPOINT_QA_PAID_FLOW") == "1":
+    database.wallet_add_entry(901,500,"test","Synthetic wallet funds","paid-browser-seed")
+pro_buyer = int(os.environ.get("HPOINT_QA_PRO_FIXTURE_USER", "0"))
+if pro_buyer:
+    assert pro_buyer in (901, 905)
+    database.wallet_add_entry(pro_buyer,249,"test","Synthetic PRO purchase funds","pro-browser-seed")
+if os.environ.get("HPOINT_QA_HELP_AWARDS") == "1":
+    # Historical reviewed help, predating achievements; synthetic local DB only.
+    legacy=services.create_request(903,{**payload,"what":"Synthetic historical help"})
+    services.try_assign_helper(legacy,905)
+    services.complete_request(legacy,905,confirmed_by=903)
+    database.db.execute("UPDATE requests SET requester_rating=5,rating=5 WHERE id=?",(legacy,))
+    # Preserve an archived game while all running web game endpoints are paused.
+    from hpoint import games
+    games.GAMES_ENABLED=True
+    games.start_game(904,"crossing")
+    games.GAMES_ENABLED=False
+    database.db.execute("INSERT INTO game_achievements(user_id,achievement_id) VALUES(904,'first_steps')")
+database.db.execute("UPDATE users SET pro_until=NULL WHERE user_id IN (901,903)")
 database.create_web_login_ticket(901,"theme-browser-data")
 database.create_web_login_ticket(905,"theme-browser-empty")
 database.create_web_login_ticket(905,"theme-browser-game-deep")
@@ -77,7 +118,6 @@ web.run()
                     time.sleep(0.1)
             else:
                 raise RuntimeError("Local QA server did not become ready")
-            script = sys.argv[1] if len(sys.argv) > 1 else "tests/theme_browser.cjs"
             subprocess.run(["node", script], cwd=root, env=env, check=True)
         finally:
             if os.name == "nt":

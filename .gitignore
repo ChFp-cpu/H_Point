@@ -85,4 +85,6 @@ dist/
 *.local
 .runtime/
 .theme-qa/
+.pitch-demo/
+/Материалы/
 

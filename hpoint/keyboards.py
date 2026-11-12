@@ -1,16 +1,25 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from .config import *
+from .features import GAMES_ENABLED
+from contextvars import ContextVar
 
-def main_menu_kb():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text=BTN_NEED_HELP), KeyboardButton(text=BTN_WANT_HELP)],
-        [KeyboardButton(text=BTN_FIND_CANDIDATES), KeyboardButton(text=BTN_MY_CANDIDATES)],
-        [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_HISTORY)],
-        [KeyboardButton(text=BTN_SETTINGS)],
-        [KeyboardButton(text=BTN_GAMES)],
-        [KeyboardButton(text="💳 H-Point+"), KeyboardButton(text=BTN_NAVIGATOR)],
-        [KeyboardButton(text=BTN_WEBSITE)],
-    ], resize_keyboard=True)
+MENU_USER = ContextVar("hpoint_bot_menu_user",default=None)
+BOT_REQUESTS_BUTTON = "📋 Мои заявки"
+
+def main_menu_kb(user_id=None):
+    from . import database,work_bot
+    user_id=MENU_USER.get() if user_id is None else user_id
+    rows=[
+        [KeyboardButton(text=BTN_WEBSITE), KeyboardButton(text="💬 Мои чаты")],
+        [KeyboardButton(text=BTN_NAVIGATOR), KeyboardButton(text=BTN_CANCEL)],
+    ]
+    if user_id is not None:
+        from . import personal
+        if personal.is_pro(user_id,db_connection=database.db):
+            rows.insert(1,[KeyboardButton(text=BTN_NEED_HELP),KeyboardButton(text=BOT_REQUESTS_BUTTON)])
+            rows.insert(2,[KeyboardButton(text=BTN_WANT_HELP)])
+    if work_bot.has_paid_access(database.db,user_id):rows.insert(1,[KeyboardButton(text=work_bot.WORK_BUTTON)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def cancel_kb(*extra_rows):
@@ -18,8 +27,28 @@ def cancel_kb(*extra_rows):
     rows.append([KeyboardButton(text=BTN_CANCEL)])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
+def _request_owner_pro(request_id):
+    from . import database,personal
+    request=database.get_request(request_id)
+    return bool(request and personal.is_pro(request["requester_id"],db_connection=database.db))
+
+
 def finish_kb(request_id):
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Завершить помощь", callback_data=f"finish:{request_id}")]])
+    action=(InlineKeyboardButton(text="✅ Завершить помощь",callback_data=f"finish:{request_id}")
+            if _request_owner_pro(request_id) else InlineKeyboardButton(text="✅ Завершить помощь на сайте",url=WEB_PUBLIC_URL.rstrip("/")+"/#/help"))
+    return InlineKeyboardMarkup(inline_keyboard=request_chat_kb(request_id).inline_keyboard+[[action]])
+
+
+def request_chat_kb(request_id, chat_id=None):
+    url=WEB_PUBLIC_URL.rstrip("/")+"/#/help/chat/"+str(int(request_id))
+    if chat_id is not None:url+="/"+str(int(chat_id))
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Открыть чат заявки",url=url)]])
+
+
+def confirm_paid_completion_kb(request_id):
+    if not _request_owner_pro(request_id):return finish_kb(request_id)
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Подтвердить помощь и выплатить из резерва", callback_data=f"paid_done:{request_id}")]])
+
 
 def rating_kb(request_id, prefix="rate"):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{n} ⭐", callback_data=f"{prefix}:{request_id}:{n}") for n in range(1, 6)]])
@@ -28,7 +57,9 @@ def leave_queue_kb():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚪 Выйти из очереди", callback_data="leave_queue")]])
 
 def cancel_request_kb(request_id):
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🗑 Отменить заявку", callback_data=f"cancel_req:{request_id}")]])
+    button=(InlineKeyboardButton(text="🗑 Отменить заявку",callback_data=f"cancel_req:{request_id}")
+            if _request_owner_pro(request_id) else InlineKeyboardButton(text="Отменить заявку на сайте",url=WEB_PUBLIC_URL.rstrip("/")+"/#/help"))
+    return InlineKeyboardMarkup(inline_keyboard=[[button]])
 
 def category_kb(prefix="cat"):
     keys = list(CATEGORIES)
@@ -39,6 +70,7 @@ def category_kb(prefix="cat"):
 
 def profile_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏅 Достижения за помощь", callback_data="profile:achievements")],
         [InlineKeyboardButton(text=BTN_HISTORY, callback_data="profile:history")],
         [InlineKeyboardButton(text=BTN_SETTINGS, callback_data="profile:settings")],
     ])
@@ -58,27 +90,39 @@ def settings_categories_kb(selected: set[str]):
 
 def billing_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{item['title']} — {item['rub']} ₽" + (" / 30 дней" if key == "pro" else ""), callback_data=f"buy:{key}")]
-        for key, item in MONETIZATION_ITEMS.items()
+        [InlineKeyboardButton(text=f"H-Point PRO · {PRICE_PRO_RUB} тестовых ₽ · 30 дней",callback_data="buy:pro")],
+        [InlineKeyboardButton(text="Для работы · профессиональный кабинет",url=WEB_PUBLIC_URL.rstrip("/")+"/#/profile")],
     ])
 
+
 def choose_request_kb(requests):
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"№{r['id']} — {r['what'][:28]}", callback_data=f"buyreq:{r['id']}")] for r in requests])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=r["what"][:48], callback_data=f"buyreq:{r['id']}")] for r in requests])
 
 
 def choose_match_request_kb(requests, prefix="matchreq"):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"№{r['id']} — {r['what'][:32]}", callback_data=f"{prefix}:{r['id']}")]
+        [InlineKeyboardButton(text=r["what"][:48], callback_data=f"{prefix}:{r['id']}")]
         for r in requests
     ])
 
-def candidate_kb(request_id, candidate_id):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🤝 Выбрать помощника", callback_data=f"candidate:assign:{request_id}:{candidate_id}")]
-    ])
+def candidate_kb(request_id, candidate_id, status="pending", token=""):
+    if status == "applied":
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🤝 Выбрать помощника", callback_data=f"cc:{request_id}:{candidate_id}:{token}")]])
+    if status == "offered":
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="↩️ Отменить приглашение", callback_data=f"offer:cancel:{request_id}:{token}")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📨 Предложить заявку", callback_data=f"candidate:invite:{request_id}:{candidate_id}")]])
 
 def application_kb(request_id, helper_id, token, for_author=True):
-    rows = [[InlineKeyboardButton(text="🤝 Выбрать помощника", callback_data=f"candidate:assign:{request_id}:{helper_id}")]] if for_author else []
+    action=(InlineKeyboardButton(text="🤝 Выбрать помощника",callback_data=f"cc:{request_id}:{helper_id}:{token}")
+            if _request_owner_pro(request_id) else InlineKeyboardButton(text="Выбрать помощника на сайте",url=WEB_PUBLIC_URL.rstrip("/")+"/#/help"))
+    rows = [[action]] if for_author else []
+    if for_author:
+        from . import database
+        chat=database.db.execute("SELECT id FROM chats WHERE request_id=? AND user_b_id=?",(request_id,helper_id)).fetchone()
+        if chat:rows=request_chat_kb(request_id,chat["id"]).inline_keyboard+rows
     rows.append([InlineKeyboardButton(text="Отклонить отклик" if for_author else "Отозвать отклик", callback_data=f"ac:{request_id}:{helper_id}:{token}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -86,14 +130,16 @@ def application_kb(request_id, helper_id, token, for_author=True):
 def helper_offer_kb(request_id, offer_token=""):
     suffix = f":{offer_token}" if offer_token else ""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Помогу", callback_data=f"offer:accept:{request_id}{suffix}"),
+        [InlineKeyboardButton(text="✅ Готов обсудить", callback_data=f"offer:accept:{request_id}{suffix}"),
          InlineKeyboardButton(text="↩️ Отклонить", callback_data=f"offer:decline:{request_id}{suffix}")]
     ])
 
 def candidates_navigation_kb(request_id, offer=None):
     rows = []
-    if offer:
-        rows.append([InlineKeyboardButton(text="↩️ Отменить приглашение", callback_data=f"offer:cancel:{request_id}:{offer['offer_token'] or ''}")])
+    offers = [offer] if offer and hasattr(offer,"keys") else list(offer or [])
+    for item in offers:
+        name = str(item["name"] if "name" in item.keys() and item["name"] else "помощнику")[:30]
+        rows.append([InlineKeyboardButton(text="↩️ Отменить приглашение · "+name, callback_data=f"offer:cancel:{request_id}:{item['offer_token'] or ''}")])
     rows.extend([
         [InlineKeyboardButton(text="🔄 Обновить кандидатов", callback_data=f"candidate:refresh:{request_id}")],
         [InlineKeyboardButton(text="⬅️ К заявке", callback_data=f"candidate:back:{request_id}")]

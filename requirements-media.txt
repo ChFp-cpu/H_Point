@@ -1,0 +1,2 @@
+# Official PyPI release verified on 2026-10-25.
+Pillow==13.0.0

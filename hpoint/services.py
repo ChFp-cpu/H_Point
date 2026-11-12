@@ -2,15 +2,45 @@
 import json, re, secrets
 from datetime import datetime, timedelta, timezone
 from .config import *
-from .database import db, get_request, get_user, get_active_help, save_request_candidates, get_request_candidates, insert_id, request_identity_verification, wallet_add_entry
+from .help_achievements import award_locked
+from . import reliability, workflow, chat_threads
+from .database import db, get_request, get_user, get_active_help, insert_id, request_identity_verification, wallet_add_entry, get_or_create_chat_for_request
 
 
 def infer_category(what: str) -> str:
-    text = what.lower()
+    """Suggest a direction without changing any explicitly chosen category.
+
+    Keywords are word prefixes, not arbitrary substrings: «автоматический»
+    is not transport and «ключевые слова» is not a request to borrow tools.
+    Specific phrases outrank a lone generic noun such as «мебель».
+    """
+    words = re.findall(r"[a-zа-я0-9]+", str(what or "").lower().replace("ё", "е"))
+    if not words:
+        return "other"
+    short_endings = {"", "а", "у", "ом", "е", "ы", "ов", "ам", "ами", "ах",
+                     "и", "я", "ю", "ем", "ей", "ях", "ям", "ями", "ь", "ья", "ью",
+                     "ой", "ою", "ый", "ая", "ое", "ые", "ого", "ому", "ым", "ыми", "ую"}
+
+    def starts(word, stem):
+        return word.startswith(stem) and (len(stem) > 4 or word[len(stem):] in short_endings)
+
+    winner, best = "other", (0, 0)
     for category, keywords in CATEGORY_KEYWORDS.items():
-        if any(keyword in text for keyword in keywords):
-            return category
-    return "other"
+        matches = []
+        for keyword in keywords:
+            stems = re.findall(r"[a-zа-я0-9]+", keyword.lower().replace("ё", "е"))
+            if any(all(starts(word, stem) for word, stem in zip(words[index:], stems))
+                   for index in range(len(words) - len(stems) + 1)):
+                matches.append((len(stems), sum(map(len, stems))))
+        if matches:
+            # Multiple meaningful words reinforce a suggestion; broad repair
+            # wording yields to a named trade (e.g. plumbing or electronics).
+            score = (max(item[0] for item in matches),
+                     sum(min(item[1], 14) for item in sorted(matches, reverse=True)[:3])
+                     - (2 if category == "repairs" else 0))
+            if score > best:
+                winner, best = category, score
+    return winner
 
 
 def set_helper_categories(user_id: int, categories: list[str]) -> None:
@@ -29,50 +59,129 @@ def get_helper_categories(user_id: int) -> list[str]:
         return []
 
 
+def save_helper_preferences(user_id, categories, availability="", ready=False, radius=0, available_from=None, available_until=None):
+    """Persist preferences and queue readiness atomically, independent of responses."""
+    if not isinstance(categories,list) or any(not isinstance(category,str) or category not in CATEGORIES for category in categories):
+        raise ValueError("Выберите категории помощи.")
+    if not isinstance(ready,bool):raise ValueError("Проверьте готовность к помощи.")
+    if not isinstance(availability,str) or len(availability)>240:raise ValueError("Комментарий: до 240 символов.")
+    categories=list(dict.fromkeys(categories))
+    availability=availability.strip()
+    if isinstance(radius,bool) or not isinstance(radius,(int,str)) or not re.fullmatch(r"[0-9]+",str(radius)):
+        raise ValueError("Радиус должен быть целым числом.")
+    radius=int(radius)
+    if radius<0 or radius>1000:raise ValueError("Радиус: от 0 до 1000 км.")
+    available_from=normalize_schedule(available_from)
+    available_until=normalize_schedule(available_until)
+    if available_from and available_until and available_until<=available_from:raise ValueError("Проверьте время доступности.")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        suffix=" FOR NO KEY UPDATE" if getattr(db,"is_postgres",False) else ""
+        user=db.execute("SELECT user_id,is_blocked FROM users WHERE user_id=?"+suffix,(user_id,)).fetchone()
+        if not user or user["is_blocked"]:raise PermissionError("Аккаунт недоступен.")
+        db.execute("""UPDATE users SET helper_categories=?,helper_availability=?,helper_radius_km=?,
+            helper_available_from=?,helper_available_until=? WHERE user_id=?""",
+            (json.dumps(categories,ensure_ascii=False),availability,radius,available_from,available_until,user_id))
+        active=bool(get_active_help(user_id))
+        if ready:add_to_queue(user_id)
+        else:remove_from_queue(user_id)
+        db.execute("COMMIT")
+        return {"helper_categories":categories,"helper_availability":availability,"helper_radius_km":radius,
+            "helper_available_from":available_from,"helper_available_until":available_until,"helper_ready":ready,
+            "helper_busy":active}
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
+
+
+def normalize_schedule(value):
+    if value in (None,""):return None
+    try:
+        value=datetime.fromisoformat(str(value).replace("Z","+00:00"))
+        if value.tzinfo is None:raise ValueError("timezone required")
+        return value.astimezone(timezone.utc).isoformat()
+    except (TypeError,ValueError,OverflowError):raise ValueError("Укажите дату и время с часовым поясом.")
+
+
+def matches_helper_preferences(request, helper, distance, *, require_location=True):
+    radius=int(helper["helper_radius_km"] or 0)
+    if radius:
+        if distance is None and require_location:return False
+        if distance is not None and distance>radius:return False
+    return _matches_helper_schedule(request,helper)
+
+
+def _matches_helper_schedule(request, helper):
+    try:
+        at=_schedule_datetime(request["scheduled_at"]) or datetime.now(timezone.utc)
+        start=_schedule_datetime(helper["helper_available_from"])
+        end=_schedule_datetime(helper["helper_available_until"])
+    except (TypeError,ValueError,OverflowError):return False
+    if start and at<start:return False
+    if end and at>end:return False
+    return True
+
+
+def _schedule_datetime(value):
+    if not value:return None
+    date=datetime.fromisoformat(str(value).replace("Z","+00:00"))
+    if date.tzinfo is None:date=date.replace(tzinfo=timezone.utc)
+    return date.astimezone(timezone.utc)
+
+
+def _location_known(request,helper):
+    try:
+        values=[request["lat"],request["lon"],helper["lat"],helper["lon"]]
+        if any(value is None or isinstance(value,bool) for value in values):return False
+        return all(-limit<=float(value)<=limit for value,limit in zip(values,(90,180,90,180)))
+    except (TypeError,ValueError,OverflowError):return False
+
+
 def create_request(user_id: int, data: dict) -> int:
+    from . import personal
     category = data.get("category") or infer_category(data["what"])
     hours = max(1, min(int(data.get("expires_in_hours", 48)), 168))
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
-    reward = int(data.get("reward_rub") or 0)
-    if not 0 <= reward <= 100_000:
-        raise ValueError("reward_rub")
-    request_id = insert_id(
-        """INSERT INTO requests
-        (requester_id, category, what, place, time_needed, urgency, details, status, priority_boost, lat, lon, expires_at, reward_rub)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
-        (user_id, category, data["what"], data["place"], data["time_needed"], data["urgency"], data["details"], STATUS_OPEN,
-         data.get("lat"), data.get("lon"), expires_at, reward),
-    )
-    db.execute(
-        "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
-        (request_id, user_id, "created", "Заявка опубликована и ожидает помощника."),
-    )
-    return request_id
+    raw_reward = data.get("reward_rub", 0)
+    quote = workflow.quote_new_reward(0 if raw_reward is None or raw_reward == "" else raw_reward)
+    scheduled_at = normalize_schedule(data.get("scheduled_at"))
+    # Web creation and the recurrence runner can already own a transaction.
+    # The shared context uses a savepoint when nested; the capacity check and
+    # insertion always hold the same owner lock across processes.
+    with personal.owner_transaction(user_id, db_connection=db):
+        personal.assert_request_capacity(user_id, db_connection=db)
+        request_id = insert_id(
+            """INSERT INTO requests
+            (requester_id, category, what, place, time_needed, urgency, details, status, priority_boost,
+             lat, lon, expires_at, reward_rub, scheduled_at, reserve_deadline_at,
+             reward_pricing_version,reward_total_rub,commission_rub,helper_reward_rub)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, category, data["what"], data["place"], data["time_needed"], data["urgency"], data["details"], STATUS_OPEN,
+             data.get("lat"), data.get("lon"), expires_at, quote["reward_rub"], scheduled_at,
+             workflow.reserve_deadline() if quote["reward_rub"] else None, quote["version"],
+             quote["total_rub"], quote["commission_rub"], quote["helper_rub"]),
+        )
+        db.execute(
+            "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
+            (request_id, user_id, "created", "Заявка опубликована и ожидает помощника."),
+        )
+        return request_id
 
 def expire_open_requests() -> None:
-    """Close only unassigned requests whose chosen publication term ended."""
-    expired = db.execute(
-        "SELECT id,requester_id,reward_rub,reward_payment_status FROM requests WHERE status=? AND expires_at IS NOT NULL AND expires_at<=?",
-        (STATUS_OPEN, datetime.now(timezone.utc).isoformat()),
-    ).fetchall()
-    if not expired:
-        return
-    ids = [row["id"] for row in expired]
-    marks = ",".join("?" for _ in ids)
-    db.execute(
-        f"UPDATE requests SET status=?,cancel_reason=?,cancelled_at=CURRENT_TIMESTAMP WHERE id IN ({marks})",
-        (STATUS_CANCELLED, "Срок публикации истёк", *ids),
-    )
-    for row in expired:
-        request_id = row["id"]
-        if row["reward_payment_status"] == "paid" and int(row["reward_rub"] or 0) > 0:
-            amount = int(row["reward_rub"])
-            wallet_add_entry(row["requester_id"], amount, "reward_refund", "Вознаграждение возвращено в кошелёк: срок заявки истёк", f"request:{request_id}:expiry-refund", request_id)
-            db.execute("UPDATE requests SET reward_payment_status='wallet_refunded' WHERE id=?", (request_id,))
-        db.execute(
-            "INSERT INTO request_events(request_id,event_type,message) VALUES(?,?,?)",
-            (request_id, "expired", "Срок публикации истёк. Заявка закрыта."),
-        )
+    cutoff=datetime.now(timezone.utc).isoformat()
+    ids=[r["id"] for r in db.execute("SELECT id FROM requests WHERE status=? AND ((expires_at IS NOT NULL AND expires_at<=?) OR (reward_rub>0 AND reward_payment_status='none' AND reserve_deadline_at IS NOT NULL AND reserve_deadline_at<=?))",(STATUS_OPEN,cutoff,cutoff)).fetchall()]
+    for rid in ids:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            lock=" FOR UPDATE" if getattr(db,"is_postgres",False) else ""
+            row=db.execute("SELECT * FROM requests WHERE id=?"+lock,(rid,)).fetchone()
+            if row and row["status"]==STATUS_OPEN:
+                reserve_expired=bool(row["reward_rub"] and row["reward_payment_status"]=="none" and row["reserve_deadline_at"] and row["reserve_deadline_at"]<=cutoff)
+                if reserve_expired or (row["expires_at"] and row["expires_at"]<=cutoff):
+                    reliability.close_locked_request(db,row,None,"Резерв не создан за 5 минут" if reserve_expired else "Срок публикации истёк","reserve_expired" if reserve_expired else "expired",wallet_add_entry)
+            db.execute("COMMIT")
+        except Exception:
+            db.execute("ROLLBACK");raise
 
 
 def is_in_queue(user_id: int) -> bool:
@@ -85,7 +194,67 @@ def add_to_queue(user_id: int) -> None:
 
 def remove_from_queue(user_id: int) -> None:
     db.execute("DELETE FROM helper_queue WHERE user_id = ?", (user_id,))
-    db.execute("UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE candidate_id=? AND status='applied'", (user_id,))
+
+
+def _open_for_responses(request):
+    """A stale tab cannot bypass deadlines between maintenance worker ticks.
+
+    Check under the caller's request lock. Active agreements keep their own
+    lifecycle; publication expiry only closes the window for a new match.
+    """
+    if not request or request["status"] != STATUS_OPEN:
+        return False
+    deadlines = [request["expires_at"]]
+    if int(request["reward_rub"] or 0) > 0 and request["reward_payment_status"] == "none":
+        deadlines.append(request["reserve_deadline_at"])
+    at = datetime.now(timezone.utc)
+    for value in deadlines:
+        if not value:
+            continue
+        try:
+            deadline = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            if deadline <= at:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+    return True
+
+
+def accept_open_request(request_id: int, helper_id: int, author_id: int | None = None, application_token: str | None = None) -> str:
+    """Only the author can select a consenting candidate; helpers merely apply."""
+    if author_id is None:
+        return apply_to_request(request_id,helper_id)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        lock = " FOR UPDATE" if getattr(db,"is_postgres",False) else ""
+        request = db.execute("SELECT * FROM requests WHERE id=?" + lock,(request_id,)).fetchone()
+        helper = db.execute("SELECT * FROM users WHERE user_id=?" + (" FOR NO KEY UPDATE" if lock else ""),(helper_id,)).fetchone()
+        if not helper or helper["is_blocked"] or not request or request["requester_id"] == helper_id:
+            db.execute("ROLLBACK");return "unavailable"
+        if request["status"] == STATUS_IN_PROGRESS and request["helper_id"] == helper_id:
+            if request["requester_id"]!=author_id:
+                db.execute("ROLLBACK");return "unavailable"
+            get_or_create_chat_for_request(request_id)
+            db.execute("COMMIT");return "existing"
+        application=db.execute("SELECT status,offer_token FROM request_candidates WHERE request_id=? AND candidate_id=?"+lock,(request_id,helper_id)).fetchone()
+        if request["requester_id"] != author_id or not application or application["status"] != "applied" or not application_token or application["offer_token"] != application_token:
+            db.execute("ROLLBACK");return "unavailable"
+        if not _open_for_responses(request) or request["helper_id"] is not None or get_active_help(helper_id):
+            db.execute("ROLLBACK");return "unavailable"
+        if int(request["reward_rub"] or 0) > 0 and request["reward_payment_status"] != "paid":
+            db.execute("ROLLBACK");return "awaiting_funds"
+        db.execute("UPDATE requests SET helper_id=?,status=? WHERE id=?",(helper_id,STATUS_IN_PROGRESS,request_id))
+        db.execute("""INSERT INTO request_candidates(request_id,candidate_id,score,status,offer_token,updated_at)
+                      VALUES(?,?,0,'accepted',NULL,CURRENT_TIMESTAMP)
+                      ON CONFLICT(request_id,candidate_id) DO UPDATE SET status='accepted',offer_token=NULL,updated_at=CURRENT_TIMESTAMP""",(request_id,helper_id))
+        db.execute("UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND candidate_id!=? AND status IN ('pending','applied','offered')",(request_id,helper_id))
+        get_or_create_chat_for_request(request_id)
+        db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",(request_id,author_id,"helper_accepted","Автор выбрал помощника из откликов. Заявка в работе."))
+        db.execute("COMMIT");return "created"
+    except Exception:
+        db.execute("ROLLBACK");raise
 
 
 def apply_to_request(request_id: int, helper_id: int) -> str:
@@ -93,20 +262,24 @@ def apply_to_request(request_id: int, helper_id: int) -> str:
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
-        helper = db.execute("SELECT * FROM users WHERE user_id=?" + lock, (helper_id,)).fetchone()
         request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
-        if not helper or helper["is_blocked"] or not request or request["status"] != STATUS_OPEN or request["requester_id"] == helper_id or get_active_help(helper_id):
+        helper = db.execute("SELECT * FROM users WHERE user_id=?" + (" FOR NO KEY UPDATE" if lock else ""), (helper_id,)).fetchone()
+        if not helper or helper["is_blocked"] or not _open_for_responses(request) or request["requester_id"] == helper_id:
             db.execute("ROLLBACK")
             return "unavailable"
         existing = db.execute("SELECT * FROM request_candidates WHERE request_id=? AND candidate_id=?" + lock, (request_id, helper_id)).fetchone()
-        if existing and existing["status"] in ("applied", "offered"):
-            db.execute("ROLLBACK")
+        if existing and existing["status"] == "applied":
+            chat_threads.ensure_chat(db,request_id,helper_id)
+            db.execute("COMMIT")
             return existing["status"]
-        add_to_queue(helper_id)
+        # Clicking a request-specific response is consent even after an invitation.
+        # Keep its token so another concurrent tab cannot revive a stale choice.
+        token=existing["offer_token"] if existing and existing["status"]=="offered" else secrets.token_hex(8)
         db.execute("""INSERT INTO request_candidates(request_id,candidate_id,score,status,offer_token,seen_at,updated_at)
                       VALUES(?,?,?,'applied',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
                       ON CONFLICT(request_id,candidate_id) DO UPDATE SET score=excluded.score,status='applied',offer_token=excluded.offer_token,updated_at=CURRENT_TIMESTAMP""",
-                   (request_id, helper_id, match_score(request, helper_id), secrets.token_hex(8)))
+                   (request_id, helper_id, match_score(request, helper_id), token))
+        chat_threads.ensure_chat(db,request_id,helper_id)
         db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)", (request_id, helper_id, "helper_applied", "Помощник откликнулся на заявку. Автор может выбрать его в подборе."))
         db.execute("COMMIT")
         return "created"
@@ -116,13 +289,40 @@ def apply_to_request(request_id: int, helper_id: int) -> str:
 
 
 def get_request_applications(requester_id: int, limit: int = 100):
-    return db.execute("""SELECT rc.request_id,rc.candidate_id helper_id,rc.offer_token application_token,
-                         u.name helper_name,r.what,r.requester_id,rc.updated_at
+    rows = db.execute("""SELECT rc.request_id,rc.candidate_id helper_id,rc.offer_token application_token,
+                         u.name helper_name,r.what,r.requester_id,rc.updated_at,
+                         r.category,r.lat request_lat,r.lon request_lon,r.scheduled_at,
+                         u.lat,u.lon,u.helper_categories,u.helper_radius_km,u.helper_available_from,
+                         u.helper_available_until,u.pro_until,u.verified_until,
+                         COALESCE((SELECT AVG(done.requester_rating) FROM requests done
+                            WHERE done.helper_id=u.user_id AND done.status='done' AND done.requester_rating IS NOT NULL),0) helper_rating,
+                         EXISTS(SELECT 1 FROM requests active WHERE active.helper_id=u.user_id AND active.status='in_progress') helper_busy
                          FROM request_candidates rc JOIN requests r ON r.id=rc.request_id
                          JOIN users u ON u.user_id=rc.candidate_id
                          WHERE r.requester_id=? AND r.status=? AND rc.status='applied' AND u.is_blocked=0
-                         AND NOT EXISTS(SELECT 1 FROM requests busy WHERE busy.helper_id=rc.candidate_id AND busy.status=?)
-                         ORDER BY rc.updated_at DESC,rc.request_id DESC LIMIT ?""", (requester_id, STATUS_OPEN, STATUS_IN_PROGRESS, limit)).fetchall()
+                         ORDER BY rc.updated_at DESC,rc.request_id DESC""", (requester_id, STATUS_OPEN)).fetchall()
+    result = []
+    fields = ("request_id", "helper_id", "application_token", "helper_name", "what", "requester_id", "updated_at")
+    for row in rows:
+        try:
+            stored = json.loads(row["helper_categories"] or "[]")
+            cats = [category for category in stored if category in CATEGORIES] if isinstance(stored, list) else []
+        except (TypeError, ValueError):
+            cats = []
+        request = {"lat": row["request_lat"], "lon": row["request_lon"], "scheduled_at": row["scheduled_at"], "category": row["category"]}
+        distance = haversine_km(request["lat"], request["lon"], row["lat"], row["lon"]) if _location_known(request,row) else None
+        category_match = not cats or request["category"] in cats
+        available = matches_helper_preferences(request, row, distance) and not row["helper_busy"]
+        fitness = 100 if category_match else 0
+        fitness += 20 if available else 0
+        fitness += float(row["helper_rating"]) * 12 + (max(0, 30-distance*3) if distance is not None else 0)
+        fitness += 12 if _entitlement_active(row["verified_until"]) else 0
+        active = _entitlement_active(row["pro_until"])
+        # The same small live bonus as matching, never an unconditional PRO-first
+        # tier. Category, availability, reputation and distance retain weight.
+        result.append({**{field: row[field] for field in fields}, "helper_busy":bool(row["helper_busy"]),"can_select":not bool(row["helper_busy"]),"pro_active": active, "score": round(fitness + (8 if active and category_match and available else 0), 1)})
+    result.sort(key=lambda row: (row["score"], row["updated_at"], row["request_id"]), reverse=True)
+    return result[:max(1, min(int(limit), 1000))]
 
 
 def get_helper_applications(helper_id: int):
@@ -137,8 +337,8 @@ def cancel_request_application(request_id: int, helper_id: int, actor_id: int, t
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
-        if lock: db.execute("SELECT user_id FROM users WHERE user_id=? FOR UPDATE", (helper_id,)).fetchone()
         request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
+        if lock: db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (helper_id,)).fetchone()
         application = db.execute("SELECT * FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='applied'" + lock, (request_id, helper_id)).fetchone()
         if not request or request["status"] != STATUS_OPEN or actor_id not in (helper_id, request["requester_id"]) or not application or (application["offer_token"] or "") != token:
             db.execute("ROLLBACK")
@@ -153,8 +353,8 @@ def cancel_request_application(request_id: int, helper_id: int, actor_id: int, t
         raise
 
 
-def get_current_helper_offer(request_id: int):
-    """Return the one helper currently deciding on a request, if any."""
+def get_request_helper_offers(request_id: int):
+    """Pending invitations are independent; inviting someone never replaces another."""
     return db.execute(
         """SELECT rc.request_id, rc.candidate_id, rc.status, rc.updated_at, rc.offer_token,
                   u.name, u.username, u.tg_user_id
@@ -162,16 +362,28 @@ def get_current_helper_offer(request_id: int):
            JOIN users u ON u.user_id = rc.candidate_id
            JOIN requests r ON r.id = rc.request_id
            WHERE rc.request_id = ? AND rc.status = 'offered' AND r.status = ?
-           ORDER BY rc.updated_at DESC LIMIT 1""",
+           ORDER BY rc.updated_at DESC,rc.candidate_id""",
         (request_id, STATUS_OPEN),
-    ).fetchone()
+    ).fetchall()
+
+
+def get_helper_offer(request_id: int, helper_id: int):
+    return next((row for row in get_request_helper_offers(request_id) if row["candidate_id"]==helper_id),None)
+
+
+def get_current_helper_offer(request_id: int, helper_id: int | None = None):
+    """Compatibility accessor; use the full list when rendering a request."""
+    if helper_id is not None:return get_helper_offer(request_id,helper_id)
+    rows=get_request_helper_offers(request_id)
+    return rows[0] if rows else None
 
 
 def get_helper_offers(helper_id: int, limit: int = 20):
     """Offers awaiting a helper's answer; used by both the site and the bot."""
     return db.execute(
         """SELECT rc.request_id, rc.updated_at, rc.offer_token, r.category, r.what, r.place,
-                  r.time_needed, r.urgency, r.details, r.requester_id,
+                  r.time_needed, r.urgency, r.details, r.requester_id, r.reward_rub, r.reward_test_rub, r.reward_payment_status,
+                  r.reward_pricing_version,r.reward_total_rub,r.commission_rub,r.helper_reward_rub,
                   requester.name requester_name, requester.username requester_username
            FROM request_candidates rc
            JOIN requests r ON r.id = rc.request_id
@@ -183,40 +395,26 @@ def get_helper_offers(helper_id: int, limit: int = 20):
 
 
 def offer_helper(request_id: int, helper_id: int, replace_offer_token: str | None = None) -> bool:
-    """Let a requester invite one available volunteer without assigning them yet."""
+    """Invite a matching ready helper; each invitation requires their consent."""
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
-        if lock:
-            db.execute("SELECT user_id FROM users WHERE user_id=? FOR UPDATE", (helper_id,)).fetchone()
         request = db.execute("SELECT * FROM requests WHERE id = ?" + lock, (request_id,)).fetchone()
-        available = db.execute("SELECT 1 FROM helper_queue q JOIN users u ON u.user_id=q.user_id WHERE q.user_id=? AND u.is_blocked=0" + lock, (helper_id,)).fetchone()
-        busy = db.execute(
-            "SELECT 1 FROM requests WHERE helper_id = ? AND status = ?" + lock,
-            (helper_id, STATUS_IN_PROGRESS),
-        ).fetchone()
-        reward_ready = (int(request["reward_rub"] or 0) == 0 or request["reward_payment_status"] == "paid") if request else False
-        categories = get_helper_categories(helper_id)
-        applied = db.execute("SELECT 1 FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='applied'", (request_id, helper_id)).fetchone()
-        if not request or request["status"] != STATUS_OPEN or request["requester_id"] == helper_id or not reward_ready or not available or busy or (categories and request["category"] not in categories and not applied):
+        helper=db.execute("SELECT * FROM users WHERE user_id=?"+(" FOR NO KEY UPDATE" if lock else ""),(helper_id,)).fetchone()
+        if not _open_for_responses(request) or request["requester_id"]==helper_id or not helper or helper["is_blocked"] or not is_in_queue(helper_id) or get_active_help(helper_id):
             db.execute("ROLLBACK")
             return False
-
-        current = get_current_helper_offer(request_id)
-        # A stale tab must not silently replace an invitation the author did
-        # not see. Replacing one requires its exact confirmed token.
-        if current:
-            if current["candidate_id"] == helper_id or replace_offer_token is None or (current["offer_token"] or "") != replace_offer_token:
-                db.execute("ROLLBACK")
-                return False
-        elif replace_offer_token is not None:
-            db.execute("ROLLBACK")
-            return False
-        db.execute(
-            "UPDATE request_candidates SET status='withdrawn', updated_at=CURRENT_TIMESTAMP "
-            "WHERE request_id=? AND status='offered' AND candidate_id!=?",
-            (request_id, helper_id),
-        )
+        if int(request["reward_rub"] or 0)>0 and request["reward_payment_status"]!="paid":
+            db.execute("ROLLBACK");return False
+        categories=get_helper_categories(helper_id)
+        distance=haversine_km(request["lat"],request["lon"],helper["lat"],helper["lon"]) if _location_known(request,helper) else None
+        if (categories and request["category"] not in categories) or not matches_helper_preferences(request,helper,distance):
+            db.execute("ROLLBACK");return False
+        existing=db.execute("SELECT status FROM request_candidates WHERE request_id=? AND candidate_id=?"+lock,(request_id,helper_id)).fetchone()
+        if existing and existing["status"] in ("offered","applied","accepted","declined"):
+            db.execute("ROLLBACK");return False
+        # The old replacement token is deliberately not used to revoke anybody:
+        # a stale browser can only add an independent invitation now.
         db.execute(
             """INSERT INTO request_candidates(request_id,candidate_id,score,status,offer_token,seen_at,updated_at)
                VALUES(?,?,?,'offered',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
@@ -240,9 +438,9 @@ def withdraw_helper_offer(request_id: int, requester_id: int, helper_id: int, of
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
-        if lock:
-            db.execute("SELECT user_id FROM users WHERE user_id=? FOR UPDATE", (helper_id,)).fetchone()
         request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
+        if lock:
+            db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (helper_id,)).fetchone()
         offer = db.execute(
             "SELECT * FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='offered'" + lock,
             (request_id, helper_id),
@@ -260,19 +458,18 @@ def withdraw_helper_offer(request_id: int, requester_id: int, helper_id: int, of
 
 
 def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool, offer_token: str | None = None) -> bool:
-    """Accept or decline an invitation atomically, keeping the queue shared."""
+    """A positive answer is an application, never an automatic assignment."""
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
-        if lock:
-            db.execute("SELECT user_id FROM users WHERE user_id=? FOR UPDATE", (helper_id,)).fetchone()
         request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
+        helper=db.execute("SELECT user_id,is_blocked FROM users WHERE user_id=?"+(" FOR NO KEY UPDATE" if lock else ""),(helper_id,)).fetchone()
         offer = db.execute(
             "SELECT * FROM request_candidates WHERE request_id=? AND candidate_id=? AND status='offered'" + lock,
             (request_id, helper_id),
         ).fetchone()
         reward_ready = (int(request["reward_rub"] or 0) == 0 or request["reward_payment_status"] == "paid") if request else False
-        if not offer or not request or request["status"] != STATUS_OPEN or (accept and not reward_ready) or (offer_token is not None and (offer["offer_token"] or "") != offer_token):
+        if not offer or not helper or helper["is_blocked"] or not request or request["status"] != STATUS_OPEN or (accept and (not reward_ready or not _open_for_responses(request))) or (offer_token is not None and (offer["offer_token"] or "") != offer_token):
             db.execute("ROLLBACK")
             return False
         if not accept:
@@ -288,39 +485,17 @@ def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool, offer
             db.execute("COMMIT")
             return True
 
-        current = db.execute(
-            """UPDATE requests SET helper_id=?, status=?
-               WHERE id=? AND status=? AND helper_id IS NULL AND requester_id!=?
-               AND NOT EXISTS (
-                 SELECT 1 FROM requests active
-                 WHERE active.helper_id=? AND active.status=?
-               )""",
-            (helper_id, STATUS_IN_PROGRESS, request_id, STATUS_OPEN, helper_id, helper_id, STATUS_IN_PROGRESS),
-        )
-        if current.rowcount != 1:
-            db.execute("ROLLBACK")
-            return False
-        remove_from_queue(helper_id)
         db.execute(
-            "UPDATE request_candidates SET status='accepted', updated_at=CURRENT_TIMESTAMP "
+            "UPDATE request_candidates SET status='applied', updated_at=CURRENT_TIMESTAMP "
             "WHERE request_id=? AND candidate_id=?",
             (request_id, helper_id),
         )
-        db.execute(
-            "UPDATE request_candidates SET status='withdrawn', updated_at=CURRENT_TIMESTAMP "
-            "WHERE request_id=? AND candidate_id!=? AND status IN ('pending','applied','offered')",
-            (request_id, helper_id),
-        )
-        db.execute(
-            "UPDATE request_candidates SET status='withdrawn', updated_at=CURRENT_TIMESTAMP "
-            "WHERE candidate_id=? AND request_id!=? AND status IN ('applied','offered')",
-            (helper_id, request_id),
-        )
-        db.execute("COMMIT")
+        chat_threads.ensure_chat(db,request_id,helper_id)
         db.execute(
             "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
-            (request_id, helper_id, "helper_accepted", "Помощник подтвердил участие. Заявка в работе."),
+            (request_id, helper_id, "helper_applied", "Помощник принял приглашение. Автор может обсудить помощь и выбрать исполнителя."),
         )
+        db.execute("COMMIT")
         return True
     except Exception:
         db.execute("ROLLBACK")
@@ -328,28 +503,12 @@ def respond_to_helper_offer(request_id: int, helper_id: int, accept: bool, offer
 
 
 def find_best_open_request_for(helper_id: int):
-    rows = db.execute(
-        "SELECT * FROM requests WHERE status = ? AND requester_id != ? ORDER BY id ASC LIMIT 50",
-        (STATUS_OPEN, helper_id),
-    ).fetchall()
-    if not rows:
-        return None
-    return max(rows, key=lambda row: match_score(row, helper_id))
+    rows=smart_requests_for_helper(helper_id,limit=1)
+    return rows[0]["request"] if rows else None
 
 
 def find_best_queued_helper(request):
-    rows = db.execute(
-        "SELECT user_id FROM helper_queue WHERE user_id != ? ORDER BY joined_at, user_id",
-        (request["requester_id"],),
-    ).fetchall()
-    candidates = []
-    for row in rows:
-        helper_id = row["user_id"]
-        if get_active_help(helper_id) is None:
-            candidates.append(helper_id)
-    if not candidates:
-        return None
-    return max(candidates, key=lambda uid: match_score(request, uid))
+    return next((candidate["user_id"] for candidate in smart_match(request["id"]) if candidate["can_invite"]),None)
 
 
 def try_assign_helper(request_id: int, helper_id: int) -> bool:
@@ -357,10 +516,16 @@ def try_assign_helper(request_id: int, helper_id: int) -> bool:
     try:
         db.execute("BEGIN IMMEDIATE")
         if getattr(db, "is_postgres", False):
+            request = db.execute("SELECT * FROM requests WHERE id=? FOR UPDATE",(request_id,)).fetchone()
             # Serialize assignments for one helper across distinct requests.
-            if not db.execute("SELECT user_id FROM users WHERE user_id=? FOR UPDATE", (helper_id,)).fetchone():
+            if not db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (helper_id,)).fetchone():
                 db.execute("ROLLBACK")
                 return False
+        else:
+            request = get_request(request_id)
+        if not _open_for_responses(request):
+            db.execute("ROLLBACK")
+            return False
         cur = db.execute(
             """UPDATE requests SET helper_id = ?, status = ?
             WHERE id = ? AND status = ? AND helper_id IS NULL AND requester_id != ?
@@ -372,12 +537,11 @@ def try_assign_helper(request_id: int, helper_id: int) -> bool:
             (helper_id, STATUS_IN_PROGRESS, request_id, STATUS_OPEN, helper_id, helper_id, STATUS_IN_PROGRESS),
         )
         if cur.rowcount == 1:
-            remove_from_queue(helper_id)
-            db.execute("COMMIT")
             db.execute(
                 "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
                 (request_id, helper_id, "helper_assigned", "Помощник назначен. Заявка в работе."),
             )
+            db.execute("COMMIT")
             return True
         db.execute("ROLLBACK")
         return False
@@ -386,12 +550,94 @@ def try_assign_helper(request_id: int, helper_id: int) -> bool:
         raise
 
 
-def complete_request(request_id: int, helper_id: int) -> bool:
+def request_reward_note(request) -> str:
+    quote = workflow.reward_quote(request)
+    if not quote["reward_rub"]:
+        return "Бесплатная помощь, расчёт в H-Points."
+    unit = "тестовых ₽" if quote["test_only"] else "₽"
+    label = (f"Помощнику {quote['helper_rub']} {unit}; комиссия H-Point {quote['commission_rub']} {unit}; "
+             f"всего {quote['total_rub']} {unit}")
+    if request["reward_payment_status"] == "released":
+        return f"Помощник получил {quote['helper_rub']} {unit}. Комиссия H-Point — {quote['commission_rub']} {unit}."
+    if request["reward_payment_status"] == "wallet_refunded":
+        return f"Весь резерв {quote['total_rub']} {unit} возвращён автору."
+    if request["reward_payment_status"] == "paid":
+        return label + " в резерве. Выплата после подтверждения автором."
+    return label + ". Создайте резерв в течение 5 минут."
+
+
+def reserve_request_reward(request_id: int, requester_id: int, expected_amount: int) -> bool:
+    """Hold the agreed full test reserve, without payout or changing H-Points."""
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
+        request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
+        if lock:
+            db.execute("SELECT user_id FROM users WHERE user_id=? FOR NO KEY UPDATE", (requester_id,)).fetchone()
+        if not request or request["requester_id"] != requester_id or request["status"] != STATUS_OPEN:
+            raise ValueError("request unavailable")
+        quote = workflow.reward_quote(request)
+        amount = quote["total_rub"]
+        if amount <= 0 or isinstance(expected_amount, bool) or not isinstance(expected_amount, int) or amount != expected_amount:
+            raise ValueError("reward changed")
+        if request["reward_payment_status"] == "paid":
+            db.execute("COMMIT")
+            return False
+        if request["reward_payment_status"] != "none":
+            raise ValueError("request unavailable")
+        # An already opened acquiring session must not race wallet funding.
+        invoices = db.execute("SELECT metadata FROM billing_invoices WHERE user_id=? AND item_type='request_reward' AND status='pending' AND provider_payment_id IS NOT NULL", (requester_id,)).fetchall()
+        if any(json.loads(row["metadata"] or "{}").get("request_id") == request_id for row in invoices):
+            raise ValueError("external payment pending")
+        if request["reserve_deadline_at"] and request["reserve_deadline_at"]<=datetime.now(timezone.utc).isoformat():raise ValueError("reserve deadline expired")
+        balance = db.execute("SELECT COALESCE(SUM(test_amount_rub),0) amount FROM wallet_transactions WHERE user_id=?", (requester_id,)).fetchone()["amount"]
+        if int(balance or 0) < amount:
+            raise ValueError("insufficient wallet")
+        if not wallet_add_entry(requester_id, -amount, "reward_reserve", "Полная тестовая сумма помощи и комиссии зарезервирована до подтверждения автором", f"request:{request_id}:reserve", request_id, test_amount_rub=-amount):
+            raise ValueError("reserve already recorded")
+        reserve=db.execute("SELECT test_amount_rub FROM wallet_transactions WHERE reference=?",(f"request:{request_id}:reserve",)).fetchone()
+        db.execute("UPDATE requests SET reward_payment_status='paid',reward_test_rub=? WHERE id=?", (-int(reserve["test_amount_rub"]),request_id))
+        db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)", (request_id, requester_id, "reward_reserved", f"В кошельке зарезервировано {amount} ₽. Выплата — после помощи и подтверждения автора."))
+        db.execute("COMMIT")
+        return True
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def request_help_completion(request_id: int, helper_id: int) -> str:
+    """Record a helper's report only; the requester alone completes help."""
+    request = get_request(request_id)
+    if not request or request["status"] != STATUS_IN_PROGRESS or request["helper_id"] != helper_id:
+        return "unavailable"
+    if not int(request["reward_rub"] or 0):
+        return "unavailable"
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
+        request = db.execute("SELECT * FROM requests WHERE id=?" + lock, (request_id,)).fetchone()
+        if not request or request["status"] != STATUS_IN_PROGRESS or request["helper_id"] != helper_id or request["reward_payment_status"] != "paid":
+            db.execute("ROLLBACK")
+            return "unavailable"
+        if request["completion_requested_at"]:
+            db.execute("COMMIT")
+            return "pending"
+        db.execute("UPDATE requests SET completion_requested_at=CURRENT_TIMESTAMP WHERE id=?", (request_id,))
+        db.execute("INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)", (request_id, helper_id, "completion_requested", "Помощник сообщил о выполнении. Ожидается подтверждение автора для выплаты из резерва."))
+        db.execute("COMMIT")
+        return "created"
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def complete_request(request_id: int, helper_id: int, confirmed_by: int | None = None) -> bool:
+    """Complete help only on the requester's explicit confirmation."""
     try:
         db.execute("BEGIN IMMEDIATE")
         lock = " FOR UPDATE" if getattr(db, "is_postgres", False) else ""
         req = db.execute("SELECT * FROM requests WHERE id = ?" + lock, (request_id,)).fetchone()
-        if req is None or req["status"] != STATUS_IN_PROGRESS or req["helper_id"] != helper_id:
+        if req is None or req["status"] != STATUS_IN_PROGRESS or req["helper_id"] != helper_id or confirmed_by != req["requester_id"] or req["dispute_status"]=="open":
             db.execute("ROLLBACK")
             return False
         paid_request = int(req["reward_rub"] or 0) > 0
@@ -402,29 +648,41 @@ def complete_request(request_id: int, helper_id: int) -> bool:
         # with a RUB reward is settled exclusively through the wallet ledger.
         # Loading and checking point balances for such requests used to make a
         # RUB job fail or alter HP despite the advertised payment method.
+        settle_hp = False
         if not paid_request:
             user_rows = db.execute(
-                "SELECT user_id,balance FROM users WHERE user_id IN (?,?) ORDER BY user_id" + lock,
+                "SELECT user_id,balance FROM users WHERE user_id IN (?,?) ORDER BY user_id" + (" FOR NO KEY UPDATE" if lock else ""),
                 (req["requester_id"], helper_id),
             ).fetchall()
             balances = {row["user_id"]: row["balance"] for row in user_rows}
             requester_balance = balances.get(req["requester_id"])
-            if requester_balance is None or helper_id not in balances or requester_balance < REQUEST_COST:
+            settle_hp=reliability.pair_reward_available(db,req["requester_id"],helper_id)
+            if requester_balance is None or helper_id not in balances or (settle_hp and requester_balance < REQUEST_COST):
                 db.execute("ROLLBACK")
                 return False
-        db.execute("UPDATE requests SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?", (STATUS_DONE, request_id))
-        if not paid_request:
+        db.execute("UPDATE requests SET status=?,completed_at=?,hp_settled=? WHERE id=?",(STATUS_DONE,datetime.now(timezone.utc).isoformat(),int(settle_hp),request_id))
+        if settle_hp:
             db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (REQUEST_COST, req["requester_id"]))
             db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (HELPER_REWARD, helper_id))
         if req["reward_payment_status"] == "paid" and int(req["reward_rub"] or 0) > 0:
-            amount = int(req["reward_rub"])
-            wallet_add_entry(helper_id, amount, "reward_earned", "Вознаграждение за завершённую заявку", f"request:{request_id}:earned", request_id)
+            quote = workflow.reward_quote(req)
+            if int(req["reward_test_rub"] or 0) == quote["total_rub"]:
+                fee, net = workflow.record_commission(db,request_id,quote)
+                if not wallet_add_entry(helper_id, net, "reward_earned", "Тестовое вознаграждение за завершённую помощь по согласованным условиям", f"request:{request_id}:earned", request_id, test_amount_rub=net):
+                    raise ValueError("payout already recorded")
+                db.execute("UPDATE requests SET commission_rub=?,helper_reward_rub=? WHERE id=?",(fee,net,request_id))
+            else:
+                # Preserve obligations for any historical real reserves.
+                if quote["version"] != workflow.LEGACY_PRICING_VERSION:
+                    raise ValueError("new reward requires test reserve")
+                if not wallet_add_entry(helper_id, quote["helper_rub"], "reward_earned", "Вознаграждение за завершённую заявку", f"request:{request_id}:earned", request_id, test_amount_rub=quote["helper_test_rub"]):
+                    raise ValueError("payout already recorded")
             db.execute("UPDATE requests SET reward_payment_status='released' WHERE id=?", (request_id,))
-        db.execute("COMMIT")
         db.execute(
             "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
-            (request_id, helper_id, "completed", "Помощник отметил заявку как завершённую. Можно оставить отзыв."),
+            (request_id, confirmed_by, "completed", "Автор подтвердил помощь и выплату из резерва. Можно оставить отзыв." if paid_request else ("Автор подтвердил выполнение помощи. Можно оставить отзыв." if settle_hp else "Автор подтвердил помощь. За повторную помощь между этой парой в течение 24 часов HP не списываются и не начисляются.")),
         )
+        db.execute("COMMIT")
         return True
     except Exception:
         db.execute("ROLLBACK")
@@ -432,17 +690,31 @@ def complete_request(request_id: int, helper_id: int) -> bool:
 
 
 def set_rating(request_id: int, user_id: int, rating: int) -> bool:
-    if not 1 <= rating <= 5:
+    if isinstance(rating, bool) or not isinstance(rating, int) or not 1 <= rating <= 5:
         return False
-    cur = db.execute(
-        "UPDATE requests SET rating = ?, requester_rating = ? WHERE id = ? AND requester_id = ? AND status = ? AND requester_rating IS NULL",
-        (rating, rating, request_id, user_id, STATUS_DONE),
-    )
-    return cur.rowcount == 1
+    request=get_request(request_id)
+    if not request or request["requester_id"]!=user_id or request["status"]!=STATUS_DONE or not request["helper_id"]:
+        return False
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        lock=" FOR UPDATE" if getattr(db,"is_postgres",False) else ""
+        db.execute("SELECT user_id FROM users WHERE user_id=?"+lock,(request["helper_id"],)).fetchone()
+        cur=db.execute(
+            "UPDATE requests SET rating = ?, requester_rating = ? WHERE id = ? AND requester_id = ? AND status = ? AND requester_rating IS NULL",
+            (rating,rating,request_id,user_id,STATUS_DONE))
+        if cur.rowcount!=1:
+            db.execute("ROLLBACK")
+            return False
+        award_locked(db,request["helper_id"],source_request_id=request_id)
+        db.execute("COMMIT")
+        return True
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
 
 
 def set_helper_rating(request_id: int, user_id: int, rating: int) -> bool:
-    if not 1 <= rating <= 5:
+    if isinstance(rating, bool) or not isinstance(rating, int) or not 1 <= rating <= 5:
         return False
     cur = db.execute(
         "UPDATE requests SET helper_rating = ? WHERE id = ? AND helper_id = ? AND status = ? AND helper_rating IS NULL",
@@ -464,37 +736,17 @@ def set_review(request_id: int, user_id: int, review: str, side: str) -> bool:
 
 
 def cancel_request(request_id: int, user_id: int, reason: str = "") -> bool:
-    reason = str(reason).strip()[:300] or "Отменено автором заявки"
+    reason=str(reason).strip()[:300] or "Отменено автором заявки"
+    db.execute("BEGIN IMMEDIATE")
     try:
-        db.execute("BEGIN IMMEDIATE")
-        request = db.execute("SELECT requester_id,reward_rub,reward_payment_status FROM requests WHERE id=?", (request_id,)).fetchone()
-        if not request or request["requester_id"] != user_id or request["reward_payment_status"] not in ("none", "paid", "wallet_refunded"):
-            db.execute("ROLLBACK")
-            return False
-        cur = db.execute(
-            "UPDATE requests SET status=?,cancel_reason=?,cancelled_at=CURRENT_TIMESTAMP WHERE id=? AND requester_id=? AND status=?",
-            (STATUS_CANCELLED, reason, request_id, user_id, STATUS_OPEN),
-        )
-        if cur.rowcount != 1:
-            db.execute("ROLLBACK")
-            return False
-        db.execute(
-            "UPDATE request_candidates SET status='withdrawn',updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND status IN ('pending','applied','offered')",
-            (request_id,),
-        )
-        if request["reward_payment_status"] == "paid" and int(request["reward_rub"] or 0) > 0:
-            amount = int(request["reward_rub"])
-            wallet_add_entry(user_id, amount, "reward_refund", "Вознаграждение возвращено в кошелёк после отмены заявки", f"request:{request_id}:cancel-refund", request_id)
-            db.execute("UPDATE requests SET reward_payment_status='wallet_refunded' WHERE id=?", (request_id,))
-        db.execute(
-            "INSERT INTO request_events(request_id,actor_id,event_type,message) VALUES(?,?,?,?)",
-            (request_id, user_id, "cancelled", f"Автор отменил заявку. Причина: {reason}"),
-        )
-        db.execute("COMMIT")
-        return True
+        lock=" FOR UPDATE" if getattr(db,"is_postgres",False) else ""
+        row=db.execute("SELECT * FROM requests WHERE id=?"+lock,(request_id,)).fetchone()
+        if not row or user_id not in (row["requester_id"],row["helper_id"]) or row["status"] not in (STATUS_OPEN,STATUS_IN_PROGRESS):
+            db.execute("ROLLBACK");return False
+        reliability.close_locked_request(db,row,user_id,reason,"cancelled",wallet_add_entry)
+        db.execute("COMMIT");return True
     except Exception:
-        db.execute("ROLLBACK")
-        raise
+        db.execute("ROLLBACK");raise
 
 
 # --- Monetization / billing business logic ---
@@ -503,27 +755,47 @@ from datetime import datetime, timedelta, timezone
 def _future_iso(days: int = 30) -> str:
     return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
 
+def _entitlement_date(value):
+    if not value:return None
+    try:
+        parsed=datetime.fromisoformat(str(value).replace("Z","+00:00"))
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    except (TypeError,ValueError):return None
+
+def _entitlement_active(value):
+    end=_entitlement_date(value)
+    return bool(end and end>datetime.now(timezone.utc))
+
 def is_pro(user_id: int) -> bool:
     row = get_user(user_id)
     if not row or not row["pro_until"]:
         return False
-    return row["pro_until"] > datetime.now(timezone.utc).isoformat()
+    return _entitlement_active(row["pro_until"])
 
 def is_verified(user_id: int) -> bool:
     row = get_user(user_id)
-    return bool(row and row["verified_until"] and row["verified_until"] > datetime.now(timezone.utc).isoformat())
+    return bool(row and _entitlement_active(row["verified_until"]))
 
 def is_business(user_id: int) -> bool:
     row = get_user(user_id)
-    return bool(row and row["business_until"] and row["business_until"] > datetime.now(timezone.utc).isoformat())
+    return bool(row and _entitlement_active(row["business_until"]))
 
 def grant_entitlement(user_id: int, item_type: str, request_id: int | None = None, ad_text: str | None = None, subscription_until: int | None = None) -> None:
     if item_type == "pro":
+        current = get_user(user_id)["pro_until"]
+        prior_end = _entitlement_date(current)
+        at = datetime.now(timezone.utc)
+        if prior_end and prior_end <= at:
+            # A purchase can arrive before the periodic worker observes expiry.
+            # Preserve the required explicit resume, even across server downtime.
+            from . import personal
+            for schedule in db.execute("SELECT id,frequency,local_time,weekday,day_of_month FROM personal_schedules WHERE owner_id=? AND status='active'", (user_id,)).fetchall():
+                following=personal.next_run(schedule["frequency"],schedule["local_time"],schedule["weekday"],schedule["day_of_month"],at)
+                db.execute("UPDATE personal_schedules SET status='paused',next_run_at=?,last_status='paused',last_reason='pro_expired',updated_at=? WHERE id=? AND owner_id=? AND status='active'", (following,at.isoformat(),schedule["id"],user_id))
         if subscription_until:
             until = datetime.fromtimestamp(subscription_until, tz=timezone.utc).isoformat()
         else:
-            current = get_user(user_id)["pro_until"]
-            base = datetime.fromisoformat(current) if current else datetime.now(timezone.utc)
+            base = prior_end or at
             if base < datetime.now(timezone.utc): base = datetime.now(timezone.utc)
             until = (base + timedelta(days=30)).isoformat()
         db.execute("UPDATE users SET pro_until=? WHERE user_id=?", (until, user_id))
@@ -536,7 +808,7 @@ def grant_entitlement(user_id: int, item_type: str, request_id: int | None = Non
             until = datetime.fromtimestamp(subscription_until, tz=timezone.utc).isoformat()
         else:
             current = get_user(user_id)["business_until"]
-            base = datetime.fromisoformat(current) if current else datetime.now(timezone.utc)
+            base = _entitlement_date(current) or datetime.now(timezone.utc)
             if base < datetime.now(timezone.utc): base = datetime.now(timezone.utc)
             until = (base + timedelta(days=30)).isoformat()
         db.execute("UPDATE users SET business_until=? WHERE user_id=?", (until, user_id))
@@ -572,83 +844,224 @@ def add_favorite(user_id: int, favorite_user_id: int) -> bool:
     cur = db.execute("INSERT OR IGNORE INTO favorites(user_id,favorite_user_id) VALUES(?,?)", (user_id,favorite_user_id))
     return cur.rowcount == 1
 
-def match_score(request, helper_id: int) -> int:
-    score = 0
-    categories = get_helper_categories(helper_id)
-    if not categories or request["category"] in categories:
-        score += 100
-    if request["urgency"] == URGENCY_OPTIONS[0]: score += 15
-    elif request["urgency"] == URGENCY_OPTIONS[1]: score += 10
-    score += max(0, 20 - int(request["id"]) % 20)
-    score += int(request["priority_boost"] or 0)
-    if is_pro(request["requester_id"]): score += 10
-    return score
+def _stored_categories(helper):
+    try:
+        categories=json.loads(helper["helper_categories"] or "[]")
+        return [category for category in categories if category in CATEGORIES] if isinstance(categories,list) else []
+    except (TypeError,ValueError):return []
+
+
+def _match_factors(request,helper,rating=0,reviews=0,*,require_location=True):
+    """Keep historical ranking points separate from the match percentage."""
+    categories=_stored_categories(helper)
+    explicit=request["category"] in categories
+    category_match=explicit or not categories
+    known=_location_known(request,helper)
+    distance=haversine_km(request["lat"],request["lon"],helper["lat"],helper["lon"]) if known else None
+    available=matches_helper_preferences(request,helper,distance,require_location=require_location)
+    score=(100 if explicit else 45 if category_match else 0)+(20 if available else 0)
+    score+=float(rating)*12+min(int(reviews),10)
+    score+=max(0,30-distance*3) if distance is not None else 0
+    verified=_entitlement_active(helper["verified_until"])
+    pro=_entitlement_active(helper["pro_until"])
+    score+=12 if verified else 0
+    score+=8 if pro and category_match and available else 0
+    reasons=[]
+    if explicit:reasons.append("подходит по категории")
+    elif not categories:reasons.append("готов помогать в разных категориях")
+    else:reasons.append("категория вне настроек помощника")
+    if distance is None:reasons.append("расстояние неизвестно: точка не указана")
+    else:reasons.append("рядом" if distance<=3 else "расстояние до заявки известно")
+    if not available:
+        reasons.append("вне указанного времени или радиуса")
+    else:
+        if helper["helper_radius_km"] and distance is not None:
+            reasons.append("в пределах радиуса помощника")
+        if helper["helper_available_from"] or helper["helper_available_until"]:
+            reasons.append("подходит по времени")
+    if reviews:reasons.append("есть рейтинг за завершённую помощь")
+    if verified:reasons.append("Личность подтверждена")
+    return {"score":round(score,1),"category_match":category_match,"profile_match":explicit,
+            "available":available,"distance_km":round(distance,2) if distance is not None else None,
+            "location_known":known,"pro_active":pro,"verified":verified,"reasons":reasons}
+
+
+def match_score(request, helper_id: int) -> float:
+    helper=get_user(helper_id)
+    if not helper:return 0
+    stats=db.execute("SELECT AVG(requester_rating) avg,COUNT(*) n FROM requests WHERE helper_id=? AND status=? AND requester_rating IS NOT NULL",(helper_id,STATUS_DONE)).fetchone()
+    return _match_factors(request,helper,stats["avg"] or 0,stats["n"] or 0)["score"]+(10 if is_pro(request["requester_id"]) else 0)
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
     from math import radians, sin, cos, asin, sqrt
     if None in (lat1,lon1,lat2,lon2): return 999.0
+    lat1,lon1,lat2,lon2=map(float,(lat1,lon1,lat2,lon2))
     dlat=radians(lat2-lat1); dlon=radians(lon2-lon1)
     a=sin(dlat/2)**2+cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
-    return 6371*2*asin(sqrt(a))
+    return 6371*2*asin(sqrt(min(1,max(0,a))))
 
-def _query_terms(query):
-    return {word for word in re.findall(r"[\wа-яё-]{3,}", (query or "").lower())}
+SMART_MATCH_LIMIT = 5
+MANUAL_MATCH_LIMIT = 20
+_MATCH_CONTACT = re.compile(r"(?:https?://|www\.)\S+|[\w.+%'-]+@(?:[\w-]+\.)+[\w-]+", re.IGNORECASE)
+_MATCH_STOP = frozenset({
+    "мне", "нам", "нужен", "нужна", "нужно", "нужны", "надо", "ищу", "ищем", "помощь", "помощник",
+    "помочь", "человек", "для", "кто", "как", "или", "это", "чтобы", "если", "есть", "может", "могу",
+    "просто", "срочно", "сегодня", "завтра", "сейчас", "пожалуйста", "сделать", "делать", "умеет", "опытом",
+})
+_TASK_STOP = frozenset({"настроить", "починить", "заменить", "убрать", "принести", "собрать", "ремонт", "задача"})
 
-def smart_match(request_id, limit=20, query=""):
+
+def _match_terms(text, *, title=False):
+    # Ignore contacts an autofill manager may supply to the skill field.
+    text = _MATCH_CONTACT.sub(" ", str(text or "")).lower().replace("ё", "е")
+    words = set(re.findall(r"[a-zа-я0-9]{3,}", text))
+    return words - _MATCH_STOP - (_TASK_STOP if title else frozenset())
+
+
+def _matched_terms(terms, words):
+    return sorted(term for term in terms if any(
+        term == word or (min(len(term), len(word)) >= 4 and (term.startswith(word) or word.startswith(term)))
+        for word in words
+    ))
+
+
+def _request_match_fit(request, helper, base, task_terms, requirement_terms):
+    criteria = []
+
+    def add(key, label, detail, points, maximum, status):
+        criteria.append({"key": key, "label": label, "detail": detail,
+                         "points": points, "max_points": maximum, "status": status})
+
+    category = request["category"]
+    categories = _stored_categories(helper)
+    known_category = category in CATEGORIES and category != "other"
+    category_match = known_category and base["profile_match"]
+    if not known_category:
+        add("category", "Сфера помощи", "В заявке не указана специальная категория", 0, 0, "not_applicable")
+    elif category_match:
+        name = CATEGORIES[category].split(" ", 1)[1]
+        add("category", "Сфера помощи", f"Выбрал сферу «{name}»", 45, 45, "matched")
+    elif not categories:
+        add("category", "Сфера помощи", "Помощник не указал специализацию", 0, 45, "unknown")
+    else:
+        name = CATEGORIES[category].split(" ", 1)[1]
+        add("category", "Сфера помощи", f"Не выбрал сферу «{name}»", 0, 45, "mismatch")
+
+    bio = _match_terms(helper["bio"], title=True)
+    task_hits = _matched_terms(task_terms, bio)
+    if not task_terms:
+        add("profile", "Навыки по задаче", "В названии заявки нет конкретного навыка", 0, 0, "not_applicable")
+    elif task_hits:
+        add("profile", "Навыки по задаче", "В профиле есть слова по задаче: " + ", ".join(task_hits),
+            round(25 * len(task_hits) / len(task_terms)), 25,
+            "matched" if len(task_hits) == len(task_terms) else "partial")
+    else:
+        add("profile", "Навыки по задаче", "Совпадений с названием заявки в профиле нет", 0, 25,
+            "mismatch" if bio else "unknown")
+
+    requirement_hits = []
+    meets_requirements = True
+    if requirement_terms:
+        skills = _match_terms(helper["bio"]) | _match_terms(" ".join(CATEGORIES[item] for item in categories))
+        requirement_hits = _matched_terms(requirement_terms, skills)
+        hit_count = len(requirement_hits)
+        meets_requirements = hit_count >= max(min(len(requirement_terms), 2), (len(requirement_terms) + 1) // 2)
+        add("requirements", "Уточнение", "Совпало в профиле: " + ", ".join(requirement_hits)
+            if requirement_hits else "В профиле нет совпадений с уточнением",
+            round(25 * hit_count / len(requirement_terms)), 25,
+            "matched" if hit_count == len(requirement_terms) else "partial" if hit_count else "mismatch")
+
+    distance = base["distance_km"]
+    radius = int(helper["helper_radius_km"] or 0)
+    if not _location_known(request, request):
+        add("distance", "Расстояние", "В заявке не указана точка", 0, 0, "not_applicable")
+    elif distance is None:
+        add("distance", "Расстояние", "Помощник не указал точку", 0, 20, "unknown")
+    else:
+        distance_text = f"{distance:g}".replace(".", ",") + " км до заявки"
+        if radius and distance > radius:
+            add("distance", "Расстояние", distance_text + f" · вне радиуса {radius} км", 0, 20, "mismatch")
+        else:
+            points = round(20 * max(0, min(1, (30 - distance) / 27)))
+            if radius:
+                distance_text += f" · в радиусе {radius} км"
+            add("distance", "Расстояние", distance_text, points, 20,
+                "matched" if points == 20 else "partial" if points else "mismatch")
+
+    if not request["scheduled_at"]:
+        add("availability", "Время", "В заявке нет точного времени, согласуйте его в чате", 0, 0, "not_applicable")
+    elif not (helper["helper_available_from"] or helper["helper_available_until"]):
+        add("availability", "Время", "Помощник не указал часы доступности", 0, 10, "unknown")
+    elif _matches_helper_schedule(request, helper):
+        add("availability", "Время", "Время заявки входит в часы доступности", 10, 10, "matched")
+    else:
+        add("availability", "Время", "Время заявки вне часов доступности", 0, 10, "mismatch")
+
+    points = sum(criterion["points"] for criterion in criteria)
+    maximum = sum(criterion["max_points"] for criterion in criteria)
+    percent = round(100 * points / maximum) if maximum else 0
+    has_evidence = category_match or bool(task_hits) or bool(requirement_hits and meets_requirements)
+    return percent, criteria, has_evidence, meets_requirements
+
+
+def smart_match(request_id, limit=None, query="", *, mode="recommended"):
     req=get_request(request_id)
-    if not req: return []
-    rows=db.execute("""SELECT u.*, r.id request_id, r.category request_category, r.what, r.lat request_lat, r.lon request_lon
+    if not _open_for_responses(req) or (int(req["reward_rub"] or 0)>0 and req["reward_payment_status"]!="paid"):return []
+    manual = mode == "manual"
+    cap = MANUAL_MATCH_LIMIT if manual else SMART_MATCH_LIMIT
+    if limit is not None:
+        cap = max(1, min(int(limit), cap))
+    task_terms = _match_terms(req["what"], title=True)
+    requirement_terms = _match_terms(query)
+    rows=db.execute("""SELECT u.*,q.user_id queue_user_id,rc.status candidate_status,rc.offer_token,
+                       EXISTS(SELECT 1 FROM requests active WHERE active.helper_id=u.user_id AND active.status='in_progress') helper_busy,
+                       COALESCE(stats.rating,0) helper_rating,COALESCE(stats.reviews,0) helper_reviews
                        FROM users u
-                       JOIN helper_queue q ON q.user_id=u.user_id
-                       CROSS JOIN (SELECT id,category,what,lat,lon FROM requests WHERE id=?) r
+                       LEFT JOIN helper_queue q ON q.user_id=u.user_id
+                       LEFT JOIN request_candidates rc ON rc.candidate_id=u.user_id AND rc.request_id=?
+                       LEFT JOIN (SELECT helper_id,AVG(requester_rating) rating,COUNT(*) reviews FROM requests
+                         WHERE status='done' AND requester_rating IS NOT NULL GROUP BY helper_id) stats ON stats.helper_id=u.user_id
                        WHERE u.user_id != ? AND u.user_id IS NOT NULL AND u.is_blocked=0
+                       AND (q.user_id IS NOT NULL OR rc.status IN ('applied','offered'))
                        """,(request_id,req["requester_id"])).fetchall()
-    applied_ids = {row["candidate_id"] for row in db.execute("SELECT candidate_id FROM request_candidates WHERE request_id=? AND status='applied'", (request_id,)).fetchall()}
-    unavailable_for_request = {
-        row["candidate_id"] for row in db.execute(
-            "SELECT candidate_id FROM request_candidates WHERE request_id=? AND status IN ('declined','offered')",
-            (request_id,),
-        ).fetchall()
-    }
     out=[]
-    terms = _query_terms(query)
     for u in rows:
-        if u["user_id"] in unavailable_for_request or get_active_help(u["user_id"]) is not None: continue
-        cats=get_helper_categories(u["user_id"])
-        if cats and req["category"] not in cats and u["user_id"] not in applied_ids: continue
-        category_bonus=100 if (not cats or req["category"] in cats) else 0
-        distance=haversine_km(req["lat"],req["lon"],u["lat"],u["lon"])
-        stats=db.execute("""SELECT AVG(requester_rating) avg,COUNT(*) n FROM requests
-                            WHERE helper_id=? AND status=? AND requester_rating IS NOT NULL""",(u["user_id"],STATUS_DONE)).fetchone()
-        rating=float(stats["avg"]) if stats["avg"] is not None else 0.0
-        rating_bonus=rating*12
-        verified_bonus=12 if is_verified(u["user_id"]) else 0
-        pro_bonus=8 if is_pro(u["user_id"]) else 0
-        distance_bonus=max(0,30-distance*3) if distance < 10 else 0
-        profile_text=" ".join(str(u.get(field) or "") if isinstance(u, dict) else str(u[field] or "") for field in ("name","username","city","bio","helper_categories")).lower()
-        query_bonus=min(25, 8 * sum(term in profile_text for term in terms))
-        score=category_bonus+rating_bonus+verified_bonus+pro_bonus+distance_bonus+query_bonus+int(req["priority_boost"] or 0)
-        reasons=[]
-        if u["user_id"] in applied_ids: reasons.append("откликнулся на вашу заявку")
-        if category_bonus: reasons.append("подходит по категории")
-        if distance_bonus: reasons.append("рядом")
-        if rating_bonus: reasons.append("есть рейтинг")
-        if verified_bonus: reasons.append("Telegram подтверждён")
-        if query_bonus: reasons.append("соответствует уточнению")
+        status=u["candidate_status"] or "pending"
+        applied,offered=status=="applied",status=="offered"
+        if status in ("declined","accepted"):continue
+        busy=bool(u["helper_busy"])
+        ready=u["queue_user_id"] is not None
+        rating=float(u["helper_rating"] or 0)
+        factors=_match_factors(req,u,rating,u["helper_reviews"])
+        percent,criteria,has_evidence,query_match = _request_match_fit(req,u,factors,task_terms,requirement_terms)
+        suitable=factors["category_match"] and factors["available"] and query_match and not busy
+        # Existing conversations remain manageable even after a preference or
+        # availability change. They are visibly distinct from recommendations.
+        if not (applied or offered) and not (ready and suitable and (manual or has_evidence)):continue
+        reasons=factors.pop("reasons")
+        if requirement_terms and query_match:reasons.append("соответствует уточнению")
+        if applied:reasons.insert(0,"откликнулся на вашу заявку")
+        elif offered:reasons.insert(0,"приглашение отправлено, ожидается ответ")
+        if busy:reasons.append("сейчас занят другой помощью")
+        elif not ready:reasons.append("автоматический подбор приостановлен")
         out.append({"user_id":u["user_id"],"name":u["name"],"username":u["username"],"rating":round(rating,1),
-                    "reviews":int(stats["n"] or 0),"verified":is_verified(u["user_id"]),"distance_km":round(distance,2) if distance<999 else None,
-                    "score":round(score,1),"applied":u["user_id"] in applied_ids,
+                    "reviews":int(u["helper_reviews"] or 0),**factors,"applied":applied,"offered":offered,
+                    "match_percent":percent,"match_factors":criteria,"query_match":query_match,
+                    "status":status,"application_status":status,"helper_ready":ready,"helper_busy":busy,
+                    "eligible":not busy and (applied or (ready and suitable)),"can_select":applied and not busy,
+                    "can_invite":ready and suitable and not (applied or offered),
+                    "application_token":u["offer_token"] if applied else None,"offer_token":u["offer_token"] if offered else None,
                     # A requester only needs the distance to compare helpers.
                     # Publishing even rounded coordinates would expose a
                     # helper's neighbourhood before they accept the task.
-                    "lat":None,"lon":None,"availability":u["helper_availability"] or "По договорённости","reasons":reasons})
-    out.sort(key=lambda x:(x["applied"],x["score"],x["rating"],-(x["distance_km"] or 999)),reverse=True)
-    out = out[:limit]
-    save_request_candidates(request_id, out)
-    return out
+                    "lat":None,"lon":None,"availability":u["helper_availability"] or "По договорённости","reasons":reasons,"match_reasons":reasons})
+    out.sort(key=lambda x:(not x["helper_busy"],x["applied"],x["offered"],x["category_match"],x["available"],x["match_percent"],x["score"],x["rating"],-(x["distance_km"] if x["distance_km"] is not None else float("inf")),-x["user_id"]),reverse=True)
+    existing = [row for row in out if row["applied"] or row["offered"]]
+    new = [row for row in out if not row["applied"] and not row["offered"]]
+    return existing + new[:cap]
 
-def get_candidates_for_request(request_id, limit=20):
+def get_candidates_for_request(request_id, limit=None):
     """Return the same candidate pool used by the website and Telegram."""
     req = get_request(request_id)
     if not req:
@@ -658,12 +1071,26 @@ def get_candidates_for_request(request_id, limit=20):
     return smart_match(request_id, limit=limit)
 
 def smart_requests_for_helper(helper_id, limit=20):
-    rows=db.execute("SELECT * FROM requests WHERE status=? AND requester_id!=? ORDER BY created_at DESC LIMIT 100",(STATUS_OPEN,helper_id)).fetchall()
+    expire_open_requests()
+    helper=get_user(helper_id)
+    if not helper or helper["is_blocked"] or get_active_help(helper_id):return []
+    categories=get_helper_categories(helper_id)
+    sql="SELECT * FROM requests WHERE status=? AND requester_id!=? AND (reward_rub=0 OR reward_payment_status='paid')"
+    args=[STATUS_OPEN,helper_id]
+    if categories:
+        sql+=" AND category IN ("+",".join("?" for _ in categories)+")";args+=categories
     result=[]
-    for r in rows:
-        distance=haversine_km(r["lat"],r["lon"],get_user(helper_id)["lat"],get_user(helper_id)["lon"])
-        score=match_score(r,helper_id)
-        if distance<999: score += max(0,30-distance*3)
-        result.append((score,r,distance))
-    result.sort(key=lambda x:x[0],reverse=True)
-    return [{"request":dict(r),"score":round(score,1),"distance_km":round(d,2) if d<999 else None} for score,r,d in result[:limit]]
+    for row in db.execute(sql,args).fetchall():
+        if not _open_for_responses(row):continue
+        candidate=db.execute("SELECT status FROM request_candidates WHERE request_id=? AND candidate_id=?",(row["id"],helper_id)).fetchone()
+        if candidate and candidate["status"] in ("declined","accepted"):continue
+        # The manual feed can show tasks at unknown distances. Automatic
+        # invitations still require a known point when a radius is set.
+        factors=_match_factors(row,helper,require_location=False)
+        if not factors["available"]:continue
+        # A request's own subscription priority is meaningful when ranking
+        # requests, never a constant added to every candidate of one request.
+        score=factors["score"]+min(10,max(0,int(row["priority_boost"] or 0)))+(10 if is_pro(row["requester_id"]) else 0)
+        result.append((score,row,factors))
+    result.sort(key=lambda item:(item[0],item[1]["created_at"]),reverse=True)
+    return [{"request":dict(row),"score":round(score,1),"distance_km":factors["distance_km"],"reasons":factors["reasons"],"match_reasons":factors["reasons"]} for score,row,factors in result[:max(1,min(int(limit),100))]]

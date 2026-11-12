@@ -1,0 +1,573 @@
+{
+  "schema_version": 1,
+  "license": {
+    "name": "Pexels License",
+    "url": "https://www.pexels.com/license/",
+    "verified_on": "2026-10-29",
+    "primary_terms_url": "https://www.pexels.com/terms-of-service/",
+    "summary": "Free use and modification in websites and apps, including commercial projects; attribution appreciated. No implied endorsement, no misleading attribution, no standalone stock redistribution, no trademark use.",
+    "usage": "Thematic illustrations of help and professions. Not actual H-Point members, work results, testimonials, avatars or portfolios."
+  },
+  "count": 16,
+  "total_bytes": 996694,
+  "photos": {
+    "help": {
+      "key": "help",
+      "pexels_id": 7156181,
+      "source_url": "https://www.pexels.com/photo/happy-volunteers-packing-up-goods-7156181/",
+      "download_url": "https://images.pexels.com/photos/7156181/pexels-photo-7156181.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "Gustavo Fring",
+      "alt": "Волонтёры вместе собирают вещи и продукты для помощи",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/help-480.webp",
+          "bytes": 10730,
+          "sha256": "772a232bedd28a46f1b55b7b5efeef93142301b7b26fe5fa7930ea630dc349f0"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/help-960.webp",
+          "bytes": 26092,
+          "sha256": "8d389fe61669161c88a0f440c2dc422ca81161cc495e9493b0a3895776f67ccc"
+        },
+        {
+          "width": 1600,
+          "height": 1067,
+          "path": "photos/help-1600.webp",
+          "bytes": 54662,
+          "sha256": "6828badd376eae59ddb1205fd0876716e1ee330271ceb7261eba35a23d096088"
+        }
+      ]
+    },
+    "home": {
+      "key": "home",
+      "pexels_id": 4971210,
+      "source_url": "https://www.pexels.com/photo/a-young-couple-holding-cardboard-boxes-in-a-living-room-4971210/",
+      "download_url": "https://images.pexels.com/photos/4971210/pexels-photo-4971210.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "Gustavo Fring",
+      "alt": "Два человека помогают друг другу с коробками в светлой комнате",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/home-480.webp",
+          "bytes": 12592,
+          "sha256": "797ecaa28c5ac05ae40126eaccfb6aec0282bba13921e3777e97b3c72b1faddb"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/home-960.webp",
+          "bytes": 33672,
+          "sha256": "e26e91d34f2d50c98359719c451288046404ced0922981fd04c710aedfab2116"
+        },
+        {
+          "width": 1600,
+          "height": 1067,
+          "path": "photos/home-1600.webp",
+          "bytes": 80672,
+          "sha256": "a59bab05f00f9bb35fe26ef65f3e6b8a79d299fd8101cde1d325fa1b8aa0b4ca"
+        }
+      ]
+    },
+    "trainer": {
+      "key": "trainer",
+      "pexels_id": 8769171,
+      "source_url": "https://www.pexels.com/photo/gym-instructor-guiding-a-woman-8769171/",
+      "download_url": "https://images.pexels.com/photos/8769171/pexels-photo-8769171.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "Gustavo Fring",
+      "alt": "Тренер помогает посетительнице выполнять упражнение в спортзале",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/trainer-480.webp",
+          "bytes": 8454,
+          "sha256": "518d721b58a4aa1b7668d0301eda98fa88571ba24a3cc00017e206910d52b538"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/trainer-960.webp",
+          "bytes": 19588,
+          "sha256": "92964363b73c634ea487ac0f1a0fdaad66a26b45c587dd9465d8ff2b5db19bea"
+        }
+      ]
+    },
+    "foreman": {
+      "key": "foreman",
+      "pexels_id": 8961133,
+      "source_url": "https://www.pexels.com/photo/a-man-and-a-woman-with-ppe-s-looking-at-a-blue-print-8961133/",
+      "download_url": "https://images.pexels.com/photos/8961133/pexels-photo-8961133.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "Mikael Blomkvist",
+      "alt": "Инженерная команда обсуждает чертёж на строительном объекте",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/foreman-480.webp",
+          "bytes": 22780,
+          "sha256": "d2642c8e6b8e02a5364a2e584242ec79723114f0c56e283132f73922d4ea6e2c"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/foreman-960.webp",
+          "bytes": 52742,
+          "sha256": "bc70f63ff80fd6c0d21f0f65eeeb4a13a3682622e415a8438379bdf58b57dc84"
+        }
+      ]
+    },
+    "tutor": {
+      "key": "tutor",
+      "pexels_id": 5212354,
+      "source_url": "https://www.pexels.com/photo/teacher-helping-a-student-5212354/",
+      "download_url": "https://images.pexels.com/photos/5212354/pexels-photo-5212354.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "Max Fischer",
+      "alt": "Преподаватель помогает ученице разобраться с заданием",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/tutor-480.webp",
+          "bytes": 14260,
+          "sha256": "ecd1ac970551cfa37a655f19d2f5e6a36891aff1bc8c9b6538dbe7d74af4e924"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/tutor-960.webp",
+          "bytes": 36162,
+          "sha256": "ff5f5a4490151572ee8a1ebb6cf43cbc71809561d2b379971e878f09a3704cec"
+        }
+      ]
+    },
+    "beauty": {
+      "key": "beauty",
+      "pexels_id": 34930100,
+      "source_url": "https://www.pexels.com/photo/professional-manicure-with-nail-tools-in-salon-34930100/",
+      "download_url": "https://images.pexels.com/photos/34930100/pexels-photo-34930100.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "José Antonio Otegui Auzmendi",
+      "alt": "Мастер аккуратно выполняет маникюр в салоне",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/beauty-480.webp",
+          "bytes": 7584,
+          "sha256": "5626cf13e4c8d791fd1983f36ccda9dd3c4ec731521260119148017b34f89270"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/beauty-960.webp",
+          "bytes": 18660,
+          "sha256": "dd25f6dd488e809e0711654942227a6def959b3cea6539039d454fd55d45153c"
+        }
+      ]
+    },
+    "repair": {
+      "key": "repair",
+      "pexels_id": 12863086,
+      "source_url": "https://www.pexels.com/photo/man-hands-working-on-computer-hardware-12863086/",
+      "download_url": "https://images.pexels.com/photos/12863086/pexels-photo-12863086.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "Jacob Yavin",
+      "alt": "Руки мастера с инструментами во время ремонта электроники",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/repair-480.webp",
+          "bytes": 14502,
+          "sha256": "040d76ff44a9da24e3816a64dfb41d370e8d2e5bfbd247cfe22a942efacc1dee"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/repair-960.webp",
+          "bytes": 34452,
+          "sha256": "fa2ba88023f0d7679f8aad6ea3fcdebddce923bca745425e51adc2dc2dc3c56a"
+        }
+      ]
+    },
+    "events": {
+      "key": "events",
+      "pexels_id": 7327987,
+      "source_url": "https://www.pexels.com/photo/a-woman-setting-a-table-at-a-birthday-party-7327987/",
+      "download_url": "https://images.pexels.com/photos/7327987/pexels-photo-7327987.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "PNW Production",
+      "alt": "Организатор готовит стол к встрече гостей",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/events-480.webp",
+          "bytes": 9556,
+          "sha256": "7a74b75699afb642547971ac62caad4f84585632b2f838ee1cb5257c3e5422d8"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/events-960.webp",
+          "bytes": 24746,
+          "sha256": "cfbed5f4265f81b2a8f06e9556da0e9fb03041820bace4058c1803884e7184c0"
+        }
+      ]
+    },
+    "studio": {
+      "key": "studio",
+      "pexels_id": 4241339,
+      "source_url": "https://www.pexels.com/photo/woman-forming-clay-bowl-on-pottery-wheel-4241339/",
+      "download_url": "https://images.pexels.com/photos/4241339/pexels-photo-4241339.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "Gustavo Fring",
+      "alt": "Мастер создаёт керамическую чашу в светлой студии",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/studio-480.webp",
+          "bytes": 17020,
+          "sha256": "72ba8ec8ff7320bdeb99b243837f3c262a23ce72c14dc89b6403afc3359cf8ae"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/studio-960.webp",
+          "bytes": 46418,
+          "sha256": "81c4b0e5f391609cdad4acfe20f2e683a98d9166bf217372fb3d9b4d3078b170"
+        }
+      ]
+    },
+    "organization": {
+      "key": "organization",
+      "pexels_id": 7693730,
+      "source_url": "https://www.pexels.com/photo/group-of-men-and-women-looking-at-a-laptop-and-working-together-7693730/",
+      "download_url": "https://images.pexels.com/photos/7693730/pexels-photo-7693730.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "Yan Krukau",
+      "alt": "Команда обсуждает рабочий проект за общим столом",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/organization-480.webp",
+          "bytes": 12696,
+          "sha256": "d90ce90acf2f5931e14f878909cc22c84b84620512cbb95aadcc8f2b8f0d4e31"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/organization-960.webp",
+          "bytes": 31942,
+          "sha256": "be0f3382b59ab3412f286c33db59ecf55247ad1a23137b5e915448efee69102a"
+        }
+      ]
+    },
+    "specialist": {
+      "key": "specialist",
+      "pexels_id": 7014337,
+      "source_url": "https://www.pexels.com/photo/woman-working-retouching-photo-on-laptop-at-convenient-workplace-7014337/",
+      "download_url": "https://images.pexels.com/photos/7014337/pexels-photo-7014337.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "George Milton",
+      "alt": "Специалист работает с ноутбуком и графическим планшетом",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/specialist-480.webp",
+          "bytes": 11606,
+          "sha256": "3762968481577c8615f54bd8a9f992ee6eb019f9ad7dc138b23360a82fd04345"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/specialist-960.webp",
+          "bytes": 26272,
+          "sha256": "ea36e147b9aed8e2dd9877ab6815d9a836a2236bcc244fe99906a299a9988029"
+        }
+      ]
+    },
+    "digital": {
+      "key": "digital",
+      "pexels_id": 3823489,
+      "source_url": "https://www.pexels.com/photo/young-positive-woman-helping-senior-man-using-laptop-3823489/",
+      "download_url": "https://images.pexels.com/photos/3823489/pexels-photo-3823489.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "Andrea Piacquadio",
+      "alt": "Женщина помогает старшему человеку пользоваться ноутбуком",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/digital-480.webp",
+          "bytes": 10196,
+          "sha256": "f3b940212233dc5c953ef32417737210fa14cf78dcdec29c0b760292de4978ee"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/digital-960.webp",
+          "bytes": 24274,
+          "sha256": "492f1c67fbe2b39f6f7b2cf07bb1a97b8e3f736ef49288d0d6ae99029a7a36bd"
+        }
+      ]
+    },
+    "pets": {
+      "key": "pets",
+      "pexels_id": 5256729,
+      "source_url": "https://www.pexels.com/photo/crop-woman-walking-with-cute-puppy-5256729/",
+      "download_url": "https://images.pexels.com/photos/5256729/pexels-photo-5256729.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "Samson Katt",
+      "alt": "Прогулка с собакой на поводке в зелёном парке",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/pets-480.webp",
+          "bytes": 34612,
+          "sha256": "d1208d1291d20d8ea8e2b2a07c9c0964be9edee6d6190da8ef7115967846cfb2"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/pets-960.webp",
+          "bytes": 111420,
+          "sha256": "a821b8938b81caf2230a9f044a351fdb30239328b5543ec1e93574cd15d44a49"
+        }
+      ]
+    },
+    "garden": {
+      "key": "garden",
+      "pexels_id": 27176773,
+      "source_url": "https://www.pexels.com/photo/woman-planting-flowers-in-garden-27176773/",
+      "download_url": "https://images.pexels.com/photos/27176773/pexels-photo-27176773.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "Helena Lopes",
+      "alt": "Руки садовода высаживают небольшое растение в грунт",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/garden-480.webp",
+          "bytes": 21300,
+          "sha256": "446a4a19705daa0d417d5d5d4f69df715d171f1f4787bc9acf57cff3b3d8061f"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/garden-960.webp",
+          "bytes": 54252,
+          "sha256": "7cd919ffff21ec36a0efd0269b1b280d852e147192c72e01e4f510c3a988a567"
+        }
+      ]
+    },
+    "moving": {
+      "key": "moving",
+      "pexels_id": 8962869,
+      "source_url": "https://www.pexels.com/photo/a-couple-unpacking-boxes-in-their-new-house-8962869/",
+      "download_url": "https://images.pexels.com/photos/8962869/pexels-photo-8962869.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "Ivan S",
+      "alt": "Два человека разбирают коробки в новой квартире",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/moving-480.webp",
+          "bytes": 13380,
+          "sha256": "1fb33cb14f5931597e0e8656f6395248939e448e10be6e53fdc314f8e9a9cf0a"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/moving-960.webp",
+          "bytes": 34732,
+          "sha256": "92f7e80fc6cd1ef878a98d169ccb3e8aa1e9213a42297a3d603633f34b6782c6"
+        }
+      ]
+    },
+    "cooking": {
+      "key": "cooking",
+      "pexels_id": 12673981,
+      "source_url": "https://www.pexels.com/photo/a-person-holding-vegetables-12673981/",
+      "download_url": "https://images.pexels.com/photos/12673981/pexels-photo-12673981.jpeg?auto=compress&cs=tinysrgb&w=1600&q=86",
+      "photographer": "Anna Shvets",
+      "alt": "Подготовка свежих овощей на кухонном столе",
+      "focal_point": [
+        50,
+        50
+      ],
+      "license": "Pexels License",
+      "license_url": "https://www.pexels.com/license/",
+      "purpose": "thematic_illustration",
+      "not_a_user_photo": true,
+      "width": 960,
+      "height": 640,
+      "sources": [
+        {
+          "width": 480,
+          "height": 320,
+          "path": "photos/cooking-480.webp",
+          "bytes": 17824,
+          "sha256": "2eb2b4035889818dfec5d8d10873dea3e067a270ff99ca9c5d4fbcf696851cf7"
+        },
+        {
+          "width": 960,
+          "height": 640,
+          "path": "photos/cooking-960.webp",
+          "bytes": 46844,
+          "sha256": "6daabf30ac28d2dd336c1d7539f058e931cbe8c4d239d4e4d174597df93f401d"
+        }
+      ]
+    }
+  }
+}
