@@ -1,7 +1,7 @@
 name: hpoint
 description: "H-Point — помощь рядом."
 publish_to: 'none'
-version: 0.1.0+1
+version: 0.2.0+2
 
 environment:
   sdk: ^3.13.7
@@ -13,6 +13,7 @@ dependencies:
     sdk: flutter
   flutter_secure_storage: ^10.0.0
   image_picker: ^1.2.1
+  share_plus: ^13.3.1
   url_launcher: ^6.3.2
 
 dev_dependencies:

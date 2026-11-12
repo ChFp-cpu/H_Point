@@ -113,7 +113,7 @@ class HPointApi {
   Future<Uint8List> getBytes(String path, [Map<String, String>? query]) async {
     final response = await _send('GET', path, query: query);
     if (response.status >= 400) {
-      throw ApiException('Не удалось загрузить фото.', response.status);
+      throw ApiException('Не удалось загрузить файл.', response.status);
     }
     return response.bytes;
   }

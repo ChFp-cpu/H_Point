@@ -10,6 +10,7 @@ import 'community.dart';
 import 'help.dart';
 import 'profile.dart';
 import 'session.dart';
+import 'work.dart';
 
 void main() => runApp(const HPointApp());
 
