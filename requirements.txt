@@ -2,7 +2,7 @@ aiogram==3.31.0
 aiohttp==3.14.5
 certifi==2026.10.23
 python-dotenv==1.2.4
-psycopg[binary]==3.3.7
+psycopg[binary]==3.3.8
 
 -r requirements-media.txt
 -r requirements-exports.txt
